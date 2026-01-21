@@ -75,13 +75,18 @@ impl Path {
         Self::new(mount, dentry)
     }
 
-    fn new(mount: Arc<Mount>, dentry: Arc<Dentry>) -> Self {
+    pub(in crate::fs) fn new(mount: Arc<Mount>, dentry: Arc<Dentry>) -> Self {
         Self { mount, dentry }
     }
 
     /// Gets the mount node of current `Path`.
     pub fn mount_node(&self) -> &Arc<Mount> {
         &self.mount
+    }
+
+    /// Gets the dentry of current `Path`.
+    pub(in crate::fs) fn dentry(&self) -> &Arc<Dentry> {
+        &self.dentry
     }
 
     /// Returns true if the current `Path` is the root of its mount.
@@ -200,7 +205,7 @@ impl Path {
         &self,
         fs: Arc<dyn FileSystem>,
         flags: PerMountFlags,
-        source: String,
+        source: Option<String>,
         ctx: &Context,
     ) -> Result<Arc<Mount>> {
         if self.type_() != InodeType::Dir {

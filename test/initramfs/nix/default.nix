@@ -33,7 +33,7 @@ in rec {
     testSuite = syscallTestSuite;
     workDir = syscallTestWorkDir;
   };
-  
+
   initramfs = pkgs.callPackage ./initramfs.nix {
     inherit busybox kmod;
     xfstests = if enableXfstests then xfstests else null;

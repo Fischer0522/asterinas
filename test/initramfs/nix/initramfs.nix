@@ -1,5 +1,5 @@
-{ lib, stdenvNoCC, fetchFromGitHub, hostPlatform, writeClosure, busybox, kmod, xfstests, apps
-, benchmark, syscall, dnsServer, pkgs }:
+{ lib, stdenvNoCC, fetchFromGitHub, hostPlatform, writeClosure, busybox, kmod
+, xfstests, apps, benchmark, syscall, dnsServer, pkgs }:
 let
   etc = lib.fileset.toSource {
     root = ./../src/etc;
