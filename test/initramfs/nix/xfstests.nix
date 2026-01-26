@@ -29,6 +29,7 @@ ${pkgs.gnused}/bin:\
 ${pkgs.gawk}/bin:\
 ${pkgs.coreutils}/bin:\
 ${pkgs.findutils}/bin:\
+${pkgs.util-linux}/bin:\
 ${pkgs.bc}/bin:\
 ${pkgs.xfsprogs}/bin:\
 ${pkgs.xfsprogs}/sbin:\
