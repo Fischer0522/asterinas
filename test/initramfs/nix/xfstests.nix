@@ -31,6 +31,8 @@ ${pkgs.coreutils}/bin:\
 ${pkgs.findutils}/bin:\
 ${pkgs.util-linux}/bin:\
 ${pkgs.bc}/bin:\
+${pkgs.kmod}/bin:\
+${pkgs.kmod}/sbin:\
 ${pkgs.xfsprogs}/bin:\
 ${pkgs.xfsprogs}/sbin:\
 ${pkgs.e2fsprogs}/bin:\

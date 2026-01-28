@@ -299,11 +299,10 @@ impl PathResolver {
             let fs_type = mount.fs().name();
             let fs_flags = mount.fs().flags();
             let source = mount.source();
-            
+
             // The following fields are dummy for now.
             let major = 0;
             let minor = 0;
-
 
             let entry = MountInfoEntry {
                 mount_id,

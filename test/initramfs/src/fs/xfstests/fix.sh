@@ -1,6 +1,7 @@
 cd /xfstests
 
-sed -i 's|/proc/self/oom_score_adj|/dev/null|g' check
+# Replace echo with printf for oom_score_adj writes (echo fails on this system).
+sed -i 's|echo \(.*\) > /proc/self/oom_score_adj|printf \1 > /proc/self/oom_score_adj|g' check
 
 
 # # 1. disable the original _check_mounted_on
@@ -56,11 +57,10 @@ sed -i 's|/proc/self/oom_score_adj|/dev/null|g' check
 
 # disable modprobe calls in common/rc
 
-rm -f /sbin/modprobe /bin/modprobe /sbin/depmod
-echo -e '#!/bin/sh\nexit 0' > /bin/modprobe
-chmod +x /bin/modprobe
-cp /bin/modprobe /sbin/modprobe
-cp /bin/modprobe /sbin/depmod
-
+# rm -f /sbin/modprobe /bin/modprobe /sbin/depmod
+# echo -e '#!/bin/sh\nexit 0' > /bin/modprobe
+# chmod +x /bin/modprobe
+# cp /bin/modprobe /sbin/modprobe
+# cp /bin/modprobe /sbin/depmod
 
 
