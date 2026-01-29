@@ -54,7 +54,7 @@ def analyze_and_generate_whitelist(log_filename="xfstests.log", whitelist_filena
         
         if passed_tests:
             print(f"SUCCESS: Whitelist generated at '{whitelist_filename}'")
-            print(f"You can now run: ./run-xfstests.sh $(cat {whitelist_filename})")
+            print(f"You can now run: ./run_xfstests.sh $(cat {whitelist_filename})")
             print("-" * 60)
             print("\n[PASSED TESTS INCLUDED IN WHITELIST]:")
             for i in range(0, len(passed_tests), 4):

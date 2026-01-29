@@ -105,6 +105,9 @@ ENABLE_BASIC_TEST := true
 	endif
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="INTEL_TDX=$(INTEL_TDX)"
 CARGO_OSDK_BUILD_ARGS += --init-args="/test/run_general_test.sh"
+else ifeq ($(AUTO_TEST), xfstest)
+ENABLE_XFSTESTS := true
+CARGO_OSDK_BUILD_ARGS += --init-args="/xfstests/run_xfstests.sh"
 else ifeq ($(AUTO_TEST), boot)
 ENABLE_BASIC_TEST := true
 CARGO_OSDK_BUILD_ARGS += --init-args="/test/boot_hello.sh"
@@ -310,11 +313,14 @@ run_kernel: initramfs $(CARGO_OSDK)
 	@cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS)
 # Check the running status of auto tests from the QEMU log
 ifeq ($(AUTO_TEST), syscall)
-	@tail --lines 100 qemu.log | grep -q "^All  tests passed." \
+	@tail --lines 100 qemu.log | grep -q "^All syscall tests passed." \
 		|| (echo "Syscall test failed" && exit 1)
 else ifeq ($(AUTO_TEST), test)
 	@tail --lines 100 qemu.log | grep -q "^All general tests passed." \
 		|| (echo "General test failed" && exit 1)
+else ifeq ($(AUTO_TEST), xfstest)
+	@tail --lines 100 qemu.log | grep -q "^All xfstests passed." \
+		|| (echo "Xfstests failed" && exit 1)
 else ifeq ($(AUTO_TEST), boot)
 	@tail --lines 100 qemu.log | grep -q "^Successfully booted." \
 		|| (echo "Boot test failed" && exit 1)

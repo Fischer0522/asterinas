@@ -19,8 +19,9 @@ stdenvNoCC.mkDerivation {
     cp -r ${pkgs.xfstests}/bin/* $out/bin/
 
     # Create wrapper script for running xfstests
-    cat > $out/xfstests/run-xfstests.sh << 'EOF'
+    cat > $out/xfstests/run_xfstests.sh << 'EOF'
 #!/bin/sh
+set -e
 export PATH=\
 ${pkgs.perl}/bin:\
 ${pkgs.bash}/bin:\
@@ -40,9 +41,10 @@ ${pkgs.e2fsprogs}/sbin:\
 /bin:\
 /usr/bin
 cd /xfstests
-exec ./check "$@"
+./check "$@"
+echo "All xfstests passed."
 EOF
-    chmod +x $out/xfstests/run-xfstests.sh
+    chmod +x $out/xfstests/run_xfstests.sh
 
     # Copy local.config from source directory
     cp ${./../src/fs/xfstests/local.config} $out/xfstests/local.config
@@ -75,6 +77,9 @@ EOF
 
     # copy skip.list into xfstests directory
     cp ${./../src/fs/xfstests/skip.list} $out/xfstests/skip.list
+
+    # copy full.list into xfstests directory
+    cp ${./../src/fs/xfstests/full.list} $out/xfstests/full.list
 
     # copy white.list into xfstests directory if it exists
     ${lib.optionalString hasWhiteList ''

@@ -1,7 +1,7 @@
-cd /xfstests
+# cd /xfstests
 
-# Replace echo with printf for oom_score_adj writes (echo fails on this system).
-sed -i 's|echo \(.*\) > /proc/self/oom_score_adj|printf \1 > /proc/self/oom_score_adj|g' check
+# # Replace echo with printf for oom_score_adj writes (echo fails on this system).
+# sed -i 's|echo \(.*\) > /proc/self/oom_score_adj|printf \1 > /proc/self/oom_score_adj|g' check
 
 
 # # 1. disable the original _check_mounted_on
