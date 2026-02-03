@@ -1,18 +1,45 @@
 [PROMPT]
 Provide `kernel/src/fs/ext2/fs.rs`. Output Rust code only. No unsafe. No panic/assert/unimplemented.
-Use Rust OOP style: all functions must be methods in `impl Ext2`.
+Implementation logic MUST follow [SOURCE] Linux code.
+
+[SOURCE]
+Ext2 (core fs state)        → fs/ext2/super.c:ext2_fill_super
+Ext2::open                  → fs/ext2/super.c:ext2_fill_super
+Ext2::root_inode            → fs/ext2/inode.c:ext2_iget
+Ext2::block_device          → fs/ext2/super.c:ext2_fill_super
+Ext2::block_size            → fs/ext2/super.c:ext2_fill_super
+Ext2::inode_size            → fs/ext2/super.c:ext2_fill_super
+Ext2::inodes_per_group      → fs/ext2/super.c:ext2_fill_super
+Ext2::blocks_per_group      → fs/ext2/super.c:ext2_fill_super
+Ext2::super_block           → fs/ext2/super.c:ext2_fill_super
+Ext2::fs_event_subscriber_stats → fs/ext2/super.c:ext2_fill_super
 
 [RELY]
+```rust
 use super::prelude::*;
+```
+
+```rust
 use super::block_group::BlockGroup;
+```
+
+```rust
 use super::inode::Inode;
+```
+
+```rust
 use super::super_block::SuperBlock;
+```
+
+```rust
 use super::utils::Dirty;
+```
+
+```rust
 use crate::fs::utils::FsEventSubscriberStats;
+```
 
-/// The root inode number (Linux EXT2_ROOT_INO).
-pub const ROOT_INO: u32 = 2;
-
+```rust
 /// The Ext2 filesystem (core state holder).
 #[derive(Debug)]
 pub struct Ext2 {
@@ -37,6 +64,7 @@ pub struct Ext2 {
     /// Weak self reference for inode back-pointers.
     self_ref: Weak<Ext2>,
 }
+```
 
 [GUARANTEE]
 impl Ext2 {
@@ -69,6 +97,9 @@ impl Ext2 {
 }
 
 [SPECIFICATION]
+Pre (module):
+- Must define `pub const ROOT_INO: u32 = 2` in this file (Linux EXT2_ROOT_INO).
+
 Pre (open):
 - `block_device` is a valid block device handle.
 
