@@ -40,12 +40,20 @@ pub use fs::Ext2;
 pub use inode::{FilePerm, Inode};
 pub use super_block::{MAGIC_NUM, SuperBlock};
 
-// use crate::fs::ext2::fs::Ext2Type;
+use crate::fs::ext2_old::fs::Ext2Type;
+
+mod block_group;
+mod block_ptr;
+mod dir;
+mod fs;
+mod impl_for_vfs;
+mod indirect_block_cache;
+mod inode;
+mod prelude;
+mod super_block;
+mod utils;
+mod xattr;
 
 pub(super) fn init() {
     super::registry::register(&Ext2Type).unwrap();
 }
-mod super_block;
-mod block_group;
-mod inode;
-mod prelude;

@@ -5,8 +5,8 @@ pub mod configfs;
 pub mod device;
 pub mod devpts;
 pub mod epoll;
-pub mod exfat;
 pub mod ext2;
+pub mod exfat;
 pub mod file_handle;
 pub mod file_table;
 pub mod inode_handle;
@@ -45,7 +45,6 @@ pub fn init() {
     devpts::init();
     pseudofs::init();
 
-    ext2::init();
     exfat::init();
     overlayfs::init();
 

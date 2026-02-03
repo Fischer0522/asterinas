@@ -2,7 +2,7 @@
 
 use ostd::const_assert;
 
-use super::prelude::*;
+use super::{inode::RawInode, prelude::*};
 
 /// The magic number of Ext2.
 pub const MAGIC_NUM: u16 = 0xef53;
@@ -116,108 +116,6 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
     type Error = crate::error::Error;
 
     fn try_from(sb: RawSuperBlock) -> Result<Self> {
-        if sb.magic != MAGIC_NUM {
-            return_errno_with_message!(Errno::EINVAL, "bad ext2 magic number");
-        }
-
-        if sb.log_block_size != 2 {
-            return_errno_with_message!(Errno::EINVAL, "unsupported block size");
-        }
-        if sb.log_frag_size != sb.log_block_size {
-            return_errno_with_message!(Errno::EINVAL, "invalid fragment size");
-        }
-
-        let block_size = BLOCK_SIZE;
-        let frag_size = BLOCK_SIZE;
-
-        let state = FsState::from_bits(sb.state)
-            .ok_or(Error::with_message(Errno::EINVAL, "invalid fs state"))?;
-
-        let errors_behaviour = ErrorsBehaviour::try_from(sb.errors)
-            .map_err(|_| Error::with_message(Errno::EINVAL, "invalid errors behaviour"))?;
-        if errors_behaviour != ErrorsBehaviour::Continue {
-            return_errno_with_message!(Errno::EINVAL, "unsupported errors behaviour");
-        }
-
-        let creator_os = OsId::try_from(sb.creator_os)
-            .map_err(|_| Error::with_message(Errno::EINVAL, "invalid creator os"))?;
-        if creator_os != OsId::Linux {
-            return_errno_with_message!(Errno::EINVAL, "not supported os id");
-        }
-
-        let rev_level = RevLevel::try_from(sb.rev_level)
-            .map_err(|_| Error::with_message(Errno::EINVAL, "invalid revision level"))?;
-        let (first_ino, inode_size) = match rev_level {
-            RevLevel::GoodOld => (11, 128usize),
-            RevLevel::Dynamic => {
-                let inode_size = sb.inode_size as usize;
-                if inode_size < 128 {
-                    return_errno_with_message!(Errno::EINVAL, "inode size is too small");
-                }
-                if inode_size > BLOCK_SIZE {
-                    return_errno_with_message!(Errno::EINVAL, "inode size is too large");
-                }
-                if !inode_size.is_power_of_two() {
-                    return_errno_with_message!(Errno::EINVAL, "inode size is not power of two");
-                }
-                (sb.first_ino, inode_size)
-            }
-        };
-
-        let inodes_per_group = sb.inodes_per_group;
-        let blocks_per_group = sb.blocks_per_group;
-        if inodes_per_group == 0 || blocks_per_group == 0 {
-            return_errno_with_message!(Errno::EINVAL, "invalid group sizes");
-        }
-
-        let inodes_per_block = (block_size / inode_size) as u32;
-        if inodes_per_block == 0 {
-            return_errno_with_message!(Errno::EINVAL, "invalid inode size");
-        }
-
-        if inodes_per_group < inodes_per_block {
-            return_errno_with_message!(Errno::EINVAL, "inodes per group is too small");
-        }
-
-        let max_per_group = (block_size as u32) * 8;
-        if inodes_per_group > max_per_group {
-            return_errno_with_message!(Errno::EINVAL, "inodes per group is too large");
-        }
-        if blocks_per_group > max_per_group {
-            return_errno_with_message!(Errno::EINVAL, "blocks per group is too large");
-        }
-
-        let itb_per_group = inodes_per_group / inodes_per_block;
-        if blocks_per_group <= itb_per_group + 3 {
-            return_errno_with_message!(Errno::EINVAL, "blocks per group is too small");
-        }
-
-        let blocks_count = sb.blocks_count as u64;
-        let first_data_block = sb.first_data_block as u64;
-        if blocks_count <= first_data_block + 1 {
-            return_errno_with_message!(Errno::EINVAL, "invalid blocks count");
-        }
-        let blocks_after = blocks_count - first_data_block - 1;
-        let groups_count = (blocks_after / blocks_per_group as u64) + 1;
-        if groups_count * (inodes_per_group as u64) != sb.inodes_count as u64 {
-            return_errno_with_message!(Errno::EINVAL, "invalid inodes count");
-        }
-
-        let feature_compat = FeatureCompatSet::from_bits_truncate(sb.feature_compat);
-
-        let allowed_incompat = FeatureInCompatSet::FILETYPE.bits();
-        if (sb.feature_incompat & !allowed_incompat) != 0 {
-            return_errno_with_message!(Errno::EINVAL, "unsupported incompat feature");
-        }
-        let feature_incompat = FeatureInCompatSet::from_bits_truncate(sb.feature_incompat);
-
-        let allowed_ro_compat =
-            FeatureRoCompatSet::SPARSE_SUPER.bits() | FeatureRoCompatSet::LARGE_FILE.bits();
-        if (sb.feature_ro_compat & !allowed_ro_compat) != 0 {
-            return_errno_with_message!(Errno::EINVAL, "unsupported ro compat feature");
-        }
-        let feature_ro_compat = FeatureRoCompatSet::from_bits_truncate(sb.feature_ro_compat);
-
         Ok(Self {
             inodes_count: sb.inodes_count,
             blocks_count: sb.blocks_count,
@@ -225,8 +123,8 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             free_blocks_count: sb.free_blocks_count,
             free_inodes_count: sb.free_inodes_count,
             first_data_block: Bid::new(sb.first_data_block as _),
-            block_size,
-            frag_size,
+            block_size: SUPER_BLOCK_SIZE << sb.log_block_size,
+            frag_size: SUPER_BLOCK_SIZE << sb.log_frag_size,
             blocks_per_group: sb.blocks_per_group,
             frags_per_group: sb.frags_per_group,
             inodes_per_group: sb.inodes_per_group,
@@ -234,21 +132,54 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             wtime: sb.wtime,
             mnt_count: sb.mnt_count,
             max_mnt_count: sb.max_mnt_count,
-            magic: MAGIC_NUM,
-            state,
-            errors_behaviour,
+            magic: {
+                if sb.magic != MAGIC_NUM {
+                    return_errno_with_message!(Errno::EINVAL, "bad ext2 magic number");
+                }
+                MAGIC_NUM
+            },
+            state: FsState::from_bits(sb.state)
+                .ok_or(Error::with_message(Errno::EINVAL, "invalid fs state"))?,
+            errors_behaviour: ErrorsBehaviour::try_from(sb.errors)
+                .map_err(|_| Error::with_message(Errno::EINVAL, "invalid errors behaviour"))?,
             last_check_time: sb.last_check_time,
             check_interval: Duration::from_secs(sb.check_interval as _),
-            creator_os,
-            rev_level,
+            creator_os: {
+                let os_id = OsId::try_from(sb.creator_os)
+                    .map_err(|_| Error::with_message(Errno::EINVAL, "invalid creator os"))?;
+                if os_id != OsId::Linux {
+                    return_errno_with_message!(Errno::EINVAL, "not supported os id");
+                }
+                OsId::Linux
+            },
+            rev_level: {
+                let rev_level = RevLevel::try_from(sb.rev_level)
+                    .map_err(|_| Error::with_message(Errno::EINVAL, "invalid revision level"))?;
+                if rev_level != RevLevel::Dynamic {
+                    return_errno_with_message!(Errno::EINVAL, "not supported rev level");
+                }
+                RevLevel::Dynamic
+            },
             def_resuid: sb.def_resuid as _,
             def_resgid: sb.def_resgid as _,
-            first_ino,
-            inode_size,
+            first_ino: sb.first_ino,
+            inode_size: {
+                let inode_size = sb.inode_size as _;
+                if inode_size < size_of::<RawInode>() {
+                    return_errno_with_message!(Errno::EINVAL, "inode size is too small");
+                }
+                inode_size
+            },
             block_group_idx: sb.block_group_idx as _,
-            feature_compat,
-            feature_incompat,
-            feature_ro_compat,
+            feature_compat: FeatureCompatSet::from_bits(sb.feature_compat).ok_or(
+                Error::with_message(Errno::EINVAL, "invalid feature compat set"),
+            )?,
+            feature_incompat: FeatureInCompatSet::from_bits(sb.feature_incompat).ok_or(
+                Error::with_message(Errno::EINVAL, "invalid feature incompat set"),
+            )?,
+            feature_ro_compat: FeatureRoCompatSet::from_bits(sb.feature_ro_compat).ok_or(
+                Error::with_message(Errno::EINVAL, "invalid feature ro compat set"),
+            )?,
             uuid: sb.uuid,
             volume_name: sb.volume_name,
             last_mounted_dir: sb.last_mounted_dir,
@@ -303,19 +234,9 @@ impl SuperBlock {
         self.blocks_per_group
     }
 
-    /// Returns the first data block number.
-    pub fn first_data_block(&self) -> u32 {
-        self.first_data_block.to_raw() as u32
-    }
-
     /// Returns the number of inodes in each block group.
     pub fn inodes_per_group(&self) -> u32 {
         self.inodes_per_group
-    }
-
-    /// Returns the first non-reserved inode number.
-    pub fn first_ino(&self) -> u32 {
-        self.first_ino
     }
 
     /// Returns the number of block groups.
