@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use super::block_group::BlockGroup;
+use super::block_group::{BlockGroup, RawGroupDesc};
 use super::inode::Inode;
 use super::prelude::*;
 use super::super_block::SuperBlock;
 use super::utils::Dirty;
 use crate::fs::utils::FsEventSubscriberStats;
+use core::mem::size_of;
 
 /// The root inode number (Linux EXT2_ROOT_INO).
 pub const ROOT_INO: u32 = 2;
@@ -79,5 +80,72 @@ impl Ext2 {
     /// Returns the root inode.
     pub fn root_inode(&self) -> Result<Arc<Inode>> {
         return_errno!(Errno::ENOSYS);
+    }
+
+    /// Loads the group descriptor table into a segment.
+    ///
+    /// Linux: /root/linux/fs/ext2/super.c:695 (ext2_check_descriptors)
+    pub(super) fn load_group_desc_table(&self, sb: &SuperBlock) -> Result<USegment> {
+        let groups_count = sb.block_groups_count() as usize;
+        let desc_bytes = groups_count * size_of::<RawGroupDesc>();
+        let npages = desc_bytes.div_ceil(BLOCK_SIZE);
+
+        let segment = FrameAllocOptions::new().zeroed(false).alloc_segment(npages)?;
+        let bio_segment = BioSegment::new_from_segment(segment.clone().into(), BioDirection::FromDevice);
+        match self.block_device.read_blocks(sb.group_descriptors_bid(0), bio_segment)? {
+            BioStatus::Complete => {}
+            err_status => {
+                return Err(Error::from(err_status));
+            }
+        }
+        let segment: USegment = segment.into();
+        self.check_group_desc_table(sb, &segment)?;
+        Ok(segment)
+    }
+
+    /// Validates the group descriptor table.
+    ///
+    /// Linux: /root/linux/fs/ext2/super.c:695 (ext2_check_descriptors)
+    pub(super) fn check_group_desc_table(&self, sb: &SuperBlock, group_descs: &USegment) -> Result<()> {
+        let groups_count = sb.block_groups_count() as usize;
+        let itb_per_group = sb.itb_per_group();
+
+        for group_idx in 0..groups_count {
+            let offset = group_idx * size_of::<RawGroupDesc>();
+            let desc = group_descs.read_val::<RawGroupDesc>(offset)?;
+
+            let first_block = sb.group_first_block_no(group_idx);
+            let last_block = sb.group_last_block_no(group_idx);
+
+            let block_bitmap = desc.block_bitmap;
+            let inode_bitmap = desc.inode_bitmap;
+            let inode_table = desc.inode_table;
+
+            if block_bitmap < first_block || block_bitmap > last_block {
+                return_errno!(Errno::EINVAL);
+            }
+            if inode_bitmap < first_block || inode_bitmap > last_block {
+                return_errno!(Errno::EINVAL);
+            }
+            let table_last = inode_table.saturating_add(itb_per_group.saturating_sub(1));
+            if inode_table < first_block || table_last > last_block {
+                return_errno!(Errno::EINVAL);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn load_block_groups(
+        &self,
+        sb: &SuperBlock,
+        group_descs: &USegment,
+    ) -> Result<Vec<BlockGroup>> {
+        let groups_count = sb.block_groups_count() as usize;
+        let mut groups = Vec::with_capacity(groups_count);
+        for idx in 0..groups_count {
+            let group = BlockGroup::load(group_descs, idx)?;
+            groups.push(group);
+        }
+        Ok(groups)
     }
 }

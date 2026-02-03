@@ -41,6 +41,8 @@ pub struct SuperBlock {
     frags_per_group: u32,
     /// Number of inodes in each block group.
     inodes_per_group: u32,
+    /// Number of inode table blocks in each group.
+    itb_per_group: u32,
     /// Mount time.
     mtime: UnixTime,
     /// Write time.
@@ -228,6 +230,7 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             blocks_per_group: sb.blocks_per_group,
             frags_per_group: sb.frags_per_group,
             inodes_per_group: sb.inodes_per_group,
+            itb_per_group,
             mtime: sb.mtime,
             wtime: sb.wtime,
             mnt_count: sb.mnt_count,
@@ -323,6 +326,29 @@ impl SuperBlock {
         self.blocks_per_group
     }
 
+    /// Returns the first block number of a block group.
+    ///
+    /// Linux: /root/linux/fs/ext2/ext2.h:798 (ext2_group_first_block_no)
+    pub(super) fn group_first_block_no(&self, group_idx: usize) -> u32 {
+        (group_idx as u32)
+            .saturating_mul(self.blocks_per_group)
+            .saturating_add(self.first_data_block())
+    }
+
+    /// Returns the last block number of a block group.
+    ///
+    /// Linux: /root/linux/fs/ext2/ext2.h:804 (ext2_group_last_block_no)
+    pub(super) fn group_last_block_no(&self, group_idx: usize) -> u32 {
+        let groups_count = self.block_groups_count();
+        if group_idx as u32 == groups_count.saturating_sub(1) {
+            self.total_blocks().saturating_sub(1)
+        } else {
+            self.group_first_block_no(group_idx)
+                .saturating_add(self.blocks_per_group)
+                .saturating_sub(1)
+        }
+    }
+
     /// Returns the first data block number.
     pub fn first_data_block(&self) -> u32 {
         self.first_data_block.to_raw() as u32
@@ -331,6 +357,11 @@ impl SuperBlock {
     /// Returns the number of inodes in each block group.
     pub fn inodes_per_group(&self) -> u32 {
         self.inodes_per_group
+    }
+
+    /// Returns the number of inode table blocks in each block group.
+    pub(super) fn itb_per_group(&self) -> u32 {
+        self.itb_per_group
     }
 
     /// Returns the first non-reserved inode number.
