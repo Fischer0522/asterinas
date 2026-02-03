@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use core::mem::size_of;
+
 use ostd::const_assert;
 
 use super::prelude::*;
@@ -116,6 +118,7 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
     type Error = crate::error::Error;
 
     fn try_from(sb: RawSuperBlock) -> Result<Self> {
+        // Linux: /root/linux/fs/ext2/super.c:877 (ext2_fill_super)
         if sb.magic != MAGIC_NUM {
             return_errno_with_message!(Errno::EINVAL, "bad ext2 magic number");
         }
@@ -211,11 +214,6 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
         }
         let feature_incompat = FeatureInCompatSet::from_bits_truncate(sb.feature_incompat);
 
-        let allowed_ro_compat =
-            FeatureRoCompatSet::SPARSE_SUPER.bits() | FeatureRoCompatSet::LARGE_FILE.bits();
-        if (sb.feature_ro_compat & !allowed_ro_compat) != 0 {
-            return_errno_with_message!(Errno::EINVAL, "unsupported ro compat feature");
-        }
         let feature_ro_compat = FeatureRoCompatSet::from_bits_truncate(sb.feature_ro_compat);
 
         Ok(Self {
@@ -270,6 +268,28 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             reserved: sb.reserved,
         })
     }
+}
+
+/// Reads and validates the on-disk superblock.
+///
+/// Linux: /root/linux/fs/ext2/super.c:877 (ext2_fill_super)
+pub fn load_super_block(device: &dyn BlockDevice, read_only: bool) -> Result<SuperBlock> {
+    let raw = device.read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)?;
+    let sb = SuperBlock::try_from(raw)?;
+
+    let device_bytes = (device.metadata().nr_sectors as u64) * (SECTOR_SIZE as u64);
+    let device_blocks = device_bytes / (BLOCK_SIZE as u64);
+    if device_blocks < raw.blocks_count as u64 {
+        return_errno_with_message!(Errno::EINVAL, "device size is too small");
+    }
+
+    let allowed_ro_compat =
+        FeatureRoCompatSet::SPARSE_SUPER.bits() | FeatureRoCompatSet::LARGE_FILE.bits();
+    if !read_only && (raw.feature_ro_compat & !allowed_ro_compat) != 0 {
+        return_errno_with_message!(Errno::EINVAL, "unsupported ro compat feature");
+    }
+
+    Ok(sb)
 }
 
 impl SuperBlock {

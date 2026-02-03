@@ -47,7 +47,6 @@ Goal: parse/validate on-disk structures and mount read-only.
 - New structs:
   - `RawSuperBlock`, `RawGroupDesc`, `RawInode`, `RawDirEntry` (`#[repr(C)] + Pod`).
 - Methods:
-  - `RawSuperBlock::read_from(frame, offset)`.
 - Linux refs:
   - `/root/linux/include/linux/ext2_fs.h:103` (superblock).
   - `/root/linux/include/linux/ext2_fs.h:180` (group desc).
@@ -61,7 +60,8 @@ Goal: parse/validate on-disk structures and mount read-only.
 - New/extend structs:
   - `SuperBlock` (in-memory), `FeatureCompatSet`, `FeatureInCompatSet`, `FeatureRoCompatSet`.
 - Methods:
-  - `SuperBlock::from_raw(raw)`.
+  - `RawSuperBlock::read_from(frame, offset)`.
+  - `impl TryFrom<RawSuperBlock> for SuperBlock`.
   - `Ext2::read_super(block_device)`.
   - `Ext2::validate_super(&SuperBlock)`.
 - Linux refs:
@@ -70,7 +70,7 @@ Goal: parse/validate on-disk structures and mount read-only.
 - Asterinas adjustments:
   - block size fixed to 4096 (per project constraint), restrict features accordingly.
   - error handling via `Errno` mapping.
-- Spec: `phase-01-superblock.spec` (already present; update if needed).
+- Spec: `phase-01-superblock.spec`.
 
 ### Module 1.3: Group Descriptor Table Load
 - New/extend structs:
