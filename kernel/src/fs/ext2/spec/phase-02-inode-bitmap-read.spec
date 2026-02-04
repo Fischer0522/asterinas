@@ -4,7 +4,7 @@ All functions must be methods in `impl` blocks.
 Implementation logic MUST follow [SOURCE] Linux code.
 
 [SOURCE]
-read_inode_bitmap          → fs/ext2/ialloc.c:31
+read_inode_bitmap          → fs/ext2/ialloc.c:40
 
 [RELY]
 ```rust

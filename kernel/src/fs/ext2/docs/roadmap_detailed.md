@@ -6,6 +6,12 @@
 - Rust style: OOP `impl` methods only, no unsafe, no panic/assert, Asterinas infra only.
 - Isolation wall: do not reuse ext2_old logic (only trait signatures/registration patterns).
 
+## Unsupported Features
+The following Linux Ext2 features are explicitly out of scope:
+- **Quota**: User/group disk usage limits (`CONFIG_QUOTA`, `i_dquot[]` in `ext2_inode_info`)
+- **DAX (Direct Access)**: Persistent memory direct mapping (`-o dax`, `s_daxdev` in `ext2_sb_info`)
+- **fiemap**: Physical block mapping ioctl (`FS_IOC_FIEMAP`, `ext2_fiemap()` in `inode.c`)
+
 ## Shared Asterinas Adaptation Patterns (apply everywhere)
 - I/O: `BlockDevice` + `PageCache` + `BioWaiter` instead of `buffer_head` chains.
 - Sync: `RwMutex`/`Mutex`/`SpinLock` with lock ordering from `developing-ext2`.
@@ -374,6 +380,92 @@ Goal: finalize boundary checks, feature gating, and consistency rules.
 - Asterinas adjustments:
   - use PageCache and `BlockDevice::sync`.
 - Spec: `phase-09-sync.spec`.
+
+---
+
+## Phase 10: Extended Attributes & ioctl
+Goal: support extended attributes and file attribute ioctls.
+
+### Module 10.1: Extended Attributes Core
+- New/extend structs:
+  - `XattrEntry` (on-disk xattr entry format).
+  - `XattrBlock` (xattr block reader/writer).
+- Methods:
+  - `Ext2Inode::getxattr(name)`.
+  - `Ext2Inode::setxattr(name, value, flags)`.
+  - `Ext2Inode::listxattr()`.
+  - `Ext2Inode::removexattr(name)`.
+- Linux refs:
+  - `/root/linux/fs/ext2/xattr.c:200` (`ext2_xattr_get`).
+  - `/root/linux/fs/ext2/xattr.c:400` (`ext2_xattr_set`).
+- Asterinas adjustments:
+  - use PageCache for xattr block I/O.
+  - namespace handlers as trait objects or enum dispatch.
+- Spec: `phase-10-xattr-core.spec`.
+
+### Module 10.2: Xattr Namespace Handlers
+- Methods:
+  - `UserXattrHandler::get/set`.
+  - `TrustedXattrHandler::get/set`.
+  - `SecurityXattrHandler::get/set`.
+- Linux refs:
+  - `/root/linux/fs/ext2/xattr_user.c`.
+  - `/root/linux/fs/ext2/xattr_trusted.c`.
+  - `/root/linux/fs/ext2/xattr_security.c`.
+- Asterinas adjustments:
+  - permission checks via Asterinas credential APIs.
+- Spec: `phase-10-xattr-handlers.spec`.
+
+### Module 10.3: ioctl Operations
+- Methods:
+  - `Ext2Inode::ioctl_getflags()`.
+  - `Ext2Inode::ioctl_setflags(flags)`.
+  - `Ext2Inode::ioctl_getversion()`.
+  - `Ext2Inode::ioctl_setversion(version)`.
+- Linux refs:
+  - `/root/linux/fs/ext2/ioctl.c:20` (`ext2_ioctl`).
+- Asterinas adjustments:
+  - integrate with VFS ioctl dispatch.
+- Spec: `phase-10-ioctl.spec`.
+
+---
+
+## Phase 11: Orphan Inode & Crash Recovery
+Goal: handle unlinked-but-open files and ensure crash consistency.
+
+### Module 11.1: Orphan List Management
+- New/extend structs:
+  - `OrphanList` (in-memory orphan inode tracking).
+- Methods:
+  - `Ext2::add_orphan(inode)`.
+  - `Ext2::remove_orphan(inode)`.
+- Linux refs:
+  - `/root/linux/fs/ext2/inode.c:70` (`ext2_add_orphan`).
+  - `/root/linux/fs/ext2/inode.c:100` (`ext2_orphan_del`).
+- Asterinas adjustments:
+  - use linked list or BTreeSet for orphan tracking.
+  - update `s_last_orphan` in superblock.
+- Spec: `phase-11-orphan-list.spec`.
+
+### Module 11.2: Orphan Cleanup on Mount
+- Methods:
+  - `Ext2::cleanup_orphans()`.
+- Linux refs:
+  - `/root/linux/fs/ext2/super.c:200` (orphan cleanup in `ext2_fill_super`).
+- Asterinas adjustments:
+  - iterate orphan chain via `i_dtime` linkage.
+  - truncate and free each orphan inode.
+- Spec: `phase-11-orphan-cleanup.spec`.
+
+### Module 11.3: Evict Inode Integration
+- Methods:
+  - `Ext2Inode::evict()` (called when inode refcount drops to zero).
+- Linux refs:
+  - `/root/linux/fs/ext2/inode.c:130` (`ext2_evict_inode`).
+- Asterinas adjustments:
+  - if nlink=0: truncate data, free inode, remove from orphan list.
+  - if nlink>0: just sync metadata.
+- Spec: `phase-11-evict-inode.spec`.
 
 ---
 

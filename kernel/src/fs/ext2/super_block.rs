@@ -349,6 +349,33 @@ impl SuperBlock {
         }
     }
 
+    /// Returns whether a data block range is valid.
+    ///
+    /// Linux: /root/linux/fs/ext2/balloc.c:1177 (ext2_data_block_valid)
+    pub(super) fn data_block_valid(&self, start_blk: u32, count: u32) -> bool {
+        if count == 0 {
+            return false;
+        }
+
+        let first_data_block = self.first_data_block();
+        let blocks_count = self.total_blocks();
+
+        let Some(end_blk) = start_blk.checked_add(count.saturating_sub(1)) else {
+            return false;
+        };
+
+        if start_blk <= first_data_block || end_blk < start_blk || end_blk >= blocks_count {
+            return false;
+        }
+
+        let sb_block = if self.block_size == SUPER_BLOCK_SIZE { 1u32 } else { 0u32 };
+        if start_blk <= sb_block && end_blk >= sb_block {
+            return false;
+        }
+
+        true
+    }
+
     /// Returns the first data block number.
     pub fn first_data_block(&self) -> u32 {
         self.first_data_block.to_raw() as u32

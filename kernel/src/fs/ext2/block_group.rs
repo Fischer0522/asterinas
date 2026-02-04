@@ -171,4 +171,28 @@ impl BlockGroup {
 
         Ok(bitmap)
     }
+
+    /// Loads the inode bitmap for this group.
+    ///
+    /// Linux: /root/linux/fs/ext2/ialloc.c:31 (read_inode_bitmap)
+    pub fn load_inode_bitmap(&self, fs: &Ext2, sb: &SuperBlock) -> Result<IdBitmap> {
+        let desc = self.desc.read();
+        let bitmap_bid = desc.inode_bitmap;
+
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        if fs
+            .block_device()
+            .read_bytes(bitmap_bid.to_offset(), &mut buf)
+            .is_err()
+        {
+            return_errno!(Errno::EIO);
+        }
+
+        let capacity = sb.inodes_per_group() as usize;
+        if capacity > IdBitmap::capacity() as usize {
+            return_errno!(Errno::EINVAL);
+        }
+
+        Ok(IdBitmap::from_buf(buf.into_boxed_slice(), capacity as u16))
+    }
 }

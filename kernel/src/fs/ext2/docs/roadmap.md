@@ -6,6 +6,12 @@
 - Linux sources are the single source of truth for logic; Asterinas infra is the runtime substrate.
 - Each phase follows: Spec -> Impl -> Verify, and must pass before moving on.
 
+## Unsupported Features
+The following Linux Ext2 features are explicitly out of scope for this implementation:
+- **Quota**: User/group disk usage limits (`CONFIG_QUOTA`, `i_dquot[]`)
+- **DAX (Direct Access)**: Persistent memory direct mapping (`-o dax`, `s_daxdev`)
+- **fiemap**: Physical block mapping ioctl (`FS_IOC_FIEMAP`, `ext2_fiemap`)
+
 ## High-Level Module Decomposition
 1. On-disk formats: superblock, group descriptor, inode, directory entry, feature flags.
 2. Superblock/mount: read/validate, feature gating, state/clean flags, mount options.
@@ -71,6 +77,16 @@ Goal: implement symlink/device/fifo/socket behaviors and metadata updates.
 Goal: finalize boundary checks, feature gating, error mapping, and consistency.
 - Modules: feature compat/incompat handling, limits, edge cases, stats.
 - Linux anchors: fs/ext2/super.c, fs/ext2/inode.c.
+
+### Phase 10: Extended Attributes & ioctl
+Goal: support extended attributes and file attribute ioctls.
+- Modules: xattr get/set/list/remove, user/trusted/security namespaces, ioctl handlers.
+- Linux anchors: fs/ext2/xattr.c, fs/ext2/xattr_user.c, fs/ext2/xattr_trusted.c, fs/ext2/xattr_security.c, fs/ext2/ioctl.c.
+
+### Phase 11: Orphan Inode & Crash Recovery
+Goal: handle unlinked-but-open files and ensure crash consistency.
+- Modules: orphan list management, orphan cleanup on mount, s_last_orphan tracking.
+- Linux anchors: fs/ext2/inode.c (ext2_evict_inode), fs/ext2/super.c (orphan cleanup).
 
 ## Phase Completion Gate (applies to every phase)
 - Spec written to `kernel/src/fs/ext2/spec/` with pre/post and lock protocol.

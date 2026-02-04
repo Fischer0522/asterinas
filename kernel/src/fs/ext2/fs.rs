@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use super::block_group::{BlockGroup, RawGroupDesc};
-use super::inode::Inode;
+use super::inode::{Inode, InodeDesc, RawInode};
 use super::prelude::*;
 use super::super_block::SuperBlock;
 use super::utils::Dirty;
@@ -80,6 +80,68 @@ impl Ext2 {
     /// Returns the root inode.
     pub fn root_inode(&self) -> Result<Arc<Inode>> {
         return_errno!(Errno::ENOSYS);
+    }
+
+    /// Reads an inode and constructs its in-memory representation.
+    /// TODO: Add inode caching.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:1387 (ext2_iget)
+    pub(super) fn read_inode(&self, ino: u32) -> Result<Arc<Inode>> {
+        let desc = self.read_inode_desc(ino)?;
+        Inode::from_desc(ino, desc, self.self_ref.clone())
+    }
+
+    /// Returns the inode table block ID for the given group.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:1314 (ext2_get_inode)
+    pub(super) fn inode_table_block(&self, group_idx: usize, table_block_index: u32) -> Result<Bid> {
+        let group = self
+            .block_groups
+            .get(group_idx)
+            .ok_or_else(|| Error::new(Errno::EIO))?;
+        Ok(group.inode_table_bid() + table_block_index as u64)
+    }
+
+    /// Reads an inode descriptor from disk.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:1314 (ext2_get_inode)
+    pub(super) fn read_inode_desc(&self, ino: u32) -> Result<InodeDesc> {
+        let sb = self.super_block.read();
+
+        if (ino != ROOT_INO && ino < sb.first_ino()) || ino > sb.total_inodes() {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let inodes_per_group = sb.inodes_per_group();
+        let group_idx = (ino - 1) / inodes_per_group;
+        let index_in_group = (ino - 1) % inodes_per_group;
+
+        let inode_size = sb.inode_size();
+        let block_size = sb.block_size();
+        let offset_bytes = (index_in_group as usize).saturating_mul(inode_size);
+        let block_index = offset_bytes / block_size;
+        let offset_in_block = offset_bytes % block_size;
+
+        let block_bid = self.inode_table_block(group_idx as usize, block_index as u32)?;
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        if self
+            .block_device
+            .read_bytes(block_bid.to_offset(), &mut buf)
+            .is_err()
+        {
+            return_errno!(Errno::EIO);
+        }
+
+        if offset_in_block + size_of::<RawInode>() > BLOCK_SIZE {
+            return_errno!(Errno::EIO);
+        }
+
+        let mut reader = VmReader::from(buf.as_slice());
+        let raw = reader
+            .skip(offset_in_block)
+            .read_val::<RawInode>()
+            .map_err(|_| Error::new(Errno::EIO))?;
+        Ok(InodeDesc { raw })
     }
 
     /// Loads the group descriptor table into a segment.
