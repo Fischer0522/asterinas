@@ -5,7 +5,6 @@
 - No unsafe, no panic/assert, no C-macro style; Rust OOP `impl`-based APIs only.
 - Linux sources are the single source of truth for logic; Asterinas infra is the runtime substrate.
 - Each phase follows: Spec -> Impl -> Verify, and must pass before moving on.
-- Naming alignment: Ext2 inode struct is `Inode` (no `Ext2Inode` type yet).
 
 ## Unsupported Features
 The following Linux Ext2 features are explicitly out of scope for this implementation:
@@ -29,13 +28,6 @@ The following Linux Ext2 features are explicitly out of scope for this implement
 
 ## Phase Roadmap (High-Level)
 
-## Progress (as of 2026-02-05)
-- Implemented (spec + code): Phase 0.1 (core skeleton), Phase 1.1-1.3, Phase 2.1-2.3,
-  Phase 3.1, Phase 3.3, Phase 4.1-4.2.
-- Partially implemented: Phase 0.2 (VFS glue stubs not present), Phase 3.2 (inode cache not wired; read_inode implemented).
-- Verified against Linux: Phase 4.2 (lookup/readdir) via linux-logic-verify.
-- Not started: Phase 5+.
-
 ### Phase 0: Scaffolding & Interfaces
 Goal: establish module layout and VFS wiring points without logic.
 - Modules: prelude, errors, traits glue, minimal Ext2 struct, registration.
@@ -53,7 +45,7 @@ Goal: load/validate group descriptors and bitmaps, expose counters.
 
 ### Phase 3: Inode Read Path & Block Mapping
 Goal: read inode from disk, map logical blocks (direct/indirect), support read-only file access.
-- Modules: inode table I/O, inode cache, block_to_path, get_block logic, file read path.
+- Modules: inode table I/O, inode cache, block_to_path, get_block logic.
 - Linux anchors: fs/ext2/inode.c.
 
 ### Phase 4: Directory Read Path

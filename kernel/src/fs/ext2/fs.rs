@@ -3,9 +3,9 @@
 use super::block_group::{BlockGroup, RawGroupDesc};
 use super::inode::{Inode, InodeDesc, RawInode};
 use super::prelude::*;
-use super::super_block::SuperBlock;
+use super::super_block::{SuperBlock, SUPER_BLOCK_OFFSET};
 use super::utils::Dirty;
-use crate::fs::utils::FsEventSubscriberStats;
+use crate::fs::utils::{FsEventSubscriberStats, IdBitmap};
 use core::mem::size_of;
 
 /// The root inode number (Linux EXT2_ROOT_INO).
@@ -209,5 +209,335 @@ impl Ext2 {
             groups.push(group);
         }
         Ok(groups)
+    }
+
+    /// Allocates up to `count` contiguous blocks.
+    pub(super) fn alloc_blocks(&self, count: u32) -> Result<Range<u32>> {
+        if count == 0 {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let (
+            first_data_block,
+            blocks_per_group,
+            total_blocks,
+            groups_count,
+            sb_free_blocks,
+            itb_per_group,
+        ) = {
+            let guard = self.super_block.read();
+            (
+                guard.first_data_block(),
+                guard.blocks_per_group(),
+                guard.total_blocks(),
+                guard.block_groups_count() as usize,
+                guard.free_blocks_count(),
+                guard.itb_per_group(),
+            )
+        };
+        if groups_count == 0 || self.block_groups.len() < groups_count {
+            return_errno!(Errno::EIO);
+        }
+        if sb_free_blocks == 0 {
+            return_errno!(Errno::ENOSPC);
+        }
+
+        let mut saw_corruption = false;
+        for group_idx in 0..groups_count {
+            let group = self
+                .block_groups
+                .get(group_idx)
+                .ok_or_else(|| Error::new(Errno::EIO))?;
+            if group.free_blocks_count() == 0 {
+                continue;
+            }
+
+            let (range, corrupt) = self.try_alloc_in_group(
+                first_data_block,
+                blocks_per_group,
+                total_blocks,
+                groups_count,
+                itb_per_group,
+                sb_free_blocks,
+                group,
+                group_idx,
+                count,
+            )?;
+            if corrupt {
+                saw_corruption = true;
+            }
+            if let Some(range) = range {
+                return Ok(range);
+            }
+        }
+
+        if saw_corruption {
+            return_errno!(Errno::EIO);
+        }
+        return_errno!(Errno::ENOSPC);
+    }
+
+    /// Frees a range of blocks starting at `start`.
+    pub(super) fn free_blocks(&self, start: u32, count: u32) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+
+        let (first_data_block, blocks_per_group, total_blocks, groups_count, itb_per_group, block_size) = {
+            let guard = self.super_block.read();
+            (
+                guard.first_data_block(),
+                guard.blocks_per_group(),
+                guard.total_blocks(),
+                guard.block_groups_count() as usize,
+                guard.itb_per_group(),
+                guard.block_size(),
+            )
+        };
+        if !Self::data_block_valid(first_data_block, total_blocks, block_size, start, count) {
+            return_errno!(Errno::EIO);
+        }
+
+        let mut current = start;
+        let mut remaining = count;
+
+        while remaining > 0 {
+            let group_idx = ((current - first_data_block) / blocks_per_group) as usize;
+            let group = self
+                .block_groups
+                .get(group_idx)
+                .ok_or_else(|| Error::new(Errno::EIO))?;
+
+            let group_first = Self::group_first_block_no(first_data_block, blocks_per_group, group_idx);
+            let group_last = Self::group_last_block_no(
+                first_data_block,
+                blocks_per_group,
+                total_blocks,
+                groups_count,
+                group_idx,
+            );
+            if group_last < group_first {
+                return_errno!(Errno::EIO);
+            }
+            let group_size = group_last - group_first + 1;
+            if group_size as usize > BLOCK_SIZE * 8 {
+                return_errno!(Errno::EIO);
+            }
+            let bit = current.saturating_sub(group_first);
+            if bit >= group_size {
+                return_errno!(Errno::EIO);
+            }
+            let group_count = remaining.min(group_size.saturating_sub(bit));
+
+            let mut bitmap = {
+                let sb_guard = self.super_block.read();
+                group.load_block_bitmap(self, &sb_guard)?
+            };
+
+            if self.range_overlaps_system_zone(itb_per_group, group, current, group_count) {
+                return_errno!(Errno::EIO);
+            }
+
+            let mut freed = 0u32;
+            let range_start = bit as u16;
+            let range_end = (bit + group_count) as u16;
+            for idx in range_start..range_end {
+                assert!(bitmap.is_allocated(idx));
+            }
+
+            bitmap.free_consecutive(range_start..range_end);
+            freed = group_count;
+
+            if self
+                .block_device
+                .write_bytes(group.block_bitmap_bid().to_offset(), bitmap.as_bytes())
+                .is_err()
+            {
+                return_errno!(Errno::EIO);
+            }
+
+            if freed > 0 {
+                group.inc_free_blocks(freed as u16);
+                let mut sb_write = self.super_block.write();
+                sb_write.inc_free_blocks(freed);
+            }
+
+            current = current.saturating_add(group_count);
+            remaining = remaining.saturating_sub(group_count);
+        }
+
+        Ok(())
+    }
+
+    // TODO: Move this method into BlockGroup?
+    fn try_alloc_in_group(
+        &self,
+        first_data_block: u32,
+        blocks_per_group: u32,
+        total_blocks: u32,
+        groups_count: usize,
+        itb_per_group: u32,
+        sb_free_blocks: u32,
+        group: &BlockGroup,
+        group_idx: usize,
+        count: u32,
+    ) -> Result<(Option<Range<u32>>, bool)> {
+        let group_first = Self::group_first_block_no(first_data_block, blocks_per_group, group_idx);
+        let group_last = Self::group_last_block_no(
+            first_data_block,
+            blocks_per_group,
+            total_blocks,
+            groups_count,
+            group_idx,
+        );
+        if group_last < group_first {
+            return_errno!(Errno::EIO);
+        }
+        let group_size = group_last - group_first + 1;
+        if group_size as usize > BLOCK_SIZE * 8 {
+            return_errno!(Errno::EIO);
+        }
+
+        let mut saw_corruption = false;
+        let mut bitmap = {
+            let sb_guard = self.super_block.read();
+            group.load_block_bitmap(self, &sb_guard)?
+        };
+        if group.free_blocks_count() > 0 {
+            if let Some(range) = bitmap.alloc_consecutive(1) {
+                bitmap.free_consecutive(range);
+            } else {
+                saw_corruption = true;
+            }
+        }
+
+        let mut rejected = Vec::new();
+        let mut req = count.min(group_size) as u16;
+        while req > 0 {
+            let Some(range) = bitmap.alloc_consecutive(req) else {
+                req /= 2;
+                continue;
+            };
+            let alloc_len = range.len() as u32;
+            let run_start = range.start as u32;
+            let ret_block = group_first.saturating_add(run_start);
+
+            if self.range_overlaps_system_zone(itb_per_group, group, ret_block, alloc_len) {
+                saw_corruption = true;
+                rejected.push(range);
+                continue;
+            }
+            if group.free_blocks_count() < alloc_len as u16 || sb_free_blocks < alloc_len {
+                saw_corruption = true;
+                rejected.push(range);
+                continue;
+            }
+
+            for rejected_range in rejected.drain(..) {
+                bitmap.free_consecutive(rejected_range);
+            }
+
+            if self
+                .block_device
+                .write_bytes(group.block_bitmap_bid().to_offset(), bitmap.as_bytes())
+                .is_err()
+            {
+                return_errno!(Errno::EIO);
+            }
+
+            group.dec_free_blocks(alloc_len as u16);
+            let mut sb_write = self.super_block.write();
+            sb_write.dec_free_blocks(alloc_len);
+
+            let range = ret_block..ret_block.saturating_add(alloc_len);
+            return Ok((Some(range), saw_corruption));
+        }
+
+        Ok((None, saw_corruption))
+    }
+
+    fn range_overlaps_system_zone(
+        &self,
+        itb_per_group: u32,
+        group: &BlockGroup,
+        start: u32,
+        count: u32,
+    ) -> bool {
+        let Some(end) = start.checked_add(count.saturating_sub(1)) else {
+            return true;
+        };
+        let block_bitmap = group.block_bitmap_bid().to_raw() as u32;
+        let inode_bitmap = group.inode_bitmap_bid().to_raw() as u32;
+        let inode_table = group.inode_table_bid().to_raw() as u32;
+
+        if Self::ranges_overlap(start, end, block_bitmap, 1) {
+            return true;
+        }
+        if Self::ranges_overlap(start, end, inode_bitmap, 1) {
+            return true;
+        }
+        if Self::ranges_overlap(start, end, inode_table, itb_per_group) {
+            return true;
+        }
+        false
+    }
+
+    fn group_first_block_no(first_data_block: u32, blocks_per_group: u32, group_idx: usize) -> u32 {
+        (group_idx as u32)
+            .saturating_mul(blocks_per_group)
+            .saturating_add(first_data_block)
+    }
+
+    fn group_last_block_no(
+        first_data_block: u32,
+        blocks_per_group: u32,
+        total_blocks: u32,
+        groups_count: usize,
+        group_idx: usize,
+    ) -> u32 {
+        if group_idx as u32 == (groups_count as u32).saturating_sub(1) {
+            total_blocks.saturating_sub(1)
+        } else {
+            Self::group_first_block_no(first_data_block, blocks_per_group, group_idx)
+                .saturating_add(blocks_per_group)
+                .saturating_sub(1)
+        }
+    }
+
+    fn data_block_valid(
+        first_data_block: u32,
+        total_blocks: u32,
+        block_size: usize,
+        start_blk: u32,
+        count: u32,
+    ) -> bool {
+        if count == 0 {
+            return false;
+        }
+
+        let Some(end_blk) = start_blk.checked_add(count.saturating_sub(1)) else {
+            return false;
+        };
+
+        if start_blk <= first_data_block || end_blk < start_blk || end_blk >= total_blocks {
+            return false;
+        }
+
+        let sb_block = if block_size == SUPER_BLOCK_OFFSET { 1u32 } else { 0u32 };
+        if start_blk <= sb_block && end_blk >= sb_block {
+            return false;
+        }
+
+        true
+    }
+
+    fn ranges_overlap(start: u32, end: u32, zone_start: u32, zone_len: u32) -> bool {
+        if zone_len == 0 {
+            return false;
+        }
+        let Some(zone_end) = zone_start.checked_add(zone_len.saturating_sub(1)) else {
+            return true;
+        };
+        !(end < zone_start || start > zone_end)
     }
 }

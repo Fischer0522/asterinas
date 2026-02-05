@@ -49,6 +49,7 @@ mod fs;
 mod fs_type;
 mod super_block;
 mod block_group;
+mod dir;
 mod inode;
 mod prelude;
 mod utils;

@@ -96,6 +96,18 @@ impl BlockGroup {
         self.desc.read().used_dirs_count
     }
 
+    /// Decreases the free-block counter for this group.
+    pub(super) fn dec_free_blocks(&self, count: u16) {
+        let mut desc = self.desc.write();
+        desc.free_blocks_count = desc.free_blocks_count.saturating_sub(count);
+    }
+
+    /// Increases the free-block counter for this group.
+    pub(super) fn inc_free_blocks(&self, count: u16) {
+        let mut desc = self.desc.write();
+        desc.free_blocks_count = desc.free_blocks_count.saturating_add(count);
+    }
+
     /// Loads and validates the block bitmap for this group.
     ///
     /// Linux: /root/linux/fs/ext2/balloc.c:129 (read_block_bitmap)

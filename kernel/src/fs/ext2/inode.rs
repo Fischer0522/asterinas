@@ -4,6 +4,8 @@ use core::mem::size_of;
 
 use ostd::const_assert;
 
+use crate::fs::ext2::dir::{DirEntry, DirEntryIter};
+
 use super::prelude::*;
 use super::fs::Ext2;
 
@@ -52,6 +54,141 @@ impl Inode {
         return_errno!(Errno::ENOSYS);
     }
 
+    /// Finds a directory entry by name and returns its inode number.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:342 (ext2_find_entry)
+    pub(super) fn find_entry(&self, name: &str) -> Result<u32> {
+        if self.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let sb = fs.super_block();
+        let block_size = fs.block_size();
+        let size = self.size;
+        let max_inumber = sb.total_inodes();
+        let max_blocks = (self.blocks as u64) >> 3;
+        let mut block_idx = 0usize;
+
+        while (block_idx as u64).saturating_mul(block_size as u64) < size {
+            if (block_idx as u64) > max_blocks {
+                return_errno!(Errno::ENOENT);
+            }
+            let block_offset = (block_idx as u64).saturating_mul(block_size as u64);
+            let remain = size.saturating_sub(block_offset);
+            let limit = (remain.min(block_size as u64)) as usize;
+            if limit == 0 {
+                break;
+            }
+
+            let bid = self
+                .get_block(block_idx as u32)?
+                .ok_or_else(|| Error::new(Errno::EIO))?;
+            let mut buf = vec![0u8; BLOCK_SIZE];
+            if fs.block_device().read_bytes(bid.to_offset(), &mut buf).is_err() {
+                return_errno!(Errno::EIO);
+            }
+
+            let mut iter = DirEntryIter::new(&buf, limit, max_inumber)?;
+            while let Some(entry) = iter.next_entry()? {
+                if entry.inode == 0 {
+                    continue;
+                }
+                if entry.name_len as usize != name.len() {
+                    continue;
+                }
+                let entry_name = entry.name.as_bytes();
+                if entry_name.len() == name.len() && entry_name == name.as_bytes() {
+                    return Ok(entry.inode);
+                }
+            }
+
+            block_idx += 1;
+        }
+
+        return_errno!(Errno::ENOENT);
+    }
+
+    /// Reads directory entries starting at byte offset and feeds visitor.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:257 (ext2_readdir)
+    pub(super) fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize> {
+        if self.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let size = self.size as usize;
+        let min_rec_len = DirEntry::dir_rec_len(1) as usize;
+        if size < min_rec_len || offset > size - min_rec_len {
+            return Ok(0);
+        }
+
+        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let sb = fs.super_block();
+        let block_size = fs.block_size();
+        let max_inumber = sb.total_inodes();
+
+        let start_block = offset / block_size;
+        let mut current_offset = offset;
+        let mut advanced = 0usize;
+
+        let total_blocks = (size + block_size - 1) / block_size;
+        for block_idx in start_block..total_blocks {
+            let block_offset = block_idx.saturating_mul(block_size);
+            if block_offset >= size {
+                break;
+            }
+            let remain = size.saturating_sub(block_offset);
+            let limit = remain.min(block_size);
+            if limit == 0 {
+                break;
+            }
+
+            let bid = self
+                .get_block(block_idx as u32)?
+                .ok_or_else(|| Error::new(Errno::EIO))?;
+            let mut buf = vec![0u8; BLOCK_SIZE];
+            if fs.block_device().read_bytes(bid.to_offset(), &mut buf).is_err() {
+                return_errno!(Errno::EIO);
+            }
+
+            let mut iter = DirEntryIter::new(&buf, limit, max_inumber)?;
+            let mut inner_off = 0usize;
+            while let Some(entry) = iter.next_entry()? {
+                let entry_offset = block_offset.saturating_add(inner_off);
+                let next_offset = entry_offset.saturating_add(entry.rec_len as usize);
+
+                if next_offset <= current_offset {
+                    inner_off = next_offset.saturating_sub(block_offset);
+                    continue;
+                }
+                if entry_offset < current_offset {
+                    current_offset = next_offset;
+                    inner_off = next_offset.saturating_sub(block_offset);
+                    continue;
+                }
+
+                if entry.inode != 0 {
+                    let dtype = DirEntryFileType::from(entry.file_type);
+                    let inode_type = InodeType::from(dtype);
+                    if visitor
+                        .visit(entry.name.as_str()?, entry.inode as u64, inode_type, entry_offset)
+                        .is_err()
+                    {
+                        advanced = current_offset.saturating_sub(offset);
+                        return Ok(advanced);
+                    }
+                }
+
+                current_offset = next_offset;
+                inner_off = next_offset.saturating_sub(block_offset);
+            }
+
+            advanced = current_offset.saturating_sub(offset);
+        }
+
+        Ok(advanced)
+    }
     // TODO: Implement inode_from_desc caching.
     pub(super) fn from_desc(ino: u32, desc: InodeDesc, fs: Weak<Ext2>) -> Result<Arc<Inode>> {
         let raw = desc.raw;
@@ -235,6 +372,58 @@ impl Inode {
         }
 
         Ok(Some(Bid::new(bid as u64)))
+    }
+}
+
+/// Directory entry type mapping (ext2 file_type field).
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum DirEntryFileType {
+    /// Unknown file type.
+    Unknown = 0,
+    /// Regular file.
+    File = 1,
+    /// Directory.
+    Dir = 2,
+    /// Character device.
+    Char = 3,
+    /// Block device.
+    Block = 4,
+    /// FIFO.
+    Fifo = 5,
+    /// Socket.
+    Socket = 6,
+    /// Symlink.
+    Symlink = 7,
+}
+
+impl From<u8> for DirEntryFileType {
+    fn from(value: u8) -> Self {
+        match value {
+            1 => Self::File,
+            2 => Self::Dir,
+            3 => Self::Char,
+            4 => Self::Block,
+            5 => Self::Fifo,
+            6 => Self::Socket,
+            7 => Self::Symlink,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl From<DirEntryFileType> for InodeType {
+    fn from(file_type: DirEntryFileType) -> Self {
+        match file_type {
+            DirEntryFileType::Unknown => Self::Unknown,
+            DirEntryFileType::File => Self::File,
+            DirEntryFileType::Dir => Self::Dir,
+            DirEntryFileType::Char => Self::CharDevice,
+            DirEntryFileType::Block => Self::BlockDevice,
+            DirEntryFileType::Fifo => Self::NamedPipe,
+            DirEntryFileType::Socket => Self::Socket,
+            DirEntryFileType::Symlink => Self::SymLink,
+        }
     }
 }
 
