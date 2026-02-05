@@ -7,7 +7,7 @@ use device_id::DeviceId;
 use crate::{
     device,
     fs::{
-        ext2::{FilePerm, Inode as Ext2Inode},
+        ext2_old::{FilePerm, Inode as Ext2Inode},
         inode_handle::FileIo,
         utils::{
             AccessMode, DirentVisitor, Extension, FallocMode, FileSystem, Inode, InodeIo,

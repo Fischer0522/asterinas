@@ -4,7 +4,7 @@ use ostd::sync::RwMutexReadGuard;
 
 use crate::{
     fs::{
-        ext2::{Ext2, MAGIC_NUM as EXT2_MAGIC, SuperBlock as Ext2SuperBlock, utils::Dirty},
+        ext2_old::{Ext2, MAGIC_NUM as EXT2_MAGIC, SuperBlock as Ext2SuperBlock, utils::Dirty},
         utils::{FileSystem, FsEventSubscriberStats, Inode, NAME_MAX, SuperBlock},
     },
     prelude::*,

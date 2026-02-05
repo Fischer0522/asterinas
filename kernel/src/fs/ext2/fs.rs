@@ -3,7 +3,7 @@
 use super::block_group::{BlockGroup, RawGroupDesc};
 use super::inode::{Inode, InodeDesc, RawInode};
 use super::prelude::*;
-use super::super_block::{SuperBlock, SUPER_BLOCK_OFFSET};
+use super::super_block::{RawSuperBlock, SuperBlock, SUPER_BLOCK_OFFSET};
 use super::utils::Dirty;
 use crate::fs::utils::{FsEventSubscriberStats, IdBitmap};
 use core::mem::size_of;
@@ -366,6 +366,217 @@ impl Ext2 {
             remaining = remaining.saturating_sub(group_count);
         }
 
+        Ok(())
+    }
+
+    /// Allocates a new inode number.
+    pub(super) fn alloc_inode(&self, parent_ino: u32, inode_type: InodeType) -> Result<u32> {
+        let (groups_count, inodes_per_group, total_inodes, first_ino, free_inodes) = {
+            let sb_guard = self.super_block.read();
+            (
+                sb_guard.block_groups_count() as usize,
+                sb_guard.inodes_per_group(),
+                sb_guard.total_inodes(),
+                sb_guard.first_ino(),
+                sb_guard.free_inodes_count(),
+            )
+        };
+        if groups_count == 0 || self.block_groups.len() < groups_count {
+            return_errno!(Errno::EIO);
+        }
+        if parent_ino < ROOT_INO || parent_ino > total_inodes {
+            return_errno!(Errno::EIO);
+        }
+        if free_inodes == 0 {
+            return_errno!(Errno::ENOSPC);
+        }
+
+        let parent_group = ((parent_ino - 1) / inodes_per_group) as usize;
+        let mut saw_corruption = false;
+        for offset in 0..groups_count {
+            let group_idx = (parent_group + offset) % groups_count;
+            let group = self
+                .block_groups
+                .get(group_idx)
+                .ok_or_else(|| Error::new(Errno::EIO))?;
+            if group.free_inodes_count() == 0 {
+                continue;
+            }
+
+            let mut bitmap = {
+                let sb_guard = self.super_block.read();
+                group.load_inode_bitmap(self, &sb_guard)?
+            };
+            let Some(inode_idx) = bitmap.alloc() else {
+                saw_corruption = true;
+                continue;
+            };
+
+            let ino = (group_idx as u32)
+                .saturating_mul(inodes_per_group)
+                .saturating_add(inode_idx as u32)
+                .saturating_add(1);
+            if ino < first_ino || ino > total_inodes {
+                return_errno!(Errno::EIO);
+            }
+
+            if self
+                .block_device
+                .write_bytes(group.inode_bitmap_bid().to_offset(), bitmap.as_bytes())
+                .is_err()
+            {
+                return_errno!(Errno::EIO);
+            }
+
+            group.dec_free_inodes(1);
+            if inode_type.is_directory() {
+                group.inc_used_dirs();
+            }
+            let mut sb_write = self.super_block.write();
+            sb_write.dec_free_inodes();
+
+            return Ok(ino);
+        }
+
+        if saw_corruption {
+            return_errno!(Errno::EIO);
+        }
+        return_errno!(Errno::ENOSPC);
+    }
+
+    /// Frees an inode by number.
+    pub(super) fn free_inode(&self, ino: u32) -> Result<()> {
+        let (inodes_per_group, total_inodes, first_ino, groups_count) = {
+            let sb_guard = self.super_block.read();
+            (
+                sb_guard.inodes_per_group(),
+                sb_guard.total_inodes(),
+                sb_guard.first_ino(),
+                sb_guard.block_groups_count() as usize,
+            )
+        };
+        if ino < first_ino || ino > total_inodes {
+            return_errno!(Errno::EIO);
+        }
+        if groups_count == 0 || self.block_groups.len() < groups_count {
+            return_errno!(Errno::EIO);
+        }
+
+        let desc = self.read_inode_desc(ino)?;
+        let inode_type = InodeType::from_raw_mode(desc.raw.mode)
+            .map_err(|_| Error::new(Errno::EIO))?;
+        let is_dir = inode_type.is_directory();
+
+        let group_idx = ((ino - 1) / inodes_per_group) as usize;
+        let bit = ((ino - 1) % inodes_per_group) as u16;
+        let group = self
+            .block_groups
+            .get(group_idx)
+            .ok_or_else(|| Error::new(Errno::EIO))?;
+
+        let mut bitmap = {
+            let sb_guard = self.super_block.read();
+            group.load_inode_bitmap(self, &sb_guard)?
+        };
+        bitmap.free(bit);
+
+        if self
+            .block_device
+            .write_bytes(group.inode_bitmap_bid().to_offset(), bitmap.as_bytes())
+            .is_err()
+        {
+            return_errno!(Errno::EIO);
+        }
+
+        group.inc_free_inodes(1);
+        if is_dir {
+            group.dec_used_dirs();
+        }
+        let mut sb_write = self.super_block.write();
+        sb_write.inc_free_inodes();
+
+        Ok(())
+    }
+
+    /// Writes back superblock and group descriptor table if dirty.
+    pub fn sync_metadata(&self) -> Result<()> {
+        let sb_dirty = self.super_block.read().is_dirty();
+        let mut any_group_dirty = false;
+        for group in &self.block_groups {
+            if group.is_desc_dirty() {
+                any_group_dirty = true;
+                break;
+            }
+        }
+
+        if !sb_dirty && !any_group_dirty {
+            return Ok(());
+        }
+
+        let groups_count = {
+            let sb_guard = self.super_block.read();
+            sb_guard.block_groups_count() as usize
+        };
+        if groups_count == 0 || self.block_groups.len() < groups_count {
+            return_errno!(Errno::EIO);
+        }
+
+        for group in &self.block_groups {
+            group.sync_metadata(&self.group_descriptors_segment)?;
+        }
+
+        let desc_bytes = groups_count * size_of::<RawGroupDesc>();
+        let mut desc_buf = vec![0u8; desc_bytes];
+        if self
+            .group_descriptors_segment
+            .read_bytes(0, &mut desc_buf)
+            .is_err()
+        {
+            return_errno!(Errno::EIO);
+        }
+
+        let sb_guard = self.super_block.read();
+        if self
+            .block_device
+            .write_bytes(sb_guard.group_descriptors_bid(0).to_offset(), &desc_buf)
+            .is_err()
+        {
+            return_errno!(Errno::EIO);
+        }
+
+        let mut raw_sb = RawSuperBlock::from(&*sb_guard);
+        if self
+            .block_device
+            .write_bytes(SUPER_BLOCK_OFFSET, raw_sb.as_bytes())
+            .is_err()
+        {
+            return_errno!(Errno::EIO);
+        }
+
+        for idx in 1..groups_count {
+            if !sb_guard.is_backup_group(idx) {
+                continue;
+            }
+            raw_sb.block_group_idx = idx as u16;
+            if self
+                .block_device
+                .write_bytes(sb_guard.bid(idx).to_offset(), raw_sb.as_bytes())
+                .is_err()
+            {
+                return_errno!(Errno::EIO);
+            }
+            if self
+                .block_device
+                .write_bytes(sb_guard.group_descriptors_bid(idx).to_offset(), &desc_buf)
+                .is_err()
+            {
+                return_errno!(Errno::EIO);
+            }
+        }
+
+        drop(sb_guard);
+        let mut sb_write = self.super_block.write();
+        sb_write.clear_dirty();
         Ok(())
     }
 

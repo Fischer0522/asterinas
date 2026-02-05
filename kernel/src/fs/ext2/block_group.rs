@@ -57,6 +57,21 @@ impl From<RawGroupDesc> for GroupDesc {
     }
 }
 
+impl From<GroupDesc> for RawGroupDesc {
+    fn from(desc: GroupDesc) -> Self {
+        Self {
+            block_bitmap: desc.block_bitmap.to_raw() as u32,
+            inode_bitmap: desc.inode_bitmap.to_raw() as u32,
+            inode_table: desc.inode_table.to_raw() as u32,
+            free_blocks_count: desc.free_blocks_count,
+            free_inodes_count: desc.free_inodes_count,
+            used_dirs_count: desc.used_dirs_count,
+            pad: 0,
+            reserved: [0; 3],
+        }
+    }
+}
+
 impl BlockGroup {
     pub fn load(group_descs: &USegment, idx: usize) -> Result<Self> {
         let offset = idx * size_of::<RawGroupDesc>();
@@ -106,6 +121,51 @@ impl BlockGroup {
     pub(super) fn inc_free_blocks(&self, count: u16) {
         let mut desc = self.desc.write();
         desc.free_blocks_count = desc.free_blocks_count.saturating_add(count);
+    }
+
+    /// Decreases the free-inode counter for this group.
+    pub(super) fn dec_free_inodes(&self, count: u16) {
+        let mut desc = self.desc.write();
+        desc.free_inodes_count = desc.free_inodes_count.saturating_sub(count);
+    }
+
+    /// Increases the free-inode counter for this group.
+    pub(super) fn inc_free_inodes(&self, count: u16) {
+        let mut desc = self.desc.write();
+        desc.free_inodes_count = desc.free_inodes_count.saturating_add(count);
+    }
+
+    /// Increases the used-dirs counter for this group.
+    pub(super) fn inc_used_dirs(&self) {
+        let mut desc = self.desc.write();
+        desc.used_dirs_count = desc.used_dirs_count.saturating_add(1);
+    }
+
+    /// Decreases the used-dirs counter for this group.
+    pub(super) fn dec_used_dirs(&self) {
+        let mut desc = self.desc.write();
+        desc.used_dirs_count = desc.used_dirs_count.saturating_sub(1);
+    }
+
+    pub(super) fn is_desc_dirty(&self) -> bool {
+        self.desc.read().is_dirty()
+    }
+
+    pub(super) fn sync_metadata(&self, group_descs: &USegment) -> Result<()> {
+        if !self.desc.read().is_dirty() {
+            return Ok(());
+        }
+
+        let mut desc = self.desc.write();
+        if !desc.is_dirty() {
+            return Ok(());
+        }
+
+        let raw = RawGroupDesc::from(*desc);
+        let offset = self.idx * size_of::<RawGroupDesc>();
+        group_descs.write_val(offset, &raw)?;
+        desc.clear_dirty();
+        Ok(())
     }
 
     /// Loads and validates the block bitmap for this group.
