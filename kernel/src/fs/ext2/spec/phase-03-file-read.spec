@@ -5,8 +5,8 @@ Implementation logic MUST follow [SOURCE] Linux code.
 
 [SOURCE]
 ext2_file_read_iter        → fs/ext2/file.c:283
-ext2_read_folio             → fs/ext2/inode.c:917
-ext2_get_block              → fs/ext2/inode.c:783
+ext2_read_folio            → fs/ext2/inode.c:917
+ext2_get_block             → fs/ext2/inode.c:783
 
 [RELY]
 ```rust
@@ -22,44 +22,32 @@ use crate::fs::utils::CachePage;
 ```
 
 ```rust
-/// The Ext2 inode (in-memory).
 #[derive(Debug)]
 pub struct Inode {
-    /// Inode type.
+    ino: u32,
     type_: InodeType,
-    /// File size in bytes.
-    size: u64,
-    /// Block pointers (i_block).
-    block_ptrs: [u32; 15],
-    /// Owning filesystem.
+    inner: RwMutex<InodeInner>,
+    block_group_idx: usize,
+    fs: Weak<Ext2>,
+}
+```
+
+```rust
+#[derive(Debug)]
+pub struct InodeInner {
+    desc: Dirty<InodeDesc>,
+    is_freed: bool,
+    weak_self: Weak<Inode>,
     fs: Weak<Ext2>,
 }
 ```
 
 [GUARANTEE]
-impl Inode {
+impl InodeInner {
     /// Reads file data at the given byte offset.
-    ///
-    /// # Arguments
-    /// * `offset` - Byte offset within the file.
-    /// * `writer` - Destination buffer writer.
-    ///
-    /// # Returns
-    /// * `Ok(usize)` - Number of bytes read.
-    /// * `Err(EISDIR)` - `self` is a directory.
-    /// * `Err(EIO)` - I/O failure or invalid block mapping.
     pub(super) fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize>;
 
     /// Reads a full block-sized page for page cache.
-    ///
-    /// # Arguments
-    /// * `page_idx` - Block/page index within the file (block size == PAGE_SIZE).
-    /// * `page` - Target cache page to fill.
-    ///
-    /// # Returns
-    /// * `Ok(())` - Page filled with data (zero-filled for holes/EOF tail).
-    /// * `Err(EISDIR)` - `self` is a directory.
-    /// * `Err(EIO)` - I/O failure or invalid block mapping.
     pub(super) fn read_page(&self, page_idx: usize, page: &CachePage) -> Result<()>;
 }
 
@@ -68,46 +56,40 @@ Pre (read_at):
 - `offset` is a byte offset within the file.
 
 Post (read_at: success):
-- If `self.type_` is `InodeType::Dir`, returns `Err(EISDIR)`.
-- If `offset >= self.size`, returns `Ok(0)`.
-- Computes `read_len = min(writer.avail(), self.size - offset)`.
-- Iterates over file blocks covering `[offset, offset + read_len)`:
+- If `self.desc.type_` is `InodeType::Dir`, returns `Err(EISDIR)`.
+- If `offset >= self.desc.size`, returns `Ok(0)`.
+- Computes `read_len = min(writer.avail(), self.desc.size - offset)`.
+- Iterates blocks covering `[offset, offset + read_len)`:
   - `block_size = fs.block_size()`.
   - `block_idx = cur_off / block_size`, `block_off = cur_off % block_size`.
   - `chunk = min(block_size - block_off, remaining)`.
-  - Calls `self.get_block(block_idx)` to map logical to physical block.
-    - If `None`, writes `chunk` zero bytes into `writer` and advances.
-    - If `Some(bid)`, reads the full block from `fs.block_device()` and copies the
-      `[block_off, block_off + chunk)` slice into `writer`.
-- Returns `Ok(read_len)` after all chunks are consumed.
+  - Calls `self.get_block(block_idx)`.
+    - `None` → writes `chunk` zero bytes.
+    - `Some(bid)` → reads full block then copies `[block_off, block_off + chunk)`.
+- Returns `Ok(read_len)`.
 
 Post (read_at: failure):
-- Returns `Err(EIO)` if any block I/O fails or `self.fs` cannot be upgraded.
+- Returns `Err(EIO)` if block I/O fails or `self.fs` cannot be upgraded.
 
 Pre (read_page):
 - `page_idx` is a block index (page size == `BLOCK_SIZE`).
 
 Post (read_page: success):
-- If `self.type_` is `InodeType::Dir`, returns `Err(EISDIR)`.
-- Computes `block_size = fs.block_size()` and `page_offset = page_idx * block_size`.
-- If `page_offset >= self.size`, fills `page` with zeros and returns `Ok(())`.
-- Otherwise, maps `page_idx` using `self.get_block(page_idx)`:
-  - If `None`, fills `page` with zeros.
-  - If `Some(bid)`, reads the full block into `page`.
-- If `page_offset + block_size > self.size`, zero-fills the tail beyond EOF.
-- Returns `Ok(())` on success.
+- If `self.desc.type_` is `InodeType::Dir`, returns `Err(EISDIR)`.
+- Computes `page_offset = page_idx * block_size`.
+- If `page_offset >= self.desc.size`, zero-fills `page` and returns `Ok(())`.
+- Otherwise uses `self.get_block(page_idx as u32)`:
+  - `None` → zero-fill page.
+  - `Some(bid)` → read full block into page.
+- If page crosses EOF, zero-fills tail beyond `self.desc.size`.
 
 Post (read_page: failure):
-- Returns `Err(EIO)` if any block I/O fails or `self.fs` cannot be upgraded.
+- Returns `Err(EIO)` for I/O failures or invalid mapping states.
 
 Invariant:
-- Unmapped blocks (sparse regions) are read as zeroes.
+- Sparse regions are read as zeroes.
 
 [DIFF]
-Linux: Uses `generic_file_read_iter` and page cache readahead with `ext2_read_folio`.
-  → Asterinas: Direct block reads for now; PageCache backend is a thin wrapper over block reads.
-  Reason: Asterinas does not yet have ext2 page cache wiring or readahead.
-
-Linux: Supports DAX and O_DIRECT fast paths in `ext2_file_read_iter`.
-  → Asterinas: No DAX/O_DIRECT in this phase.
-  Reason: DAX and direct I/O are out of scope and blocked on VFS support.
+Linux: Uses `generic_file_read_iter` and folio readahead plumbing.
+  → Asterinas: Uses direct block reads in `InodeInner` and page-cache callback wrappers.
+  Reason: Current architecture has not wired ext2 into generic folio helpers.

@@ -466,6 +466,8 @@ impl TryFrom<&RawInode> for InodeDesc {
 
         let block_ptrs = raw.block;
 
+        let flags = FileFlags::from_bits(raw.flags).ok_or_else(|| Error::new(Errno::EIO))?;     
+
         Ok(InodeDesc {
             type_,
             perm,
@@ -478,7 +480,7 @@ impl TryFrom<&RawInode> for InodeDesc {
             dtime: UnixTime::from(Duration::from_secs(0)),
             links_count: raw.links_count,
             blocks,
-            flags: FileFlags::from_bits(raw.flags).unwrap(),
+            flags,
             file_acl,
             block_ptrs,
         })

@@ -25,146 +25,95 @@ use crate::fs::utils::DirentVisitor;
 ```
 
 ```rust
-/// The Ext2 inode (in-memory).
 #[derive(Debug)]
 pub struct Inode {
-    /// Inode number.
     ino: u32,
-    /// Inode type.
     type_: InodeType,
-    /// File size in bytes.
-    size: u64,
-    /// Directory start hint (unused for now).
-    dir_start_lookup: u32,
-    /// Block pointers (i_block).
-    block_ptrs: [u32; 15],
-    /// Owning filesystem.
+    inner: RwMutex<InodeInner>,
+    block_group_idx: usize,
     fs: Weak<Ext2>,
 }
 ```
 
 ```rust
-/// Directory entry type mapping (ext2 file_type field).
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum DirEntryFileType {
-    /// Unknown file type.
-    Unknown = 0,
-    /// Regular file.
-    File = 1,
-    /// Directory.
-    Dir = 2,
-    /// Character device.
-    Char = 3,
-    /// Block device.
-    Block = 4,
-    /// FIFO.
-    Fifo = 5,
-    /// Socket.
-    Socket = 6,
-    /// Symlink.
-    Symlink = 7,
+#[derive(Debug)]
+pub struct InodeInner {
+    desc: Dirty<InodeDesc>,
+    is_freed: bool,
+    weak_self: Weak<Inode>,
+    fs: Weak<Ext2>,
+}
+```
+
+```rust
+#[derive(Clone, Copy, Debug)]
+pub(super) struct InodeDesc {
+    type_: InodeType,
+    size: u64,
+    blocks: u32,
+    block_ptrs: [u32; 15],
 }
 ```
 
 [GUARANTEE]
-impl Inode {
-    /// Finds a directory entry by name and returns its inode number.
-    ///
-    /// # Arguments
-    /// * `name` - The target entry name (UTF-8).
-    ///
-    /// # Returns
-    /// * `Ok(u32)` - The inode number of the matching entry.
-    /// * `Err(ENOENT)` - Not found.
-    /// * `Err(ENOTDIR)` - `self` is not a directory.
-    /// * `Err(EIO)` - Directory data is corrupted or I/O fails.
+impl InodeInner {
     pub(super) fn find_entry(&self, name: &str) -> Result<u32>;
-
-    /// Reads directory entries starting at byte offset and feeds visitor.
-    ///
-    /// # Arguments
-    /// * `offset` - Byte offset within the directory file.
-    /// * `visitor` - Visitor that consumes entries.
-    ///
-    /// # Returns
-    /// * `Ok(usize)` - Number of bytes advanced from `offset`.
-    /// * `Err(ENOTDIR)` - `self` is not a directory.
-    /// * `Err(EIO)` - Directory data is corrupted or I/O fails.
-    pub(super) fn readdir_at(
-        &self,
-        offset: usize,
-        visitor: &mut dyn DirentVisitor,
-    ) -> Result<usize>;
+    pub(super) fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize>;
 }
 
 [SPECIFICATION]
 Pre (find_entry):
-- `self.type_` is `InodeType::Dir`.
+- `self.desc.type_` is `InodeType::Dir`.
 
 Post (find_entry: success):
-- Iterates over directory blocks in order (no wrap-around).
+- Iterates directory blocks in ascending order.
 - For each block:
   - `block_size = fs.block_size()`.
   - `block_offset = block_idx * block_size`.
-  - `limit = min(block_size, self.size - block_offset)`; if `limit == 0`, stop.
+  - `limit = min(block_size, self.desc.size - block_offset)`.
   - `max_inumber = sb.total_inodes()`.
-  - `max_blocks = self.blocks >> 3` (i_blocks in 512-byte sectors; 4K blocks).
+  - `max_blocks = self.desc.blocks >> 3` (512-byte sectors to fs-block bound).
   - If `block_idx > max_blocks`, returns `Err(ENOENT)`.
-  - Reads the data block via `self.get_block(block_idx)`; if `None`, returns `Err(EIO)`.
-  - Uses `DirEntryIter` to parse entries within `[0, limit)`.
+  - Resolves data block by `self.get_block(block_idx)`; `None` => `Err(EIO)`.
+  - Parses entries with `DirEntryIter` in `[0, limit)`.
   - Skips entries with `inode == 0`.
-  - If `name_len == name.len()` and bytes equal, returns `Ok(inode)`.
-- If no match found, returns `Err(ENOENT)`.
+  - Exact name match returns `Ok(inode)`.
+- No match returns `Err(ENOENT)`.
 
 Post (find_entry: failure):
-- Returns `Err(ENOTDIR)` if `self.type_` is not directory.
+- Returns `Err(ENOTDIR)` if not directory.
 - Returns `Err(EIO)` for invalid entry layout or I/O failures.
 
 Pre (readdir_at):
-- `self.type_` is `InodeType::Dir`.
+- `self.desc.type_` is `InodeType::Dir`.
 
 Post (readdir_at: success):
-- Let `min_rec_len = DirEntry::dir_rec_len(1)`.
-- If `self.size < min_rec_len` or `offset > self.size - min_rec_len`, returns `Ok(0)`.
-- Computes:
-  - `block_size = fs.block_size()`.
-  - `start_block = offset / block_size`.
-  - `start_inner = offset % block_size`.
-- Iterates blocks from `start_block` to end of directory size:
-  - Computes `block_offset = block_idx * block_size` and `limit` as in `find_entry`.
-  - Reads data block via `self.get_block(block_idx)`; if `None`, returns `Err(EIO)`.
-  - Uses `DirEntryIter` to parse entries within `[0, limit)`.
-  - Skips entries with `inode == 0`.
-  - For the first block, skip entries until `entry_offset >= start_inner`.
-  - For each entry, determines `type_` from `file_type`:
-    - 0 → `InodeType::Unknown`.
-    - 1..7 → map to the corresponding `InodeType` (File/Dir/Char/Block/Fifo/Socket/SymLink).
-  - Calls `visitor.visit(name, inode as u64, type_, entry_global_offset)`.
-  - If visitor returns `Err`, stops and returns bytes advanced so far.
+- If directory too small for one minimal entry or `offset` beyond valid scan range, returns `Ok(0)`.
+- Computes `start_block = offset / block_size`.
+- Scans blocks from `start_block`, each with `limit = min(block_size, size - block_offset)`.
+- For each parsed entry:
+  - Skip invalid window and `inode == 0` entries.
+  - Convert ext2 `file_type` to `InodeType` mapping (0=>Unknown, 1..7=>typed).
+  - Calls `visitor.visit(name, inode, type, global_offset)`.
+  - If visitor stops, returns bytes advanced so far.
 - Returns total bytes advanced from `offset`.
 
 Post (readdir_at: failure):
-- Returns `Err(ENOTDIR)` if `self.type_` is not directory.
-- Returns `Err(EIO)` for invalid entry layout or I/O failures.
+- Returns `Err(ENOTDIR)` if not directory.
+- Returns `Err(EIO)` for parse/layout or I/O failure.
 
 Invariant:
-- Entry parsing uses `DirEntryIter` rules from Module 4.1 and matches Linux `ext2_check_folio` constraints.
+- Parsing follows module 4.1 layout checks (`DirEntryIter` / `ext2_check_folio`-compatible constraints).
 
 [DIFF]
-Linux: Uses folio/page cache and `dir_context` with `ctx->pos`.
-  → Asterinas: Uses direct block reads and `DirentVisitor` with byte offsets (no folio).
-  Reason: Asterinas has no folio abstraction; PageCache integration comes later.
+Linux: Uses folio/pagecache and `dir_context` (`ctx->pos`) helpers.
+  → Asterinas: Uses direct block reads and `DirentVisitor` byte offsets.
+  Reason: Current ext2 path does not use folio abstraction.
 
-Linux: Uses `i_dir_start_lookup` and wrap-around search in `ext2_find_entry`.
-  → Asterinas: Always scans from block 0 without wrap-around.
-  Reason: No inode-local lookup cache yet.
+Linux: Maintains `i_dir_start_lookup` hint and wrap-around lookup.
+  → Asterinas: Linear scan from block 0/start block without wrap-around hint.
+  Reason: Lookup hint optimization deferred.
 
-Linux: Uses `EXT2_FEATURE_INCOMPAT_FILETYPE` to interpret `file_type`.
-  → Asterinas: Maps `file_type` directly and treats 0 as `Unknown`.
-  Reason: Feature gating not implemented in this phase.
-
-Linux: Uses `need_revalidate` + `inode_query_iversion` and `ext2_validate_entry` to
-re-sync `ctx->pos` after directory changes.
-  → Asterinas: No iversion/ctx->pos mechanism; no `ext2_validate_entry` offset fixup.
-  Reason: Asterinas VFS readdir API lacks per-iteration version tracking.
+Linux: Methods conceptually belong to inode private state in VFS inode.
+  → Asterinas: Methods are placed on `InodeInner` guarded by inode lock.
+  Reason: Current split-handle inode abstraction.

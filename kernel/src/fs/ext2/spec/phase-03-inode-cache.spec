@@ -5,7 +5,7 @@ Implementation logic MUST follow [SOURCE] Linux code.
 
 [SOURCE]
 ext2_iget                  → fs/ext2/inode.c:1387
-ext2_data_block_valid       → fs/ext2/balloc.c:1177
+ext2_set_inode_flags       → fs/ext2/inode.c:1357
 
 [RELY]
 ```rust
@@ -13,7 +13,7 @@ use super::prelude::*;
 ```
 
 ```rust
-use super::inode::{Inode, InodeDesc, RawInode, FilePerm};
+use super::inode::{Inode, InodeDesc, InodeInner};
 ```
 
 ```rust
@@ -46,46 +46,24 @@ pub struct Ext2 {
 ```
 
 ```rust
-/// The root inode number (Linux EXT2_ROOT_INO).
-pub const ROOT_INO: u32 = 2;
-```
-
-```rust
-#[derive(Clone, Copy, Debug)]
-pub(super) struct InodeDesc {
-    pub raw: RawInode,
-}
-```
-
-```rust
-pub enum InodeType { Unknown, NamedPipe, CharDevice, Dir, BlockDevice, File, SymLink, Socket }
-```
-
-```rust
+/// The Ext2 inode public handle.
 #[derive(Debug)]
 pub struct Inode {
     ino: u32,
     type_: InodeType,
-    perm: FilePerm,
-    uid: u32,
-    gid: u32,
-    size: u64,
-    atime: UnixTime,
-    ctime: UnixTime,
-    mtime: UnixTime,
-    dtime: UnixTime,
-    links_count: u16,
-    blocks: u32,
-    flags: u32,
-    faddr: u32,
-    frag: u8,
-    fsize: u8,
-    file_acl: u32,
-    dir_acl: u32,
-    generation: u32,
+    inner: RwMutex<InodeInner>,
     block_group_idx: usize,
-    dir_start_lookup: u32,
-    block_ptrs: [u32; 15],
+    fs: Weak<Ext2>,
+}
+```
+
+```rust
+/// Mutable inode state.
+#[derive(Debug)]
+pub struct InodeInner {
+    desc: Dirty<InodeDesc>,
+    is_freed: bool,
+    weak_self: Weak<Inode>,
     fs: Weak<Ext2>,
 }
 ```
@@ -95,67 +73,47 @@ impl Ext2 {
     pub(super) fn read_inode(&self, ino: u32) -> Result<Arc<Inode>>;
 }
 
-impl Inode {
-    pub(super) fn from_desc(ino: u32, desc: InodeDesc, fs: Weak<Ext2>) -> Result<Arc<Inode>>;
+impl InodeInner {
+    pub fn new(desc: Dirty<InodeDesc>, weak_self: Weak<Inode>, fs: Weak<Ext2>) -> Self;
 }
 
 [SPECIFICATION]
 Pre (read_inode):
-- `self.super_block` has been validated by `load_super_block`.
+- `self.super_block` has been validated.
 - `ino` is a 1-based inode number.
 
 Post (read_inode: success):
-- Calls `self.read_inode_desc(ino)`.
-- If `read_inode_desc` returns `Err(Errno::EINVAL|EIO)`, returns the same error.
-- Uses `Inode::from_desc(ino, desc, self.self_ref.clone())` to construct the inode.
+- Calls `self.read_inode_desc(ino)` and obtains decoded `InodeDesc`.
+- Computes `block_group_idx = (ino - 1) / sb.inodes_per_group()`.
+- Constructs inode using two-layer abstraction:
+  - outer immutable handle `Inode` (identity/type/group/fs link),
+  - inner mutable state `InodeInner { desc, is_freed, weak_self, fs }`.
+- `inner.desc` is initialized dirty-state wrapper over decoded descriptor.
 - Returns `Ok(Arc<Inode>)`.
 
 Post (read_inode: failure):
-- Returns `Err(Errno::ESTALE)` if Linux equivalent would reject deleted inode:
-  - `desc.raw.links_count == 0` and (`desc.raw.mode == 0` or `desc.raw.dtime != 0`).
-- Returns `Err(Errno::EFSCORRUPTED)` if `from_desc` detects corrupt on-disk metadata.
-- Returns `Err(Errno::EIO)` for any I/O failure from `read_inode_desc`.
-- Returns `Err(Errno::EINVAL)` for invalid inode numbers.
+- Propagates `Err(EINVAL|EIO|ESTALE|EUCLEAN)` from `read_inode_desc`.
+- Returns `Err(EIO)` if self-reference wiring fails.
 
-Pre (Inode::from_desc):
-- `desc.raw` was read from disk (`RawInode`).
+Pre (InodeInner::new):
+- `desc` is a valid decoded descriptor for one inode.
+- `weak_self` and `fs` correspond to the same inode/filesystem object graph.
 
-Post (Inode::from_desc: success):
-- Decodes the following fields (Linux `ext2_iget` logic):
-  - `mode = desc.raw.mode`.
-  - `type_` derived from `mode` (file type bits); unknown → `Err(EINVAL)`.
-  - `perm = FilePerm::from_bits_truncate(mode)`.
-  - `uid = desc.raw.uid | (desc.raw.uid_high << 16)`.
-  - `gid = desc.raw.gid | (desc.raw.gid_high << 16)`.
-  - `links_count = desc.raw.links_count`.
-  - `atime/ctime/mtime = desc.raw.atime/ctime/mtime` (UnixTime seconds).
-  - `dtime = desc.raw.dtime` (used for deleted inode check).
-  - `blocks = desc.raw.blocks`.
-  - `flags = desc.raw.flags` (stored; Asterinas mapping of ext2_set_inode_flags is deferred).
-  - `faddr = desc.raw.faddr`.
-  - `frag = desc.raw.frag`.
-  - `fsize = desc.raw.fsize`.
-  - `file_acl = desc.raw.file_acl`.
-  - `generation = desc.raw.generation`.
-  - `block_group_idx = (ino - 1) / sb.inodes_per_group()`.
-  - `dir_start_lookup = 0`.
-  - `block_ptrs = desc.raw.block` (no byte swap).
-- Deleted inode check (Linux e2fsck rule):
-  - If `links_count == 0` and (`mode == 0` or `dtime != 0`) → `Err(Errno::ESTALE)`.
-- Extended attribute block validity (Linux `ext2_data_block_valid`):
-  - If `file_acl != 0` and `!sb.data_block_valid(file_acl, 1)` → `Err(Errno::EFSCORRUPTED)`.
-- Size handling:
-  - `size = desc.raw.size_lo`.
-  - If `type_ == InodeType::File`, set `size |= (desc.raw.size_high as u64) << 32`.
-  - Else set `dir_acl = desc.raw.size_high` and keep `size = size_lo`.
-  - If `size > i64::MAX as u64` → `Err(Errno::EFSCORRUPTED)`.
-- Clears in-memory deletion time after successful parse: set `dtime = 0`.
-- Returns `Ok(Arc<Inode>)` with decoded metadata stored.
-
-Post (Inode::from_desc: failure):
-- Returns `Err(Errno::EINVAL)` if `mode` maps to unknown file type.
-- Returns `Err(Errno::ESTALE)` for deleted inode check.
-- Returns `Err(Errno::EFSCORRUPTED)` for invalid ACL block or invalid size.
+Post (InodeInner::new):
+- Stores `desc` without altering decoded metadata.
+- Initializes `is_freed = false`.
+- Preserves `weak_self` and `fs` for callbacks/lookups.
 
 Invariant:
-- All decoding follows Linux `ext2_iget` field semantics.
+- Public `Inode` identity and mutable inode metadata are separated.
+- All mutable metadata transitions happen via `inner.desc` under lock.
+- `Inode.type_` is consistent with `inner.desc.type_` at construction time.
+
+[DIFF]
+Linux: Ext2 inode private state is embedded in VFS inode (`EXT2_I(inode)`).
+  → Asterinas: Uses explicit split between `Inode` and `InodeInner` guarded by `RwMutex`.
+  Reason: Rust ownership and lock-based mutability model.
+
+Linux: Global inode cache (`iget_locked`) is VFS-provided.
+  → Asterinas: Cache infrastructure is deferred; this phase defines object construction contract only.
+  Reason: Incremental bring-up of Ext2 stack.

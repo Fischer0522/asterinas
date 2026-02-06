@@ -93,18 +93,18 @@ impl Ext2 {
 }
 ```
 
+```rust
+impl InodeDesc {
+    pub fn type_(&self) -> InodeType;
+}
+```
+
 [GUARANTEE]
 impl BlockGroup {
     /// Decreases the free-inode counter for this group.
-    ///
-    /// # Arguments
-    /// * `count` - Number of inodes to subtract.
     pub(super) fn dec_free_inodes(&self, count: u16);
 
     /// Increases the free-inode counter for this group.
-    ///
-    /// # Arguments
-    /// * `count` - Number of inodes to add.
     pub(super) fn inc_free_inodes(&self, count: u16);
 
     /// Increases the used-dirs counter for this group.
@@ -116,25 +116,9 @@ impl BlockGroup {
 
 impl Ext2 {
     /// Allocates a new inode number.
-    ///
-    /// # Arguments
-    /// * `parent_ino` - Parent directory inode number (1-based).
-    /// * `inode_type` - Type of inode to allocate.
-    ///
-    /// # Returns
-    /// * `Ok(u32)` - Allocated inode number (1-based).
-    /// * `Err(ENOSPC)` - No free inode available.
-    /// * `Err(EIO)` - I/O failure or metadata inconsistency.
     pub(super) fn alloc_inode(&self, parent_ino: u32, inode_type: InodeType) -> Result<u32>;
 
     /// Frees an inode by number.
-    ///
-    /// # Arguments
-    /// * `ino` - Inode number to free (1-based).
-    ///
-    /// # Returns
-    /// * `Ok(())` - Inode freed.
-    /// * `Err(EIO)` - I/O failure or invalid inode number.
     pub(super) fn free_inode(&self, ino: u32) -> Result<()>;
 }
 
@@ -143,80 +127,75 @@ Pre (BlockGroup::dec_free_inodes / inc_free_inodes):
 - `count` fits within `u16` and does not underflow/overflow the group counter.
 
 Post (BlockGroup::dec_free_inodes):
-- Decreases `free_inodes_count` by `count` and marks the descriptor dirty.
+- Decreases `free_inodes_count` by `count` and marks descriptor dirty.
 
 Post (BlockGroup::inc_free_inodes):
-- Increases `free_inodes_count` by `count` and marks the descriptor dirty.
+- Increases `free_inodes_count` by `count` and marks descriptor dirty.
 
 Post (BlockGroup::inc_used_dirs / dec_used_dirs):
-- Adjusts `used_dirs_count` by +/-1 and marks the descriptor dirty.
+- Adjusts `used_dirs_count` by +/-1 and marks descriptor dirty.
 
 Pre (alloc_inode):
 - `parent_ino` is within `[ROOT_INO, sb.total_inodes()]`.
 - `self.super_block` is validated and `self.block_groups` is loaded.
-- If `sb.free_inodes_count() == 0`, return `Err(ENOSPC)` without bitmap I/O.
+- If `sb.free_inodes_count() == 0`, returns `Err(ENOSPC)` without bitmap I/O.
 
 Post (alloc_inode: success):
 - Returns `Ok(ino)` where:
   - `ino` is within `[sb.first_ino(), sb.total_inodes()]`.
-  - The inode bit for `ino` is set in the owning group bitmap.
-- Allocation search order (simplified from Linux):
-  1. Compute `parent_group = (parent_ino - 1) / inodes_per_group`.
-  2. Scan groups in cyclic order starting at `parent_group` for `groups_count` iterations.
-  3. Skip groups with `free_inodes_count == 0`.
-  4. For each candidate group:
-     - Load bitmap via `BlockGroup::load_inode_bitmap(self, sb)`.
-     - Allocate one inode with `IdBitmap::alloc()`.
-     - If allocation fails but `free_inodes_count > 0`, continue scanning other groups
-       (Linux-consistent rare race / approximate counter case).
-     - If allocation succeeds, compute filesystem inode number:
-       `ino = group_idx * inodes_per_group + inode_idx + 1`.
-     - Return Err(EIO) if `ino` is not within `[sb.first_ino(), sb.total_inodes()]`.
-     - Persist bitmap via `BlockDevice::write_bytes(group.inode_bitmap_bid())`.
-     - Update counters:
-       - `BlockGroup::dec_free_inodes(1)`.
-       - `SuperBlock::dec_free_inodes()`.
-       - If `inode_type.is_directory()`, `BlockGroup::inc_used_dirs()`.
-- If any bitmap read/write fails, return `Err(EIO)`.
+  - inode bitmap bit for `ino` is set in owning group.
+- Allocation order (simplified from Linux):
+  1. `parent_group = (parent_ino - 1) / inodes_per_group`.
+  2. Cyclic group scan from `parent_group`.
+  3. Skip groups with zero free inode counter.
+  4. Candidate group path:
+     - `load_inode_bitmap`.
+     - allocate one bit with `IdBitmap::alloc()`.
+     - compute `ino = group_idx * inodes_per_group + inode_idx + 1`.
+     - validate inode range.
+     - persist bitmap.
+     - update counters:
+       - `group.dec_free_inodes(1)`
+       - `sb.dec_free_inodes()`
+       - if directory: `group.inc_used_dirs()`.
+- Returns `Err(EIO)` for bitmap I/O failures.
 
 Post (alloc_inode: failure):
-- Returns `Err(ENOSPC)` if no free inode exists in any group.
-- Returns `Err(EIO)` on I/O error.
-- On failure, on-disk and in-memory counters remain unchanged.
+- `Err(ENOSPC)` if no free inode is found.
+- `Err(EIO)` on I/O failure.
+- On failure, counters remain unchanged.
 
 Pre (free_inode):
 - `ino` is within `[sb.first_ino(), sb.total_inodes()]`.
 
 Post (free_inode: success):
-- Determines `is_dir` by reading inode descriptor via `read_inode_desc(ino)` and parsing
-  `raw.mode` with `InodeType::from_raw_mode`.
+- Determines `is_dir` by `read_inode_desc(ino)?.type_().is_directory()`.
 - Computes `group_idx = (ino - 1) / inodes_per_group`, `bit = (ino - 1) % inodes_per_group`.
-- Loads inode bitmap via `BlockGroup::load_inode_bitmap(self, sb)`.
-- If the bit is set, clears it via `IdBitmap::free(bit)` and marks `freed = true`.
-- If the bit is already clear, logs metadata inconsistency and keeps `freed = false`.
-- Persists bitmap via `BlockDevice::write_bytes(group.inode_bitmap_bid())`.
-- Updates counters only when `freed == true`:
-  - `BlockGroup::inc_free_inodes(1)`.
-  - `SuperBlock::inc_free_inodes()`.
-  - If `is_dir`, `BlockGroup::dec_used_dirs()`.
-- Returns `Ok(())`.
+- Loads inode bitmap.
+- If bit is allocated, clears it and marks local flag for counter updates.
+- If bit is already clear, logs metadata inconsistency and skips counter updates.
+- Persists bitmap.
+- When bit transitioned allocated→free, updates:
+  - `group.inc_free_inodes(1)`
+  - `sb.inc_free_inodes()`
+  - if directory: `group.dec_used_dirs()`.
 
 Post (free_inode: failure):
 - Returns `Err(EIO)` on bitmap I/O failure or invalid inode number.
 
 Invariant:
-- Inode numbers are 1-based; group/bit are derived from `(ino - 1)`.
-- Bitmap bit 0 means free, bit 1 means allocated (LSB0).
+- Inode numbering is 1-based.
+- Group and bit indices are derived from `(ino - 1)`.
+- Bitmap bit semantics: 0 free, 1 allocated.
 
 [DIFF]
-Linux: Uses Orlov allocator for directories and multiple heuristics in `find_group_orlov`/`find_group_other`.
-  → Asterinas: Cyclic scan starting from parent group, based only on `free_inodes_count`.
-  Reason: Simplified allocator for initial bring-up; preserves locality without Orlov debt tracking.
+Linux: Uses Orlov allocator (`find_group_orlov` / `find_group_other`).
+  → Asterinas: Cyclic scan starting from parent group and free counter heuristics.
+  Reason: Simpler allocator for current bring-up phase.
 
-Linux: Uses quota, security, ACL, and VFS inode initialization in `ext2_new_inode`.
-  → Asterinas: Only returns inode number and updates bitmap/counters.
-  Reason: VFS inode construction and security hooks are out of scope for this phase.
+Linux: Inode free path consults inode/VFS state and broad side effects.
+  → Asterinas: Uses decoded `InodeDesc` (`type_`) for dir counter decision.
+  Reason: Current abstraction centralizes parsed inode metadata in `InodeDesc`.
 
-Linux: On freeing an already-free inode, logs an error and continues.
-  → Asterinas: Logs metadata inconsistency and continues without counter updates.
-  Reason: Preserve Linux-like resilience while avoiding free-count corruption.
+Linux: Already-free inode free logs error and continues.
+  → Asterinas: Same resilience policy, no counter mutation on already-free bit.

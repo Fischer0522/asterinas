@@ -5,6 +5,7 @@ use super::inode::{Inode, InodeDesc, RawInode};
 use super::prelude::*;
 use super::super_block::{RawSuperBlock, SuperBlock, SUPER_BLOCK_OFFSET};
 use super::utils::Dirty;
+use crate::fs::ext2::inode::InodeInner;
 use crate::fs::utils::FsEventSubscriberStats;
 use core::mem::size_of;
 
@@ -88,8 +89,15 @@ impl Ext2 {
     /// Linux: /root/linux/fs/ext2/inode.c:1387 (ext2_iget)
     pub(super) fn read_inode(&self, ino: u32) -> Result<Arc<Inode>> {
         let desc = self.read_inode_desc(ino)?;
+        // let inner = RwMutex::new(InodeInner::new(Dirty::new(desc), Weak::new(), self.self_ref.clone()));
+        // Ok(Arc::new_cyclic(|weak_self| Inode {
+        //     ino,
+        //     type_: desc.type_(),
+        //     inner,
+        //     block_group_idx: 0,
+        //     fs: self.self_ref.clone(),
+        // }))
         todo!()
-        // Inode::from_desc(ino, desc, self.self_ref.clone())
     }
 
     /// Returns the inode table block ID for the given group.
