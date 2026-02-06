@@ -88,7 +88,8 @@ impl Ext2 {
     /// Linux: /root/linux/fs/ext2/inode.c:1387 (ext2_iget)
     pub(super) fn read_inode(&self, ino: u32) -> Result<Arc<Inode>> {
         let desc = self.read_inode_desc(ino)?;
-        Inode::from_desc(ino, desc, self.self_ref.clone())
+        todo!()
+        // Inode::from_desc(ino, desc, self.self_ref.clone())
     }
 
     /// Returns the inode table block ID for the given group.
@@ -141,7 +142,7 @@ impl Ext2 {
             .skip(offset_in_block)
             .read_val::<RawInode>()
             .map_err(|_| Error::new(Errno::EIO))?;
-        Ok(InodeDesc { raw })
+        InodeDesc::try_from(&raw)
     }
 
     /// Writes an inode descriptor to disk.
@@ -512,8 +513,7 @@ impl Ext2 {
         }
 
         let desc = self.read_inode_desc(ino)?;
-        let inode_type = InodeType::from_raw_mode(desc.raw.mode)
-            .map_err(|_| Error::new(Errno::EIO))?;
+        let inode_type = desc.type_();
         let is_dir = inode_type.is_directory();
 
         let group_idx = ((ino - 1) / inodes_per_group) as usize;

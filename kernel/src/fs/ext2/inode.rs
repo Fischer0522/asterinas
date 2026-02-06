@@ -22,31 +22,30 @@ impl FilePerm {
 pub struct Inode {
     ino: u32,
     type_: InodeType,
-    perm: FilePerm,
-    uid: u32,
-    gid: u32,
-    size: u64,
-    atime: UnixTime,
-    ctime: UnixTime,
-    mtime: UnixTime,
-    dtime: UnixTime,
-    links_count: u16,
-    blocks: u32,
-    flags: u32,
-    faddr: u32,
-    frag: u8,
-    fsize: u8,
-    file_acl: u32,
-    dir_acl: u32,
-    generation: u32,
+    inner: RwMutex<InodeInner>,
     block_group_idx: usize,
-    dir_start_lookup: u32,
-    block_ptrs: [u32; 15],
     fs: Weak<Ext2>,
 }
 
-impl Inode {
-    pub fn create(&self, _name: &str, _type_: InodeType, _perm: FilePerm) -> Result<Arc<Inode>> {
+#[derive(Debug)]
+pub struct InodeInner {
+    desc: Dirty<InodeDesc>,
+    is_freed: bool,
+    weak_self: Weak<Inode>,
+    fs: Weak<Ext2>,
+}
+
+impl InodeInner {
+    pub fn new(desc: Dirty<InodeDesc>, weak_self: Weak<Inode>, fs: Weak<Ext2>) -> Self {
+        Self {
+            desc,
+            is_freed: false,
+            weak_self,
+            fs,
+        }
+    }
+
+     pub fn create(&self, _name: &str, _type_: InodeType, _perm: FilePerm) -> Result<Arc<Inode>> {
         return_errno!(Errno::ENOSYS);
     }
 
@@ -58,16 +57,16 @@ impl Inode {
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:342 (ext2_find_entry)
     pub(super) fn find_entry(&self, name: &str) -> Result<u32> {
-        if self.type_ != InodeType::Dir {
+        if self.desc.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
 
         let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
         let sb = fs.super_block();
         let block_size = fs.block_size();
-        let size = self.size;
+        let size = self.desc.size;
         let max_inumber = sb.total_inodes();
-        let max_blocks = (self.blocks as u64) >> 3;
+        let max_blocks = (self.desc.blocks as u64) >> 3;
         let mut block_idx = 0usize;
 
         while (block_idx as u64).saturating_mul(block_size as u64) < size {
@@ -113,11 +112,11 @@ impl Inode {
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:257 (ext2_readdir)
     pub(super) fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize> {
-        if self.type_ != InodeType::Dir {
+        if self.desc.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let size = self.size as usize;
+        let size = self.desc.size as usize;
         let min_rec_len = DirEntry::dir_rec_len(1) as usize;
         if size < min_rec_len || offset > size - min_rec_len {
             return Ok(0);
@@ -189,84 +188,7 @@ impl Inode {
 
         Ok(advanced)
     }
-    // TODO: Implement inode_from_desc caching.
-    pub(super) fn from_desc(ino: u32, desc: InodeDesc, fs: Weak<Ext2>) -> Result<Arc<Inode>> {
-        let raw = desc.raw;
-        let mode = raw.mode;
-
-        if raw.links_count == 0 && (mode == 0 || raw.dtime != 0) {
-            return_errno!(Errno::ESTALE);
-        }
-
-        // TODO: Different from Linux
-        let type_ = InodeType::from_raw_mode(mode)?;
-
-        let perm = FilePerm::from_bits_truncate(mode);
-
-        let uid = (raw.uid as u32) | ((raw.uid_high as u32) << 16);
-        let gid = (raw.gid as u32) | ((raw.gid_high as u32) << 16);
-
-        let atime = UnixTime::from(Duration::from_secs(raw.atime as u64));
-        let ctime = UnixTime::from(Duration::from_secs(raw.ctime as u64));
-        let mtime = UnixTime::from(Duration::from_secs(raw.mtime as u64));
-
-        let blocks = raw.blocks;
-        let flags = raw.flags;
-        let faddr = raw.faddr;
-        let frag = raw.frag;
-        let fsize = raw.fsize;
-        let file_acl = raw.file_acl;
-        let generation = raw.generation;
-        let mut dir_acl = 0u32;
-
-        let mut size = raw.size_lo as u64;
-        if type_ == InodeType::File {
-            size |= (raw.size_high as u64) << 32;
-        } else {
-            dir_acl = raw.size_high;
-        }
-        if size > i64::MAX as u64 {
-            return_errno!(Errno::EUCLEAN);
-        }
-
-        let fs_arc = fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
-        let sb = fs_arc.super_block();
-        if file_acl != 0 && !sb.data_block_valid(file_acl, 1) {
-            return_errno!(Errno::EUCLEAN);
-        }
-
-        let block_group_idx = ((ino - 1) / sb.inodes_per_group()) as usize;
-        let dir_start_lookup = 0;
-        let block_ptrs = raw.block;
-
-        let inode = Inode {
-            ino,
-            type_,
-            perm,
-            uid,
-            gid,
-            size,
-            atime,
-            ctime,
-            mtime,
-            dtime: UnixTime::from(Duration::from_secs(0)),
-            links_count: raw.links_count,
-            blocks,
-            flags,
-            faddr,
-            frag,
-            fsize,
-            file_acl,
-            dir_acl,
-            generation,
-            block_group_idx,
-            dir_start_lookup,
-            block_ptrs,
-            fs,
-        };
-
-        Ok(Arc::new(inode))
-    }
+  
 
     /// Translates a logical block number into a path of block pointer offsets.
     ///
@@ -342,7 +264,7 @@ impl Inode {
             return Ok(None);
         }
 
-        let mut bid = self.block_ptrs[path.offsets[0] as usize];
+        let mut bid = self.desc.block_ptrs[path.offsets[0] as usize];
         if bid == 0 {
             return Ok(None);
         }
@@ -373,6 +295,11 @@ impl Inode {
 
         Ok(Some(Bid::new(bid as u64)))
     }
+
+}
+
+impl Inode {
+   
 }
 
 /// Directory entry type mapping (ext2 file_type field).
@@ -436,10 +363,126 @@ pub(super) struct BlockPath {
     pub boundary: u32,
 }
 
+bitflags! {
+    pub struct FileFlags: u32 {
+        /// Secure deletion.
+        const SECURE_DEL = 1 << 0;
+        /// Undelete.
+        const UNDELETE = 1 << 1;
+        /// Compress file.
+        const COMPRESS = 1 << 2;
+        /// Synchronous updates.
+        const SYNC_UPDATE = 1 << 3;
+        /// Immutable file.
+        const IMMUTABLE = 1 << 4;
+        /// Append only.
+        const APPEND_ONLY = 1 << 5;
+        /// Do not dump file.
+        const NO_DUMP = 1 << 6;
+        /// Do not update atime.
+        const NO_ATIME = 1 << 7;
+        /// Dirty.
+        const DIRTY = 1 << 8;
+        /// One or more compressed clusters.
+        const COMPRESS_BLK = 1 << 9;
+        /// Do not compress.
+        const NO_COMPRESS = 1 << 10;
+        /// Encrypted file.
+        const ENCRYPT = 1 << 11;
+        /// Hash-indexed directory.
+        const INDEX_DIR = 1 << 12;
+        /// AFS directory.
+        const IMAGIC = 1 << 13;
+        /// Journal file data.
+        const JOURNAL_DATA = 1 << 14;
+        /// File tail should not be merged.
+        const NO_TAIL = 1 << 15;
+        /// Dirsync behaviour (directories only).
+        const DIR_SYNC = 1 << 16;
+        /// Top of directory hierarchies.
+        const TOP_DIR = 1 << 17;
+        /// Reserved for ext2 lib.
+        const RESERVED = 1 << 31;
+    }
+}
+
 /// In-memory inode descriptor (raw on-disk view).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct InodeDesc {
-    pub raw: RawInode,
+    type_: InodeType,
+    perm: FilePerm,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    atime: UnixTime,
+    ctime: UnixTime,
+    mtime: UnixTime,
+    dtime: UnixTime,
+    links_count: u16,
+    blocks: u32,
+    flags: FileFlags,
+    file_acl: u32,
+    block_ptrs: [u32; 15],
+}
+
+impl InodeDesc {
+    pub fn type_(&self) -> InodeType {
+        self.type_
+    }
+}
+
+impl TryFrom<&RawInode> for InodeDesc {
+    type Error = Error;
+    fn try_from(raw: &RawInode) -> Result<Self> {
+        let mode = raw.mode;
+
+        if raw.links_count == 0 && (mode == 0 || raw.dtime != 0) {
+            return_errno!(Errno::ESTALE);
+        }
+
+        // TODO: Different from Linux
+        let type_ = InodeType::from_raw_mode(mode)?;
+
+        let perm = FilePerm::from_bits_truncate(mode);
+
+        let uid = (raw.uid as u32) | ((raw.uid_high as u32) << 16);
+        let gid = (raw.gid as u32) | ((raw.gid_high as u32) << 16);
+
+        let atime = UnixTime::from(Duration::from_secs(raw.atime as u64));
+        let ctime = UnixTime::from(Duration::from_secs(raw.ctime as u64));
+        let mtime = UnixTime::from(Duration::from_secs(raw.mtime as u64));
+
+        let blocks = raw.blocks;
+
+        let mut size = raw.size_lo as u64;
+        if type_ == InodeType::File {
+            size |= (raw.size_high as u64) << 32;
+        }
+        if size > i64::MAX as u64 {
+            return_errno!(Errno::EUCLEAN);
+        }
+
+        let file_acl = raw.file_acl;
+
+        let block_ptrs = raw.block;
+
+        Ok(InodeDesc {
+            type_,
+            perm,
+            uid,
+            gid,
+            size,
+            atime,
+            ctime,
+            mtime,
+            dtime: UnixTime::from(Duration::from_secs(0)),
+            links_count: raw.links_count,
+            blocks,
+            flags: FileFlags::from_bits(raw.flags).unwrap(),
+            file_acl,
+            block_ptrs,
+        })
+    }
 }
 
 /// On-disk inode structure (128 bytes for GOOD_OLD_REV).
