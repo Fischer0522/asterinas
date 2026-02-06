@@ -45,11 +45,212 @@ use self::fs_type::Ext2Type;
 pub(super) fn init() {
     super::registry::register(&Ext2Type).unwrap();
 }
-mod fs;
-mod fs_type;
-mod super_block;
 mod block_group;
 mod dir;
+mod fs;
+mod fs_type;
 mod inode;
 mod prelude;
+mod super_block;
 mod utils;
+
+
+#[cfg(ktest)]
+pub(super) mod test {
+    use core::{fmt, mem::size_of};
+
+    use aster_block::{
+        BLOCK_SIZE, BlockDevice, BlockDeviceMeta, SECTOR_SIZE,
+        bio::{BioEnqueueError, BioStatus, BioType, SubmittedBio},
+    };
+    use device_id::{DeviceId, MajorId, MinorId};
+    use ostd::{
+        mm::{FrameAllocOptions, PAGE_SIZE, Segment, USegment, VmIo, io_util::HasVmReaderWriter},
+        prelude::*,
+    };
+
+    use super::{
+        block_group::RawGroupDesc,
+        super_block::{
+            ErrorsBehaviour, FsState, OsId, RawSuperBlock, RevLevel, SUPER_BLOCK_OFFSET,
+        },
+        super_block::{MAGIC_NUM, SuperBlock},
+    };
+
+    pub(super) struct Ext2MemoryDisk {
+        segment: Segment<()>,
+    }
+
+    impl Ext2MemoryDisk {
+        pub(super) fn new(nblocks: usize) -> Self {
+            let npages = (nblocks * BLOCK_SIZE).div_ceil(PAGE_SIZE);
+            let segment = FrameAllocOptions::new()
+                .zeroed(true)
+                .alloc_segment(npages)
+                .unwrap();
+            Self { segment }
+        }
+
+        pub(super) fn segment(&self) -> &Segment<()> {
+            &self.segment
+        }
+
+        pub(super) fn write_super_block(&self, raw: &RawSuperBlock) {
+            self.segment.write_val(SUPER_BLOCK_OFFSET, raw).unwrap();
+        }
+
+        pub(super) fn write_group_desc_table(&self, sb: &SuperBlock, descs: &[RawGroupDesc]) {
+            let table_offset = sb.group_descriptors_bid(0).to_offset();
+            for (idx, desc) in descs.iter().enumerate() {
+                let offset = table_offset + idx * size_of::<RawGroupDesc>();
+                self.segment.write_val(offset, desc).unwrap();
+            }
+        }
+    }
+
+    impl fmt::Debug for Ext2MemoryDisk {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Ext2MemoryDisk")
+                .field("bytes", &self.segment.size())
+                .finish()
+        }
+    }
+
+    impl BlockDevice for Ext2MemoryDisk {
+        fn enqueue(&self, bio: SubmittedBio) -> core::result::Result<(), BioEnqueueError> {
+            let mut cur_device_ofs = bio.sid_range().start.to_raw() as usize * SECTOR_SIZE;
+
+            for seg in bio.segments() {
+                let io_size = match bio.type_() {
+                    BioType::Read => seg
+                        .writer()
+                        .unwrap()
+                        .write(self.segment.reader().skip(cur_device_ofs)),
+                    BioType::Write => self
+                        .segment
+                        .writer()
+                        .skip(cur_device_ofs)
+                        .write(&mut seg.reader().unwrap()),
+                    _ => {
+                        bio.complete(BioStatus::NotSupported);
+                        return Ok(());
+                    }
+                };
+                cur_device_ofs += io_size;
+            }
+
+            bio.complete(BioStatus::Complete);
+            Ok(())
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta {
+                max_nr_segments_per_bio: usize::MAX,
+                nr_sectors: self.segment.size() / SECTOR_SIZE,
+            }
+        }
+
+        fn name(&self) -> &str {
+            "ext2-memory-disk"
+        }
+
+        fn id(&self) -> DeviceId {
+            DeviceId::new(MajorId::new(1), MinorId::new(0))
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) struct ErrorBioDisk {
+        read_status: BioStatus,
+        nr_sectors: usize,
+    }
+
+    impl ErrorBioDisk {
+        pub(super) fn new(read_status: BioStatus, nr_sectors: usize) -> Self {
+            Self { read_status, nr_sectors }
+        }
+    }
+
+    impl BlockDevice for ErrorBioDisk {
+        fn enqueue(&self, bio: SubmittedBio) -> core::result::Result<(), BioEnqueueError> {
+            let status = match bio.type_() {
+                BioType::Read => self.read_status,
+                _ => BioStatus::Complete,
+            };
+            bio.complete(status);
+            Ok(())
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta {
+                max_nr_segments_per_bio: usize::MAX,
+                nr_sectors: self.nr_sectors,
+            }
+        }
+
+        fn name(&self) -> &str {
+            "ext2-error-disk"
+        }
+
+        fn id(&self) -> DeviceId {
+            DeviceId::new(MajorId::new(1), MinorId::new(1))
+        }
+    }
+
+    pub(super) fn make_valid_raw_super_block(groups_count: u32) -> RawSuperBlock {
+        let mut raw = RawSuperBlock::default();
+        raw.magic = MAGIC_NUM;
+        raw.log_block_size = 2;
+        raw.log_frag_size = 2;
+        raw.state = FsState::VALID.bits();
+        raw.errors = ErrorsBehaviour::Continue as u16;
+        raw.creator_os = OsId::Linux as u32;
+        raw.rev_level = RevLevel::GoodOld as u32;
+        raw.first_data_block = 1;
+        raw.blocks_per_group = 128;
+        raw.frags_per_group = raw.blocks_per_group;
+        raw.inodes_per_group = 1024;
+        raw.inodes_count = groups_count * raw.inodes_per_group;
+
+        let tail_blocks = 64;
+        raw.blocks_count = raw.first_data_block
+            + 1
+            + (groups_count.saturating_sub(1)) * raw.blocks_per_group
+            + tail_blocks;
+        raw
+    }
+
+    pub(super) fn make_valid_super_block(groups_count: u32) -> SuperBlock {
+        SuperBlock::try_from(make_valid_raw_super_block(groups_count)).unwrap()
+    }
+
+    pub(super) fn make_valid_group_desc(sb: &SuperBlock, group_idx: usize) -> RawGroupDesc {
+        let first = sb.group_first_block_no(group_idx);
+        RawGroupDesc {
+            block_bitmap: first,
+            inode_bitmap: first + 1,
+            inode_table: first + 2,
+            free_blocks_count: 0,
+            free_inodes_count: 0,
+            used_dirs_count: 0,
+            pad: 0,
+            reserved: [0; 3],
+        }
+    }
+
+    pub(super) fn build_group_desc_segment(sb: &SuperBlock, descs: &[RawGroupDesc]) -> USegment {
+        let desc_bytes = (sb.block_groups_count() as usize) * size_of::<RawGroupDesc>();
+        let npages = desc_bytes.div_ceil(BLOCK_SIZE);
+        let segment = FrameAllocOptions::new()
+            .zeroed(true)
+            .alloc_segment(npages)
+            .unwrap();
+
+        for (idx, desc) in descs.iter().enumerate() {
+            let offset = idx * size_of::<RawGroupDesc>();
+            segment.write_val(offset, desc).unwrap();
+        }
+
+        segment.into()
+    }
+}

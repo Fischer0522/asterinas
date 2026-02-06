@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use aster_virtio::device::socket::error;
+
 use super::block_group::{BlockGroup, RawGroupDesc};
 use super::inode::{Inode, InodeDesc, RawInode};
 use super::prelude::*;
@@ -215,6 +217,7 @@ impl Ext2 {
         match self.block_device.read_blocks(sb.group_descriptors_bid(0), bio_segment)? {
             BioStatus::Complete => {}
             err_status => {
+                ostd::early_println!("Ext2: Failed to read group descriptor table: {:?}", err_status);
                 return Err(Error::from(err_status));
             }
         }
@@ -242,13 +245,16 @@ impl Ext2 {
             let inode_table = desc.inode_table;
 
             if block_bitmap < first_block || block_bitmap > last_block {
+                error!("Ext2: Block bitmap out of range");
                 return_errno!(Errno::EINVAL);
             }
             if inode_bitmap < first_block || inode_bitmap > last_block {
+                error!("Ext2: Inode bitmap out of range");
                 return_errno!(Errno::EINVAL);
             }
             let table_last = inode_table.saturating_add(itb_per_group.saturating_sub(1));
             if inode_table < first_block || table_last > last_block {
+                error!("Ext2: Inode table out of range");
                 return_errno!(Errno::EINVAL);
             }
         }
@@ -820,5 +826,135 @@ impl Ext2 {
             return true;
         };
         !(end < zone_start || start > zone_end)
+    }
+}
+
+
+#[cfg(ktest)]
+mod test {
+
+    use aster_block::bio::BioStatus;
+    use ostd::prelude::*;
+
+    use super::*;
+    use crate::fs::{
+        ext2::test::{
+            Ext2MemoryDisk, ErrorBioDisk, build_group_desc_segment, make_valid_group_desc,
+            make_valid_super_block,
+        },
+        utils::FsEventSubscriberStats,
+    };
+
+    fn make_test_ext2(sb: SuperBlock, block_device: Arc<dyn BlockDevice>) -> Ext2 {
+        let group_descriptors_segment: USegment =
+            FrameAllocOptions::new().zeroed(true).alloc_segment(1).unwrap().into();
+
+        Ext2 {
+            block_device,
+            super_block: RwMutex::new(Dirty::new(sb)),
+            block_groups: Vec::new(),
+            inodes_per_group: sb.inodes_per_group(),
+            blocks_per_group: sb.blocks_per_group(),
+            inode_size: sb.inode_size(),
+            block_size: sb.block_size(),
+            group_descriptors_segment,
+            fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+            self_ref: Weak::new(),
+        }
+    }
+
+    #[ktest]
+    fn group_bounds_ok() {
+        let sb = make_valid_super_block(3);
+
+        assert_eq!(sb.group_first_block_no(0), 1);
+        assert_eq!(sb.group_first_block_no(1), 1 + sb.blocks_per_group());
+        assert_eq!(
+            sb.group_last_block_no(0),
+            sb.group_first_block_no(0) + sb.blocks_per_group() - 1
+        );
+
+        let last_group = sb.block_groups_count() as usize - 1;
+        assert_eq!(sb.group_last_block_no(last_group), sb.total_blocks() - 1);
+    }
+
+    #[ktest]
+    fn reject_bad_bitmap() {
+        let sb = make_valid_super_block(2);
+        let mut descs = (0..sb.block_groups_count() as usize)
+            .map(|idx| make_valid_group_desc(&sb, idx))
+            .collect::<Vec<_>>();
+
+        descs[0].block_bitmap = sb.group_first_block_no(0).saturating_sub(1);
+
+        let group_descs = build_group_desc_segment(&sb, &descs);
+        let ext2 = make_test_ext2(sb, Arc::new(Ext2MemoryDisk::new(64)));
+
+        let err = ext2.check_group_desc_table(&sb, &group_descs).unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
+    }
+
+    #[ktest]
+    fn reject_bad_inode_table() {
+        let sb = make_valid_super_block(2);
+        let mut descs = (0..sb.block_groups_count() as usize)
+            .map(|idx| make_valid_group_desc(&sb, idx))
+            .collect::<Vec<_>>();
+
+        let first = sb.group_first_block_no(0);
+        let last = sb.group_last_block_no(0);
+        let itb = sb.itb_per_group();
+        descs[0].inode_table = last.saturating_sub(itb.saturating_sub(2));
+        assert!(descs[0].inode_table >= first);
+
+        let group_descs = build_group_desc_segment(&sb, &descs);
+        let ext2 = make_test_ext2(sb, Arc::new(Ext2MemoryDisk::new(64)));
+
+        let err = ext2.check_group_desc_table(&sb, &group_descs).unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
+    }
+
+    #[ktest]
+    fn load_descriptors_ok() {
+        let sb = make_valid_super_block(3);
+        let descs = (0..sb.block_groups_count() as usize)
+            .map(|idx| make_valid_group_desc(&sb, idx))
+            .collect::<Vec<_>>();
+        let disk = Ext2MemoryDisk::new(64);
+        disk.write_group_desc_table(&sb, &descs);
+
+        let ext2 = make_test_ext2(sb, Arc::new(disk));
+        let loaded = ext2.load_group_desc_table(&sb).unwrap();
+        let first_desc = loaded.read_val::<RawGroupDesc>(0).unwrap();
+
+        assert_eq!(first_desc.block_bitmap, descs[0].block_bitmap);
+        assert_eq!(first_desc.inode_bitmap, descs[0].inode_bitmap);
+        assert_eq!(first_desc.inode_table, descs[0].inode_table);
+    }
+
+    #[ktest]
+    fn load_descriptors_io_error() {
+        let sb = make_valid_super_block(1);
+        let disk = ErrorBioDisk::new(BioStatus::IoError, 64 * BLOCK_SIZE / SECTOR_SIZE);
+        let ext2 = make_test_ext2(sb, Arc::new(disk));
+
+        let err = ext2.load_group_desc_table(&sb).unwrap_err();
+        assert_eq!(err.error(), Errno::EIO);
+    }
+
+    #[ktest]
+    fn load_descriptors_bad_descriptor() {
+        let sb = make_valid_super_block(2);
+        let mut descs = (0..sb.block_groups_count() as usize)
+            .map(|idx| make_valid_group_desc(&sb, idx))
+            .collect::<Vec<_>>();
+        descs[1].inode_bitmap = sb.group_last_block_no(1).saturating_add(1);
+
+        let disk = Ext2MemoryDisk::new(64);
+        disk.write_group_desc_table(&sb, &descs);
+
+        let ext2 = make_test_ext2(sb, Arc::new(disk));
+        let err = ext2.load_group_desc_table(&sb).unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
     }
 }

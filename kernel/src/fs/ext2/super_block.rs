@@ -746,3 +746,70 @@ impl Default for Reserved {
         Self([0u32; 190])
     }
 }
+
+
+#[cfg(ktest)]
+mod test {
+    use ostd::prelude::*;
+
+    use super::*;
+    use crate::fs::ext2::test::{Ext2MemoryDisk, make_valid_raw_super_block};
+
+    #[ktest]
+    fn load_super_block_ok() {
+        let raw = make_valid_raw_super_block(2);
+        let disk_size_blocks = raw.blocks_count as usize;
+        let disk = Ext2MemoryDisk::new(disk_size_blocks);
+        disk.write_super_block(&raw);
+
+        let sb = load_super_block(&disk, false).unwrap();
+        assert_eq!(sb.total_blocks(), raw.blocks_count);
+        assert_eq!(sb.total_inodes(), raw.inodes_count);
+        assert_eq!(sb.block_groups_count(), 2);
+    }
+
+    #[ktest]
+    fn reject_bad_magic() {
+        let mut raw = make_valid_raw_super_block(1);
+        raw.magic = 0;
+
+        let disk = Ext2MemoryDisk::new(raw.blocks_count as usize);
+        disk.write_super_block(&raw);
+
+        let err = load_super_block(&disk, false).unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
+    }
+
+    #[ktest]
+    fn reject_read_write_with_bad_compat() {
+        let mut raw = make_valid_raw_super_block(1);
+        raw.feature_ro_compat = FeatureRoCompatSet::BTREE_DIR.bits();
+
+        let disk = Ext2MemoryDisk::new(raw.blocks_count as usize);
+        disk.write_super_block(&raw);
+
+        let err = load_super_block(&disk, false).unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
+    }
+
+    #[ktest]
+    fn allow_read_only_with_bad_compat() {
+        let mut raw = make_valid_raw_super_block(1);
+        raw.feature_ro_compat = FeatureRoCompatSet::BTREE_DIR.bits();
+
+        let disk = Ext2MemoryDisk::new(raw.blocks_count as usize);
+        disk.write_super_block(&raw);
+
+        assert!(load_super_block(&disk, true).is_ok());
+    }
+
+    #[ktest]
+    fn reject_small_device() {
+        let raw = make_valid_raw_super_block(2);
+        let disk = Ext2MemoryDisk::new((raw.blocks_count as usize).saturating_sub(1));
+        disk.write_super_block(&raw);
+
+        let err = load_super_block(&disk, false).unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
+    }
+}
