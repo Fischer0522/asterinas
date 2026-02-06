@@ -79,6 +79,34 @@ impl Ext2 {
 }
 ```
 
+```rust
+/// A parsed directory entry.
+#[derive(Clone, Debug)]
+pub(super) struct DirEntry {
+    pub inode: u32,
+    pub rec_len: u16,
+    pub name_len: u8,
+    pub file_type: u8,
+    pub name: CStr256,
+}
+impl DirEntry {
+      pub(super) fn parse_at(
+        buf: &[u8],
+        offset: usize,
+        limit: usize,
+        max_inumber: u32,
+    ) -> Result<DirEntry>;
+}
+/// Directory entry iterator over a single block buffer.
+pub(super) struct DirEntryIter<'a> {
+    buf: &'a [u8],
+    offset: usize,
+    limit: usize,
+    max_inumber: u32,
+}
+```
+
+
 [GUARANTEE]
 impl Inode {
     /// Adds a new directory entry to this directory inode.
