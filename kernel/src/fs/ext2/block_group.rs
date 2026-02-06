@@ -161,7 +161,7 @@ impl BlockGroup {
             return Ok(());
         }
 
-        let raw = RawGroupDesc::from(*desc);
+        let raw = RawGroupDesc::from(**desc);
         let offset = self.idx * size_of::<RawGroupDesc>();
         group_descs.write_val(offset, &raw)?;
         desc.clear_dirty();

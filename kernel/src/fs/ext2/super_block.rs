@@ -456,6 +456,10 @@ impl SuperBlock {
         self.free_inodes_count += 1;
     }
 
+    pub (super) fn set_wtime(&mut self, time: UnixTime) {
+        self.wtime = time;
+    }
+
     /// Decrease the number of free inodes.
     pub(super) fn dec_free_inodes(&mut self) {
         debug_assert!(self.free_inodes_count > 0);

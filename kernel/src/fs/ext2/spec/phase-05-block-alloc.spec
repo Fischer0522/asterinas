@@ -172,8 +172,8 @@ Post (free_blocks: success):
   - If the range overlaps group system zones (block bitmap, inode bitmap, inode table),
     return `Err(EIO)` and stop.
   - For each bit in the per-group range:
-    - Assert the bit is set (panic on inconsistent state).
-    - Clear it and increment `freed`.
+    - If the bit is set, clear it and increment `freed`.
+    - If the bit is already clear, log metadata inconsistency and continue.
   - Write the bitmap back to disk.
   - Update counters with the actual number of bits cleared:
     - `BlockGroup::inc_free_blocks(freed as u16)`.
@@ -206,5 +206,5 @@ Linux: On system-zone overlap during allocation, logs and retries with possibly 
   Reason: Provide explicit error reporting in absence of kernel error logger.
 
 Linux: On freeing an already-free block, logs an error and continues.
-  → Asterinas: Asserts (panics) on this inconsistent state.
-  Reason: Current skills allow panic on detected metadata inconsistency.
+  → Asterinas: Logs metadata inconsistency and continues freeing remaining bits.
+  Reason: Keep allocator progress while preserving corruption visibility.

@@ -29,12 +29,14 @@ The following Linux Ext2 features are explicitly out of scope for this implement
 
 ## Phase Roadmap (High-Level)
 
-## Progress (as of 2026-02-05)
+## Progress (as of 2026-02-06)
 - Implemented (spec + code): Phase 0.1 (core skeleton), Phase 1.1-1.3, Phase 2.1-2.3,
-  Phase 3.1, Phase 3.3, Phase 4.1-4.2.
+  Phase 3.1, Phase 3.3, Phase 4.1-4.2, Phase 5.1-5.3.
 - Partially implemented: Phase 0.2 (VFS glue stubs not present), Phase 3.2 (inode cache not wired; read_inode implemented).
+- Not implemented: Phase 3.4 (file read path).
 - Verified against Linux: Phase 4.2 (lookup/readdir) via linux-logic-verify.
-- Not started: Phase 5+.
+- Pending verification: Phase 5.1-5.3 do not yet have a recorded linux-logic-verify pass.
+- Not started: Phase 6+.
 
 ### Phase 0: Scaffolding & Interfaces
 Goal: establish module layout and VFS wiring points without logic.

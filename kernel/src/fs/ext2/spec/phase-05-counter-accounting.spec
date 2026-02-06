@@ -121,6 +121,8 @@ Post (sync_metadata: success):
      `sb.group_descriptors_bid(0).to_offset()` using `BlockDevice::write_bytes`.
   4. Serialize the superblock via `RawSuperBlock::from(&*sb_guard)` and write it to
      `SUPER_BLOCK_OFFSET` using `BlockDevice::write_bytes`.
+     - Before serialization, update superblock write time:
+       `sb.wtime = UnixTime::now()` (Linux `ext2_sync_super` `s_wtime` update).
   5. For each backup group `i` where `sb.is_backup_group(i)` is true:
      - Clone the raw superblock and set `block_group_idx = i as u16`.
      - Write the backup superblock to `sb.bid(i).to_offset()`.

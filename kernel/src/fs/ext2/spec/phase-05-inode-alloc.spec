@@ -167,8 +167,8 @@ Post (alloc_inode: success):
   4. For each candidate group:
      - Load bitmap via `BlockGroup::load_inode_bitmap(self, sb)`.
      - Allocate one inode with `IdBitmap::alloc()`.
-     - If allocation fails but `free_inodes_count > 0`, mark metadata inconsistency
-       and continue scanning other groups.
+     - If allocation fails but `free_inodes_count > 0`, continue scanning other groups
+       (Linux-consistent rare race / approximate counter case).
      - If allocation succeeds, compute filesystem inode number:
        `ino = group_idx * inodes_per_group + inode_idx + 1`.
      - Return Err(EIO) if `ino` is not within `[sb.first_ino(), sb.total_inodes()]`.
@@ -181,7 +181,7 @@ Post (alloc_inode: success):
 
 Post (alloc_inode: failure):
 - Returns `Err(ENOSPC)` if no free inode exists in any group.
-- Returns `Err(EIO)` on I/O error or if metadata inconsistency was detected during scanning.
+- Returns `Err(EIO)` on I/O error.
 - On failure, on-disk and in-memory counters remain unchanged.
 
 Pre (free_inode):
@@ -192,9 +192,10 @@ Post (free_inode: success):
   `raw.mode` with `InodeType::from_raw_mode`.
 - Computes `group_idx = (ino - 1) / inodes_per_group`, `bit = (ino - 1) % inodes_per_group`.
 - Loads inode bitmap via `BlockGroup::load_inode_bitmap(self, sb)`.
-- Asserts the bit is set; clears it via `IdBitmap::free(bit)`.
+- If the bit is set, clears it via `IdBitmap::free(bit)` and marks `freed = true`.
+- If the bit is already clear, logs metadata inconsistency and keeps `freed = false`.
 - Persists bitmap via `BlockDevice::write_bytes(group.inode_bitmap_bid())`.
-- Updates counters:
+- Updates counters only when `freed == true`:
   - `BlockGroup::inc_free_inodes(1)`.
   - `SuperBlock::inc_free_inodes()`.
   - If `is_dir`, `BlockGroup::dec_used_dirs()`.
@@ -217,5 +218,5 @@ Linux: Uses quota, security, ACL, and VFS inode initialization in `ext2_new_inod
   Reason: VFS inode construction and security hooks are out of scope for this phase.
 
 Linux: On freeing an already-free inode, logs an error and continues.
-  → Asterinas: Asserts (panics) on this inconsistent state.
-  Reason: Current skills allow panic on detected metadata inconsistency.
+  → Asterinas: Logs metadata inconsistency and continues without counter updates.
+  Reason: Preserve Linux-like resilience while avoiding free-count corruption.

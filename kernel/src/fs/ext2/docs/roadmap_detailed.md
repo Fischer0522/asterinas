@@ -244,6 +244,10 @@ Goal: enable writable mount and allocation semantics.
 - Asterinas adjustments:
   - direct bitmap read/write via `BlockDevice`; `IdBitmap::alloc_consecutive` with halving fallback.
 - Spec: `phase-05-block-alloc.spec`.
+- Status: implemented in code (`Ext2::alloc_blocks` / `Ext2::free_blocks`), verification pending.
+- Known gaps vs Linux:
+  - No goal-based placement heuristic (`find_next_usable_block` path).
+  - Reserved-block policy (`ext2_has_free_blocks`) not implemented yet.
 
 ### Module 5.2: Inode Allocation Core
 - New/extend structs:
@@ -255,8 +259,9 @@ Goal: enable writable mount and allocation semantics.
   - `/root/linux/fs/ext2/ialloc.c:419` (`ext2_new_inode`).
   - `/root/linux/fs/ext2/ialloc.c:79` (`ext2_free_inode`).
 - Asterinas adjustments:
-  - Orlov policy implemented with `BTreeMap` statistics, no global hash.
+  - Current implementation uses cyclic scan from parent group; Orlov policy is not implemented yet.
 - Spec: `phase-05-inode-alloc.spec`.
+- Status: implemented in code (`Ext2::alloc_inode` / `Ext2::free_inode`), verification pending.
 
 ### Module 5.3: Writable Superblock / Group Counters
 - Methods:
@@ -267,6 +272,12 @@ Goal: enable writable mount and allocation semantics.
 - Asterinas adjustments:
   - atomicity via `RwMutex` and `Dirty`.
 - Spec: `phase-05-counter-accounting.spec`.
+- Status: implemented in code (`sync_metadata` + group/super counter updates), verification pending.
+
+### Phase 5 Gate Snapshot (2026-02-06)
+- Spec: pass (phase-05 specs complete).
+- Implementation: pass (core methods present).
+- linux-logic-verify: pending (no recorded pass yet).
 
 ---
 

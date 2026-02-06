@@ -5,7 +5,7 @@ use super::inode::{Inode, InodeDesc, RawInode};
 use super::prelude::*;
 use super::super_block::{RawSuperBlock, SuperBlock, SUPER_BLOCK_OFFSET};
 use super::utils::Dirty;
-use crate::fs::utils::{FsEventSubscriberStats, IdBitmap};
+use crate::fs::utils::FsEventSubscriberStats;
 use core::mem::size_of;
 
 /// The root inode number (Linux EXT2_ROOT_INO).
@@ -142,6 +142,55 @@ impl Ext2 {
             .read_val::<RawInode>()
             .map_err(|_| Error::new(Errno::EIO))?;
         Ok(InodeDesc { raw })
+    }
+
+    /// Writes an inode descriptor to disk.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:1314 (ext2_get_inode)
+    pub(super) fn write_inode_desc(&self, ino: u32, raw: &RawInode) -> Result<()> {
+        let sb = self.super_block.read();
+
+        if (ino != ROOT_INO && ino < sb.first_ino()) || ino > sb.total_inodes() {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let inodes_per_group = sb.inodes_per_group();
+        let group_idx = (ino - 1) / inodes_per_group;
+        let index_in_group = (ino - 1) % inodes_per_group;
+
+        let inode_size = sb.inode_size();
+        let block_size = sb.block_size();
+        let offset_bytes = (index_in_group as usize).saturating_mul(inode_size);
+        let block_index = offset_bytes / block_size;
+        let offset_in_block = offset_bytes % block_size;
+
+        // TODO: remove this read.
+        let block_bid = self.inode_table_block(group_idx as usize, block_index as u32)?;
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        if self
+            .block_device
+            .read_bytes(block_bid.to_offset(), &mut buf)
+            .is_err()
+        {
+            return_errno!(Errno::EIO);
+        }
+
+        let inode_len = size_of::<RawInode>();
+        if offset_in_block + inode_len > BLOCK_SIZE {
+            return_errno!(Errno::EIO);
+        }
+
+        buf[offset_in_block..offset_in_block + inode_len].copy_from_slice(raw.as_bytes());
+
+        if self
+            .block_device
+            .write_bytes(block_bid.to_offset(), &buf)
+            .is_err()
+        {
+            return_errno!(Errno::EIO);
+        }
+
+        Ok(())
     }
 
     /// Loads the group descriptor table into a segment.
@@ -341,10 +390,15 @@ impl Ext2 {
             let mut freed = 0u32;
             let range_start = bit as u16;
             let range_end = (bit + group_count) as u16;
-            for idx in range_start..range_end {
-                assert!(bitmap.is_allocated(idx));
-            }
 
+            for idx in range_start..range_end {
+                if !bitmap.is_allocated(idx) {
+                    warn!(
+                        "ext2_free_blocks: bit already cleared for block {}",
+                        current.saturating_add((idx - range_start) as u32)
+                    );
+                }
+            }
             bitmap.free_consecutive(range_start..range_end);
             freed = group_count;
 
@@ -392,7 +446,6 @@ impl Ext2 {
         }
 
         let parent_group = ((parent_ino - 1) / inodes_per_group) as usize;
-        let mut saw_corruption = false;
         for offset in 0..groups_count {
             let group_idx = (parent_group + offset) % groups_count;
             let group = self
@@ -408,7 +461,6 @@ impl Ext2 {
                 group.load_inode_bitmap(self, &sb_guard)?
             };
             let Some(inode_idx) = bitmap.alloc() else {
-                saw_corruption = true;
                 continue;
             };
 
@@ -438,9 +490,6 @@ impl Ext2 {
             return Ok(ino);
         }
 
-        if saw_corruption {
-            return_errno!(Errno::EIO);
-        }
         return_errno!(Errno::ENOSPC);
     }
 
@@ -478,7 +527,15 @@ impl Ext2 {
             let sb_guard = self.super_block.read();
             group.load_inode_bitmap(self, &sb_guard)?
         };
-        bitmap.free(bit);
+
+        let mut freed = false;
+        if !bitmap.is_allocated(bit) {
+            freed = true;   
+            warn!("ext2_free_inode: inode {} already freed", ino);
+        }
+        if !freed {
+            bitmap.free(bit);
+        }
 
         if self
             .block_device
@@ -488,12 +545,14 @@ impl Ext2 {
             return_errno!(Errno::EIO);
         }
 
-        group.inc_free_inodes(1);
-        if is_dir {
-            group.dec_used_dirs();
+        if !freed { 
+            group.inc_free_inodes(1);
+            if is_dir {
+                group.dec_used_dirs();
+            }
+            let mut sb_write = self.super_block.write();
+            sb_write.inc_free_inodes();
         }
-        let mut sb_write = self.super_block.write();
-        sb_write.inc_free_inodes();
 
         Ok(())
     }
@@ -535,7 +594,12 @@ impl Ext2 {
             return_errno!(Errno::EIO);
         }
 
-        let sb_guard = self.super_block.read();
+        let mut sb_guard = self.super_block.write();
+        let wtime = crate::time::SystemTime::now()
+            .duration_since(&crate::time::SystemTime::UNIX_EPOCH)
+            .map(UnixTime::from)
+            .map_err(|_| Error::new(Errno::EIO))?;
+        sb_guard.set_wtime(wtime);
         if self
             .block_device
             .write_bytes(sb_guard.group_descriptors_bid(0).to_offset(), &desc_buf)
@@ -544,7 +608,7 @@ impl Ext2 {
             return_errno!(Errno::EIO);
         }
 
-        let mut raw_sb = RawSuperBlock::from(&*sb_guard);
+        let mut raw_sb = RawSuperBlock::from(&**sb_guard);
         if self
             .block_device
             .write_bytes(SUPER_BLOCK_OFFSET, raw_sb.as_bytes())
@@ -574,9 +638,7 @@ impl Ext2 {
             }
         }
 
-        drop(sb_guard);
-        let mut sb_write = self.super_block.write();
-        sb_write.clear_dirty();
+        sb_guard.clear_dirty();
         Ok(())
     }
 
