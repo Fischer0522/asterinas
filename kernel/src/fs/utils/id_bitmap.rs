@@ -107,6 +107,10 @@ impl IdBitmap {
         if count == 0 {
             return None;
         }
+        
+        if self.first_available_id >= self.len {
+            return None;
+        }
 
         // Scan the bitmap from the position `first_available_id`
         // for the first `count` number of consecutive 0's.

@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use super::prelude::*;
-use crate::fs::registry::{FsProperties, FsType};
-use crate::fs::utils::{FileSystem, FsFlags};
 use aster_systree::SysNode;
+
+use super::prelude::*;
+use crate::fs::{
+    registry::{FsProperties, FsType},
+    utils::{FileSystem, FsFlags},
+};
 
 /// VFS-visible Ext2 filesystem type.
 /// Linux: /root/linux/fs/ext2/super.c:1698 (ext2_fs_type)

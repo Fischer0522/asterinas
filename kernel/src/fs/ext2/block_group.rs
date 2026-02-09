@@ -4,9 +4,7 @@ use core::mem::size_of;
 
 use ostd::const_assert;
 
-use super::prelude::*;
-use super::fs::Ext2;
-use super::super_block::SuperBlock;
+use super::{fs::Ext2, prelude::*, super_block::SuperBlock};
 use crate::fs::utils::IdBitmap;
 
 #[derive(Debug)]
@@ -75,7 +73,9 @@ impl From<GroupDesc> for RawGroupDesc {
 impl BlockGroup {
     pub fn load(group_descs: &USegment, idx: usize) -> Result<Self> {
         let offset = idx * size_of::<RawGroupDesc>();
-        let raw = group_descs.read_val::<RawGroupDesc>(offset)?;
+        let raw = group_descs
+            .read_val::<RawGroupDesc>(offset)
+            .map_err(|_| Error::new(Errno::EIO))?;
         let desc = GroupDesc::from(raw);
         Ok(Self {
             idx,
@@ -266,5 +266,68 @@ impl BlockGroup {
         }
 
         Ok(IdBitmap::from_buf(buf.into_boxed_slice(), capacity as u16))
+    }
+}
+
+#[cfg(ktest)]
+mod test {
+    use ostd::{
+        mm::{FrameAllocOptions, VmIo},
+        prelude::*,
+    };
+
+    use super::*;
+    use crate::fs::ext2::test::{
+        build_group_desc_segment, make_valid_group_desc, make_valid_super_block,
+    };
+    #[ktest]
+    fn block_group_load_and_accessors_ok() {
+        let sb = make_valid_super_block(2);
+        let descs = (0..sb.block_groups_count() as usize)
+            .map(|idx| make_valid_group_desc(&sb, idx))
+            .collect::<Vec<_>>();
+        let group_descs = build_group_desc_segment(&sb, &descs);
+
+        let group = BlockGroup::load(&group_descs, 1).unwrap();
+
+        assert_eq!(group.idx(), 1);
+        assert_eq!(
+            group.block_bitmap_bid().to_raw() as u32,
+            descs[1].block_bitmap
+        );
+        assert_eq!(
+            group.inode_bitmap_bid().to_raw() as u32,
+            descs[1].inode_bitmap
+        );
+        assert_eq!(
+            group.inode_table_bid().to_raw() as u32,
+            descs[1].inode_table
+        );
+        assert_eq!(group.free_blocks_count(), descs[1].free_blocks_count);
+        assert_eq!(group.free_inodes_count(), descs[1].free_inodes_count);
+        assert_eq!(group.used_dirs_count(), descs[1].used_dirs_count);
+    }
+
+    #[ktest]
+    fn block_group_free_block_counters_update_and_mark_dirty() {
+        // Counter update helpers should adjust value and mark descriptor dirty.
+        let sb = make_valid_super_block(2);
+        let mut descs = (0..sb.block_groups_count() as usize)
+            .map(|idx| make_valid_group_desc(&sb, idx))
+            .collect::<Vec<_>>();
+        descs[0].free_blocks_count = 20;
+        let group_descs = build_group_desc_segment(&sb, &descs);
+
+        let group = BlockGroup::load(&group_descs, 0).unwrap();
+        assert_eq!(group.free_blocks_count(), 20);
+        assert!(!group.is_desc_dirty());
+
+        group.dec_free_blocks(3);
+        assert_eq!(group.free_blocks_count(), 17);
+        assert!(group.is_desc_dirty());
+
+        group.inc_free_blocks(2);
+        assert_eq!(group.free_blocks_count(), 19);
+        assert!(group.is_desc_dirty());
     }
 }

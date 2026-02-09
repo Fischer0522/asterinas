@@ -368,7 +368,11 @@ impl SuperBlock {
             return false;
         }
 
-        let sb_block = if self.block_size == SUPER_BLOCK_SIZE { 1u32 } else { 0u32 };
+        let sb_block = if self.block_size == SUPER_BLOCK_SIZE {
+            1u32
+        } else {
+            0u32
+        };
         if start_blk <= sb_block && end_blk >= sb_block {
             return false;
         }
@@ -456,7 +460,7 @@ impl SuperBlock {
         self.free_inodes_count += 1;
     }
 
-    pub (super) fn set_wtime(&mut self, time: UnixTime) {
+    pub(super) fn set_wtime(&mut self, time: UnixTime) {
         self.wtime = time;
     }
 
@@ -747,7 +751,6 @@ impl Default for Reserved {
     }
 }
 
-
 #[cfg(ktest)]
 mod test {
     use ostd::prelude::*;
@@ -769,27 +772,37 @@ mod test {
     }
 
     #[ktest]
-    fn reject_bad_magic() {
-        let mut raw = make_valid_raw_super_block(1);
-        raw.magic = 0;
+    fn reject_cases() {
+        {
+            let mut raw = make_valid_raw_super_block(1);
+            raw.magic = 0;
 
-        let disk = Ext2MemoryDisk::new(raw.blocks_count as usize);
-        disk.write_super_block(&raw);
+            let disk = Ext2MemoryDisk::new(raw.blocks_count as usize);
+            disk.write_super_block(&raw);
 
-        let err = load_super_block(&disk, false).unwrap_err();
-        assert_eq!(err.error(), Errno::EINVAL);
-    }
+            let err = load_super_block(&disk, false).unwrap_err();
+            assert_eq!(err.error(), Errno::EINVAL);
+        }
 
-    #[ktest]
-    fn reject_read_write_with_bad_compat() {
-        let mut raw = make_valid_raw_super_block(1);
-        raw.feature_ro_compat = FeatureRoCompatSet::BTREE_DIR.bits();
+        {
+            let mut raw = make_valid_raw_super_block(1);
+            raw.feature_ro_compat = FeatureRoCompatSet::BTREE_DIR.bits();
 
-        let disk = Ext2MemoryDisk::new(raw.blocks_count as usize);
-        disk.write_super_block(&raw);
+            let disk = Ext2MemoryDisk::new(raw.blocks_count as usize);
+            disk.write_super_block(&raw);
 
-        let err = load_super_block(&disk, false).unwrap_err();
-        assert_eq!(err.error(), Errno::EINVAL);
+            let err = load_super_block(&disk, false).unwrap_err();
+            assert_eq!(err.error(), Errno::EINVAL);
+        }
+
+        {
+            let raw = make_valid_raw_super_block(2);
+            let disk = Ext2MemoryDisk::new((raw.blocks_count as usize).saturating_sub(1));
+            disk.write_super_block(&raw);
+
+            let err = load_super_block(&disk, false).unwrap_err();
+            assert_eq!(err.error(), Errno::EINVAL);
+        }
     }
 
     #[ktest]
@@ -801,15 +814,5 @@ mod test {
         disk.write_super_block(&raw);
 
         assert!(load_super_block(&disk, true).is_ok());
-    }
-
-    #[ktest]
-    fn reject_small_device() {
-        let raw = make_valid_raw_super_block(2);
-        let disk = Ext2MemoryDisk::new((raw.blocks_count as usize).saturating_sub(1));
-        disk.write_super_block(&raw);
-
-        let err = load_super_block(&disk, false).unwrap_err();
-        assert_eq!(err.error(), Errno::EINVAL);
     }
 }

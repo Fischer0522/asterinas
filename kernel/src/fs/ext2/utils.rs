@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::fmt::Debug;
-use core::ops::MulAssign;
+use core::{fmt::Debug, ops::MulAssign};
 
 use crate::prelude::warn;
 
@@ -46,7 +45,10 @@ impl<T: Debug> Dirty<T> {
 
     /// Creates a new Dirty with setting the dirty flag.
     pub fn new_dirty(val: T) -> Dirty<T> {
-        Dirty { value: val, dirty: true }
+        Dirty {
+            value: val,
+            dirty: true,
+        }
     }
 
     /// Returns true if dirty, false otherwise.

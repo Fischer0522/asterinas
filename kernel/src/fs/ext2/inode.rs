@@ -2,12 +2,11 @@
 
 use core::mem::size_of;
 
+use aster_virtio::device::socket::error;
 use ostd::const_assert;
 
+use super::{fs::Ext2, prelude::*};
 use crate::fs::ext2::dir::{DirEntry, DirEntryIter};
-
-use super::prelude::*;
-use super::fs::Ext2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct FilePerm(u16);
@@ -25,6 +24,24 @@ pub struct Inode {
     inner: RwMutex<InodeInner>,
     block_group_idx: usize,
     fs: Weak<Ext2>,
+}
+
+impl Inode {
+    pub fn new(
+        ino: u32,
+        type_: InodeType,
+        desc: Dirty<InodeDesc>,
+        block_group_idx: usize,
+        fs: Weak<Ext2>,
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|weak_self| Self {
+            ino,
+            type_,
+            inner: RwMutex::new(InodeInner::new(desc, weak_self.clone(), fs.clone())),
+            block_group_idx,
+            fs,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -45,7 +62,7 @@ impl InodeInner {
         }
     }
 
-     pub fn create(&self, _name: &str, _type_: InodeType, _perm: FilePerm) -> Result<Arc<Inode>> {
+    pub fn create(&self, _name: &str, _type_: InodeType, _perm: FilePerm) -> Result<Arc<Inode>> {
         return_errno!(Errno::ENOSYS);
     }
 
@@ -83,8 +100,12 @@ impl InodeInner {
             let bid = self
                 .get_block(block_idx as u32)?
                 .ok_or_else(|| Error::new(Errno::EIO))?;
-            let mut buf = vec![0u8; BLOCK_SIZE];
-            if fs.block_device().read_bytes(bid.to_offset(), &mut buf).is_err() {
+            let mut buf = vec![0u8; block_size];
+            if fs
+                .block_device()
+                .read_bytes(bid.to_offset(), &mut buf)
+                .is_err()
+            {
                 return_errno!(Errno::EIO);
             }
 
@@ -111,7 +132,11 @@ impl InodeInner {
     /// Reads directory entries starting at byte offset and feeds visitor.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:257 (ext2_readdir)
-    pub(super) fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize> {
+    pub(super) fn readdir_at(
+        &self,
+        offset: usize,
+        visitor: &mut dyn DirentVisitor,
+    ) -> Result<usize> {
         if self.desc.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
@@ -146,8 +171,12 @@ impl InodeInner {
             let bid = self
                 .get_block(block_idx as u32)?
                 .ok_or_else(|| Error::new(Errno::EIO))?;
-            let mut buf = vec![0u8; BLOCK_SIZE];
-            if fs.block_device().read_bytes(bid.to_offset(), &mut buf).is_err() {
+            let mut buf = vec![0u8; block_size];
+            if fs
+                .block_device()
+                .read_bytes(bid.to_offset(), &mut buf)
+                .is_err()
+            {
                 return_errno!(Errno::EIO);
             }
 
@@ -171,7 +200,12 @@ impl InodeInner {
                     let dtype = DirEntryFileType::from(entry.file_type);
                     let inode_type = InodeType::from(dtype);
                     if visitor
-                        .visit(entry.name.as_str()?, entry.inode as u64, inode_type, entry_offset)
+                        .visit(
+                            entry.name.as_str()?,
+                            entry.inode as u64,
+                            inode_type,
+                            entry_offset,
+                        )
                         .is_err()
                     {
                         advanced = current_offset.saturating_sub(offset);
@@ -188,7 +222,6 @@ impl InodeInner {
 
         Ok(advanced)
     }
-  
 
     /// Translates a logical block number into a path of block pointer offsets.
     ///
@@ -281,8 +314,8 @@ impl InodeInner {
             }
 
             let mut reader = VmReader::from(buf.as_slice());
-            let offset_bytes = (path.offsets[level] as usize)
-                .saturating_mul(size_of::<u32>());
+            let offset_bytes = (path.offsets[level] as usize).saturating_mul(size_of::<u32>());
+
             let next = reader
                 .skip(offset_bytes)
                 .read_val::<u32>()
@@ -295,12 +328,9 @@ impl InodeInner {
 
         Ok(Some(Bid::new(bid as u64)))
     }
-
 }
 
-impl Inode {
-   
-}
+impl Inode {}
 
 /// Directory entry type mapping (ext2 file_type field).
 #[repr(u8)]
@@ -466,7 +496,7 @@ impl TryFrom<&RawInode> for InodeDesc {
 
         let block_ptrs = raw.block;
 
-        let flags = FileFlags::from_bits(raw.flags).ok_or_else(|| Error::new(Errno::EIO))?;     
+        let flags = FileFlags::from_bits(raw.flags).ok_or_else(|| Error::new(Errno::EIO))?;
 
         Ok(InodeDesc {
             type_,
@@ -477,7 +507,7 @@ impl TryFrom<&RawInode> for InodeDesc {
             atime,
             ctime,
             mtime,
-            dtime: UnixTime::from(Duration::from_secs(0)),
+            dtime: UnixTime::from(Duration::from_secs(raw.dtime as u64)),
             links_count: raw.links_count,
             blocks,
             flags,
@@ -493,29 +523,29 @@ impl TryFrom<&RawInode> for InodeDesc {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
 pub(super) struct RawInode {
-    pub mode: u16,         // i_mode
-    pub uid: u16,          // i_uid (low 16 bits)
-    pub size_lo: u32,      // i_size
-    pub atime: u32,        // i_atime
-    pub ctime: u32,        // i_ctime
-    pub mtime: u32,        // i_mtime
-    pub dtime: u32,        // i_dtime
-    pub gid: u16,          // i_gid (low 16 bits)
-    pub links_count: u16,  // i_links_count
-    pub blocks: u32,       // i_blocks (512-byte sectors)
-    pub flags: u32,        // i_flags
-    pub osd1: u32,         // osd1.linux1.l_i_reserved1
-    pub block: [u32; 15],  // i_block
-    pub generation: u32,   // i_generation
-    pub file_acl: u32,     // i_file_acl
-    pub size_high: u32,    // i_dir_acl (size high)
-    pub faddr: u32,        // i_faddr
-    pub frag: u8,          // osd2.linux2.l_i_frag
-    pub fsize: u8,         // osd2.linux2.l_i_fsize
-    pub pad1: u16,         // osd2.linux2.i_pad1
-    pub uid_high: u16,     // osd2.linux2.l_i_uid_high
-    pub gid_high: u16,     // osd2.linux2.l_i_gid_high
-    pub reserved2: u32,    // osd2.linux2.l_i_reserved2
+    pub mode: u16,        // i_mode
+    pub uid: u16,         // i_uid (low 16 bits)
+    pub size_lo: u32,     // i_size
+    pub atime: u32,       // i_atime
+    pub ctime: u32,       // i_ctime
+    pub mtime: u32,       // i_mtime
+    pub dtime: u32,       // i_dtime
+    pub gid: u16,         // i_gid (low 16 bits)
+    pub links_count: u16, // i_links_count
+    pub blocks: u32,      // i_blocks (512-byte sectors)
+    pub flags: u32,       // i_flags
+    pub osd1: u32,        // osd1.linux1.l_i_reserved1
+    pub block: [u32; 15], // i_block
+    pub generation: u32,  // i_generation
+    pub file_acl: u32,    // i_file_acl
+    pub size_high: u32,   // i_dir_acl (size high)
+    pub faddr: u32,       // i_faddr
+    pub frag: u8,         // osd2.linux2.l_i_frag
+    pub fsize: u8,        // osd2.linux2.l_i_fsize
+    pub pad1: u16,        // osd2.linux2.i_pad1
+    pub uid_high: u16,    // osd2.linux2.l_i_uid_high
+    pub gid_high: u16,    // osd2.linux2.l_i_gid_high
+    pub reserved2: u32,   // osd2.linux2.l_i_reserved2
 }
 
 const_assert!(size_of::<RawInode>() == 128);
@@ -533,3 +563,510 @@ pub(super) struct RawDirEntry {
 }
 
 const_assert!(size_of::<RawDirEntry>() == 8);
+
+#[cfg(ktest)]
+mod test {
+    use core::{mem::size_of, time::Duration};
+
+    use ostd::{mm::VmIo, prelude::ktest};
+    use crate::prelude::*;
+
+    use super::*;
+    use crate::fs::ext2::{
+        SuperBlock,
+        block_group::RawGroupDesc,
+        test::{ErrorBioDisk, Ext2MemoryDisk, make_valid_group_desc, make_valid_raw_super_block},
+    };
+
+    fn make_raw_inode(mode: u16) -> RawInode {
+        RawInode {
+            mode,
+            uid: 0,
+            size_lo: 0,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: 0,
+            gid: 0,
+            links_count: 1,
+            blocks: 0,
+            flags: 0,
+            osd1: 0,
+            block: [0; 15],
+            generation: 0,
+            file_acl: 0,
+            size_high: 0,
+            faddr: 0,
+            frag: 0,
+            fsize: 0,
+            pad1: 0,
+            uid_high: 0,
+            gid_high: 0,
+            reserved2: 0,
+        }
+    }
+
+    fn prepare_disk(
+        groups: u32,
+        nblocks: usize,
+    ) -> (Arc<Ext2MemoryDisk>, SuperBlock, Vec<RawGroupDesc>) {
+        let raw_sb = make_valid_raw_super_block(groups);
+        let sb = SuperBlock::try_from(raw_sb).unwrap();
+        let descs = (0..sb.block_groups_count() as usize)
+            .map(|idx| make_valid_group_desc(&sb, idx))
+            .collect::<Vec<_>>();
+
+        let disk = Arc::new(Ext2MemoryDisk::new(nblocks));
+        disk.write_super_block(&raw_sb);
+        disk.write_group_desc_table(&sb, &descs);
+
+        (disk, sb, descs)
+    }
+
+    fn make_inode_inner(fs: Weak<Ext2>, block_ptrs: [u32; 15]) -> InodeInner {
+        let mut raw = make_raw_inode(0o100644);
+        raw.block = block_ptrs;
+        let desc = InodeDesc::try_from(&raw).unwrap();
+        InodeInner::new(Dirty::new(desc), Weak::new(), fs)
+    }
+
+    fn make_dir_inode_inner(fs: Weak<Ext2>, size: usize, blocks: u32, block_ptrs: [u32; 15]) -> InodeInner {
+        let mut raw = make_raw_inode(0o040755);
+        raw.size_lo = size as u32;
+        raw.blocks = blocks;
+        raw.block = block_ptrs;
+        let desc = InodeDesc::try_from(&raw).unwrap();
+        InodeInner::new(Dirty::new(desc), Weak::new(), fs)
+    }
+
+    fn write_dir_entry(
+        buf: &mut [u8],
+        offset: usize,
+        inode: u32,
+        rec_len: u16,
+        name: &[u8],
+        file_type: u8,
+    ) {
+        let header_len = size_of::<RawDirEntry>();
+        assert!(offset + rec_len as usize <= buf.len());
+        assert!(name.len() <= (rec_len as usize).saturating_sub(header_len));
+
+        buf[offset..offset + 4].copy_from_slice(&inode.to_le_bytes());
+        buf[offset + 4..offset + 6].copy_from_slice(&rec_len.to_le_bytes());
+        buf[offset + 6] = name.len() as u8;
+        buf[offset + 7] = file_type;
+        buf[offset + header_len..offset + header_len + name.len()].copy_from_slice(name);
+    }
+
+    #[derive(Default)]
+    struct CollectDirentVisitor {
+        entries: Vec<(String, u64, InodeType, usize)>,
+    }
+
+    impl DirentVisitor for CollectDirentVisitor {
+        fn visit(&mut self, name: &str, ino: u64, type_: InodeType, offset: usize) -> Result<()> {
+            self.entries.push((name.to_string(), ino, type_, offset));
+            Ok(())
+        }
+    }
+
+    struct StopAfterVisitor {
+        allow_count: usize,
+        seen: usize,
+    }
+
+    impl StopAfterVisitor {
+        fn new(allow_count: usize) -> Self {
+            Self {
+                allow_count,
+                seen: 0,
+            }
+        }
+    }
+
+    impl DirentVisitor for StopAfterVisitor {
+        fn visit(&mut self, _name: &str, _ino: u64, _type_: InodeType, _offset: usize) -> Result<()> {
+            if self.seen >= self.allow_count {
+                return_errno!(Errno::EINTR);
+            }
+            self.seen += 1;
+            Ok(())
+        }
+    }
+
+    // Writes one u32 pointer into an indirect block slot.
+    fn write_indirect_ptr(disk: &Ext2MemoryDisk, bid: u32, index: u32, next: u32) {
+        let offset = Bid::new(bid as u64).to_offset() + (index as usize) * size_of::<u32>();
+        disk.segment().write_val(offset, &next).unwrap();
+    }
+
+    #[ktest]
+    fn inode_desc_try_from_success() {
+        let mut raw = make_raw_inode(0o100644);
+        raw.size_lo = 0x1122_3344;
+        raw.size_high = 0x5566_7788;
+        raw.uid = 0x1234;
+        raw.uid_high = 0x5678;
+        raw.gid = 0x4321;
+        raw.gid_high = 0x8765;
+        raw.blocks = 99;
+        raw.block[0] = 42;
+        raw.dtime = 123;
+
+        let desc = InodeDesc::try_from(&raw).unwrap();
+        assert_eq!(desc.size, 0x5566_7788_1122_3344);
+        assert_eq!(desc.uid, 0x5678_1234);
+        assert_eq!(desc.gid, 0x8765_4321);
+        assert_eq!(desc.blocks, 99);
+        assert_eq!(desc.block_ptrs[0], 42);
+
+        let dtime: Duration = desc.dtime.into();
+        assert_eq!(dtime.as_secs(), 123);
+
+        let mut raw_dir = make_raw_inode(0o040755);
+        raw_dir.size_lo = 7;
+        raw_dir.size_high = u32::MAX;
+        let dir_desc = InodeDesc::try_from(&raw_dir).unwrap();
+        assert_eq!(dir_desc.size, 7);
+    }
+
+    #[ktest]
+    fn inode_desc_try_from_error_cases() {
+        let mut deleted_inode = make_raw_inode(0);
+        deleted_inode.links_count = 0;
+        deleted_inode.dtime = 1;
+        let deleted_err = InodeDesc::try_from(&deleted_inode).unwrap_err();
+        assert_eq!(deleted_err.error(), Errno::ESTALE);
+
+        let mut invalid_flags_inode = make_raw_inode(0o100644);
+        invalid_flags_inode.flags = 1 << 30;
+        let flags_err = InodeDesc::try_from(&invalid_flags_inode).unwrap_err();
+        assert_eq!(flags_err.error(), Errno::EIO);
+
+        let mut size_overflow_inode = make_raw_inode(0o100644);
+        size_overflow_inode.size_lo = u32::MAX;
+        size_overflow_inode.size_high = u32::MAX;
+        let size_err = InodeDesc::try_from(&size_overflow_inode).unwrap_err();
+        assert_eq!(size_err.error(), Errno::EUCLEAN);
+
+        let invalid_mode_inode = make_raw_inode(0o030000);
+        let mode_err = InodeDesc::try_from(&invalid_mode_inode).unwrap_err();
+        assert_eq!(mode_err.error(), Errno::EINVAL);
+    }
+
+    #[ktest]
+    fn dir_lookup_readdir_ok() {
+        let (disk, _sb, _descs) = prepare_disk(2, 256);
+        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let block_size = ext2.block_size();
+
+        let mut block = vec![0u8; block_size];
+        write_dir_entry(&mut block, 0, 2, 12, b".", 2);
+        write_dir_entry(&mut block, 12, 11, 12, b"foo", 1);
+        write_dir_entry(&mut block, 24, 14, 12, b"unk", 0);
+        write_dir_entry(&mut block, 36, 0, 12, b"hid", 1);
+        write_dir_entry(&mut block, 48, 13, 16, b"subdir", 2);
+
+        let data_bid = 80u32;
+        disk.segment()
+            .write_bytes(Bid::new(data_bid as u64).to_offset(), &block)
+            .unwrap();
+
+        let mut block_ptrs = [0u32; 15];
+        block_ptrs[0] = data_bid;
+        let inode_inner = make_dir_inode_inner(Arc::downgrade(&ext2), 64, 8, block_ptrs);
+
+        assert_eq!(inode_inner.find_entry("foo").unwrap(), 11);
+        assert_eq!(inode_inner.find_entry("subdir").unwrap(), 13);
+        let miss = inode_inner.find_entry("missing").unwrap_err();
+        assert_eq!(miss.error(), Errno::ENOENT);
+
+        let mut visitor = CollectDirentVisitor::default();
+        let advanced = inode_inner.readdir_at(0, &mut visitor).unwrap();
+        assert_eq!(advanced, 64);
+        assert_eq!(visitor.entries.len(), 4);
+        assert_eq!(visitor.entries[0], (".".to_string(), 2, InodeType::Dir, 0));
+        assert_eq!(visitor.entries[1], ("foo".to_string(), 11, InodeType::File, 12));
+        assert_eq!(visitor.entries[2], ("unk".to_string(), 14, InodeType::Unknown, 24));
+        assert_eq!(visitor.entries[3], ("subdir".to_string(), 13, InodeType::Dir, 48));
+
+        let mut stop_visitor = StopAfterVisitor::new(2);
+        let stop_advanced = inode_inner.readdir_at(0, &mut stop_visitor).unwrap();
+        assert_eq!(stop_advanced, 24);
+
+        let mut offset_visitor = CollectDirentVisitor::default();
+        let offset_advanced = inode_inner.readdir_at(5, &mut offset_visitor).unwrap();
+        assert_eq!(offset_advanced, 59);
+        assert_eq!(offset_visitor.entries.len(), 3);
+        assert_eq!(offset_visitor.entries[0].0, "foo");
+    }
+
+    #[ktest]
+    fn dir_lookup_readdir_error_cases() {
+        let (disk, _sb, _descs) = prepare_disk(2, 256);
+        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let block_size = ext2.block_size();
+
+        let mut file_ptrs = [0u32; 15];
+        file_ptrs[0] = 80;
+        let file_inode = make_inode_inner(Arc::downgrade(&ext2), file_ptrs);
+        assert_eq!(file_inode.find_entry("foo").unwrap_err().error(), Errno::ENOTDIR);
+        let mut vec_visitor = Vec::<String>::new();
+        assert_eq!(file_inode.readdir_at(0, &mut vec_visitor).unwrap_err().error(), Errno::ENOTDIR);
+
+        let hole_inode = make_dir_inode_inner(Arc::downgrade(&ext2), 12, 8, [0u32; 15]);
+        assert_eq!(hole_inode.find_entry("foo").unwrap_err().error(), Errno::EIO);
+        let mut vec_visitor = Vec::<String>::new();
+        assert_eq!(hole_inode.readdir_at(0, &mut vec_visitor).unwrap_err().error(), Errno::EIO);
+
+        let mut one_block = vec![0u8; block_size];
+        write_dir_entry(&mut one_block, 0, 2, 12, b".", 2);
+        write_dir_entry(
+            &mut one_block,
+            12,
+            0,
+            (block_size - 12) as u16,
+            b"",
+            0,
+        );
+        let data_bid = 81u32;
+        disk.segment()
+            .write_bytes(Bid::new(data_bid as u64).to_offset(), &one_block)
+            .unwrap();
+
+        let mut ptrs = [0u32; 15];
+        ptrs[0] = data_bid;
+        let limited_blocks_inode = make_dir_inode_inner(
+            Arc::downgrade(&ext2),
+            block_size * 2,
+            0,
+            ptrs,
+        );
+        assert_eq!(
+            limited_blocks_inode.find_entry("missing").unwrap_err().error(),
+            Errno::ENOENT
+        );
+
+        let tiny_dir_inode = make_dir_inode_inner(Arc::downgrade(&ext2), 11, 8, ptrs);
+        let mut vec_visitor = Vec::<String>::new();
+        assert_eq!(tiny_dir_inode.readdir_at(0, &mut vec_visitor).unwrap(), 0);
+
+        let mut vec_visitor = Vec::<String>::new();
+        assert_eq!(
+            limited_blocks_inode
+                .readdir_at(2 * block_size - 11, &mut vec_visitor)
+                .unwrap(),
+            0
+        );
+
+        let mut bad_block = vec![0u8; block_size];
+        bad_block[0..4].copy_from_slice(&2u32.to_le_bytes());
+        bad_block[4..6].copy_from_slice(&8u16.to_le_bytes());
+        bad_block[6] = 1;
+        bad_block[7] = 2;
+        bad_block[8] = b'.';
+        let bad_bid = 82u32;
+        disk.segment()
+            .write_bytes(Bid::new(bad_bid as u64).to_offset(), &bad_block)
+            .unwrap();
+
+        let mut bad_ptrs = [0u32; 15];
+        bad_ptrs[0] = bad_bid;
+        let bad_inode = make_dir_inode_inner(Arc::downgrade(&ext2), 12, 8, bad_ptrs);
+        assert_eq!(bad_inode.find_entry(".").unwrap_err().error(), Errno::EIO);
+        let mut vec_visitor = Vec::<String>::new();
+        assert_eq!(bad_inode.readdir_at(0, &mut vec_visitor).unwrap_err().error(), Errno::EIO);
+    }
+
+    #[ktest]
+    fn block_mapping_ok() {
+        let (disk, _sb, _descs) = prepare_disk(2, 256);
+        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+
+        let ptrs = (ext2.block_size() / size_of::<u32>()) as u32;
+        let ptrs_bits = ptrs.trailing_zeros();
+        let double_blocks = 1u32 << (ptrs_bits * 2);
+
+        let indirect_bid = 40u32;
+        let indirect_index = 5u32;
+        let mapped_bid = 77u32;
+        write_indirect_ptr(disk.as_ref(), indirect_bid, indirect_index, mapped_bid);
+
+        let double_l1_bid = 41u32;
+        let double_l2_bid = 42u32;
+        let double_data_bid = 78u32;
+        write_indirect_ptr(disk.as_ref(), double_l1_bid, 3, double_l2_bid);
+        write_indirect_ptr(disk.as_ref(), double_l2_bid, 4, double_data_bid);
+
+        let triple_l1_bid = 43u32;
+        let triple_l2_bid = 44u32;
+        let triple_l3_bid = 45u32;
+        let triple_data_bid = 79u32;
+        write_indirect_ptr(disk.as_ref(), triple_l1_bid, 2, triple_l2_bid);
+        write_indirect_ptr(disk.as_ref(), triple_l2_bid, 3, triple_l3_bid);
+        write_indirect_ptr(disk.as_ref(), triple_l3_bid, 4, triple_data_bid);
+
+        let mut block_ptrs = [0u32; 15];
+        block_ptrs[0] = 11;
+        block_ptrs[12] = indirect_bid;
+        block_ptrs[13] = double_l1_bid;
+        block_ptrs[14] = triple_l1_bid;
+        let inode_inner = make_inode_inner(Arc::downgrade(&ext2), block_ptrs);
+
+        // Cover exact transition boundaries across all mapping levels.
+        let direct_path = inode_inner.block_to_path(0).unwrap();
+        assert_eq!(direct_path.depth, 1);
+        assert_eq!(direct_path.offsets[0], 0);
+        assert_eq!(direct_path.boundary, 11);
+
+        let direct_last_path = inode_inner.block_to_path(11).unwrap();
+        assert_eq!(direct_last_path.depth, 1);
+        assert_eq!(direct_last_path.offsets[0], 11);
+        assert_eq!(direct_last_path.boundary, 0);
+
+        let indirect_first_path = inode_inner.block_to_path(12).unwrap();
+        assert_eq!(indirect_first_path.depth, 2);
+        assert_eq!(indirect_first_path.offsets[0], 12);
+        assert_eq!(indirect_first_path.offsets[1], 0);
+
+        let indirect_path = inode_inner.block_to_path(12 + indirect_index).unwrap();
+        assert_eq!(indirect_path.depth, 2);
+        assert_eq!(indirect_path.offsets[0], 12);
+        assert_eq!(indirect_path.offsets[1], indirect_index);
+
+        let indirect_last_iblock = 12 + ptrs - 1;
+        let indirect_last_path = inode_inner.block_to_path(indirect_last_iblock).unwrap();
+        assert_eq!(indirect_last_path.depth, 2);
+        assert_eq!(indirect_last_path.offsets[0], 12);
+        assert_eq!(indirect_last_path.offsets[1], ptrs - 1);
+        assert_eq!(indirect_last_path.boundary, 0);
+
+        let first_double_iblock = 12 + ptrs;
+        let first_double_path = inode_inner.block_to_path(first_double_iblock).unwrap();
+        assert_eq!(first_double_path.depth, 3);
+        assert_eq!(first_double_path.offsets[0], 13);
+        assert_eq!(first_double_path.offsets[1], 0);
+        assert_eq!(first_double_path.offsets[2], 0);
+
+        let double_iblock = 12 + ptrs + (3 << ptrs_bits) + 4;
+        let double_path = inode_inner.block_to_path(double_iblock).unwrap();
+        assert_eq!(double_path.depth, 3);
+        assert_eq!(double_path.offsets[0], 13);
+        assert_eq!(double_path.offsets[1], 3);
+        assert_eq!(double_path.offsets[2], 4);
+
+        let first_triple_iblock = 12 + ptrs + double_blocks;
+        let first_triple_path = inode_inner.block_to_path(first_triple_iblock).unwrap();
+        assert_eq!(first_triple_path.depth, 4);
+        assert_eq!(first_triple_path.offsets[0], 14);
+        assert_eq!(first_triple_path.offsets[1], 0);
+        assert_eq!(first_triple_path.offsets[2], 0);
+        assert_eq!(first_triple_path.offsets[3], 0);
+
+        let triple_iblock =
+            12 + ptrs + double_blocks + (2 << (ptrs_bits * 2)) + (3 << ptrs_bits) + 4;
+        let triple_path = inode_inner.block_to_path(triple_iblock).unwrap();
+        assert_eq!(triple_path.depth, 4);
+        assert_eq!(triple_path.offsets[0], 14);
+        assert_eq!(triple_path.offsets[1], 2);
+        assert_eq!(triple_path.offsets[2], 3);
+        assert_eq!(triple_path.offsets[3], 4);
+
+        // Verify block lookup resolves direct/indirect/double/triple chains.
+        assert_eq!(inode_inner.get_block(0).unwrap(), Some(Bid::new(11)));
+        assert_eq!(inode_inner.get_block(1).unwrap(), None);
+        assert_eq!(
+            inode_inner.get_block(12 + indirect_index).unwrap(),
+            Some(Bid::new(mapped_bid as u64))
+        );
+        assert_eq!(
+            inode_inner.get_block(double_iblock).unwrap(),
+            Some(Bid::new(double_data_bid as u64))
+        );
+        assert_eq!(
+            inode_inner.get_block(triple_iblock).unwrap(),
+            Some(Bid::new(triple_data_bid as u64))
+        );
+    }
+
+    #[ktest]
+    fn block_mapping_error() {
+        let (disk, _sb, _descs) = prepare_disk(2, 256);
+        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+
+        let ptrs = (ext2.block_size() / size_of::<u32>()) as u64;
+        let direct = 12u64;
+        let indirect = ptrs;
+        let double_blocks = 1u64 << (ptrs.trailing_zeros() * 2);
+        let triple_blocks = 1u64 << (ptrs.trailing_zeros() * 3);
+        let max_iblock = direct + indirect + double_blocks + triple_blocks - 1;
+        let too_big = (max_iblock + 1) as u32;
+
+        let inode_inner = make_inode_inner(Arc::downgrade(&ext2), [0; 15]);
+
+        // Linux semantics: max valid iblock is accepted, max + 1 is rejected.
+        inode_inner.block_to_path(max_iblock as u32).unwrap();
+
+        let too_big_err = inode_inner.block_to_path(too_big).unwrap_err();
+        assert_eq!(too_big_err.error(), Errno::EINVAL);
+
+        // Detached inode cannot upgrade fs weak ref, so mapping returns EIO.
+        let detached_inode_inner = make_inode_inner(Weak::new(), [0; 15]);
+        let detached_path_err = detached_inode_inner.block_to_path(0).unwrap_err();
+        assert_eq!(detached_path_err.error(), Errno::EIO);
+
+        let detached_err = detached_inode_inner.get_block(12).unwrap_err();
+        assert_eq!(detached_err.error(), Errno::EIO);
+
+        let get_too_big_err = inode_inner.get_block(too_big).unwrap_err();
+        assert_eq!(get_too_big_err.error(), Errno::EINVAL);
+
+        // Inject a deterministic read failure on the indirect block read path.
+        let (io_disk_base, _io_sb, _io_descs) = prepare_disk(2, 256);
+        let io_fail_offset = Bid::new(40).to_offset();
+        let io_disk = Arc::new(ErrorBioDisk::with_read_error_at(
+            io_disk_base,
+            BioStatus::IoError,
+            io_fail_offset,
+        ));
+        let io_ext2 = Ext2::open(io_disk as Arc<dyn BlockDevice>).unwrap();
+
+        let mut ptrs_for_io = [0u32; 15];
+        ptrs_for_io[12] = 40;
+        let io_inode_inner = make_inode_inner(Arc::downgrade(&io_ext2), ptrs_for_io);
+        let io_err = io_inode_inner.get_block(12).unwrap_err();
+        assert_eq!(io_err.error(), Errno::EIO);
+
+        // Any zero pointer on the branch is treated as a hole (None).
+        let mut ptrs_for_indirect_hole = [0u32; 15];
+        ptrs_for_indirect_hole[12] = 40;
+        let indirect_hole_inode = make_inode_inner(Arc::downgrade(&ext2), ptrs_for_indirect_hole);
+        assert_eq!(indirect_hole_inode.get_block(12 + 7).unwrap(), None);
+
+        let mut ptrs_for_double_hole = [0u32; 15];
+        ptrs_for_double_hole[13] = 41;
+        write_indirect_ptr(disk.as_ref(), 41, 3, 0);
+        let double_hole_inode = make_inode_inner(Arc::downgrade(&ext2), ptrs_for_double_hole);
+        let double_hole_iblock = 12 + (ptrs as u32) + (3 << ptrs.trailing_zeros()) + 4;
+        assert_eq!(
+            double_hole_inode.get_block(double_hole_iblock).unwrap(),
+            None
+        );
+
+        let mut ptrs_for_triple_hole = [0u32; 15];
+        ptrs_for_triple_hole[14] = 43;
+        write_indirect_ptr(disk.as_ref(), 43, 2, 44);
+        write_indirect_ptr(disk.as_ref(), 44, 3, 0);
+        let triple_hole_inode = make_inode_inner(Arc::downgrade(&ext2), ptrs_for_triple_hole);
+        let triple_hole_iblock = 12
+            + (ptrs as u32)
+            + (double_blocks as u32)
+            + (2 << (ptrs.trailing_zeros() * 2))
+            + (3 << ptrs.trailing_zeros())
+            + 4;
+        assert_eq!(
+            triple_hole_inode.get_block(triple_hole_iblock).unwrap(),
+            None
+        );
+    }
+}

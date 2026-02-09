@@ -54,9 +54,9 @@ mod prelude;
 mod super_block;
 mod utils;
 
-
 #[cfg(ktest)]
 pub(super) mod test {
+    use alloc::sync::Arc;
     use core::{fmt, mem::size_of};
 
     use aster_block::{
@@ -72,9 +72,9 @@ pub(super) mod test {
     use super::{
         block_group::RawGroupDesc,
         super_block::{
-            ErrorsBehaviour, FsState, OsId, RawSuperBlock, RevLevel, SUPER_BLOCK_OFFSET,
+            ErrorsBehaviour, FsState, MAGIC_NUM, OsId, RawSuperBlock, RevLevel, SUPER_BLOCK_OFFSET,
+            SuperBlock,
         },
-        super_block::{MAGIC_NUM, SuperBlock},
     };
 
     pub(super) struct Ext2MemoryDisk {
@@ -163,21 +163,78 @@ pub(super) mod test {
     pub(super) struct ErrorBioDisk {
         read_status: BioStatus,
         nr_sectors: usize,
+        fail_read_offset: Option<usize>,
+        inner: Option<Arc<Ext2MemoryDisk>>,
     }
 
     impl ErrorBioDisk {
         pub(super) fn new(read_status: BioStatus, nr_sectors: usize) -> Self {
-            Self { read_status, nr_sectors }
+            Self {
+                read_status,
+                nr_sectors,
+                fail_read_offset: None,
+                inner: None,
+            }
+        }
+
+        pub(super) fn with_read_error_at(
+            inner: Arc<Ext2MemoryDisk>,
+            read_status: BioStatus,
+            fail_read_offset: usize,
+        ) -> Self {
+            Self {
+                read_status,
+                nr_sectors: inner.segment().size() / SECTOR_SIZE,
+                fail_read_offset: Some(fail_read_offset),
+                inner: Some(inner),
+            }
         }
     }
 
     impl BlockDevice for ErrorBioDisk {
         fn enqueue(&self, bio: SubmittedBio) -> core::result::Result<(), BioEnqueueError> {
-            let status = match bio.type_() {
-                BioType::Read => self.read_status,
-                _ => BioStatus::Complete,
-            };
-            bio.complete(status);
+            let mut cur_device_ofs = bio.sid_range().start.to_raw() as usize * SECTOR_SIZE;
+
+            for seg in bio.segments() {
+                let io_size = match bio.type_() {
+                    BioType::Read => {
+                        if let Some(fail_read_offset) = self.fail_read_offset {
+                            if cur_device_ofs == fail_read_offset {
+                                bio.complete(self.read_status);
+                                return Ok(());
+                            }
+                            if let Some(inner) = self.inner.as_deref() {
+                                let mut reader = inner.segment().reader();
+                                let reader = reader.skip(cur_device_ofs);
+                                seg.writer().unwrap().write(reader)
+                            } else {
+                                bio.complete(BioStatus::IoError);
+                                return Ok(());
+                            }
+                        } else {
+                            bio.complete(self.read_status);
+                            return Ok(());
+                        }
+                    }
+                    BioType::Write => {
+                        if let Some(inner) = self.inner.as_deref() {
+                            let mut writer = inner.segment().writer();
+                            let writer = writer.skip(cur_device_ofs);
+                            writer.write(&mut seg.reader().unwrap())
+                        } else {
+                            bio.complete(BioStatus::Complete);
+                            return Ok(());
+                        }
+                    }
+                    _ => {
+                        bio.complete(BioStatus::NotSupported);
+                        return Ok(());
+                    }
+                };
+                cur_device_ofs += io_size;
+            }
+
+            bio.complete(BioStatus::Complete);
             Ok(())
         }
 
