@@ -678,7 +678,10 @@ impl Ext2 {
         }
 
         let desc_bytes = groups_count * size_of::<RawGroupDesc>();
-        let mut desc_buf = vec![0u8; desc_bytes];
+        // Group descriptor table is stored in whole filesystem blocks on disk.
+        // `write_bytes` requires sector-aligned length, so flush a block-aligned span.
+        let desc_disk_bytes = desc_bytes.div_ceil(BLOCK_SIZE) * BLOCK_SIZE;
+        let mut desc_buf = vec![0u8; desc_disk_bytes];
         if self
             .group_descriptors_segment
             .read_bytes(0, &mut desc_buf)
@@ -686,13 +689,13 @@ impl Ext2 {
         {
             return_errno!(Errno::EIO);
         }
-
+        // TODO: update wtime in superblock, aligning with Linux's ext2_sync_super
         let mut sb_guard = self.super_block.write();
-        let wtime = crate::time::SystemTime::now()
-            .duration_since(&crate::time::SystemTime::UNIX_EPOCH)
-            .map(UnixTime::from)
-            .map_err(|_| Error::new(Errno::EIO))?;
-        sb_guard.set_wtime(wtime);
+        // let wtime = crate::time::SystemTime::now()
+        //     .duration_since(&crate::time::SystemTime::UNIX_EPOCH)
+        //     .map(UnixTime::from)
+        //     .map_err(|_| Error::new(Errno::EIO))?;
+        // sb_guard.set_wtime(wtime);
         if self
             .block_device
             .write_bytes(sb_guard.group_descriptors_bid(0).to_offset(), &desc_buf)
@@ -1093,6 +1096,77 @@ mod test {
         let mut ext2 = make_test_ext2(sb, disk as Arc<dyn BlockDevice>);
         ext2.block_groups = Ext2::load_block_groups(&ext2.super_block.read(), &group_descs).unwrap();
         ext2
+    }
+
+    #[ktest]
+    fn sync_metadata_flushes_primary_and_backup_copies() {
+        let sb = make_valid_super_block(3);
+        let mut descs = (0..sb.block_groups_count() as usize)
+            .map(|idx| make_valid_group_desc(&sb, idx))
+            .collect::<Vec<_>>();
+        descs[0].free_blocks_count = 10;
+
+        let disk = Arc::new(Ext2MemoryDisk::new(512));
+        initialize_disk_for_open(&sb, &descs, &disk);
+        let ext2 = Ext2::open(disk.clone()).unwrap();
+
+        let expected_free_inodes = {
+            let mut sb_guard = ext2.super_block.write();
+            sb_guard.inc_free_inodes();
+            sb_guard.free_inodes_count()
+        };
+
+        ext2.block_groups[0].inc_free_blocks(3);
+        assert!(ext2.block_groups[0].is_desc_dirty());
+
+        ext2.sync_metadata().unwrap();
+
+        assert!(!ext2.super_block.read().is_dirty());
+        assert!(!ext2.block_groups[0].is_desc_dirty());
+
+        let groups_count = sb.block_groups_count() as usize;
+        let desc_bytes = groups_count * size_of::<RawGroupDesc>();
+        let primary_desc_offset = sb.group_descriptors_bid(0).to_offset();
+
+        let mut primary_desc = vec![0u8; desc_bytes];
+        disk.segment()
+            .read_bytes(primary_desc_offset, &mut primary_desc)
+            .unwrap();
+        let first_desc = disk
+            .segment()
+            .read_val::<RawGroupDesc>(primary_desc_offset)
+            .unwrap();
+        assert_eq!(first_desc.free_blocks_count, 13);
+
+        let primary_sb = disk
+            .segment()
+            .read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)
+            .unwrap();
+        assert_eq!(primary_sb.free_inodes_count, expected_free_inodes);
+
+        for idx in 1..groups_count {
+            if !sb.is_backup_group(idx) {
+                continue;
+            }
+
+            let backup_sb = disk
+                .segment()
+                .read_val::<RawSuperBlock>(sb.bid(idx).to_offset())
+                .unwrap();
+            assert_eq!(backup_sb.block_group_idx, idx as u16);
+
+            let mut primary_cmp = primary_sb;
+            let mut backup_cmp = backup_sb;
+            primary_cmp.block_group_idx = 0;
+            backup_cmp.block_group_idx = 0;
+            assert_eq!(backup_cmp.as_bytes(), primary_cmp.as_bytes());
+
+            let mut backup_desc = vec![0u8; desc_bytes];
+            disk.segment()
+                .read_bytes(sb.group_descriptors_bid(idx).to_offset(), &mut backup_desc)
+                .unwrap();
+            assert_eq!(backup_desc, primary_desc);
+        }
     }
 
     #[ktest]

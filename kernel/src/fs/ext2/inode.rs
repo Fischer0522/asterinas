@@ -52,6 +52,15 @@ pub struct InodeInner {
     fs: Weak<Ext2>,
 }
 
+#[derive(Debug)]
+struct DeleteTarget {
+    block_bid: Bid,
+    block_buf: Vec<u8>,
+    limit: usize,
+    entry_offset: usize,
+    entry_rec_len: usize,
+}
+
 impl InodeInner {
     pub fn new(desc: Dirty<InodeDesc>, weak_self: Weak<Inode>, fs: Weak<Ext2>) -> Self {
         Self {
@@ -328,6 +337,479 @@ impl InodeInner {
 
         Ok(Some(Bid::new(bid as u64)))
     }
+
+    /// Adds a new directory entry to this directory inode.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link)
+    pub(super) fn add_entry(
+        &mut self,
+        name: &str,
+        ino: u32,
+        file_type: DirEntryFileType,
+    ) -> Result<()> {
+        if self.desc.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty() || name_bytes.len() > u8::MAX as usize {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let max_inumber = fs.super_block().total_inodes();
+        if ino == 0 || ino > max_inumber {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let chunk_size = fs.block_size();
+        let reclen = DirEntry::dir_rec_len(name_bytes.len()) as usize;
+        if reclen > chunk_size {
+            return_errno!(Errno::ENOSPC);
+        }
+
+        let size = self.desc.size as usize;
+        let data_blocks = size.div_ceil(chunk_size);
+
+        // Candidate insertion slot selected during the ext2_add_link-style scan.
+        struct InsertSlot {
+            // Physical block that will be rewritten.
+            block_bid: Bid,
+            // Full block buffer containing the candidate slot.
+            block_buf: Vec<u8>,
+            // Byte offset of the candidate dirent slot within `block_buf`.
+            slot_offset: usize,
+            // Current rec_len of the candidate slot.
+            slot_rec_len: usize,
+            // Minimal occupied length of the existing entry head.
+            used_rec_len: usize,
+            // True when we insert by splitting an occupied entry.
+            split_used_entry: bool,
+            // True when the slot comes from a newly allocated directory block.
+            from_new_block: bool,
+        }
+
+        let mut selected: Option<InsertSlot> = None;
+        // SPEC: scan in ascending logical block order and include one growth slot.
+        for block_idx in 0..=data_blocks {
+            if block_idx == data_blocks {
+                // No reusable slot found in existing blocks: grow directory by one block.
+                let allocated = fs.alloc_blocks(1)?;
+                if allocated.end != allocated.start.saturating_add(1) {
+                    return_errno!(Errno::EIO);
+                }
+
+                if let Err(err) = self.link_new_data_block(block_idx as u32, allocated.start) {
+                    let _ = fs.free_blocks(allocated.start, 1);
+                    return Err(err);
+                }
+
+                let mut buf = vec![0u8; chunk_size];
+                Self::write_dir_entry_bytes(&mut buf, 0, 0, chunk_size as u16, b"", 0)?;
+                selected = Some(InsertSlot {
+                    block_bid: Bid::new(allocated.start as u64),
+                    block_buf: buf,
+                    slot_offset: 0,
+                    slot_rec_len: chunk_size,
+                    used_rec_len: 0,
+                    split_used_entry: false,
+                    from_new_block: true,
+                });
+                break;
+            }
+
+            let bid = self
+                .get_block(block_idx as u32)?
+                .ok_or_else(|| Error::new(Errno::EIO))?;
+
+            let mut buf = vec![0u8; chunk_size];
+            if fs.block_device().read_bytes(bid.to_offset(), &mut buf).is_err() {
+                return_errno!(Errno::EIO);
+            }
+
+            let block_offset = block_idx.saturating_mul(chunk_size);
+            let limit = size.saturating_sub(block_offset).min(chunk_size);
+            if limit == 0 {
+                continue;
+            }
+
+            let entries = Self::collect_dir_entries_with_offsets(&buf, limit, max_inumber)?;
+            for (entry_offset, entry) in entries {
+                let rec_len = entry.rec_len as usize;
+                let used_len = DirEntry::dir_rec_len(entry.name_len as usize) as usize;
+
+                if entry.inode != 0
+                    && entry.name_len as usize == name_bytes.len()
+                    && entry.name.as_bytes() == name_bytes
+                {
+                    return_errno!(Errno::EEXIST);
+                }
+
+                if (entry.inode == 0 && rec_len >= reclen)
+                    || (entry.inode != 0 && rec_len >= used_len.saturating_add(reclen))
+                {
+                    // Reuse free slot or split an occupied slot with enough tail space.
+                    selected = Some(InsertSlot {
+                        block_bid: bid,
+                        block_buf: buf,
+                        slot_offset: entry_offset,
+                        slot_rec_len: rec_len,
+                        used_rec_len: used_len,
+                        split_used_entry: entry.inode != 0,
+                        from_new_block: false,
+                    });
+                    break;
+                }
+            }
+
+            if selected.is_some() {
+                break;
+            }
+        }
+
+        let Some(InsertSlot {
+            block_bid,
+            mut block_buf,
+            slot_offset,
+            slot_rec_len,
+            used_rec_len,
+            split_used_entry,
+            from_new_block,
+        }) = selected
+        else {
+            return_errno!(Errno::ENOSPC);
+        };
+
+        let (new_offset, new_rec_len) = if split_used_entry {
+            if used_rec_len < DirEntry::dir_rec_len(1) as usize || used_rec_len >= slot_rec_len {
+                return_errno!(Errno::EIO);
+            }
+            Self::write_rec_len(&mut block_buf, slot_offset, used_rec_len as u16)?;
+            (slot_offset + used_rec_len, slot_rec_len - used_rec_len)
+        } else {
+            (slot_offset, slot_rec_len)
+        };
+
+        Self::write_dir_entry_bytes(
+            &mut block_buf,
+            new_offset,
+            ino,
+            new_rec_len as u16,
+            name_bytes,
+            file_type as u8,
+        )?;
+
+        if fs
+            .block_device()
+            .write_bytes(block_bid.to_offset(), &block_buf)
+            .is_err()
+        {
+            // SPEC: cleanup newly allocated data block if writing the new chunk fails.
+            if from_new_block {
+                let _ = fs.free_blocks(block_bid.to_raw() as u32, 1);
+            }
+            return_errno!(Errno::EIO);
+        }
+
+        if from_new_block {
+            let sectors_per_block = (chunk_size / SECTOR_SIZE) as u32;
+            self.desc.size = self
+                .desc
+                .size
+                .checked_add(chunk_size as u64)
+                .ok_or_else(|| Error::new(Errno::EIO))?;
+            self.desc.blocks = self
+                .desc
+                .blocks
+                .checked_add(sectors_per_block)
+                .ok_or_else(|| Error::new(Errno::EIO))?;
+        }
+
+
+        self.update_dir_timestamps_and_flags()?;
+        self.persist_inode_and_sync(&fs)?;
+        Ok(())
+    }
+
+    /// Deletes a directory entry by name.
+    ///
+    /// Linux: /root/linux/fs/ext2/namei.c:272 (ext2_unlink)
+    pub(super) fn delete_entry(&mut self, name: &str) -> Result<()> {
+        if self.desc.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty() || name_bytes.len() > u8::MAX as usize {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let max_inumber = fs.super_block().total_inodes();
+        let chunk_size = fs.block_size();
+        let size = self.desc.size as usize;
+
+        // Linux split: ext2_find_entry() locates, ext2_delete_entry() mutates one folio/chunk.
+        let Some(mut target) =
+            self.find_entry_slot(name_bytes, &fs, max_inumber, chunk_size, size)?
+        else {
+            return_errno!(Errno::EIO);
+        };
+
+        Self::delete_entry_in_block(
+            &mut target.block_buf,
+            target.limit,
+            chunk_size,
+            target.entry_offset,
+            target.entry_rec_len,
+        )?;
+
+        if fs
+            .block_device()
+            .write_bytes(target.block_bid.to_offset(), &target.block_buf)
+            .is_err()
+        {
+            return_errno!(Errno::EIO);
+        }
+
+        self.update_dir_timestamps_and_flags()?;
+        self.persist_inode_and_sync(&fs)?;
+        Ok(())
+    }
+
+    fn link_new_data_block(&mut self, iblock: u32, new_bid: u32) -> Result<()> {
+        // TODO:
+        // Current mutation path supports direct block growth only.
+        if iblock >= 12 {
+            return_errno!(Errno::ENOSPC);
+        }
+
+        let slot = &mut self.desc.block_ptrs[iblock as usize];
+        if *slot != 0 {
+            return_errno!(Errno::EIO);
+        }
+        *slot = new_bid;
+        Ok(())
+    }
+
+    fn collect_dir_entries_with_offsets(
+        buf: &[u8],
+        limit: usize,
+        max_inumber: u32,
+    ) -> Result<Vec<(usize, DirEntry)>> {
+        let mut iter = DirEntryIter::new(buf, limit, max_inumber)?;
+        let mut entries = Vec::new();
+        let mut entry_offset = 0usize;
+
+        while let Some(entry) = iter.next_entry()? {
+            let rec_len = entry.rec_len as usize;
+            entries.push((entry_offset, entry));
+            entry_offset = entry_offset.saturating_add(rec_len);
+        }
+
+        Ok(entries)
+    }
+
+    fn find_entry_slot(
+        &self,
+        name_bytes: &[u8],
+        fs: &Ext2,
+        max_inumber: u32,
+        chunk_size: usize,
+        size: usize,
+    ) -> Result<Option<DeleteTarget>> {
+        let data_blocks = size.div_ceil(chunk_size);
+
+        for block_idx in 0..data_blocks {
+            let block_bid = self
+                .get_block(block_idx as u32)?
+                .ok_or_else(|| Error::new(Errno::EIO))?;
+
+            let mut block_buf = vec![0u8; chunk_size];
+            if fs
+                .block_device()
+                .read_bytes(block_bid.to_offset(), &mut block_buf)
+                .is_err()
+            {
+                return_errno!(Errno::EIO);
+            }
+
+            let block_offset = block_idx.saturating_mul(chunk_size);
+            let limit = size.saturating_sub(block_offset).min(chunk_size);
+            if limit == 0 {
+                continue;
+            }
+
+            let entries = Self::collect_dir_entries_with_offsets(&block_buf, limit, max_inumber)?;
+            for (entry_offset, entry) in entries {
+                if entry.inode == 0 {
+                    continue;
+                }
+                if entry.name_len as usize != name_bytes.len() {
+                    continue;
+                }
+                if entry.name.as_bytes() != name_bytes {
+                    continue;
+                }
+
+                return Ok(Some(DeleteTarget {
+                    block_bid,
+                    block_buf,
+                    limit,
+                    entry_offset,
+                    entry_rec_len: entry.rec_len as usize,
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn delete_entry_in_block(
+        block_buf: &mut [u8],
+        limit: usize,
+        chunk_size: usize,
+        entry_offset: usize,
+        entry_rec_len: usize,
+    ) -> Result<()> {
+        // `to` is the end offset of the entry being removed.
+        let to = entry_offset.saturating_add(entry_rec_len);
+        if entry_rec_len == 0 || to > limit {
+            return_errno!(Errno::EIO);
+        }
+
+        // TODO: Maybe we can simplify the mask logic here.
+        // Linux ext2_delete_entry aligns `from` to the start of the chunk that
+        // contains `entry_offset` via: from &= ~(chunk_size - 1).
+        // For power-of-two chunk sizes, this mask clears low offset bits and keeps
+        // the chunk base. In our block-buffer path, `entry_offset` is block-local,
+        // so this usually becomes 0, but we keep the same alignment logic.
+        let chunk_mask = !(chunk_size.saturating_sub(1));
+        let mut from = entry_offset & chunk_mask;
+        // Walk from chunk base to target entry to find its previous dirent.
+        let mut de_offset = from;
+        let mut prev_offset = None;
+
+        while de_offset < entry_offset {
+            if de_offset.saturating_add(size_of::<RawDirEntry>()) > limit {
+                return_errno!(Errno::EIO);
+            }
+
+            let rec_len = u16::from_le_bytes([block_buf[de_offset + 4], block_buf[de_offset + 5]]);
+            if rec_len == 0 {
+                return_errno!(Errno::EIO);
+            }
+
+            let next = de_offset.saturating_add(rec_len as usize);
+            if next > limit {
+                return_errno!(Errno::EIO);
+            }
+
+            prev_offset = Some(de_offset);
+            de_offset = next;
+        }
+
+        // If traversal does not land exactly on the target entry, layout is corrupt.
+        if de_offset != entry_offset {
+            return_errno!(Errno::EIO);
+        }
+
+        if let Some(prev) = prev_offset {
+            // Merge the removed entry range into the previous entry by extending
+            // previous rec_len from `prev` to `to`, matching Linux behavior.
+            from = prev;
+            let merged_len = to.saturating_sub(from);
+            Self::write_rec_len(block_buf, prev, merged_len as u16)?;
+        }
+
+        // Mark removed entry as unused.
+        Self::write_inode_number(block_buf, entry_offset, 0)?;
+        Ok(())
+    }
+
+    fn write_dir_entry_bytes(
+        buf: &mut [u8],
+        offset: usize,
+        inode: u32,
+        rec_len: u16,
+        name: &[u8],
+        file_type: u8,
+    ) -> Result<()> {
+        let header_len = size_of::<RawDirEntry>();
+        if name.len() > u8::MAX as usize {
+            return_errno!(Errno::EIO);
+        }
+
+        let rec_len_usize = rec_len as usize;
+        if rec_len_usize < DirEntry::dir_rec_len(name.len()) as usize {
+            return_errno!(Errno::EIO);
+        }
+        if rec_len_usize & 3 != 0 {
+            return_errno!(Errno::EIO);
+        }
+        if offset.saturating_add(rec_len_usize) > buf.len() {
+            return_errno!(Errno::EIO);
+        }
+
+        let name_start = offset + header_len;
+        let name_end = name_start.saturating_add(name.len());
+        if name_end > offset.saturating_add(rec_len_usize) {
+            return_errno!(Errno::EIO);
+        }
+
+        buf[offset..offset + 4].copy_from_slice(&inode.to_le_bytes());
+        buf[offset + 4..offset + 6].copy_from_slice(&rec_len.to_le_bytes());
+        buf[offset + 6] = name.len() as u8;
+        buf[offset + 7] = file_type;
+        buf[name_start..name_end].copy_from_slice(name);
+        Ok(())
+    }
+
+    fn write_rec_len(buf: &mut [u8], offset: usize, rec_len: u16) -> Result<()> {
+        if rec_len == 0 || rec_len & 3 != 0 {
+            return_errno!(Errno::EIO);
+        }
+        if offset.saturating_add(size_of::<RawDirEntry>()) > buf.len() {
+            return_errno!(Errno::EIO);
+        }
+        if offset.saturating_add(rec_len as usize) > buf.len() {
+            return_errno!(Errno::EIO);
+        }
+        buf[offset + 4..offset + 6].copy_from_slice(&rec_len.to_le_bytes());
+        Ok(())
+    }
+
+    fn write_inode_number(buf: &mut [u8], offset: usize, inode: u32) -> Result<()> {
+        if offset.saturating_add(size_of::<RawDirEntry>()) > buf.len() {
+            return_errno!(Errno::EIO);
+        }
+        buf[offset..offset + 4].copy_from_slice(&inode.to_le_bytes());
+        Ok(())
+    }
+
+    fn update_dir_timestamps_and_flags(&mut self) -> Result<()> {
+        // TODO: update the timestamp
+        // if crate::time::START_TIME.get().is_none() {
+        //     return_errno!(Errno::EIO);
+        // }
+
+        // let now = crate::time::SystemTime::now()
+        //     .duration_since(&crate::time::SystemTime::UNIX_EPOCH)
+        //     .map(UnixTime::from)
+        //     .map_err(|_| Error::new(Errno::EIO))?;
+        // self.desc.ctime = now;
+        // self.desc.mtime = now;
+        self.desc.flags.remove(FileFlags::INDEX_DIR);
+        Ok(())
+    }
+
+    fn persist_inode_and_sync(&self, fs: &Ext2) -> Result<()> {
+        let inode = self.weak_self.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let raw = RawInode::from(&*self.desc);
+        fs.write_inode_desc(inode.ino, &raw)?;
+        fs.sync_metadata()?;
+        Ok(())
+    }
 }
 
 impl Inode {}
@@ -517,6 +999,53 @@ impl TryFrom<&RawInode> for InodeDesc {
     }
 }
 
+impl From<&InodeDesc> for RawInode {
+    fn from(desc: &InodeDesc) -> Self {
+        let mode = desc.perm.0;
+        let uid = desc.uid as u16;
+        let gid = desc.gid as u16;
+        let uid_high = (desc.uid >> 16) as u16;
+        let gid_high = (desc.gid >> 16) as u16;
+
+        let atime: Duration = desc.atime.into();
+        let ctime: Duration = desc.ctime.into();
+        let mtime: Duration = desc.mtime.into();
+        let dtime: Duration = desc.dtime.into();
+
+        let (size_lo, size_high) = if desc.type_ == InodeType::File {
+            (desc.size as u32, (desc.size >> 32) as u32)
+        } else {
+            (desc.size as u32, 0)
+        };
+
+        Self {
+            mode,
+            uid,
+            size_lo,
+            atime: atime.as_secs() as u32,
+            ctime: ctime.as_secs() as u32,
+            mtime: mtime.as_secs() as u32,
+            dtime: dtime.as_secs() as u32,
+            gid,
+            links_count: desc.links_count,
+            blocks: desc.blocks,
+            flags: desc.flags.bits(),
+            osd1: 0,
+            block: desc.block_ptrs,
+            generation: 0,
+            file_acl: desc.file_acl,
+            size_high,
+            faddr: 0,
+            frag: 0,
+            fsize: 0,
+            pad1: 0,
+            uid_high,
+            gid_high,
+            reserved2: 0,
+        }
+    }
+}
+
 /// On-disk inode structure (128 bytes for GOOD_OLD_REV).
 ///
 /// Linux: /root/linux/fs/ext2/ext2.h:290 (struct ext2_inode)
@@ -700,6 +1229,71 @@ mod test {
         disk.segment().write_val(offset, &next).unwrap();
     }
 
+    fn set_bit_lsb0(buf: &mut [u8], bit: usize) {
+        let byte = bit / 8;
+        let bit_in_byte = bit % 8;
+        buf[byte] |= 1u8 << bit_in_byte;
+    }
+
+    fn make_live_dir_inode(
+        ext2: &Arc<Ext2>,
+        ino: u32,
+        size: usize,
+        blocks: u32,
+        flags: FileFlags,
+        block_ptrs: [u32; 15],
+    ) -> Arc<Inode> {
+        let mut raw = make_raw_inode(0o040755);
+        raw.size_lo = size as u32;
+        raw.blocks = blocks;
+        raw.flags = flags.bits();
+        raw.block = block_ptrs;
+        let desc = InodeDesc::try_from(&raw).unwrap();
+        Inode::new(ino, InodeType::Dir, Dirty::new(desc), 0, Arc::downgrade(ext2))
+    }
+
+    fn prepare_disk_with_block_accounting(
+        nblocks: usize,
+        sb_free_blocks: u32,
+        group_free_blocks: u16,
+    ) -> (Arc<Ext2MemoryDisk>, SuperBlock, Vec<RawGroupDesc>) {
+        let mut raw_sb = make_valid_raw_super_block(1);
+        raw_sb.free_blocks_count = sb_free_blocks;
+        let sb = SuperBlock::try_from(raw_sb).unwrap();
+
+        let mut descs = vec![make_valid_group_desc(&sb, 0)];
+        descs[0].free_blocks_count = group_free_blocks;
+
+        let disk = Arc::new(Ext2MemoryDisk::new(nblocks));
+        disk.write_super_block(&raw_sb);
+        disk.write_group_desc_table(&sb, &descs);
+
+        (disk, sb, descs)
+    }
+
+    fn write_valid_block_bitmap(
+        disk: &Ext2MemoryDisk,
+        sb: &SuperBlock,
+        desc: &RawGroupDesc,
+        allocated_blocks: &[u32],
+    ) {
+        let mut bitmap_block = [0u8; BLOCK_SIZE];
+        let itb = sb.itb_per_group() as usize;
+        for bit in 0..(2 + itb) {
+            set_bit_lsb0(&mut bitmap_block, bit);
+        }
+
+        let first = sb.group_first_block_no(0);
+        for &block in allocated_blocks {
+            let bit = (block.saturating_sub(first)) as usize;
+            set_bit_lsb0(&mut bitmap_block, bit);
+        }
+
+        disk.segment()
+            .write_bytes(Bid::new(desc.block_bitmap as u64).to_offset(), &bitmap_block)
+            .unwrap();
+    }
+
     #[ktest]
     fn inode_desc_try_from_success() {
         let mut raw = make_raw_inode(0o100644);
@@ -876,6 +1470,146 @@ mod test {
         assert_eq!(bad_inode.find_entry(".").unwrap_err().error(), Errno::EIO);
         let mut vec_visitor = Vec::<String>::new();
         assert_eq!(bad_inode.readdir_at(0, &mut vec_visitor).unwrap_err().error(), Errno::EIO);
+    }
+
+    #[ktest]
+    fn dir_add_delete_entry_ok() {
+
+        let (disk, _sb, _descs) = prepare_disk(2, 256);
+        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let block_size = ext2.block_size();
+
+        let mut block = vec![0u8; block_size];
+        write_dir_entry(&mut block, 0, 2, 12, b".", 2);
+        write_dir_entry(&mut block, 12, 13, (block_size - 12) as u16, b"bar", 1);
+
+        let data_bid = 80u32;
+        disk.segment()
+            .write_bytes(Bid::new(data_bid as u64).to_offset(), &block)
+            .unwrap();
+
+        let mut block_ptrs = [0u32; 15];
+        block_ptrs[0] = data_bid;
+        let inode = make_live_dir_inode(
+            &ext2,
+            2,
+            block_size,
+            8,
+            FileFlags::INDEX_DIR,
+            block_ptrs,
+        );
+
+        {
+            let mut inner = inode.inner.write();
+            inner.add_entry("foo", 11, DirEntryFileType::File).unwrap();
+            let dup = inner
+                .add_entry("foo", 12, DirEntryFileType::File)
+                .unwrap_err();
+            assert_eq!(dup.error(), Errno::EEXIST);
+
+            assert!(!inner.desc.flags.contains(FileFlags::INDEX_DIR));
+            inner.delete_entry("foo").unwrap();
+        }
+
+        let mut post = vec![0u8; block_size];
+        disk.segment()
+            .read_bytes(Bid::new(data_bid as u64).to_offset(), &mut post)
+            .unwrap();
+
+        let dot = DirEntry::parse_at(&post, 0, block_size, ext2.super_block().total_inodes()).unwrap();
+        assert_eq!(dot.inode, 2);
+        assert_eq!(dot.rec_len, 12);
+
+        let bar = DirEntry::parse_at(&post, 12, block_size, ext2.super_block().total_inodes()).unwrap();
+        assert_eq!(bar.inode, 13);
+        assert_eq!(bar.name.as_bytes(), b"bar");
+        assert_eq!(bar.rec_len, (block_size - 12) as u16);
+
+        let inner = inode.inner.read();
+        assert_eq!(inner.find_entry("foo").unwrap_err().error(), Errno::ENOENT);
+    }
+
+    #[ktest]
+    fn dir_add_entry_grow_by_new_block_ok() {
+
+        let (disk, sb, descs) = prepare_disk_with_block_accounting(256, 32, 32);
+        let block_size = sb.block_size();
+
+        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+
+        // Pick a data block inside group 0 and outside metadata area:
+        // [block_bitmap, inode_bitmap, inode_table...].
+        let first = sb.group_first_block_no(0);
+        let last = sb.group_last_block_no(0);
+        let data_bid = first
+            .saturating_add(2)
+            .saturating_add(sb.itb_per_group())
+            .saturating_add(1);
+        assert!(data_bid <= last);
+        write_valid_block_bitmap(disk.as_ref(), &sb, &descs[0], &[data_bid]);
+
+        let mut first_block = vec![0u8; block_size];
+        write_dir_entry(&mut first_block, 0, 2, 12, b".", 2);
+        write_dir_entry(&mut first_block, 12, 2, 12, b"..", 2);
+        disk.segment()
+            .write_bytes(Bid::new(data_bid as u64).to_offset(), &first_block)
+            .unwrap();
+
+        let mut block_ptrs = [0u32; 15];
+        block_ptrs[0] = data_bid;
+        let inode = make_live_dir_inode(
+            &ext2,
+            2,
+            24,
+            8,
+            FileFlags::INDEX_DIR,
+            block_ptrs,
+        );
+
+        let new_bid = {
+            let mut inner = inode.inner.write();
+            inner.add_entry("foo", 11, DirEntryFileType::File).unwrap();
+            assert_eq!(inner.desc.size, (24 + block_size) as u64);
+            assert_eq!(inner.desc.blocks, 16);
+            assert_ne!(inner.desc.block_ptrs[1], 0);
+            inner.desc.block_ptrs[1]
+        };
+
+        let mut new_block = vec![0u8; block_size];
+        disk.segment()
+            .read_bytes(Bid::new(new_bid as u64).to_offset(), &mut new_block)
+            .unwrap();
+        let entry = DirEntry::parse_at(&new_block, 0, block_size, ext2.super_block().total_inodes()).unwrap();
+        assert_eq!(entry.inode, 11);
+        assert_eq!(entry.name.as_bytes(), b"foo");
+    }
+
+    #[ktest]
+    fn dir_mutation_error_cases() {
+        let (disk, _sb, _descs) = prepare_disk(2, 256);
+        let ext2 = Ext2::open(disk as Arc<dyn BlockDevice>).unwrap();
+
+        let mut file_inode = make_inode_inner(Arc::downgrade(&ext2), [0u32; 15]);
+        assert_eq!(
+            file_inode
+                .add_entry("foo", 2, DirEntryFileType::File)
+                .unwrap_err()
+                .error(),
+            Errno::ENOTDIR
+        );
+        assert_eq!(file_inode.delete_entry("foo").unwrap_err().error(), Errno::ENOTDIR);
+
+        let mut dir_ptrs = [0u32; 15];
+        dir_ptrs[0] = 80;
+        let mut dir_inode = make_dir_inode_inner(Arc::downgrade(&ext2), 0, 8, dir_ptrs);
+        assert_eq!(
+            dir_inode
+                .add_entry("", 2, DirEntryFileType::File)
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
+        assert_eq!(dir_inode.delete_entry("").unwrap_err().error(), Errno::EINVAL);
     }
 
     #[ktest]
