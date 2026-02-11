@@ -6,7 +6,7 @@ use aster_virtio::device::socket::error;
 
 use super::{
     block_group::{BlockGroup, RawGroupDesc},
-    inode::{Inode, InodeDesc, RawInode},
+    inode::{FilePerm, Inode, InodeDesc, RawInode},
     prelude::*,
     super_block::{RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
     utils::Dirty,
@@ -587,6 +587,66 @@ impl Ext2 {
         return_errno!(Errno::ENOSPC);
     }
 
+    /// Allocates and initializes a new inode.
+    ///
+    /// Linux: /root/linux/fs/ext2/ialloc.c:419 (ext2_new_inode)
+    pub(super) fn create_inode(
+        &self,
+        parent_ino: u32,
+        inode_type: InodeType,
+        perm: FilePerm,
+    ) -> Result<Arc<Inode>> {
+        if inode_type == InodeType::Unknown {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let ino = self.alloc_inode(parent_ino, inode_type)?;
+        // TODO: reduce this extra I/O operation after implementing inode cache.
+        // SPEC: initialize a valid on-disk inode before publishing it.
+        let mode = (inode_type as u16) | (perm.bits() & 0o07777);
+        let links_count = if inode_type.is_directory() { 2 } else { 1 };
+        let raw = RawInode {
+            mode,
+            uid: 0,
+            size_lo: 0,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: 0,
+            gid: 0,
+            links_count,
+            blocks: 0,
+            flags: 0,
+            osd1: 0,
+            block: [0; 15],
+            generation: 0,
+            file_acl: 0,
+            size_high: 0,
+            faddr: 0,
+            frag: 0,
+            fsize: 0,
+            pad1: 0,
+            uid_high: 0,
+            gid_high: 0,
+            reserved2: 0,
+        };
+
+        if let Err(err) = self.write_inode_desc(ino, &raw) {
+            // SPEC: cleanup inode allocation if descriptor initialization failed.
+            let _ = self.free_inode(ino);
+            return Err(err);
+        }
+
+        match self.read_inode(ino) {
+            Ok(inode) => Ok(inode),
+            Err(err) => {
+                // SPEC: rollback allocated inode on publish failure.
+                let _ = self.free_inode(ino);
+                Err(err)
+            }
+        }
+    }
+
     /// Frees an inode by number.
     pub(super) fn free_inode(&self, ino: u32) -> Result<()> {
         let (inodes_per_group, total_inodes, first_ino, groups_count) = {
@@ -1015,6 +1075,29 @@ mod test {
             .unwrap();
     }
 
+    fn read_raw_inode_from_disk(
+        sb: &SuperBlock,
+        descs: &[RawGroupDesc],
+        ino: u32,
+        disk: &Ext2MemoryDisk,
+    ) -> RawInode {
+        let inodes_per_group = sb.inodes_per_group();
+        let group_idx = ((ino - 1) / inodes_per_group) as usize;
+        let index_in_group = (ino - 1) % inodes_per_group;
+
+        let inode_size = sb.inode_size();
+        let block_size = sb.block_size();
+        let offset_bytes = (index_in_group as usize).saturating_mul(inode_size);
+        let block_index = offset_bytes / block_size;
+        let offset_in_block = offset_bytes % block_size;
+
+        let table_block = descs[group_idx].inode_table + block_index as u32;
+        let table_bid = Bid::new(table_block as u64);
+        disk.segment()
+            .read_val::<RawInode>(table_bid.to_offset() + offset_in_block)
+            .unwrap()
+    }
+
     fn make_test_ext2_for_inode_alloc(
         sb_free_inodes: u32,
         group_free_inodes: u16,
@@ -1298,6 +1381,55 @@ mod test {
         ext2_free.free_inode(target_ino).unwrap();
         assert_eq!(ext2_free.super_block.read().free_inodes_count(), before_sb);
         assert_eq!(ext2_free.block_groups[0].free_inodes_count(), before_group);
+    }
+
+    #[ktest]
+    fn create_inode_initializes_descriptor() {
+        let mut raw_sb = make_valid_raw_super_block(1);
+        raw_sb.free_inodes_count = 16;
+        let sb = SuperBlock::try_from(raw_sb).unwrap();
+
+        let mut descs = vec![make_valid_group_desc(&sb, 0)];
+        descs[0].free_inodes_count = 16;
+
+        let disk = Arc::new(Ext2MemoryDisk::new(128));
+        initialize_disk_for_open(&sb, &descs, &disk);
+
+        let mut inode_bitmap = [0u8; BLOCK_SIZE];
+        for bit in 0..(sb.first_ino() as usize).saturating_sub(1) {
+            set_bit_lsb0(&mut inode_bitmap, bit);
+        }
+        disk.segment()
+            .write_bytes(Bid::new(descs[0].inode_bitmap as u64).to_offset(), &inode_bitmap)
+            .unwrap();
+
+        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let inode = ext2
+            .create_inode(
+                ROOT_INO,
+                InodeType::Dir,
+                crate::fs::ext2::inode::FilePerm::from_bits_truncate(0o755),
+            )
+            .unwrap();
+        let ino = inode.ino();
+
+        let raw = read_raw_inode_from_disk(&sb, &descs, ino, disk.as_ref());
+        assert_eq!(raw.mode, 0o040755);
+        assert_eq!(raw.links_count, 2);
+        assert_eq!(raw.size_lo, 0);
+        assert_eq!(raw.blocks, 0);
+        assert_eq!(raw.block, [0; 15]);
+
+        assert_eq!(
+            ext2.create_inode(
+                ROOT_INO,
+                InodeType::Unknown,
+                crate::fs::ext2::inode::FilePerm::from_bits_truncate(0o644)
+            )
+            .unwrap_err()
+            .error(),
+            Errno::EINVAL
+        );
     }
 
     #[ktest]

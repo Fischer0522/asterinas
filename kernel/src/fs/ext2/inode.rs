@@ -15,6 +15,10 @@ impl FilePerm {
     pub fn from_bits_truncate(bits: u16) -> Self {
         Self(bits)
     }
+
+    pub(super) fn bits(self) -> u16 {
+        self.0
+    }
 }
 
 #[derive(Debug)]
@@ -41,6 +45,10 @@ impl Inode {
             block_group_idx,
             fs,
         })
+    }
+
+    pub(super) fn ino(&self) -> u32 {
+        self.ino
     }
 }
 
@@ -77,6 +85,290 @@ impl InodeInner {
 
     pub fn write_at(&self, _offset: usize, _data: &[u8]) -> Result<usize> {
         return_errno!(Errno::ENOSYS);
+    }
+
+    /// Initializes a newly allocated directory inode with `.` and `..` entries.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:617 (ext2_make_empty)
+    pub(super) fn make_empty(&mut self, parent_ino: u32) -> Result<()> {
+        if self.desc.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let total_inodes = fs.super_block().total_inodes();
+        if parent_ino == 0 || parent_ino > total_inodes {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let self_ino = self
+            .weak_self
+            .upgrade()
+            .ok_or_else(|| Error::new(Errno::EIO))?
+            .ino();
+
+        let chunk_size = fs.block_size();
+        let sectors_per_block = (chunk_size / SECTOR_SIZE) as u32;
+
+        // SPEC: allocate exactly one data block for the first directory chunk.
+        let allocated = fs.alloc_blocks(1)?;
+        if allocated.end != allocated.start.saturating_add(1) {
+            return_errno!(Errno::EIO);
+        }
+        let new_bid = allocated.start;
+
+        // Preserve old state for rollback.
+        let old_ptr0 = self.desc.block_ptrs[0];
+        let old_size = self.desc.size;
+        let old_blocks = self.desc.blocks;
+
+        if old_ptr0 != 0 {
+            let _ = fs.free_blocks(new_bid, 1);
+            return_errno!(Errno::EIO);
+        }
+        self.desc.block_ptrs[0] = new_bid;
+
+        let mut buf = vec![0u8; chunk_size];
+        // SPEC: zero-filled chunk and canonical `.`/`..` layout.
+        Self::write_dir_entry_bytes(
+            &mut buf,
+            0,
+            self_ino,
+            DirEntry::dir_rec_len(1),
+            b".",
+            DirEntryFileType::Dir as u8,
+        )?;
+        let dot_len = DirEntry::dir_rec_len(1) as usize;
+        let dotdot_len = (chunk_size.saturating_sub(dot_len)) as u16;
+        Self::write_dir_entry_bytes(
+            &mut buf,
+            dot_len,
+            parent_ino,
+            dotdot_len,
+            b"..",
+            DirEntryFileType::Dir as u8,
+        )?;
+
+        if fs
+            .block_device()
+            .write_bytes(Bid::new(new_bid as u64).to_offset(), &buf)
+            .is_err()
+        {
+            self.desc.block_ptrs[0] = old_ptr0;
+            let _ = fs.free_blocks(new_bid, 1);
+            return_errno!(Errno::EIO);
+        }
+
+        self.desc.size = chunk_size as u64;
+        self.desc.blocks = self
+            .desc
+            .blocks
+            .checked_add(sectors_per_block)
+            .ok_or_else(|| Error::new(Errno::EIO))?;
+
+        if let Err(err) = self.persist_inode_and_sync(&fs) {
+            // SPEC: cleanup allocation and restore pre-state if persistence failed.
+            self.desc.block_ptrs[0] = old_ptr0;
+            self.desc.size = old_size;
+            self.desc.blocks = old_blocks;
+            let _ = fs.free_blocks(new_bid, 1);
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    /// Checks whether this directory contains only `.` and `..` as live entries.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:659 (ext2_empty_dir)
+    pub(super) fn empty_dir(&self) -> bool {
+        if self.desc.type_ != InodeType::Dir {
+            return false;
+        }
+
+        let fs = match self.fs.upgrade() {
+            Some(fs) => fs,
+            None => return false,
+        };
+
+        let self_ino = match self.weak_self.upgrade() {
+            Some(inode) => inode.ino(),
+            None => return false,
+        };
+
+        let block_size = fs.block_size();
+        let size = self.desc.size as usize;
+        let max_inumber = fs.super_block().total_inodes();
+        let data_blocks = size.div_ceil(block_size);
+
+        for block_idx in 0..data_blocks {
+            let bid = match self.get_block(block_idx as u32) {
+                Ok(Some(bid)) => bid,
+                _ => return false,
+            };
+
+            let mut buf = vec![0u8; block_size];
+            if fs
+                .block_device()
+                .read_bytes(bid.to_offset(), &mut buf)
+                .is_err()
+            {
+                return false;
+            }
+
+            let block_offset = block_idx.saturating_mul(block_size);
+            let limit = size.saturating_sub(block_offset).min(block_size);
+            if limit == 0 {
+                continue;
+            }
+
+            let mut iter = match DirEntryIter::new(&buf, limit, max_inumber) {
+                Ok(iter) => iter,
+                Err(_) => return false,
+            };
+
+            loop {
+                let entry = match iter.next_entry() {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(_) => return false,
+                };
+
+                if entry.inode == 0 {
+                    continue;
+                }
+
+                let name = entry.name.as_bytes();
+                if name == b"." {
+                    if entry.inode != self_ino {
+                        return false;
+                    }
+                    continue;
+                }
+                if name == b".." {
+                    continue;
+                }
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Creates a subdirectory under this directory inode.
+    ///
+    /// Linux: /root/linux/fs/ext2/namei.c:228 (ext2_mkdir)
+    pub(super) fn mkdir(&mut self, name: &str, perm: FilePerm) -> Result<Arc<Inode>> {
+        if self.desc.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty()
+            || name_bytes.len() > u8::MAX as usize
+            || name_bytes == b"."
+            || name_bytes == b".."
+        {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let parent_ino = self
+            .weak_self
+            .upgrade()
+            .ok_or_else(|| Error::new(Errno::EIO))?
+            .ino();
+
+        // SPEC: reserve parent link for new subdir's `..`.
+        self.desc.links_count = self.desc.links_count.saturating_add(1);
+
+        let child = match fs.create_inode(parent_ino, InodeType::Dir, perm) {
+            Ok(child) => child,
+            Err(err) => {
+                // SPEC: rollback parent link reservation on failure.
+                self.desc.links_count = self.desc.links_count.saturating_sub(1);
+                return Err(err);
+            }
+        };
+        let child_ino = child.ino();
+
+        {
+            let mut child_inner = child.inner.write();
+            if let Err(err) = child_inner.make_empty(parent_ino) {
+                let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
+                let _ = fs.free_inode(child_ino);
+                self.desc.links_count = self.desc.links_count.saturating_sub(1);
+                return Err(err);
+            }
+        }
+
+        if let Err(err) = self.add_entry(name, child_ino, DirEntryFileType::Dir) {
+            {
+                let mut child_inner = child.inner.write();
+                let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
+            }
+            let _ = fs.free_inode(child_ino);
+            self.desc.links_count = self.desc.links_count.saturating_sub(1);
+            return Err(err);
+        }
+
+        // SPEC: persist parent link count update.
+        if let Err(err) = self.persist_inode_and_sync(&fs) {
+            let _ = self.delete_entry(name);
+            {
+                let mut child_inner = child.inner.write();
+                let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
+            }
+            let _ = fs.free_inode(child_ino);
+            self.desc.links_count = self.desc.links_count.saturating_sub(1);
+            return Err(err);
+        }
+
+        Ok(child)
+    }
+
+    /// Removes an existing empty subdirectory.
+    ///
+    /// Linux: /root/linux/fs/ext2/namei.c:302 (ext2_rmdir)
+    pub(super) fn rmdir(&mut self, name: &str) -> Result<()> {
+        if self.desc.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty()
+            || name_bytes.len() > u8::MAX as usize
+            || name_bytes == b"."
+            || name_bytes == b".."
+        {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let child_ino = self.find_entry(name)?;
+        let child = fs.read_inode(child_ino)?;
+
+        {
+            let mut child_inner = child.inner.write();
+            if child_inner.desc.type_ != InodeType::Dir {
+                return_errno!(Errno::ENOTDIR);
+            }
+            if !child_inner.empty_dir() {
+                return_errno!(Errno::ENOTEMPTY);
+            }
+
+            self.delete_entry(name)?;
+
+            child_inner.release_dir_data_blocks_for_cleanup(&fs)?;
+            child_inner.desc.size = 0;
+            child_inner.desc.links_count = child_inner.desc.links_count.saturating_sub(2);
+            child_inner.persist_inode_and_sync(&fs)?;
+        }
+
+        self.desc.links_count = self.desc.links_count.saturating_sub(1);
+        self.persist_inode_and_sync(&fs)?;
+
+        fs.free_inode(child_ino)
     }
 
     /// Finds a directory entry by name and returns its inode number.
@@ -787,6 +1079,26 @@ impl InodeInner {
         Ok(())
     }
 
+    fn release_dir_data_blocks_for_cleanup(&mut self, fs: &Ext2) -> Result<()> {
+        // DIFF from Linux:
+        // Linux mkdir-failure/rmdir cleanup reaches block release through
+        // discard_new_inode()/iput() -> ext2_evict_inode() -> ext2_truncate_blocks().
+        // Asterinas currently has no unified inode evict+truncate path, so we
+        // explicitly release directory data blocks here on rollback/removal paths.
+        // TODO: Move this logic into a shared truncate/evict pipeline, and make
+        // free_inode trigger it instead of per-call-site cleanup.
+        for bid in self.desc.block_ptrs.iter_mut().take(12) {
+            if *bid == 0 {
+                continue;
+            }
+            fs.free_blocks(*bid, 1)?;
+            *bid = 0;
+        }
+        self.desc.size = 0;
+        self.desc.blocks = 0;
+        Ok(())
+    }
+
     fn update_dir_timestamps_and_flags(&mut self) -> Result<()> {
         // TODO: update the timestamp
         // if crate::time::START_TIME.get().is_none() {
@@ -1102,6 +1414,7 @@ mod test {
 
     use super::*;
     use crate::fs::ext2::{
+        fs::ROOT_INO,
         SuperBlock,
         block_group::RawGroupDesc,
         test::{ErrorBioDisk, Ext2MemoryDisk, make_valid_group_desc, make_valid_raw_super_block},
@@ -1610,6 +1923,83 @@ mod test {
             Errno::EINVAL
         );
         assert_eq!(dir_inode.delete_entry("").unwrap_err().error(), Errno::EINVAL);
+    }
+
+    #[ktest]
+    fn dir_make_empty_and_empty_dir_ok() {
+        let (disk, sb, descs) = prepare_disk_with_block_accounting(256, 64, 64);
+        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let block_size = ext2.block_size();
+
+        let first = sb.group_first_block_no(0);
+        let last = sb.group_last_block_no(0);
+        let data_bid = first
+            .saturating_add(2)
+            .saturating_add(sb.itb_per_group())
+            .saturating_add(1);
+        assert!(data_bid <= last);
+        write_valid_block_bitmap(disk.as_ref(), &sb, &descs[0], &[data_bid]);
+
+        let mut raw = make_raw_inode(0o040755);
+        raw.links_count = 2;
+        let desc = InodeDesc::try_from(&raw).unwrap();
+        let inode = Inode::new(12, InodeType::Dir, Dirty::new(desc), 0, Arc::downgrade(&ext2));
+
+        {
+            let mut inner = inode.inner.write();
+            inner.make_empty(ROOT_INO).unwrap();
+            assert!(inner.empty_dir());
+            assert_eq!(inner.desc.size as usize, block_size);
+            assert_eq!(inner.desc.blocks, (block_size / SECTOR_SIZE) as u32);
+        }
+
+        let mut buf = vec![0u8; block_size];
+        disk.segment()
+            .read_bytes(Bid::new(data_bid as u64).to_offset(), &mut buf)
+            .unwrap();
+
+        let dot = DirEntry::parse_at(&buf, 0, block_size, ext2.super_block().total_inodes()).unwrap();
+        assert_eq!(dot.inode, 12);
+        assert_eq!(dot.name.as_bytes(), b".");
+
+        let dotdot = DirEntry::parse_at(
+            &buf,
+            DirEntry::dir_rec_len(1) as usize,
+            block_size,
+            ext2.super_block().total_inodes(),
+        )
+        .unwrap();
+        assert_eq!(dotdot.inode, ROOT_INO);
+        assert_eq!(dotdot.name.as_bytes(), b"..");
+    }
+
+    #[ktest]
+    fn empty_dir_false_on_non_dot_entries() {
+        let (disk, _sb, _descs) = prepare_disk(2, 256);
+        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let block_size = ext2.block_size();
+
+        let data_bid = 80u32;
+        let mut block = vec![0u8; block_size];
+        write_dir_entry(&mut block, 0, 2, 12, b".", 2);
+        write_dir_entry(&mut block, 12, 2, 12, b"..", 2);
+        write_dir_entry(
+            &mut block,
+            24,
+            13,
+            (block_size - 24) as u16,
+            b"foo",
+            1,
+        );
+        disk.segment()
+            .write_bytes(Bid::new(data_bid as u64).to_offset(), &block)
+            .unwrap();
+
+        let mut ptrs = [0u32; 15];
+        ptrs[0] = data_bid;
+        let inode = make_live_dir_inode(&ext2, 2, block_size, 8, FileFlags::empty(), ptrs);
+
+        assert!(!inode.inner.read().empty_dir());
     }
 
     #[ktest]

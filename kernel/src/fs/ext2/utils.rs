@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::{fmt::Debug, ops::MulAssign};
+use core::{fmt::Debug, ops::MulAssign, time::Duration};
 
-use crate::prelude::warn;
+use crate::{prelude::warn, time::Clock};
 
 pub trait IsPowerOf: Copy + Sized + MulAssign + PartialOrd {
     /// Returns true if and only if `self == x^k` for some `k` where `k > 0`.
@@ -90,4 +90,9 @@ impl<T: Debug> Debug for Dirty<T> {
         let tag = if self.dirty { "Dirty" } else { "Clean" };
         write!(f, "[{}] {:?}", tag, self.value)
     }
+}
+
+/// Returns the current time.
+pub fn now() -> Duration {
+    crate::time::clocks::RealTimeCoarseClock::get().read_time()
 }
