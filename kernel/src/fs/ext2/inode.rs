@@ -94,7 +94,10 @@ impl InodeInner {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let total_inodes = fs.super_block().total_inodes();
         if parent_ino == 0 || parent_ino > total_inodes {
             return_errno_with_message!(Errno::EINVAL, "parent inode number out of range");
@@ -271,7 +274,10 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let parent_ino = self
             .weak_self
             .upgrade()
@@ -343,7 +349,10 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let child_ino = self.find_entry(name)?;
         let child = fs.read_inode(child_ino)?;
 
@@ -378,7 +387,10 @@ impl InodeInner {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let sb = fs.super_block();
         let block_size = fs.block_size();
         let size = self.desc.size;
@@ -447,7 +459,10 @@ impl InodeInner {
             return Ok(0);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let sb = fs.super_block();
         let block_size = fs.block_size();
         let max_inumber = sb.total_inodes();
@@ -527,7 +542,10 @@ impl InodeInner {
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:163 (ext2_block_to_path)
     pub(super) fn block_to_path(&self, iblock: u32) -> Result<BlockPath> {
-        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let sb = fs.super_block();
         let ptrs = (sb.block_size() / size_of::<u32>()) as u32;
         if ptrs == 0 {
@@ -602,7 +620,10 @@ impl InodeInner {
             return Ok(None);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         for level in 1..path.depth {
             let mut buf = vec![0u8; BLOCK_SIZE];
             if fs
@@ -616,10 +637,9 @@ impl InodeInner {
             let mut reader = VmReader::from(buf.as_slice());
             let offset_bytes = (path.offsets[level] as usize).saturating_mul(size_of::<u32>());
 
-            let next = reader
-                .skip(offset_bytes)
-                .read_val::<u32>()
-                .map_err(|_| Error::with_message(Errno::EIO, "failed to read indirect block pointer"))?;
+            let next = reader.skip(offset_bytes).read_val::<u32>().map_err(|_| {
+                Error::with_message(Errno::EIO, "failed to read indirect block pointer")
+            })?;
             if next == 0 {
                 return Ok(None);
             }
@@ -647,7 +667,10 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let max_inumber = fs.super_block().total_inodes();
         if ino == 0 || ino > max_inumber {
             return_errno!(Errno::EINVAL);
@@ -844,7 +867,10 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let max_inumber = fs.super_block().total_inodes();
         if new_ino < ROOT_INO || new_ino > max_inumber {
             return_errno!(Errno::EINVAL);
@@ -894,7 +920,10 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let max_inumber = fs.super_block().total_inodes();
         let chunk_size = fs.block_size();
         let size = self.desc.size as usize;
@@ -1182,7 +1211,10 @@ impl InodeInner {
 fn read_lock_two_inodes<'a>(
     a: &'a Inode,
     b: &'a Inode,
-) -> (RwMutexReadGuard<'a, InodeInner>, RwMutexReadGuard<'a, InodeInner>) {
+) -> (
+    RwMutexReadGuard<'a, InodeInner>,
+    RwMutexReadGuard<'a, InodeInner>,
+) {
     if a.ino <= b.ino {
         let ga = a.inner.read();
         let gb = b.inner.read();
@@ -1199,7 +1231,10 @@ fn read_lock_two_inodes<'a>(
 fn write_lock_two_inodes<'a>(
     a: &'a Inode,
     b: &'a Inode,
-) -> (RwMutexWriteGuard<'a, InodeInner>, RwMutexWriteGuard<'a, InodeInner>) {
+) -> (
+    RwMutexWriteGuard<'a, InodeInner>,
+    RwMutexWriteGuard<'a, InodeInner>,
+) {
     if a.ino <= b.ino {
         let ga = a.inner.write();
         let gb = b.inner.write();
@@ -1310,7 +1345,10 @@ impl Inode {
             return Ok(ret);
         } else {
             // Linux: ext2_create → ext2_new_inode + ext2_add_nondir
-            let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+            let fs = self
+                .fs
+                .upgrade()
+                .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
             let child = fs.create_inode(self.ino, type_, perm)?;
             let child_ino = child.ino();
             let dir_ft = Self::inode_type_to_dir_file_type(type_);
@@ -1350,8 +1388,14 @@ impl Inode {
         }
 
         // SPEC: cross-filesystem link check.
-        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
-        let old_fs = old.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let old_fs = old
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         if !Arc::ptr_eq(&fs, &old_fs) {
             return_errno!(Errno::EINVAL);
         }
@@ -1400,7 +1444,10 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
 
         // Acquire self write lock to resolve and delete entry.
         let mut self_inner = self.inner.write();
@@ -1439,12 +1486,7 @@ impl Inode {
     /// Renames or moves an entry from this directory to `target` directory.
     ///
     /// Linux: /root/linux/fs/ext2/namei.c:318 (ext2_rename)
-    pub(super) fn rename(
-        &self,
-        old_name: &str,
-        target: &Arc<Inode>,
-        new_name: &str,
-    ) -> Result<()> {
+    pub(super) fn rename(&self, old_name: &str, target: &Arc<Inode>, new_name: &str) -> Result<()> {
         // SPEC: both self and target must be directories.
         if self.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
@@ -1471,8 +1513,14 @@ impl Inode {
         }
 
         // SPEC: cross-filesystem rename check.
-        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
-        let target_fs = target.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let target_fs = target
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         if !Arc::ptr_eq(&fs, &target_fs) {
             return_errno!(Errno::EINVAL);
         }
@@ -1542,11 +1590,9 @@ impl Inode {
             existing_inner.desc.ctime = now();
             if old_is_dir {
                 // Directory replacement: drop extra link for `..`.
-                existing_inner.desc.links_count =
-                    existing_inner.desc.links_count.saturating_sub(1);
+                existing_inner.desc.links_count = existing_inner.desc.links_count.saturating_sub(1);
             }
-            existing_inner.desc.links_count =
-                existing_inner.desc.links_count.saturating_sub(1);
+            existing_inner.desc.links_count = existing_inner.desc.links_count.saturating_sub(1);
 
             if existing_inner.desc.links_count == 0 {
                 existing_inner.desc.dtime = now();
@@ -1647,11 +1693,9 @@ impl Inode {
             let mut existing_inner = existing.inner.write();
             existing_inner.desc.ctime = now();
             if old_is_dir {
-                existing_inner.desc.links_count =
-                    existing_inner.desc.links_count.saturating_sub(1);
+                existing_inner.desc.links_count = existing_inner.desc.links_count.saturating_sub(1);
             }
-            existing_inner.desc.links_count =
-                existing_inner.desc.links_count.saturating_sub(1);
+            existing_inner.desc.links_count = existing_inner.desc.links_count.saturating_sub(1);
 
             if existing_inner.desc.links_count == 0 {
                 existing_inner.desc.dtime = now();
@@ -1666,8 +1710,7 @@ impl Inode {
             target_inner.add_entry(new_name, old_ino, moved_ft)?;
             if old_is_dir {
                 // Linux: inode_inc_link_count(new_dir) for new subdir.
-                target_inner.desc.links_count =
-                    target_inner.desc.links_count.saturating_add(1);
+                target_inner.desc.links_count = target_inner.desc.links_count.saturating_add(1);
             }
         }
 
@@ -1689,8 +1732,7 @@ impl Inode {
             drop(old_inner);
 
             // Linux: inode_dec_link_count(old_dir) — old parent loses a subdir.
-            self_inner.desc.links_count =
-                self_inner.desc.links_count.saturating_sub(1);
+            self_inner.desc.links_count = self_inner.desc.links_count.saturating_sub(1);
             self_inner.persist_inode_and_sync(fs)?;
 
             // If destination didn't already have the entry (no replacement),
@@ -1888,7 +1930,8 @@ impl TryFrom<&RawInode> for InodeDesc {
 
         let block_ptrs = raw.block;
 
-        let flags = FileFlags::from_bits(raw.flags).ok_or_else(|| Error::with_message(Errno::EIO, "invalid inode flags"))?;
+        let flags = FileFlags::from_bits(raw.flags)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "invalid inode flags"))?;
 
         Ok(InodeDesc {
             type_,
@@ -2015,41 +2058,17 @@ mod test {
             SuperBlock,
             block_group::RawGroupDesc,
             fs::ROOT_INO,
-            test::{
-                ErrorBioDisk, Ext2MemoryDisk,
-
-            }, testkit::{self, Ext2FixtureBuilder},
+            testkit::{
+                self, CollectDirentVisitor, ErrorBioDisk, Ext2FixtureBuilder, Ext2MemoryDisk,
+                RawInodeBuilder, StopAfterVisitor, encode_dir_entry, write_indirect_ptr,
+            },
         },
         prelude::*,
         time::clocks,
     };
 
     fn make_raw_inode(mode: u16) -> RawInode {
-        RawInode {
-            mode,
-            uid: 0,
-            size_lo: 0,
-            atime: 0,
-            ctime: 0,
-            mtime: 0,
-            dtime: 0,
-            gid: 0,
-            links_count: 1,
-            blocks: 0,
-            flags: 0,
-            osd1: 0,
-            block: [0; 15],
-            generation: 0,
-            file_acl: 0,
-            size_high: 0,
-            faddr: 0,
-            frag: 0,
-            fsize: 0,
-            pad1: 0,
-            uid_high: 0,
-            gid_high: 0,
-            reserved2: 0,
-        }
+        RawInodeBuilder::new(mode).build()
     }
 
     fn prepare_disk(
@@ -2089,67 +2108,7 @@ mod test {
         name: &[u8],
         file_type: u8,
     ) {
-        let header_len = size_of::<RawDirEntry>();
-        assert!(offset + rec_len as usize <= buf.len());
-        assert!(name.len() <= (rec_len as usize).saturating_sub(header_len));
-
-        buf[offset..offset + 4].copy_from_slice(&inode.to_le_bytes());
-        buf[offset + 4..offset + 6].copy_from_slice(&rec_len.to_le_bytes());
-        buf[offset + 6] = name.len() as u8;
-        buf[offset + 7] = file_type;
-        buf[offset + header_len..offset + header_len + name.len()].copy_from_slice(name);
-    }
-
-    #[derive(Default)]
-    struct CollectDirentVisitor {
-        entries: Vec<(String, u64, InodeType, usize)>,
-    }
-
-    impl DirentVisitor for CollectDirentVisitor {
-        fn visit(&mut self, name: &str, ino: u64, type_: InodeType, offset: usize) -> Result<()> {
-            self.entries.push((name.to_string(), ino, type_, offset));
-            Ok(())
-        }
-    }
-
-    struct StopAfterVisitor {
-        allow_count: usize,
-        seen: usize,
-    }
-
-    impl StopAfterVisitor {
-        fn new(allow_count: usize) -> Self {
-            Self {
-                allow_count,
-                seen: 0,
-            }
-        }
-    }
-
-    impl DirentVisitor for StopAfterVisitor {
-        fn visit(
-            &mut self,
-            _name: &str,
-            _ino: u64,
-            _type_: InodeType,
-            _offset: usize,
-        ) -> Result<()> {
-            if self.seen >= self.allow_count {
-                return_errno_with_message!(Errno::EINTR, "operation interrupted");
-            }
-            self.seen += 1;
-            Ok(())
-        }
-    }
-
-    // Writes one u32 pointer into an indirect block slot.
-    fn write_indirect_ptr(disk: &Ext2MemoryDisk, bid: u32, index: u32, next: u32) {
-        let offset = Bid::new(bid as u64).to_offset() + (index as usize) * size_of::<u32>();
-        disk.segment().write_val(offset, &next).unwrap();
-    }
-
-    fn set_bit_lsb0(buf: &mut [u8], bit: usize) {
-        testkit::set_bit_lsb0(buf, bit);
+        encode_dir_entry(buf, offset, inode, rec_len, name, file_type);
     }
 
     fn make_live_dir_inode(
@@ -2175,41 +2134,12 @@ mod test {
         )
     }
 
-    fn prepare_disk_with_block_accounting(
-        nblocks: usize,
-        sb_free_blocks: u32,
-        group_free_blocks: u16,
-    ) -> (Arc<Ext2MemoryDisk>, SuperBlock, Vec<RawGroupDesc>) {
-        let fixture = Ext2FixtureBuilder::new(1, nblocks)
-            .with_free_blocks(sb_free_blocks, group_free_blocks)
-            .build()
-            .unwrap();
-        (fixture.disk, fixture.sb, fixture.descs)
-    }
-
-    fn write_valid_block_bitmap(
-        disk: &Ext2MemoryDisk,
-        sb: &SuperBlock,
-        desc: &RawGroupDesc,
-        allocated_blocks: &[u32],
+    fn prepare_namei_test_env() -> (
+        Arc<Ext2MemoryDisk>,
+        Arc<Ext2>,
+        SuperBlock,
+        Vec<RawGroupDesc>,
     ) {
-        testkit::write_block_bitmap(disk, sb, desc, allocated_blocks)
-    }
-
-    fn write_valid_inode_bitmap(
-        disk: &Ext2MemoryDisk,
-        sb: &SuperBlock,
-        desc: &RawGroupDesc,
-        allocated_inodes: &[u32],
-    ) {
-        testkit::write_inode_bitmap(disk, sb, desc, allocated_inodes)
-    }
-
-    fn bit_is_set_lsb0(buf: &[u8], bit: usize) -> bool {
-        testkit::bit_is_set_lsb0(buf, bit)
-    }
-
-    fn prepare_namei_test_env() -> (Arc<Ext2MemoryDisk>, Arc<Ext2>, SuperBlock, Vec<RawGroupDesc>) {
         let fixture = Ext2FixtureBuilder::new(1, 256)
             .with_free_blocks(64, 64)
             .with_free_inodes(1000, 1000)
@@ -2229,17 +2159,30 @@ mod test {
 
         // Linux ext2_create intent: allocate inode then publish dir entry.
         let created = root
-            .create("alpha", InodeType::File, FilePerm::from_bits_truncate(0o644))
+            .create(
+                "alpha",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644),
+            )
             .unwrap();
-        assert_eq!(root.inner.read().find_entry("alpha").unwrap(), created.ino());
+        assert_eq!(
+            root.inner.read().find_entry("alpha").unwrap(),
+            created.ino()
+        );
         assert_eq!(ext2.read_inode_desc(created.ino()).unwrap().links_count, 1);
 
         // Linux ext2_mkdir intent: child links=2 and parent link count +1.
         let created_dir = root
             .create("sub", InodeType::Dir, FilePerm::from_bits_truncate(0o755))
             .unwrap();
-        assert_eq!(root.inner.read().find_entry("sub").unwrap(), created_dir.ino());
-        assert_eq!(ext2.read_inode_desc(created_dir.ino()).unwrap().links_count, 2);
+        assert_eq!(
+            root.inner.read().find_entry("sub").unwrap(),
+            created_dir.ino()
+        );
+        assert_eq!(
+            ext2.read_inode_desc(created_dir.ino()).unwrap().links_count,
+            2
+        );
         assert_eq!(ext2.read_inode_desc(ROOT_INO).unwrap().links_count, 3);
 
         assert_eq!(
@@ -2249,9 +2192,13 @@ mod test {
             Errno::EINVAL
         );
         assert_eq!(
-            root.create("alpha", InodeType::File, FilePerm::from_bits_truncate(0o644))
-                .unwrap_err()
-                .error(),
+            root.create(
+                "alpha",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644)
+            )
+            .unwrap_err()
+            .error(),
             Errno::EEXIST
         );
         assert_eq!(
@@ -2290,7 +2237,10 @@ mod test {
         let dir = root
             .create("dir", InodeType::Dir, FilePerm::from_bits_truncate(0o755))
             .unwrap();
-        assert_eq!(root.link(&dir, "dir_hard").unwrap_err().error(), Errno::EPERM);
+        assert_eq!(
+            root.link(&dir, "dir_hard").unwrap_err().error(),
+            Errno::EPERM
+        );
 
         // Linux ext2_unlink intent: remove name then decrement target nlink.
         root.unlink("alias").unwrap();
@@ -2314,7 +2264,10 @@ mod test {
                 &mut inode_bitmap,
             )
             .unwrap();
-        assert!(!bit_is_set_lsb0(&inode_bitmap, (old_ino - 1) as usize));
+        assert!(!testkit::bit_is_set_lsb0(
+            &inode_bitmap,
+            (old_ino - 1) as usize
+        ));
     }
 
     #[ktest]
@@ -2328,7 +2281,11 @@ mod test {
             .create("src", InodeType::File, FilePerm::from_bits_truncate(0o644))
             .unwrap();
         let target = root
-            .create("target", InodeType::File, FilePerm::from_bits_truncate(0o644))
+            .create(
+                "target",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644),
+            )
             .unwrap();
 
         let (ctime_before, mtime_before) = {
@@ -2387,7 +2344,10 @@ mod test {
                 &mut inode_bitmap,
             )
             .unwrap();
-        assert!(!bit_is_set_lsb0(&inode_bitmap, (replaced_ino - 1) as usize));
+        assert!(!testkit::bit_is_set_lsb0(
+            &inode_bitmap,
+            (replaced_ino - 1) as usize
+        ));
 
         let _ = src;
     }
@@ -2671,7 +2631,11 @@ mod test {
 
     #[ktest]
     fn dir_add_entry_grow_by_new_block_ok() {
-        let (disk, sb, descs) = prepare_disk_with_block_accounting(256, 32, 32);
+        let fixture = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(32, 32)
+            .build()
+            .unwrap();
+        let (disk, sb, descs) = (fixture.disk, fixture.sb, fixture.descs);
         let block_size = sb.block_size();
 
         let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
@@ -2686,7 +2650,7 @@ mod test {
             .saturating_add(1);
         assert!(data_bid <= last);
         // Let allocator choose one free data block; do not pre-occupy `data_bid`.
-        write_valid_block_bitmap(disk.as_ref(), &sb, &descs[0], &[]);
+        testkit::write_block_bitmap(disk.as_ref(), &sb, &descs[0], &[]);
 
         let mut first_block = vec![0u8; block_size];
         write_dir_entry(&mut first_block, 0, 2, 12, b".", 2);
@@ -2756,7 +2720,11 @@ mod test {
     #[ktest]
     fn dir_make_empty_and_empty_dir_ok() {
         clocks::init_for_ktest();
-        let (disk, sb, descs) = prepare_disk_with_block_accounting(256, 64, 64);
+        let fixture = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .build()
+            .unwrap();
+        let (disk, sb, descs) = (fixture.disk, fixture.sb, fixture.descs);
         let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
         let block_size = ext2.block_size();
 
@@ -2767,7 +2735,7 @@ mod test {
             .saturating_add(sb.itb_per_group())
             .saturating_add(1);
         assert!(data_bid <= last);
-        write_valid_block_bitmap(disk.as_ref(), &sb, &descs[0], &[data_bid]);
+        testkit::write_block_bitmap(disk.as_ref(), &sb, &descs[0], &[data_bid]);
 
         let mut raw = make_raw_inode(0o040755);
         raw.links_count = 2;
@@ -2837,7 +2805,11 @@ mod test {
     fn dir_rmdir_ok() {
         clocks::init_for_ktest();
 
-        let (disk, sb, descs) = prepare_disk_with_block_accounting(256, 64, 64);
+        let fixture = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .build()
+            .unwrap();
+        let (disk, sb, descs) = (fixture.disk, fixture.sb, fixture.descs);
         let block_size = sb.block_size();
         let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
 
@@ -2853,8 +2825,8 @@ mod test {
         let child_ino = sb.first_ino().saturating_add(1);
         assert!(child_ino <= sb.total_inodes());
 
-        write_valid_block_bitmap(disk.as_ref(), &sb, &descs[0], &[parent_bid, child_bid]);
-        write_valid_inode_bitmap(disk.as_ref(), &sb, &descs[0], &[ROOT_INO, child_ino]);
+        testkit::write_block_bitmap(disk.as_ref(), &sb, &descs[0], &[parent_bid, child_bid]);
+        testkit::write_inode_bitmap(disk.as_ref(), &sb, &descs[0], &[ROOT_INO, child_ino]);
 
         let mut parent_block = vec![0u8; block_size];
         write_dir_entry(&mut parent_block, 0, ROOT_INO, 12, b".", 2);
@@ -2904,7 +2876,10 @@ mod test {
             let mut parent_inner = parent.inner.write();
             parent_inner.rmdir("sub").unwrap();
             assert_eq!(parent_inner.desc.links_count, 2);
-            assert_eq!(parent_inner.find_entry("sub").unwrap_err().error(), Errno::ENOENT);
+            assert_eq!(
+                parent_inner.find_entry("sub").unwrap_err().error(),
+                Errno::ENOENT
+            );
         }
 
         let parent_desc = ext2.read_inode_desc(ROOT_INO).unwrap();
@@ -2920,14 +2895,21 @@ mod test {
                 &mut inode_bitmap,
             )
             .unwrap();
-        assert!(!bit_is_set_lsb0(&inode_bitmap, (child_ino - 1) as usize));
+        assert!(!testkit::bit_is_set_lsb0(
+            &inode_bitmap,
+            (child_ino - 1) as usize
+        ));
     }
 
     #[ktest]
     fn dir_rmdir_enotempty_keeps_parent_entry() {
         clocks::init_for_ktest();
 
-        let (disk, sb, descs) = prepare_disk_with_block_accounting(256, 64, 64);
+        let fixture = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .build()
+            .unwrap();
+        let (disk, sb, descs) = (fixture.disk, fixture.sb, fixture.descs);
         let block_size = sb.block_size();
         let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
 
@@ -2943,8 +2925,8 @@ mod test {
         let child_ino = sb.first_ino().saturating_add(1);
         assert!(child_ino <= sb.total_inodes());
 
-        write_valid_block_bitmap(disk.as_ref(), &sb, &descs[0], &[parent_bid, child_bid]);
-        write_valid_inode_bitmap(disk.as_ref(), &sb, &descs[0], &[ROOT_INO, child_ino]);
+        testkit::write_block_bitmap(disk.as_ref(), &sb, &descs[0], &[parent_bid, child_bid]);
+        testkit::write_inode_bitmap(disk.as_ref(), &sb, &descs[0], &[ROOT_INO, child_ino]);
 
         let mut parent_block = vec![0u8; block_size];
         write_dir_entry(&mut parent_block, 0, ROOT_INO, 12, b".", 2);
@@ -3005,7 +2987,10 @@ mod test {
                 &mut inode_bitmap,
             )
             .unwrap();
-        assert!(bit_is_set_lsb0(&inode_bitmap, (child_ino - 1) as usize));
+        assert!(testkit::bit_is_set_lsb0(
+            &inode_bitmap,
+            (child_ino - 1) as usize
+        ));
     }
 
     #[ktest]

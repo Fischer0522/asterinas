@@ -161,11 +161,10 @@ impl<'a> DirEntryIter<'a> {
 
 #[cfg(ktest)]
 mod test {
-    use core::mem::size_of;
-
     use ostd::prelude::*;
 
     use super::*;
+    use crate::fs::ext2::testkit::encode_dir_entry;
 
     fn encode_entry(
         buf: &mut [u8],
@@ -175,18 +174,7 @@ mod test {
         name: &[u8],
         file_type: u8,
     ) {
-        let header_len = size_of::<RawDirEntry>();
-        assert!(offset + rec_len as usize <= buf.len());
-        assert!(name.len() <= (rec_len as usize).saturating_sub(header_len));
-
-        buf[offset..offset + 4].copy_from_slice(&inode.to_le_bytes());
-        buf[offset + 4..offset + 6].copy_from_slice(&rec_len.to_le_bytes());
-        buf[offset + 6] = name.len() as u8;
-        buf[offset + 7] = file_type;
-
-        let name_start = offset + header_len;
-        let name_end = name_start + name.len();
-        buf[name_start..name_end].copy_from_slice(name);
+        encode_dir_entry(buf, offset, inode, rec_len, name, file_type);
     }
 
     #[ktest]

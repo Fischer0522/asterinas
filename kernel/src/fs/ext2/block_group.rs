@@ -197,47 +197,59 @@ impl BlockGroup {
         let itb_per_group = sb.itb_per_group();
         let bitmap = IdBitmap::from_buf(buf.into_boxed_slice(), capacity as u16);
 
-        let valid_block_bitmap =
-            |first_block: u32, max_bit: u32, desc: &GroupDesc, bitmap: &IdBitmap| -> Result<()> {
-                let block_bitmap = desc.block_bitmap.to_raw() as u32;
-                let inode_bitmap = desc.inode_bitmap.to_raw() as u32;
-                let inode_table = desc.inode_table.to_raw() as u32;
+        let valid_block_bitmap = |first_block: u32,
+                                  max_bit: u32,
+                                  desc: &GroupDesc,
+                                  bitmap: &IdBitmap|
+         -> Result<()> {
+            let block_bitmap = desc.block_bitmap.to_raw() as u32;
+            let inode_bitmap = desc.inode_bitmap.to_raw() as u32;
+            let inode_table = desc.inode_table.to_raw() as u32;
 
-                let mut offset = block_bitmap.wrapping_sub(first_block);
-                if block_bitmap < first_block || offset > max_bit {
-                    return_errno_with_message!(Errno::EINVAL, "block bitmap block out of group range");
-                }
-                if !bitmap.is_allocated(offset as u16) {
-                    return_errno_with_message!(Errno::EINVAL, "block bitmap block not marked in bitmap");
-                }
+            let mut offset = block_bitmap.wrapping_sub(first_block);
+            if block_bitmap < first_block || offset > max_bit {
+                return_errno_with_message!(Errno::EINVAL, "block bitmap block out of group range");
+            }
+            if !bitmap.is_allocated(offset as u16) {
+                return_errno_with_message!(
+                    Errno::EINVAL,
+                    "block bitmap block not marked in bitmap"
+                );
+            }
 
-                offset = inode_bitmap.wrapping_sub(first_block);
-                if inode_bitmap < first_block || offset > max_bit {
-                    return_errno_with_message!(Errno::EINVAL, "inode bitmap block out of group range");
-                }
-                if !bitmap.is_allocated(offset as u16) {
-                    return_errno_with_message!(Errno::EINVAL, "inode bitmap block not marked in bitmap");
-                }
+            offset = inode_bitmap.wrapping_sub(first_block);
+            if inode_bitmap < first_block || offset > max_bit {
+                return_errno_with_message!(Errno::EINVAL, "inode bitmap block out of group range");
+            }
+            if !bitmap.is_allocated(offset as u16) {
+                return_errno_with_message!(
+                    Errno::EINVAL,
+                    "inode bitmap block not marked in bitmap"
+                );
+            }
 
-                offset = inode_table.wrapping_sub(first_block);
-                if inode_table < first_block || offset > max_bit {
-                    return_errno_with_message!(Errno::EINVAL, "inode table start out of group range");
-                }
-                let table_last = offset.saturating_add(itb_per_group.saturating_sub(1));
-                if table_last > max_bit {
-                    return_errno_with_message!(Errno::EINVAL, "inode table extends beyond group");
-                }
+            offset = inode_table.wrapping_sub(first_block);
+            if inode_table < first_block || offset > max_bit {
+                return_errno_with_message!(Errno::EINVAL, "inode table start out of group range");
+            }
+            let table_last = offset.saturating_add(itb_per_group.saturating_sub(1));
+            if table_last > max_bit {
+                return_errno_with_message!(Errno::EINVAL, "inode table extends beyond group");
+            }
 
-                let end = offset.saturating_add(itb_per_group);
-                let mut bit = offset;
-                while bit < end {
-                    if !bitmap.is_allocated(bit as u16) {
-                        return_errno_with_message!(Errno::EINVAL, "inode table block not marked in bitmap");
-                    }
-                    bit += 1;
+            let end = offset.saturating_add(itb_per_group);
+            let mut bit = offset;
+            while bit < end {
+                if !bitmap.is_allocated(bit as u16) {
+                    return_errno_with_message!(
+                        Errno::EINVAL,
+                        "inode table block not marked in bitmap"
+                    );
                 }
-                Ok(())
-            };
+                bit += 1;
+            }
+            Ok(())
+        };
 
         valid_block_bitmap(first_block, max_bit, &desc, &bitmap)?;
 
@@ -277,7 +289,7 @@ mod test {
     };
 
     use super::*;
-    use crate::fs::ext2::test::{
+    use crate::fs::ext2::testkit::{
         build_group_desc_segment, make_valid_group_desc, make_valid_super_block,
     };
     #[ktest]

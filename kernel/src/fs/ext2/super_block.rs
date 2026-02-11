@@ -757,7 +757,7 @@ mod test {
     use ostd::prelude::*;
 
     use super::*;
-    use crate::fs::ext2::test::{Ext2MemoryDisk, make_valid_raw_super_block};
+    use crate::fs::ext2::testkit::{Ext2MemoryDisk, make_valid_raw_super_block};
 
     #[ktest]
     fn load_super_block_ok() {
