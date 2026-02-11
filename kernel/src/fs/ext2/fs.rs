@@ -1025,10 +1025,9 @@ mod test {
 
     use super::*;
     use crate::fs::ext2::testkit::{
-        self, ErrorBioDisk, Ext2MemoryDisk, RawInodeBuilder, build_group_desc_segment,
-        initialize_disk_for_open, make_test_ext2, make_test_ext2_for_block_alloc,
-        make_test_ext2_for_inode_alloc, make_valid_group_desc, make_valid_raw_super_block,
-        make_valid_super_block, read_raw_inode_from_disk, write_raw_inode_to_disk,
+        self, ErrorBioDisk, Ext2FixtureBuilder, Ext2MemoryDisk, RawInodeBuilder,
+        build_group_desc_segment, make_valid_group_desc, make_valid_super_block,
+        read_raw_inode_from_disk, write_raw_inode_to_disk,
     };
 
     fn make_raw_inode(mode: u16, links_count: u16, dtime: u32) -> RawInode {
@@ -1040,15 +1039,13 @@ mod test {
 
     #[ktest]
     fn sync_metadata_flushes_primary_and_backup_copies() {
-        let sb = make_valid_super_block(3);
-        let mut descs = (0..sb.block_groups_count() as usize)
-            .map(|idx| make_valid_group_desc(&sb, idx))
-            .collect::<Vec<_>>();
-        descs[0].free_blocks_count = 10;
-
-        let disk = Arc::new(Ext2MemoryDisk::new(512));
-        initialize_disk_for_open(&sb, &descs, &disk);
-        let ext2 = Ext2::open(disk.clone()).unwrap();
+        let fixture = Ext2FixtureBuilder::new(3, 512)
+            .with_free_blocks(0, 10)
+            .build()
+            .unwrap();
+        let ext2 = &fixture.ext2;
+        let disk = &fixture.disk;
+        let sb = &fixture.sb;
 
         let expected_free_inodes = {
             let mut sb_guard = ext2.super_block_write();
@@ -1112,18 +1109,21 @@ mod test {
     #[ktest]
     fn block_alloc_free_ok() {
         // Happy path: allocate a contiguous run and then free it back.
-        let ext2 = make_test_ext2_for_block_alloc(31, 31, false);
+        let f = Ext2FixtureBuilder::new(1, 128)
+            .with_free_blocks(31, 31)
+            .with_metadata_block_bitmap()
+            .build_raw()
+            .unwrap();
 
-        let before_sb_free = ext2.super_block().free_blocks_count();
-        let before_group_free = ext2.block_groups()[0].free_blocks_count();
+        let before_sb_free = f.ext2.super_block().free_blocks_count();
+        let before_group_free = f.block_groups()[0].free_blocks_count();
 
-        let range = ext2.alloc_blocks(8).unwrap();
+        let range = f.ext2.alloc_blocks(8).unwrap();
         let alloc_len = range.end - range.start;
         assert!(alloc_len >= 1 && alloc_len <= 8);
 
         {
-            let sb = ext2.super_block();
-            // Allocation must stay inside data zone and within one block group.
+            let sb = f.ext2.super_block();
             assert!(sb.data_block_valid(range.start, alloc_len));
             let start_group = (range.start - sb.first_data_block()) / sb.blocks_per_group();
             let end_group = (range.end - 1 - sb.first_data_block()) / sb.blocks_per_group();
@@ -1131,47 +1131,60 @@ mod test {
         }
 
         assert_eq!(
-            ext2.block_groups()[0].free_blocks_count(),
+            f.block_groups()[0].free_blocks_count(),
             before_group_free - alloc_len as u16
         );
         assert_eq!(
-            ext2.super_block().free_blocks_count(),
+            f.ext2.super_block().free_blocks_count(),
             before_sb_free - alloc_len
         );
 
-        ext2.free_blocks(range.start, alloc_len).unwrap();
-        assert_eq!(ext2.block_groups()[0].free_blocks_count(), before_group_free);
-        assert_eq!(ext2.super_block().free_blocks_count(), before_sb_free);
+        f.ext2.free_blocks(range.start, alloc_len).unwrap();
+        assert_eq!(f.block_groups()[0].free_blocks_count(), before_group_free);
+        assert_eq!(f.ext2.super_block().free_blocks_count(), before_sb_free);
     }
 
     #[ktest]
     fn block_alloc_free_error_cases() {
         // No-space and invalid-request checks.
-        let ext2_nospc = make_test_ext2_for_block_alloc(0, 0, false);
+        let f_nospc = Ext2FixtureBuilder::new(1, 128)
+            .with_free_blocks(0, 0)
+            .with_metadata_block_bitmap()
+            .build_raw()
+            .unwrap();
         assert_eq!(
-            ext2_nospc.alloc_blocks(1).unwrap_err().error(),
+            f_nospc.ext2.alloc_blocks(1).unwrap_err().error(),
             Errno::ENOSPC
         );
         assert_eq!(
-            ext2_nospc.alloc_blocks(0).unwrap_err().error(),
+            f_nospc.ext2.alloc_blocks(0).unwrap_err().error(),
             Errno::EINVAL
         );
 
         // Inconsistent counters/bitmap shape should surface as EIO on allocation.
-        let ext2_corrupt = make_test_ext2_for_block_alloc(1, 1, true);
+        let f_corrupt = Ext2FixtureBuilder::new(1, 128)
+            .with_free_blocks(1, 1)
+            .with_filled_block_bitmap(true)
+            .build_raw()
+            .unwrap();
         assert_eq!(
-            ext2_corrupt.alloc_blocks(1).unwrap_err().error(),
+            f_corrupt.ext2.alloc_blocks(1).unwrap_err().error(),
             Errno::EIO
         );
 
         // Free-path boundary and system-zone guards.
-        let ext2_free = make_test_ext2_for_block_alloc(31, 31, false);
-        assert!(ext2_free.free_blocks(10, 0).is_ok());
-        assert_eq!(ext2_free.free_blocks(1, 1).unwrap_err().error(), Errno::EIO);
+        let f_free = Ext2FixtureBuilder::new(1, 128)
+            .with_free_blocks(31, 31)
+            .with_metadata_block_bitmap()
+            .build_raw()
+            .unwrap();
+        assert!(f_free.ext2.free_blocks(10, 0).is_ok());
+        assert_eq!(f_free.ext2.free_blocks(1, 1).unwrap_err().error(), Errno::EIO);
 
-        let inode_bitmap_bid = ext2_free.block_groups()[0].inode_bitmap_bid().to_raw() as u32;
+        let inode_bitmap_bid = f_free.block_groups()[0].inode_bitmap_bid().to_raw() as u32;
         assert_eq!(
-            ext2_free
+            f_free
+                .ext2
                 .free_blocks(inode_bitmap_bid, 1)
                 .unwrap_err()
                 .error(),
@@ -1182,124 +1195,111 @@ mod test {
     #[ktest]
     fn inode_alloc_free_ok() {
         // Allocate one directory inode and verify bitmap/counter transitions.
-        let (ext2, sb, descs) = make_test_ext2_for_inode_alloc(16, 16, false);
+        let f = Ext2FixtureBuilder::new(1, 128)
+            .with_free_inodes(16, 16)
+            .with_reserved_inode_bitmap()
+            .build_raw()
+            .unwrap();
 
-        let before_sb_free = ext2.super_block().free_inodes_count();
-        let before_group_free = ext2.block_groups()[0].free_inodes_count();
-        let before_used_dirs = ext2.block_groups()[0].used_dirs_count();
+        let before_sb_free = f.ext2.super_block().free_inodes_count();
+        let before_group_free = f.block_groups()[0].free_inodes_count();
+        let before_used_dirs = f.block_groups()[0].used_dirs_count();
 
-        let ino = ext2.alloc_inode(ROOT_INO, InodeType::Dir).unwrap();
-        assert!(ino >= sb.first_ino() && ino <= sb.total_inodes());
+        let ino = f.ext2.alloc_inode(ROOT_INO, InodeType::Dir).unwrap();
+        assert!(ino >= f.sb.first_ino() && ino <= f.sb.total_inodes());
 
-        let bit = ((ino - 1) % sb.inodes_per_group()) as u16;
+        let bit = ((ino - 1) % f.sb.inodes_per_group()) as u16;
         let bitmap = {
-            let sb_guard = ext2.super_block();
-            ext2.block_groups()[0]
-                .load_inode_bitmap(&ext2, &sb_guard)
+            let sb_guard = f.ext2.super_block();
+            f.block_groups()[0]
+                .load_inode_bitmap(&f.ext2, &sb_guard)
                 .unwrap()
         };
         assert!(bitmap.is_allocated(bit));
 
         assert_eq!(
-            ext2.super_block().free_inodes_count(),
+            f.ext2.super_block().free_inodes_count(),
             before_sb_free - 1
         );
         assert_eq!(
-            ext2.block_groups()[0].free_inodes_count(),
+            f.block_groups()[0].free_inodes_count(),
             before_group_free - 1
         );
-        assert_eq!(ext2.block_groups()[0].used_dirs_count(), before_used_dirs + 1);
+        assert_eq!(f.block_groups()[0].used_dirs_count(), before_used_dirs + 1);
 
         // Free path uses read_inode_desc; write a valid on-disk directory inode first.
         let raw_dir = make_raw_inode(0o040755, 1, 0);
-        let disk = ext2.block_device_arc().downcast_ref::<Ext2MemoryDisk>().unwrap();
-        write_raw_inode_to_disk(&sb, &descs, ino, &raw_dir, disk);
+        write_raw_inode_to_disk(&f.sb, &f.descs, ino, &raw_dir, &f.disk);
 
-        ext2.free_inode(ino).unwrap();
-        assert_eq!(ext2.super_block().free_inodes_count(), before_sb_free);
-        assert_eq!(ext2.block_groups()[0].free_inodes_count(), before_group_free);
-        assert_eq!(ext2.block_groups()[0].used_dirs_count(), before_used_dirs);
+        f.ext2.free_inode(ino).unwrap();
+        assert_eq!(f.ext2.super_block().free_inodes_count(), before_sb_free);
+        assert_eq!(f.block_groups()[0].free_inodes_count(), before_group_free);
+        assert_eq!(f.block_groups()[0].used_dirs_count(), before_used_dirs);
     }
 
     #[ktest]
     fn inode_alloc_free_error_cases() {
         // No free inode counter means ENOSPC without bitmap scan.
-        let (ext2_nospc, sb_nospc, _descs) = make_test_ext2_for_inode_alloc(0, 0, false);
+        let f_nospc = Ext2FixtureBuilder::new(1, 128)
+            .with_free_inodes(0, 0)
+            .with_reserved_inode_bitmap()
+            .build_raw()
+            .unwrap();
         assert_eq!(
-            ext2_nospc
-                .alloc_inode(ROOT_INO, InodeType::File)
-                .unwrap_err()
-                .error(),
+            f_nospc.ext2.alloc_inode(ROOT_INO, InodeType::File)
+                .unwrap_err().error(),
             Errno::ENOSPC
         );
         assert_eq!(
-            ext2_nospc
-                .alloc_inode(sb_nospc.total_inodes() + 1, InodeType::File)
-                .unwrap_err()
-                .error(),
+            f_nospc.ext2.alloc_inode(f_nospc.sb.total_inodes() + 1, InodeType::File)
+                .unwrap_err().error(),
             Errno::EIO
         );
 
         // All inode bitmap bits set -> no allocatable inode.
-        let (ext2_full, _sb_full, _descs) = make_test_ext2_for_inode_alloc(8, 8, true);
+        let f_full = Ext2FixtureBuilder::new(1, 128)
+            .with_free_inodes(8, 8)
+            .with_filled_inode_bitmap(true)
+            .build_raw()
+            .unwrap();
         assert_eq!(
-            ext2_full
-                .alloc_inode(ROOT_INO, InodeType::File)
-                .unwrap_err()
-                .error(),
+            f_full.ext2.alloc_inode(ROOT_INO, InodeType::File)
+                .unwrap_err().error(),
             Errno::ENOSPC
         );
 
-        let (ext2_free, sb_free, descs_free) = make_test_ext2_for_inode_alloc(8, 8, false);
+        let f_free = Ext2FixtureBuilder::new(1, 128)
+            .with_free_inodes(8, 8)
+            .with_reserved_inode_bitmap()
+            .build_raw()
+            .unwrap();
         assert_eq!(
-            ext2_free
-                .free_inode(sb_free.first_ino() - 1)
-                .unwrap_err()
-                .error(),
+            f_free.ext2.free_inode(f_free.sb.first_ino() - 1)
+                .unwrap_err().error(),
             Errno::EIO
         );
 
         // Already-free inode: should return Ok and keep counters unchanged.
-        let target_ino = sb_free.first_ino();
+        let target_ino = f_free.sb.first_ino();
         let raw_file = make_raw_inode(0o100644, 1, 0);
-        let disk = ext2_free
-            .block_device_arc()
-            .downcast_ref::<Ext2MemoryDisk>()
-            .unwrap();
-        write_raw_inode_to_disk(&sb_free, &descs_free, target_ino, &raw_file, disk);
+        write_raw_inode_to_disk(&f_free.sb, &f_free.descs, target_ino, &raw_file, &f_free.disk);
 
-        let before_sb = ext2_free.super_block().free_inodes_count();
-        let before_group = ext2_free.block_groups()[0].free_inodes_count();
-        ext2_free.free_inode(target_ino).unwrap();
-        assert_eq!(ext2_free.super_block().free_inodes_count(), before_sb);
-        assert_eq!(ext2_free.block_groups()[0].free_inodes_count(), before_group);
+        let before_sb = f_free.ext2.super_block().free_inodes_count();
+        let before_group = f_free.block_groups()[0].free_inodes_count();
+        f_free.ext2.free_inode(target_ino).unwrap();
+        assert_eq!(f_free.ext2.super_block().free_inodes_count(), before_sb);
+        assert_eq!(f_free.block_groups()[0].free_inodes_count(), before_group);
     }
 
     #[ktest]
     fn create_inode_initializes_descriptor() {
-        let mut raw_sb = make_valid_raw_super_block(1);
-        raw_sb.free_inodes_count = 16;
-        let sb = SuperBlock::try_from(raw_sb).unwrap();
-
-        let mut descs = vec![make_valid_group_desc(&sb, 0)];
-        descs[0].free_inodes_count = 16;
-
-        let disk = Arc::new(Ext2MemoryDisk::new(128));
-        initialize_disk_for_open(&sb, &descs, &disk);
-
-        let mut inode_bitmap = [0u8; BLOCK_SIZE];
-        for bit in 0..(sb.first_ino() as usize).saturating_sub(1) {
-            testkit::set_bit_lsb0(&mut inode_bitmap, bit);
-        }
-        disk.segment()
-            .write_bytes(
-                Bid::new(descs[0].inode_bitmap as u64).to_offset(),
-                &inode_bitmap,
-            )
+        let fixture = Ext2FixtureBuilder::new(1, 128)
+            .with_free_inodes(16, 16)
+            .with_reserved_inode_bitmap()
+            .build()
             .unwrap();
 
-        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
-        let inode = ext2
+        let inode = fixture.ext2
             .create_inode(
                 ROOT_INO,
                 InodeType::Dir,
@@ -1308,7 +1308,7 @@ mod test {
             .unwrap();
         let ino = inode.ino();
 
-        let raw = read_raw_inode_from_disk(&sb, &descs, ino, disk.as_ref());
+        let raw = read_raw_inode_from_disk(&fixture.sb, &fixture.descs, ino, fixture.disk.as_ref());
         assert_eq!(raw.mode, 0o040755);
         assert_eq!(raw.links_count, 2);
         assert_eq!(raw.size_lo, 0);
@@ -1316,7 +1316,7 @@ mod test {
         assert_eq!(raw.block, [0; 15]);
 
         assert_eq!(
-            ext2.create_inode(
+            fixture.ext2.create_inode(
                 ROOT_INO,
                 InodeType::Unknown,
                 crate::fs::ext2::inode::FilePerm::from_bits_truncate(0o644)
@@ -1352,8 +1352,6 @@ mod test {
         descs[0].block_bitmap = sb.group_first_block_no(0).saturating_sub(1);
 
         let group_descs = build_group_desc_segment(&sb, &descs);
-        let ext2 = make_test_ext2(sb, Arc::new(Ext2MemoryDisk::new(64)));
-
         let err = Ext2::check_group_desc_table(&sb, &group_descs).unwrap_err();
         assert_eq!(err.error(), Errno::EINVAL);
     }
@@ -1372,8 +1370,6 @@ mod test {
         assert!(descs[0].inode_table >= first);
 
         let group_descs = build_group_desc_segment(&sb, &descs);
-        let ext2 = make_test_ext2(sb, Arc::new(Ext2MemoryDisk::new(64)));
-
         let err = Ext2::check_group_desc_table(&sb, &group_descs).unwrap_err();
         assert_eq!(err.error(), Errno::EINVAL);
     }
@@ -1415,197 +1411,156 @@ mod test {
         let disk = Ext2MemoryDisk::new(64);
         disk.write_group_desc_table(&sb, &descs);
 
-        let ext2 = make_test_ext2(sb, Arc::new(disk));
-        let disk = ext2.block_device_arc().clone();
-        let err = Ext2::load_group_desc_table(disk.as_ref(), &sb).unwrap_err();
+        let err = Ext2::load_group_desc_table(&disk, &sb).unwrap_err();
         assert_eq!(err.error(), Errno::EINVAL);
     }
 
     #[ktest]
     fn read_inode_desc_ok() {
-        let sb = make_valid_super_block(2);
-        let descs = (0..sb.block_groups_count() as usize)
-            .map(|idx| make_valid_group_desc(&sb, idx))
-            .collect::<Vec<_>>();
-        let group_descs = build_group_desc_segment(&sb, &descs);
+        let f = Ext2FixtureBuilder::new(2, 128)
+            .build_raw()
+            .unwrap();
 
         let raw = make_raw_inode(0o040755, 2, 0);
-        let disk = Ext2MemoryDisk::new(128);
-        write_raw_inode_to_disk(&sb, &descs, ROOT_INO, &raw, &disk);
+        write_raw_inode_to_disk(&f.sb, &f.descs, ROOT_INO, &raw, &f.disk);
 
-        let mut ext2 = make_test_ext2(sb, Arc::new(disk));
-        ext2.set_block_groups(Ext2::load_block_groups(&sb, &group_descs).unwrap());
-
-        let bid = ext2.inode_table_block(1, 3).unwrap();
-        let base = Bid::new(descs[1].inode_table as u64);
+        let bid = f.ext2.inode_table_block(1, 3).unwrap();
+        let base = Bid::new(f.descs[1].inode_table as u64);
         assert_eq!(bid, base + 3);
 
-        let desc = ext2.read_inode_desc(ROOT_INO).unwrap();
+        let desc = f.ext2.read_inode_desc(ROOT_INO).unwrap();
         assert_eq!(desc.type_(), InodeType::Dir);
     }
 
     #[ktest]
     fn read_inode_desc_error() {
-        let sb = make_valid_super_block(2);
-        let descs = (0..sb.block_groups_count() as usize)
-            .map(|idx| make_valid_group_desc(&sb, idx))
-            .collect::<Vec<_>>();
-        let group_descs = build_group_desc_segment(&sb, &descs);
-
-        let mut ext2 = make_test_ext2(sb, Arc::new(Ext2MemoryDisk::new(128)));
-        ext2.set_block_groups(Ext2::load_block_groups(&sb, &group_descs).unwrap());
-
-        let group_err = ext2.inode_table_block(2, 0).unwrap_err();
+        // Out-of-range group index.
+        let f = Ext2FixtureBuilder::new(2, 128).build_raw().unwrap();
+        let group_err = f.ext2.inode_table_block(2, 0).unwrap_err();
         assert_eq!(group_err.error(), Errno::EIO);
 
-        let invalid_low = ext2.read_inode_desc(1).unwrap_err();
+        // Invalid inode numbers (too low / too high).
+        let invalid_low = f.ext2.read_inode_desc(1).unwrap_err();
         assert_eq!(invalid_low.error(), Errno::EINVAL);
-
-        let invalid_high = ext2
-            .read_inode_desc(sb.total_inodes().saturating_add(1))
+        let invalid_high = f.ext2
+            .read_inode_desc(f.sb.total_inodes().saturating_add(1))
             .unwrap_err();
         assert_eq!(invalid_high.error(), Errno::EINVAL);
 
+        // I/O error from block device.
         let io_disk = ErrorBioDisk::new(BioStatus::IoError, 128 * BLOCK_SIZE / SECTOR_SIZE);
-        let mut ext2_io = make_test_ext2(sb, Arc::new(io_disk));
-        ext2_io.set_block_groups(Ext2::load_block_groups(&sb, &group_descs).unwrap());
-        let io_err = ext2_io.read_inode_desc(ROOT_INO).unwrap_err();
+        let f_io = Ext2FixtureBuilder::new(2, 128)
+            .build_raw_with_device(Arc::new(io_disk))
+            .unwrap();
+        let io_err = f_io.ext2.read_inode_desc(ROOT_INO).unwrap_err();
         assert_eq!(io_err.error(), Errno::EIO);
 
-        let ino = sb.first_ino();
+        // Deleted inode (dtime != 0, mode == 0) → ESTALE.
+        let f_parse = Ext2FixtureBuilder::new(2, 128).build_raw().unwrap();
+        let ino = f_parse.sb.first_ino();
         let raw = make_raw_inode(0, 0, 1);
-        let parse_disk = Ext2MemoryDisk::new(128);
-        write_raw_inode_to_disk(&sb, &descs, ino, &raw, &parse_disk);
-
-        let mut ext2_parse = make_test_ext2(sb, Arc::new(parse_disk));
-        ext2_parse.set_block_groups(Ext2::load_block_groups(&sb, &group_descs).unwrap());
-        let parse_err = ext2_parse.read_inode_desc(ino).unwrap_err();
+        write_raw_inode_to_disk(&f_parse.sb, &f_parse.descs, ino, &raw, &f_parse.disk);
+        let parse_err = f_parse.ext2.read_inode_desc(ino).unwrap_err();
         assert_eq!(parse_err.error(), Errno::ESTALE);
     }
 
     #[ktest]
     fn read_inode_ok() {
-        let sb = make_valid_super_block(2);
-        let descs = (0..sb.block_groups_count() as usize)
-            .map(|idx| make_valid_group_desc(&sb, idx))
-            .collect::<Vec<_>>();
+        let f = Ext2FixtureBuilder::new(2, 128).build().unwrap();
 
         let raw = make_raw_inode(0o040755, 2, 0);
-        let disk = Ext2MemoryDisk::new(128);
-        initialize_disk_for_open(&sb, &descs, &disk);
-        write_raw_inode_to_disk(&sb, &descs, ROOT_INO, &raw, &disk);
+        write_raw_inode_to_disk(&f.sb, &f.descs, ROOT_INO, &raw, &f.disk);
 
-        let ext2 = Ext2::open(Arc::new(disk)).unwrap();
-
-        assert!(ext2.read_inode(ROOT_INO).is_ok());
+        assert!(f.ext2.read_inode(ROOT_INO).is_ok());
     }
 
     #[ktest]
     fn read_inode_error() {
-        let sb = make_valid_super_block(2);
-        let descs = (0..sb.block_groups_count() as usize)
-            .map(|idx| make_valid_group_desc(&sb, idx))
-            .collect::<Vec<_>>();
-
-        let invalid_disk = Ext2MemoryDisk::new(128);
-        initialize_disk_for_open(&sb, &descs, &invalid_disk);
-        let ext2_invalid = Ext2::open(Arc::new(invalid_disk)).unwrap();
-        let invalid_err = ext2_invalid.read_inode(1).unwrap_err();
+        // Invalid inode number (below first_ino, not ROOT_INO).
+        let f_invalid = Ext2FixtureBuilder::new(2, 128).build().unwrap();
+        let invalid_err = f_invalid.ext2.read_inode(1).unwrap_err();
         assert_eq!(invalid_err.error(), Errno::EINVAL);
 
+        // Deleted inode (dtime != 0, mode == 0) → ESTALE.
+        let f_deleted = Ext2FixtureBuilder::new(2, 128).build().unwrap();
+        let deleted_ino = f_deleted.sb.first_ino();
         let raw_deleted = make_raw_inode(0, 0, 1);
-        let deleted_ino = sb.first_ino();
-        let deleted_disk = Ext2MemoryDisk::new(128);
-        initialize_disk_for_open(&sb, &descs, &deleted_disk);
-        write_raw_inode_to_disk(&sb, &descs, deleted_ino, &raw_deleted, &deleted_disk);
-
-        let ext2_deleted = Ext2::open(Arc::new(deleted_disk)).unwrap();
-        let deleted_err = ext2_deleted.read_inode(deleted_ino).unwrap_err();
+        write_raw_inode_to_disk(
+            &f_deleted.sb, &f_deleted.descs, deleted_ino,
+            &raw_deleted, &f_deleted.disk,
+        );
+        let deleted_err = f_deleted.ext2.read_inode(deleted_ino).unwrap_err();
         assert_eq!(deleted_err.error(), Errno::ESTALE);
 
+        // Raw ext2 without Arc (self_ref is Weak::new()) → EIO.
+        let f_unwired = Ext2FixtureBuilder::new(2, 128).build_raw().unwrap();
         let raw_ok = make_raw_inode(0o040755, 2, 0);
-        let unwired_disk = Ext2MemoryDisk::new(128);
-        initialize_disk_for_open(&sb, &descs, &unwired_disk);
-        write_raw_inode_to_disk(&sb, &descs, ROOT_INO, &raw_ok, &unwired_disk);
-
-        let mut ext2_unwired = make_test_ext2(sb, Arc::new(unwired_disk));
-        let group_descs = build_group_desc_segment(&sb, &descs);
-        ext2_unwired.set_block_groups(Ext2::load_block_groups(&sb, &group_descs).unwrap());
-        let unwired_err = ext2_unwired.read_inode(ROOT_INO).unwrap_err();
+        write_raw_inode_to_disk(
+            &f_unwired.sb, &f_unwired.descs, ROOT_INO,
+            &raw_ok, &f_unwired.disk,
+        );
+        let unwired_err = f_unwired.ext2.read_inode(ROOT_INO).unwrap_err();
         assert_eq!(unwired_err.error(), Errno::EIO);
     }
 
     #[ktest]
     fn load_block_bitmap_ok() {
-        let sb = make_valid_super_block(2);
-        let descs = (0..sb.block_groups_count() as usize)
-            .map(|idx| make_valid_group_desc(&sb, idx))
-            .collect::<Vec<_>>();
-        let group_descs = build_group_desc_segment(&sb, &descs);
-        let group = BlockGroup::load(&group_descs, 0).unwrap();
-
-        let mut bitmap_block = [0u8; BLOCK_SIZE];
-        let itb = sb.itb_per_group() as usize;
-        for bit in 0..(2 + itb) {
-            testkit::set_bit_lsb0(&mut bitmap_block, bit);
-        }
-
-        let disk = Ext2MemoryDisk::new(128);
-        disk.segment()
-            .write_bytes(group.block_bitmap_bid().to_offset(), &bitmap_block)
+        let f = Ext2FixtureBuilder::new(2, 128)
+            .with_metadata_block_bitmap()
+            .build_raw()
             .unwrap();
-        let ext2 = make_test_ext2(sb, Arc::new(disk));
+        let group = &f.block_groups()[0];
+        let sb_guard = f.ext2.super_block();
+        let first = sb_guard.group_first_block_no(0);
 
-        let bitmap = group.load_block_bitmap(&ext2, &sb).unwrap();
-        assert!(bitmap.is_allocated(0));
-        assert!(bitmap.is_allocated(1));
-        assert!(bitmap.is_allocated((itb + 1) as u16));
+        let bitmap = group.load_block_bitmap(&f.ext2, &sb_guard).unwrap();
+        // Block bitmap, inode bitmap, and inode table blocks must be marked.
+        let bb = (f.descs[0].block_bitmap - first) as u16;
+        let ib = (f.descs[0].inode_bitmap - first) as u16;
+        let it = (f.descs[0].inode_table - first) as u16;
+        assert!(bitmap.is_allocated(bb));
+        assert!(bitmap.is_allocated(ib));
+        assert!(bitmap.is_allocated(it));
     }
 
     #[ktest]
     fn load_block_bitmap_bad_inode_table_bits() {
-        let sb = make_valid_super_block(2);
-        let descs = (0..sb.block_groups_count() as usize)
-            .map(|idx| make_valid_group_desc(&sb, idx))
-            .collect::<Vec<_>>();
-        let group_descs = build_group_desc_segment(&sb, &descs);
-        let group = BlockGroup::load(&group_descs, 0).unwrap();
+        let f = Ext2FixtureBuilder::new(2, 128).build_raw().unwrap();
+        let group = &f.block_groups()[0];
+        let first = f.sb.group_first_block_no(0);
 
+        // Write a bitmap with only block_bitmap and inode_bitmap bits set,
+        // deliberately missing inode table bits.
         let mut bitmap_block = [0u8; BLOCK_SIZE];
-        testkit::set_bit_lsb0(&mut bitmap_block, 0);
-        testkit::set_bit_lsb0(&mut bitmap_block, 1);
-
-        let disk = Ext2MemoryDisk::new(128);
-        disk.segment()
+        testkit::set_bit_lsb0(&mut bitmap_block, (f.descs[0].block_bitmap - first) as usize);
+        testkit::set_bit_lsb0(&mut bitmap_block, (f.descs[0].inode_bitmap - first) as usize);
+        f.disk
+            .segment()
             .write_bytes(group.block_bitmap_bid().to_offset(), &bitmap_block)
             .unwrap();
-        let ext2 = make_test_ext2(sb, Arc::new(disk));
 
-        let err = group.load_block_bitmap(&ext2, &sb).unwrap_err();
+        let sb_guard = f.ext2.super_block();
+        let err = group.load_block_bitmap(&f.ext2, &sb_guard).unwrap_err();
         assert_eq!(err.error(), Errno::EINVAL);
     }
 
     #[ktest]
     fn load_inode_bitmap_ok() {
-        let sb = make_valid_super_block(2);
-        let descs = (0..sb.block_groups_count() as usize)
-            .map(|idx| make_valid_group_desc(&sb, idx))
-            .collect::<Vec<_>>();
-        let group_descs = build_group_desc_segment(&sb, &descs);
-        let group = BlockGroup::load(&group_descs, 0).unwrap();
+        let f = Ext2FixtureBuilder::new(2, 128).build_raw().unwrap();
+        let group = &f.block_groups()[0];
 
+        // Write custom inode bitmap with bits 0 and 8 set.
         let mut bitmap_block = [0u8; BLOCK_SIZE];
         testkit::set_bit_lsb0(&mut bitmap_block, 0);
         testkit::set_bit_lsb0(&mut bitmap_block, 8);
-
-        let disk = Ext2MemoryDisk::new(128);
-        disk.segment()
+        f.disk
+            .segment()
             .write_bytes(group.inode_bitmap_bid().to_offset(), &bitmap_block)
             .unwrap();
-        let ext2 = make_test_ext2(sb, Arc::new(disk));
 
-        let bitmap = group.load_inode_bitmap(&ext2, &sb).unwrap();
-        assert_eq!(bitmap.len(), sb.inodes_per_group() as u16);
+        let sb_guard = f.ext2.super_block();
+        let bitmap = group.load_inode_bitmap(&f.ext2, &sb_guard).unwrap();
+        assert_eq!(bitmap.len(), f.sb.inodes_per_group() as u16);
         assert!(bitmap.is_allocated(0));
         assert!(bitmap.is_allocated(8));
         assert!(!bitmap.is_allocated(1));

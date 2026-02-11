@@ -428,16 +428,6 @@ pub(super) fn write_indirect_ptr(disk: &Ext2MemoryDisk, bid: u32, index: u32, ne
     disk.segment().write_val(offset, &next).unwrap();
 }
 
-pub(super) fn initialize_disk_for_open(
-    sb: &SuperBlock,
-    descs: &[RawGroupDesc],
-    disk: &Ext2MemoryDisk,
-) {
-    let raw_sb = RawSuperBlock::from(sb);
-    disk.write_super_block(&raw_sb);
-    disk.write_group_desc_table(sb, descs);
-}
-
 pub(super) fn write_raw_inode_to_disk(
     sb: &SuperBlock,
     descs: &[RawGroupDesc],
@@ -737,6 +727,32 @@ impl Ext2Fixture {
     }
 }
 
+/// A test fixture that bypasses `Ext2::open` for unit-testing internal methods
+/// like `check_group_desc_table`, `load_block_groups`, `inode_table_block`,
+/// `read_inode_desc`, bitmap loading, and block/inode allocation.
+pub(super) struct RawExt2Fixture {
+    pub disk: Arc<Ext2MemoryDisk>,
+    pub ext2: Ext2,
+    pub sb: SuperBlock,
+    pub descs: Vec<RawGroupDesc>,
+}
+
+impl RawExt2Fixture {
+    pub(super) fn block_groups(&self) -> &[super::block_group::BlockGroup] {
+        self.ext2.block_groups()
+    }
+
+    pub(super) fn super_block_write(
+        &self,
+    ) -> ostd::sync::RwMutexWriteGuard<'_, super::utils::Dirty<SuperBlock>> {
+        self.ext2.super_block_write()
+    }
+
+    pub(super) fn block_device_arc(&self) -> &Arc<dyn BlockDevice> {
+        self.ext2.block_device_arc()
+    }
+}
+
 pub(super) struct Ext2FixtureBuilder {
     groups: u32,
     nblocks: usize,
@@ -748,6 +764,8 @@ pub(super) struct Ext2FixtureBuilder {
     init_root: bool,
     filled_block_bitmap: bool,
     filled_inode_bitmap: bool,
+    init_metadata_block_bitmap: bool,
+    init_reserved_inode_bitmap: bool,
 }
 
 impl Ext2FixtureBuilder {
@@ -763,6 +781,8 @@ impl Ext2FixtureBuilder {
             init_root: false,
             filled_block_bitmap: false,
             filled_inode_bitmap: false,
+            init_metadata_block_bitmap: false,
+            init_reserved_inode_bitmap: false,
         }
     }
 
@@ -798,7 +818,24 @@ impl Ext2FixtureBuilder {
         self
     }
 
-    pub(super) fn build(self) -> Result<Ext2Fixture> {
+    /// Writes a minimal block bitmap marking only metadata blocks
+    /// (block bitmap, inode bitmap, inode table).
+    pub(super) fn with_metadata_block_bitmap(mut self) -> Self {
+        self.init_metadata_block_bitmap = true;
+        self
+    }
+
+    /// Writes reserved inode bits [0, first_ino) into the inode bitmap.
+    pub(super) fn with_reserved_inode_bitmap(mut self) -> Self {
+        self.init_reserved_inode_bitmap = true;
+        self
+    }
+
+    /// Common setup: creates raw superblock, descriptors, and disk.
+    fn prepare(
+        &self,
+    ) -> Result<(RawSuperBlock, SuperBlock, Vec<RawGroupDesc>, Arc<Ext2MemoryDisk>, Group0Layout)>
+    {
         let mut raw_sb = make_valid_raw_super_block(self.groups);
         if let Some(sb_free_blocks) = self.sb_free_blocks {
             raw_sb.free_blocks_count = sb_free_blocks;
@@ -819,25 +856,55 @@ impl Ext2FixtureBuilder {
         descs[0].inode_bitmap = layout.inode_bitmap;
         descs[0].inode_table = layout.inode_table;
 
-        if let Some(group0_free_blocks) = self.group0_free_blocks {
-            descs[0].free_blocks_count = group0_free_blocks;
+        if let Some(v) = self.group0_free_blocks {
+            descs[0].free_blocks_count = v;
         }
-        if let Some(group0_free_inodes) = self.group0_free_inodes {
-            descs[0].free_inodes_count = group0_free_inodes;
+        if let Some(v) = self.group0_free_inodes {
+            descs[0].free_inodes_count = v;
         }
-        if let Some(group0_used_dirs) = self.group0_used_dirs {
-            descs[0].used_dirs_count = group0_used_dirs;
+        if let Some(v) = self.group0_used_dirs {
+            descs[0].used_dirs_count = v;
         }
 
         let disk = Arc::new(Ext2MemoryDisk::new(self.nblocks));
         disk.write_super_block(&raw_sb);
         disk.write_group_desc_table(&sb, &descs);
 
+        Ok((raw_sb, sb, descs, disk, layout))
+    }
+
+    /// Writes bitmaps to disk according to builder configuration.
+    fn write_bitmaps(
+        &self,
+        sb: &SuperBlock,
+        descs: &[RawGroupDesc],
+        disk: &Ext2MemoryDisk,
+        layout: &Group0Layout,
+    ) {
         let root_bid = layout.first_data.saturating_add(1);
+
         if self.init_root {
-            write_block_bitmap(disk.as_ref(), &sb, &descs[0], &[root_bid]);
-            write_inode_bitmap(disk.as_ref(), &sb, &descs[0], &[ROOT_INO]);
-            write_simple_root_dir_block(disk.as_ref(), root_bid, sb.block_size());
+            write_block_bitmap(disk, sb, &descs[0], &[root_bid]);
+            write_inode_bitmap(disk, sb, &descs[0], &[ROOT_INO]);
+            write_simple_root_dir_block(disk, root_bid, sb.block_size());
+        }
+
+        if self.init_metadata_block_bitmap {
+            let first = sb.group_first_block_no(0);
+            let mut bitmap_block = [0u8; BLOCK_SIZE];
+            // Mark actual metadata block positions relative to group start.
+            set_bit_lsb0(&mut bitmap_block, (descs[0].block_bitmap - first) as usize);
+            set_bit_lsb0(&mut bitmap_block, (descs[0].inode_bitmap - first) as usize);
+            let itb = sb.itb_per_group();
+            for i in 0..itb {
+                set_bit_lsb0(&mut bitmap_block, (descs[0].inode_table + i - first) as usize);
+            }
+            disk.segment()
+                .write_bytes(
+                    Bid::new(descs[0].block_bitmap as u64).to_offset(),
+                    &bitmap_block,
+                )
+                .unwrap();
         }
 
         if self.filled_block_bitmap {
@@ -856,6 +923,16 @@ impl Ext2FixtureBuilder {
                 .unwrap();
         }
 
+        if self.init_reserved_inode_bitmap {
+            let mut bitmap = [0u8; BLOCK_SIZE];
+            for bit in 0..(sb.first_ino() as usize).saturating_sub(1) {
+                set_bit_lsb0(&mut bitmap, bit);
+            }
+            disk.segment()
+                .write_bytes(Bid::new(descs[0].inode_bitmap as u64).to_offset(), &bitmap)
+                .unwrap();
+        }
+
         if self.filled_inode_bitmap {
             let mut bitmap = [0u8; BLOCK_SIZE];
             for bit in 0..(sb.inodes_per_group() as usize) {
@@ -865,9 +942,16 @@ impl Ext2FixtureBuilder {
                 .write_bytes(Bid::new(descs[0].inode_bitmap as u64).to_offset(), &bitmap)
                 .unwrap();
         }
+    }
+
+    /// Builds a fixture that goes through `Ext2::open`.
+    pub(super) fn build(self) -> Result<Ext2Fixture> {
+        let (raw_sb, sb, descs, disk, layout) = self.prepare()?;
+        self.write_bitmaps(&sb, &descs, &disk, &layout);
 
         let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>)?;
 
+        let root_bid = layout.first_data.saturating_add(1);
         if self.init_root {
             let root_raw = make_root_raw_inode(root_bid, sb.block_size());
             ext2.write_inode_desc(ROOT_INO, &root_raw)?;
@@ -881,112 +965,62 @@ impl Ext2FixtureBuilder {
             root_bid,
         })
     }
+
+    /// Builds a raw fixture that bypasses `Ext2::open` for internal method testing.
+    pub(super) fn build_raw(self) -> Result<RawExt2Fixture> {
+        let (_raw_sb, sb, descs, disk, layout) = self.prepare()?;
+        self.write_bitmaps(&sb, &descs, &disk, &layout);
+
+        let group_descs = build_group_desc_segment(&sb, &descs);
+        let mut ext2 = Ext2::new_test(sb, disk.clone() as Arc<dyn BlockDevice>);
+        let groups = {
+            let guard = ext2.super_block();
+            Ext2::load_block_groups(&guard, &group_descs).unwrap()
+        };
+        ext2.set_block_groups(groups);
+
+        let sb = {
+            let g = ext2.super_block();
+            **g
+        };
+
+        Ok(RawExt2Fixture {
+            disk,
+            ext2,
+            sb,
+            descs,
+        })
+    }
+
+    /// Builds a raw fixture with a custom block device replacing the memory disk.
+    /// The memory disk is still used to prepare superblock/descriptors, but the
+    /// `Ext2` instance uses the provided device for all I/O.
+    pub(super) fn build_raw_with_device(
+        self,
+        device: Arc<dyn BlockDevice>,
+    ) -> Result<RawExt2Fixture> {
+        let (_raw_sb, sb, descs, disk, layout) = self.prepare()?;
+        self.write_bitmaps(&sb, &descs, &disk, &layout);
+
+        let group_descs = build_group_desc_segment(&sb, &descs);
+        let mut ext2 = Ext2::new_test(sb, device);
+        let groups = {
+            let guard = ext2.super_block();
+            Ext2::load_block_groups(&guard, &group_descs).unwrap()
+        };
+        ext2.set_block_groups(groups);
+
+        let sb = {
+            let g = ext2.super_block();
+            **g
+        };
+
+        Ok(RawExt2Fixture {
+            disk,
+            ext2,
+            sb,
+            descs,
+        })
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Direct Ext2 construction helpers (bypass Ext2::open)
-// ---------------------------------------------------------------------------
-
-/// Constructs an `Ext2` directly (bypassing `Ext2::open`) for unit tests that
-/// need to test internal methods like `check_group_desc_table`, `load_block_groups`,
-/// `inode_table_block`, `read_inode_desc`, etc.
-pub(super) fn make_test_ext2(sb: SuperBlock, block_device: Arc<dyn BlockDevice>) -> Ext2 {
-    Ext2::new_test(sb, block_device)
-}
-
-/// Builds a single-group `Ext2` (bypassing `open`) with controllable free-inode
-/// counters and optional fully-filled inode bitmap.
-pub(super) fn make_test_ext2_for_inode_alloc(
-    sb_free_inodes: u32,
-    group_free_inodes: u16,
-    fill_all_inode_bits: bool,
-) -> (Ext2, SuperBlock, Vec<RawGroupDesc>) {
-    let mut sb = make_valid_super_block(1);
-    for _ in 0..sb_free_inodes {
-        sb.inc_free_inodes();
-    }
-
-    let mut descs = vec![make_valid_group_desc(&sb, 0)];
-    descs[0].free_inodes_count = group_free_inodes;
-    let group_descs = build_group_desc_segment(&sb, &descs);
-
-    let disk = Arc::new(Ext2MemoryDisk::new(128));
-    initialize_disk_for_open(&sb, &descs, &disk);
-
-    let mut inode_bitmap = [0u8; BLOCK_SIZE];
-    let first_ino = sb.first_ino() as usize;
-    for bit in 0..first_ino.saturating_sub(1) {
-        set_bit_lsb0(&mut inode_bitmap, bit);
-    }
-    if fill_all_inode_bits {
-        for bit in 0..(sb.inodes_per_group() as usize) {
-            set_bit_lsb0(&mut inode_bitmap, bit);
-        }
-    }
-
-    disk.segment()
-        .write_bytes(
-            Bid::new(descs[0].inode_bitmap as u64).to_offset(),
-            &inode_bitmap,
-        )
-        .unwrap();
-
-    let mut ext2 = make_test_ext2(sb, disk as Arc<dyn BlockDevice>);
-    let groups = {
-        let guard = ext2.super_block();
-        Ext2::load_block_groups(&guard, &group_descs).unwrap()
-    };
-    ext2.set_block_groups(groups);
-
-    let sb = { let g = ext2.super_block(); **g };
-    (ext2, sb, descs)
-}
-
-/// Builds a single-group `Ext2` (bypassing `open`) with controllable free-block
-/// counters and optional fully-filled block bitmap.
-pub(super) fn make_test_ext2_for_block_alloc(
-    sb_free_blocks: u32,
-    group_free_blocks: u16,
-    fill_all_data_bits: bool,
-) -> Ext2 {
-    let mut raw_sb = make_valid_raw_super_block(1);
-    raw_sb.free_blocks_count = sb_free_blocks;
-    let sb = SuperBlock::try_from(raw_sb).unwrap();
-
-    let mut descs = vec![make_valid_group_desc(&sb, 0)];
-    descs[0].free_blocks_count = group_free_blocks;
-    let group_descs = build_group_desc_segment(&sb, &descs);
-
-    let disk = Arc::new(Ext2MemoryDisk::new(128));
-    initialize_disk_for_open(&sb, &descs, &disk);
-
-    let mut bitmap_block = [0u8; BLOCK_SIZE];
-    let itb = sb.itb_per_group() as usize;
-    for bit in 0..(2 + itb) {
-        set_bit_lsb0(&mut bitmap_block, bit);
-    }
-
-    if fill_all_data_bits {
-        let first = sb.group_first_block_no(0);
-        let last = sb.group_last_block_no(0);
-        let group_size = (last - first + 1) as usize;
-        for bit in 0..group_size {
-            set_bit_lsb0(&mut bitmap_block, bit);
-        }
-    }
-
-    disk.segment()
-        .write_bytes(
-            Bid::new(descs[0].block_bitmap as u64).to_offset(),
-            &bitmap_block,
-        )
-        .unwrap();
-
-    let mut ext2 = make_test_ext2(sb, disk as Arc<dyn BlockDevice>);
-    let groups = {
-        let guard = ext2.super_block();
-        Ext2::load_block_groups(&guard, &group_descs).unwrap()
-    };
-    ext2.set_block_groups(groups);
-    ext2
-}
