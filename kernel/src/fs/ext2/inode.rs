@@ -1177,7 +1177,552 @@ impl InodeInner {
     }
 }
 
-impl Inode {}
+/// Acquires read locks on two inodes in ascending ino order to prevent deadlock.
+/// Returns guards in `(a, b)` order regardless of which ino is smaller.
+fn read_lock_two_inodes<'a>(
+    a: &'a Inode,
+    b: &'a Inode,
+) -> (RwMutexReadGuard<'a, InodeInner>, RwMutexReadGuard<'a, InodeInner>) {
+    if a.ino <= b.ino {
+        let ga = a.inner.read();
+        let gb = b.inner.read();
+        (ga, gb)
+    } else {
+        let gb = b.inner.read();
+        let ga = a.inner.read();
+        (ga, gb)
+    }
+}
+
+/// Acquires write locks on two inodes in ascending ino order to prevent deadlock.
+/// Returns guards in `(a, b)` order regardless of which ino is smaller.
+fn write_lock_two_inodes<'a>(
+    a: &'a Inode,
+    b: &'a Inode,
+) -> (RwMutexWriteGuard<'a, InodeInner>, RwMutexWriteGuard<'a, InodeInner>) {
+    if a.ino <= b.ino {
+        let ga = a.inner.write();
+        let gb = b.inner.write();
+        (ga, gb)
+    } else {
+        let gb = b.inner.write();
+        let ga = a.inner.write();
+        (ga, gb)
+    }
+}
+
+/// Acquires write locks on an arbitrary number of inodes in ascending ino order.
+/// Returns guards in the same order as the input slice.
+fn write_lock_multiple_inodes<'a>(inodes: &[&'a Inode]) -> Vec<RwMutexWriteGuard<'a, InodeInner>> {
+    use alloc::rc::Rc;
+    use core::cell::RefCell;
+
+    // Build (original_index, ino, inode_ref) and sort by ino.
+    let mut indexed: Vec<(usize, u32, &'a Inode)> = inodes
+        .iter()
+        .enumerate()
+        .map(|(i, inode)| (i, inode.ino, *inode))
+        .collect();
+    indexed.sort_by_key(|&(_, ino, _)| ino);
+
+    // Acquire locks in sorted (ascending ino) order, wrapping in Rc so we can
+    // later move them into the output vec in original order.
+    let mut slots: Vec<Option<Rc<RefCell<Option<RwMutexWriteGuard<'a, InodeInner>>>>>> =
+        vec![None; inodes.len()];
+    for &(orig_idx, _, inode) in &indexed {
+        let guard = inode.inner.write();
+        slots[orig_idx] = Some(Rc::new(RefCell::new(Some(guard))));
+    }
+
+    // Extract guards in original input order.
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.expect("all slots filled")
+                .borrow_mut()
+                .take()
+                .expect("guard not yet taken")
+        })
+        .collect()
+}
+
+impl Inode {
+    /// Converts an `InodeType` to the corresponding `DirEntryFileType`.
+    fn inode_type_to_dir_file_type(type_: InodeType) -> DirEntryFileType {
+        match type_ {
+            InodeType::File => DirEntryFileType::File,
+            InodeType::Dir => DirEntryFileType::Dir,
+            InodeType::CharDevice => DirEntryFileType::Char,
+            InodeType::BlockDevice => DirEntryFileType::Block,
+            InodeType::NamedPipe => DirEntryFileType::Fifo,
+            InodeType::Socket => DirEntryFileType::Socket,
+            InodeType::SymLink => DirEntryFileType::Symlink,
+            _ => DirEntryFileType::Unknown,
+        }
+    }
+
+    /// Creates a child inode and directory entry under this directory.
+    ///
+    /// Linux: /root/linux/fs/ext2/namei.c:102 (ext2_create)
+    /// Linux: /root/linux/fs/ext2/namei.c:228 (ext2_mkdir)
+    pub(super) fn create(
+        &self,
+        name: &str,
+        type_: InodeType,
+        perm: FilePerm,
+    ) -> Result<Arc<Inode>> {
+        // SPEC: self must be a directory.
+        if self.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty()
+            || name_bytes.len() > u8::MAX as usize
+            || name_bytes == b"."
+            || name_bytes == b".."
+        {
+            ostd::early_println!("ext2: create: invalid name: {:?}", name_bytes);
+            return_errno!(Errno::EINVAL);
+        }
+
+        // SPEC: Phase 6.3 supports File and Dir only.
+        if type_ != InodeType::File && type_ != InodeType::Dir {
+            ostd::early_println!("ext2: create: unsupported type: {:?}", type_);
+            return_errno!(Errno::EINVAL);
+        }
+
+        // Acquire write lock on self.inner for the entire mutation.
+        let mut inner = self.inner.write();
+
+        // SPEC: check for duplicate name before allocation.
+        if inner.find_entry(name).is_ok() {
+            return_errno!(Errno::EEXIST);
+        }
+
+        if type_ == InodeType::Dir {
+            // TODO: different from Linux, should we keep this?
+            // Delegate to existing mkdir which handles the full directory
+            // creation state machine (parent link reservation, make_empty,
+            // add_entry, rollback).
+            // Linux: ext2_mkdir
+            let ret = inner.mkdir(name, perm)?;
+            return Ok(ret);
+        } else {
+            // Linux: ext2_create → ext2_new_inode + ext2_add_nondir
+            let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+            let child = fs.create_inode(self.ino, type_, perm)?;
+            let child_ino = child.ino();
+            let dir_ft = Self::inode_type_to_dir_file_type(type_);
+
+            if let Err(err) = inner.add_entry(name, child_ino, dir_ft) {
+                // SPEC: rollback — ext2_add_nondir failure path:
+                // decrement link count and discard inode.
+                let _ = fs.free_inode(child_ino);
+                return Err(err);
+            }
+
+            Ok(child)
+        }
+    }
+
+    /// Adds a hard link in this directory to an existing non-directory inode.
+    ///
+    /// Linux: /root/linux/fs/ext2/namei.c:204 (ext2_link)
+    pub(super) fn link(&self, old: &Arc<Inode>, name: &str) -> Result<()> {
+        // SPEC: self must be a directory.
+        if self.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        // SPEC: hard links to directories are not allowed.
+        if old.type_ == InodeType::Dir {
+            return_errno!(Errno::EPERM);
+        }
+
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty()
+            || name_bytes.len() > u8::MAX as usize
+            || name_bytes == b"."
+            || name_bytes == b".."
+        {
+            return_errno!(Errno::EINVAL);
+        }
+
+        // SPEC: cross-filesystem link check.
+        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let old_fs = old.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        if !Arc::ptr_eq(&fs, &old_fs) {
+            return_errno!(Errno::EINVAL);
+        }
+
+        // Lock ordering: acquire write locks by ascending inode number
+        // to prevent deadlock when self and old are different inodes.
+        let dir_ft = Self::inode_type_to_dir_file_type(old.type_);
+
+        let (mut self_inner, mut old_inner) = write_lock_two_inodes(self, old);
+
+        // SPEC: check duplicate before modifying link count.
+        if self_inner.find_entry(name).is_ok() {
+            return_errno!(Errno::EEXIST);
+        }
+
+        // Linux: inode_set_ctime_current + inode_inc_link_count before add_link.
+        old_inner.desc.ctime = now();
+        old_inner.desc.links_count = old_inner.desc.links_count.saturating_add(1);
+
+        if let Err(err) = self_inner.add_entry(name, old.ino, dir_ft) {
+            // SPEC: rollback link count on add_entry failure.
+            old_inner.desc.links_count = old_inner.desc.links_count.saturating_sub(1);
+            return Err(err);
+        }
+
+        // Persist old inode metadata.
+        old_inner.persist_inode_and_sync(&fs)?;
+        Ok(())
+    }
+
+    /// Removes a non-directory entry from this directory.
+    ///
+    /// Linux: /root/linux/fs/ext2/namei.c:273 (ext2_unlink)
+    pub(super) fn unlink(&self, name: &str) -> Result<()> {
+        // SPEC: self must be a directory.
+        if self.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty()
+            || name_bytes.len() > u8::MAX as usize
+            || name_bytes == b"."
+            || name_bytes == b".."
+        {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+
+        // Acquire self write lock to resolve and delete entry.
+        let mut self_inner = self.inner.write();
+        let child_ino = self_inner.find_entry(name)?;
+        let child = fs.read_inode(child_ino)?;
+
+        // SPEC: unlink rejects directories — use rmdir instead.
+        if child.type_ == InodeType::Dir {
+            return_errno!(Errno::EISDIR);
+        }
+
+        // Delete the directory entry first.
+        self_inner.delete_entry(name)?;
+
+        // Linux: inode_set_ctime_to_ts(inode, inode_get_ctime(dir))
+        // then inode_dec_link_count.
+        let mut child_inner = child.inner.write();
+        child_inner.desc.ctime = self_inner.desc.ctime;
+        child_inner.desc.links_count = child_inner.desc.links_count.saturating_sub(1);
+
+        // SPEC: if link count reaches 0, mark deletion time and free inode.
+        // DIFF from Linux: Linux defers reclamation to inode eviction/orphan.
+        // Asterinas reclaims immediately since orphan pipeline is not yet integrated.
+        if child_inner.desc.links_count == 0 {
+            child_inner.desc.dtime = now();
+            child_inner.persist_inode_and_sync(&fs)?;
+            drop(child_inner);
+            let _ = fs.free_inode(child_ino);
+        } else {
+            child_inner.persist_inode_and_sync(&fs)?;
+        }
+
+        Ok(())
+    }
+
+    /// Renames or moves an entry from this directory to `target` directory.
+    ///
+    /// Linux: /root/linux/fs/ext2/namei.c:318 (ext2_rename)
+    pub(super) fn rename(
+        &self,
+        old_name: &str,
+        target: &Arc<Inode>,
+        new_name: &str,
+    ) -> Result<()> {
+        // SPEC: both self and target must be directories.
+        if self.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+        if target.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let old_bytes = old_name.as_bytes();
+        let new_bytes = new_name.as_bytes();
+        if old_bytes.is_empty()
+            || old_bytes.len() > u8::MAX as usize
+            || old_bytes == b"."
+            || old_bytes == b".."
+        {
+            return_errno!(Errno::EISDIR);
+        }
+        if new_bytes.is_empty()
+            || new_bytes.len() > u8::MAX as usize
+            || new_bytes == b"."
+            || new_bytes == b".."
+        {
+            return_errno!(Errno::EISDIR);
+        }
+
+        // SPEC: cross-filesystem rename check.
+        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let target_fs = target.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        if !Arc::ptr_eq(&fs, &target_fs) {
+            return_errno!(Errno::EINVAL);
+        }
+
+        // Rename to itself is a no-op.
+        if self.ino == target.ino && old_name == new_name {
+            return Ok(());
+        }
+
+        // Acquire directory write locks by ascending inode number to avoid deadlock.
+        let same_dir = self.ino == target.ino;
+
+        if same_dir {
+            self.rename_same_dir(old_name, new_name, &fs)
+        } else {
+            let (mut self_inner, mut target_inner) = write_lock_two_inodes(self, target);
+            Self::rename_inner(
+                &mut self_inner,
+                &mut target_inner,
+                self.ino,
+                target.ino,
+                old_name,
+                new_name,
+                &fs,
+            )
+        }
+    }
+
+    /// Rename within the same directory (single lock).
+    fn rename_same_dir(&self, old_name: &str, new_name: &str, fs: &Arc<Ext2>) -> Result<()> {
+        let mut inner = self.inner.write();
+
+        let old_ino = inner.find_entry(old_name)?;
+        let old_inode = fs.read_inode(old_ino)?;
+        let old_is_dir = old_inode.type_ == InodeType::Dir;
+        let moved_ft = Self::inode_type_to_dir_file_type(old_inode.type_);
+
+        // Check if new_name already exists.
+        let existing_ino = inner.find_entry(new_name).ok();
+
+        if let Some(existing_ino) = existing_ino {
+            let existing = fs.read_inode(existing_ino)?;
+            let existing_is_dir = existing.type_ == InodeType::Dir;
+
+            // SPEC: type compatibility check.
+            if old_is_dir && !existing_is_dir {
+                return_errno!(Errno::ENOTDIR);
+            }
+            if !old_is_dir && existing_is_dir {
+                return_errno!(Errno::EISDIR);
+            }
+
+            // SPEC: replacing a directory requires it to be empty.
+            if existing_is_dir {
+                let existing_inner = existing.inner.write();
+                if !existing_inner.empty_dir() {
+                    return_errno!(Errno::ENOTEMPTY);
+                }
+                drop(existing_inner);
+            }
+
+            // Replace destination entry: set_link(new_name, old_ino, ..., true).
+            inner.set_link(new_name, old_ino, moved_ft, true)?;
+
+            // Update replaced inode: set ctime, decrement links.
+            let mut existing_inner = existing.inner.write();
+            existing_inner.desc.ctime = now();
+            if old_is_dir {
+                // Directory replacement: drop extra link for `..`.
+                existing_inner.desc.links_count =
+                    existing_inner.desc.links_count.saturating_sub(1);
+            }
+            existing_inner.desc.links_count =
+                existing_inner.desc.links_count.saturating_sub(1);
+
+            if existing_inner.desc.links_count == 0 {
+                existing_inner.desc.dtime = now();
+                existing_inner.persist_inode_and_sync(fs)?;
+                drop(existing_inner);
+                let _ = fs.free_inode(existing_ino);
+            } else {
+                existing_inner.persist_inode_and_sync(fs)?;
+            }
+        } else {
+            // No existing entry: add new entry.
+            inner.add_entry(new_name, old_ino, moved_ft)?;
+        }
+
+        // Linux: inode_set_ctime_current(old_inode) + mark_inode_dirty.
+        {
+            let mut old_inner = old_inode.inner.write();
+            old_inner.desc.ctime = now();
+            old_inner.persist_inode_and_sync(fs)?;
+        }
+
+        // Delete old entry.
+        inner.delete_entry(old_name)?;
+
+        // Linux: when old_is_dir, always inode_dec_link_count(old_dir).
+        // For same-dir without replacement, add_entry above implicitly
+        // paired with inode_inc_link_count(new_dir) — since same dir,
+        // the net effect is zero. But we must still track both sides.
+        if old_is_dir {
+            if existing_ino.is_none() {
+                // Linux: inode_inc_link_count(new_dir) was done in the else branch
+                // of the replacement check. For same dir, this is self.
+                inner.desc.links_count = inner.desc.links_count.saturating_add(1);
+            }
+            // Linux line 397: inode_dec_link_count(old_dir) — always when old_is_dir.
+            inner.desc.links_count = inner.desc.links_count.saturating_sub(1);
+            inner.persist_inode_and_sync(fs)?;
+        }
+
+        Ok(())
+    }
+
+    /// Core rename logic when locks are already held.
+    fn rename_inner(
+        self_inner: &mut InodeInner,
+        target_inner: &mut InodeInner,
+        self_ino: u32,
+        target_ino: u32,
+        old_name: &str,
+        new_name: &str,
+        fs: &Arc<Ext2>,
+    ) -> Result<()> {
+        let old_ino = self_inner.find_entry(old_name)?;
+        let old_inode = fs.read_inode(old_ino)?;
+        let old_is_dir = old_inode.type_ == InodeType::Dir;
+        let moved_ft = Self::inode_type_to_dir_file_type(old_inode.type_);
+
+        // If moving a directory across parents, verify `..` is accessible.
+        // Linux: ext2_dotdot check.
+        if old_is_dir {
+            let old_inner = old_inode.inner.write();
+            // Verify `..` entry exists and points to self_ino.
+            let dotdot_ino = old_inner.find_entry("..")?;
+            if dotdot_ino != self_ino {
+                drop(old_inner);
+                return_errno!(Errno::EIO);
+            }
+            drop(old_inner);
+        }
+
+        // Check if new_name already exists in target.
+        let existing_ino = target_inner.find_entry(new_name).ok();
+
+        if let Some(existing_ino) = existing_ino {
+            let existing = fs.read_inode(existing_ino)?;
+            let existing_is_dir = existing.type_ == InodeType::Dir;
+
+            // SPEC: type compatibility.
+            if old_is_dir && !existing_is_dir {
+                return_errno!(Errno::ENOTDIR);
+            }
+            if !old_is_dir && existing_is_dir {
+                return_errno!(Errno::EISDIR);
+            }
+
+            if existing_is_dir {
+                let existing_inner = existing.inner.write();
+                if !existing_inner.empty_dir() {
+                    return_errno!(Errno::ENOTEMPTY);
+                }
+                drop(existing_inner);
+            }
+
+            // Replace destination: ext2_set_link(new_dir, ..., old_inode, true).
+            target_inner.set_link(new_name, old_ino, moved_ft, true)?;
+
+            // Update replaced inode.
+            let mut existing_inner = existing.inner.write();
+            existing_inner.desc.ctime = now();
+            if old_is_dir {
+                existing_inner.desc.links_count =
+                    existing_inner.desc.links_count.saturating_sub(1);
+            }
+            existing_inner.desc.links_count =
+                existing_inner.desc.links_count.saturating_sub(1);
+
+            if existing_inner.desc.links_count == 0 {
+                existing_inner.desc.dtime = now();
+                existing_inner.persist_inode_and_sync(fs)?;
+                drop(existing_inner);
+                let _ = fs.free_inode(existing_ino);
+            } else {
+                existing_inner.persist_inode_and_sync(fs)?;
+            }
+        } else {
+            // No existing entry: ext2_add_link.
+            target_inner.add_entry(new_name, old_ino, moved_ft)?;
+            if old_is_dir {
+                // Linux: inode_inc_link_count(new_dir) for new subdir.
+                target_inner.desc.links_count =
+                    target_inner.desc.links_count.saturating_add(1);
+            }
+        }
+
+        // Linux: inode_set_ctime_current(old_inode) + mark_inode_dirty.
+        {
+            let mut old_inner = old_inode.inner.write();
+            old_inner.desc.ctime = now();
+            old_inner.persist_inode_and_sync(fs)?;
+        }
+
+        // Delete old entry from source directory.
+        self_inner.delete_entry(old_name)?;
+
+        // If moving a directory across parents, update `..` to point to target.
+        if old_is_dir {
+            // ext2_set_link(old_inode, dir_de, ..., new_dir, false)
+            let mut old_inner = old_inode.inner.write();
+            old_inner.set_link("..", target_ino, DirEntryFileType::Dir, false)?;
+            drop(old_inner);
+
+            // Linux: inode_dec_link_count(old_dir) — old parent loses a subdir.
+            self_inner.desc.links_count =
+                self_inner.desc.links_count.saturating_sub(1);
+            self_inner.persist_inode_and_sync(fs)?;
+
+            // If destination didn't already have the entry (no replacement),
+            // target link count was already incremented above.
+            // If replacement happened, the replaced dir's link decrement
+            // already accounts for it.
+            target_inner.persist_inode_and_sync(fs)?;
+        }
+
+        Ok(())
+    }
+
+    /// Rewrites an existing directory entry to point to a new inode.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:450 (ext2_set_link)
+    ///
+    /// This is an `Inode`-level wrapper that acquires the write lock
+    /// and delegates to `InodeInner::set_link`.
+    pub(super) fn set_link(
+        &self,
+        name: &str,
+        new_ino: u32,
+        file_type: DirEntryFileType,
+        update_times: bool,
+    ) -> Result<()> {
+        if self.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+        let mut inner = self.inner.write();
+        inner.set_link(name, new_ino, file_type, update_times)
+    }
+}
 
 /// Directory entry type mapping (ext2 file_type field).
 #[repr(u8)]
@@ -1666,15 +2211,28 @@ mod test {
         allocated_blocks: &[u32],
     ) {
         let mut bitmap_block = [0u8; BLOCK_SIZE];
-        let itb = sb.itb_per_group() as usize;
-        for bit in 0..(2 + itb) {
+        let first = sb.group_first_block_no(0);
+        let last = sb.group_last_block_no(0);
+
+        let mut mark_block = |block: u32| {
+            if block < first || block > last {
+                return;
+            }
+            let bit = (block - first) as usize;
             set_bit_lsb0(&mut bitmap_block, bit);
+        };
+
+        // Group descriptor table block for group 0.
+        mark_block(sb.group_descriptors_bid(0).to_raw() as u32);
+        // Per-group metadata blocks described by bg descriptor.
+        mark_block(desc.block_bitmap);
+        mark_block(desc.inode_bitmap);
+        for block in desc.inode_table..desc.inode_table.saturating_add(sb.itb_per_group()) {
+            mark_block(block);
         }
 
-        let first = sb.group_first_block_no(0);
         for &block in allocated_blocks {
-            let bit = (block.saturating_sub(first)) as usize;
-            set_bit_lsb0(&mut bitmap_block, bit);
+            mark_block(block);
         }
 
         disk.segment()
@@ -1716,6 +2274,259 @@ mod test {
         let byte = bit / 8;
         let bit_in_byte = bit % 8;
         (buf[byte] & (1u8 << bit_in_byte)) != 0
+    }
+
+    fn prepare_namei_test_env() -> (Arc<Ext2MemoryDisk>, Arc<Ext2>, SuperBlock, Vec<RawGroupDesc>) {
+        let mut raw_sb = make_valid_raw_super_block(1);
+        raw_sb.free_blocks_count = 64;
+        raw_sb.free_inodes_count = 1000;
+        let sb = SuperBlock::try_from(raw_sb).unwrap();
+
+        let first = sb.group_first_block_no(0);
+        // Keep metadata blocks away from the group descriptor table block.
+        let block_bitmap = first.saturating_add(1);
+        let inode_bitmap = first.saturating_add(2);
+        let inode_table = first.saturating_add(3);
+
+        let mut descs = vec![make_valid_group_desc(&sb, 0)];
+        descs[0].block_bitmap = block_bitmap;
+        descs[0].inode_bitmap = inode_bitmap;
+        descs[0].inode_table = inode_table;
+        descs[0].free_blocks_count = 64;
+        descs[0].free_inodes_count = 1000;
+        descs[0].used_dirs_count = 1;
+
+        let disk = Arc::new(Ext2MemoryDisk::new(256));
+        disk.write_super_block(&raw_sb);
+        disk.write_group_desc_table(&sb, &descs);
+
+        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+
+        let root_bid = inode_table
+            .saturating_add(sb.itb_per_group())
+            .saturating_add(1);
+
+        write_valid_block_bitmap(disk.as_ref(), &sb, &descs[0], &[root_bid]);
+        write_valid_inode_bitmap(disk.as_ref(), &sb, &descs[0], &[ROOT_INO]);
+
+        let block_size = sb.block_size();
+        let mut root_block = vec![0u8; block_size];
+        write_dir_entry(&mut root_block, 0, ROOT_INO, 12, b".", 2);
+        write_dir_entry(
+            &mut root_block,
+            12,
+            ROOT_INO,
+            (block_size - 12) as u16,
+            b"..",
+            2,
+        );
+        disk.segment()
+            .write_bytes(Bid::new(root_bid as u64).to_offset(), &root_block)
+            .unwrap();
+
+        let mut root_raw = make_raw_inode(0o040755);
+        root_raw.size_lo = block_size as u32;
+        root_raw.blocks = (block_size / SECTOR_SIZE) as u32;
+        root_raw.links_count = 2;
+        root_raw.block[0] = root_bid;
+        ext2.write_inode_desc(ROOT_INO, &root_raw).unwrap();
+
+        (disk, ext2, sb, descs)
+    }
+
+    #[ktest]
+    fn namei_create_phase06_spec() {
+        clocks::init_for_ktest();
+
+        let (_disk, ext2, _sb, _descs) = prepare_namei_test_env();
+        let root = ext2.read_inode(ROOT_INO).unwrap();
+
+        // Linux ext2_create intent: allocate inode then publish dir entry.
+        let created = root
+            .create("alpha", InodeType::File, FilePerm::from_bits_truncate(0o644))
+            .unwrap();
+        assert_eq!(root.inner.read().find_entry("alpha").unwrap(), created.ino());
+        assert_eq!(ext2.read_inode_desc(created.ino()).unwrap().links_count, 1);
+
+        // Linux ext2_mkdir intent: child links=2 and parent link count +1.
+        let created_dir = root
+            .create("sub", InodeType::Dir, FilePerm::from_bits_truncate(0o755))
+            .unwrap();
+        assert_eq!(root.inner.read().find_entry("sub").unwrap(), created_dir.ino());
+        assert_eq!(ext2.read_inode_desc(created_dir.ino()).unwrap().links_count, 2);
+        assert_eq!(ext2.read_inode_desc(ROOT_INO).unwrap().links_count, 3);
+
+        assert_eq!(
+            root.create(".", InodeType::File, FilePerm::from_bits_truncate(0o644))
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
+        assert_eq!(
+            root.create("alpha", InodeType::File, FilePerm::from_bits_truncate(0o644))
+                .unwrap_err()
+                .error(),
+            Errno::EEXIST
+        );
+        assert_eq!(
+            root.create(
+                "sock",
+                InodeType::Socket,
+                FilePerm::from_bits_truncate(0o644)
+            )
+            .unwrap_err()
+            .error(),
+            Errno::EINVAL
+        );
+    }
+
+    #[ktest]
+    fn namei_link_unlink_phase06_spec() {
+        clocks::init_for_ktest();
+
+        let (disk, ext2, _sb, descs) = prepare_namei_test_env();
+        let root = ext2.read_inode(ROOT_INO).unwrap();
+
+        let old = root
+            .create("old", InodeType::File, FilePerm::from_bits_truncate(0o644))
+            .unwrap();
+        let old_ino = old.ino();
+        let old_links_before = ext2.read_inode_desc(old_ino).unwrap().links_count;
+
+        // Linux ext2_link intent: increase nlink before publishing name.
+        root.link(&old, "alias").unwrap();
+        assert_eq!(root.inner.read().find_entry("alias").unwrap(), old_ino);
+        assert_eq!(
+            ext2.read_inode_desc(old_ino).unwrap().links_count,
+            old_links_before + 1
+        );
+
+        let dir = root
+            .create("dir", InodeType::Dir, FilePerm::from_bits_truncate(0o755))
+            .unwrap();
+        assert_eq!(root.link(&dir, "dir_hard").unwrap_err().error(), Errno::EPERM);
+
+        // Linux ext2_unlink intent: remove name then decrement target nlink.
+        root.unlink("alias").unwrap();
+        assert_eq!(
+            root.inner.read().find_entry("alias").unwrap_err().error(),
+            Errno::ENOENT
+        );
+        assert_eq!(
+            ext2.read_inode_desc(old_ino).unwrap().links_count,
+            old_links_before
+        );
+
+        assert_eq!(root.unlink("dir").unwrap_err().error(), Errno::EISDIR);
+        assert_eq!(root.unlink(".").unwrap_err().error(), Errno::EINVAL);
+
+        root.unlink("old").unwrap();
+        let mut inode_bitmap = [0u8; BLOCK_SIZE];
+        disk.segment()
+            .read_bytes(
+                Bid::new(descs[0].inode_bitmap as u64).to_offset(),
+                &mut inode_bitmap,
+            )
+            .unwrap();
+        assert!(!bit_is_set_lsb0(&inode_bitmap, (old_ino - 1) as usize));
+    }
+
+    #[ktest]
+    fn namei_set_link_and_rename_phase06_spec() {
+        clocks::init_for_ktest();
+
+        let (disk, ext2, _sb, descs) = prepare_namei_test_env();
+        let root = ext2.read_inode(ROOT_INO).unwrap();
+
+        let src = root
+            .create("src", InodeType::File, FilePerm::from_bits_truncate(0o644))
+            .unwrap();
+        let target = root
+            .create("target", InodeType::File, FilePerm::from_bits_truncate(0o644))
+            .unwrap();
+
+        let (ctime_before, mtime_before) = {
+            let guard = root.inner.read();
+            (guard.desc.ctime, guard.desc.mtime)
+        };
+
+        // Linux ext2_set_link with update_times=false keeps ctime/mtime unchanged.
+        root.set_link("src", target.ino(), DirEntryFileType::File, false)
+            .unwrap();
+        assert_eq!(root.inner.read().find_entry("src").unwrap(), target.ino());
+        let (ctime_after, mtime_after) = {
+            let guard = root.inner.read();
+            (guard.desc.ctime, guard.desc.mtime)
+        };
+        assert_eq!(ctime_before, ctime_after);
+        assert_eq!(mtime_before, mtime_after);
+
+        assert_eq!(
+            root.set_link("missing", target.ino(), DirEntryFileType::File, false)
+                .unwrap_err()
+                .error(),
+            Errno::ENOENT
+        );
+        assert_eq!(
+            root.set_link("src", ROOT_INO - 1, DirEntryFileType::File, false)
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
+
+        // Rename to itself is a no-op success.
+        root.rename("target", &root, "target").unwrap();
+
+        let old = root
+            .create("old", InodeType::File, FilePerm::from_bits_truncate(0o644))
+            .unwrap();
+        let new = root
+            .create("new", InodeType::File, FilePerm::from_bits_truncate(0o644))
+            .unwrap();
+        let old_ino = old.ino();
+        let replaced_ino = new.ino();
+
+        // Linux ext2_rename replacement path: dst is overwritten and old name removed.
+        root.rename("old", &root, "new").unwrap();
+        {
+            let guard = root.inner.read();
+            assert_eq!(guard.find_entry("new").unwrap(), old_ino);
+            assert_eq!(guard.find_entry("old").unwrap_err().error(), Errno::ENOENT);
+        }
+
+        let mut inode_bitmap = [0u8; BLOCK_SIZE];
+        disk.segment()
+            .read_bytes(
+                Bid::new(descs[0].inode_bitmap as u64).to_offset(),
+                &mut inode_bitmap,
+            )
+            .unwrap();
+        assert!(!bit_is_set_lsb0(&inode_bitmap, (replaced_ino - 1) as usize));
+
+        let _ = src;
+    }
+
+    #[ktest]
+    fn namei_cross_fs_link_and_rename_rejected() {
+        clocks::init_for_ktest();
+
+        let (_disk_a, ext2_a, _sb_a, _descs_a) = prepare_namei_test_env();
+        let root_a = ext2_a.read_inode(ROOT_INO).unwrap();
+        let inode_a = root_a
+            .create("from", InodeType::File, FilePerm::from_bits_truncate(0o644))
+            .unwrap();
+
+        let (_disk_b, ext2_b, _sb_b, _descs_b) = prepare_namei_test_env();
+        let root_b = ext2_b.read_inode(ROOT_INO).unwrap();
+
+        assert_eq!(
+            root_b.link(&inode_a, "x").unwrap_err().error(),
+            Errno::EINVAL
+        );
+        assert_eq!(
+            root_a.rename("from", &root_b, "to").unwrap_err().error(),
+            Errno::EINVAL
+        );
     }
 
     #[ktest]
