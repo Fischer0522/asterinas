@@ -44,23 +44,32 @@ impl DirEntry {
         let rec_len_usize = rec_len as usize;
         let min_rec_len = Self::dir_rec_len(1) as usize;
         if rec_len_usize < min_rec_len {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(
+                Errno::EIO,
+                "Invalid record length: rec_len  is smaller than minimal"
+            );
         }
         if (rec_len & 3) != 0 {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "Invalid record length: rec_len is not aligned");
         }
         if name_len as usize > NAME_MAX {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "Invalid name length: name_len is too long");
         }
         let need = Self::dir_rec_len(name_len as usize) as usize;
         if rec_len_usize < need {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(
+                Errno::EIO,
+                "Invalid record length: rec_len is smaller than needed"
+            );
         }
         if offset.saturating_add(rec_len_usize) > limit {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(
+                Errno::EIO,
+                "Invalid offset: offset + rec_len is out of limit"
+            );
         }
         if inode > max_inumber {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "Invalid inode: inode is out of max_inumber");
         }
         Ok(())
     }
@@ -180,7 +189,6 @@ mod test {
         buf[name_start..name_end].copy_from_slice(name);
     }
 
-
     #[ktest]
     fn dir_entry_parse_ok() {
         // Linux helper semantics: rec_len decode and EXT2_DIR_REC_LEN rounding.
@@ -197,12 +205,26 @@ mod test {
 
         // Build one short entry and one NAME_MAX entry in a single block slice.
         encode_entry(&mut buf, 0, 7, rec_len_first, b"ab", 1);
-        encode_entry(&mut buf, rec_len_first as usize, 9, rec_len_second, &long_name, 2);
+        encode_entry(
+            &mut buf,
+            rec_len_first as usize,
+            9,
+            rec_len_second,
+            &long_name,
+            2,
+        );
 
         // Both entries pass ext2_check_folio-style validation.
         DirEntry::validate(rec_len_first, 2, 0, limit, 1024, 7).unwrap();
-        DirEntry::validate(rec_len_second, NAME_MAX as u8, rec_len_first as usize, limit, 1024, 9)
-            .unwrap();
+        DirEntry::validate(
+            rec_len_second,
+            NAME_MAX as u8,
+            rec_len_first as usize,
+            limit,
+            1024,
+            9,
+        )
+        .unwrap();
 
         // Parse both offsets and verify parsed fields.
         let first = DirEntry::parse_at(&buf, 0, limit, 1024).unwrap();
@@ -233,17 +255,48 @@ mod test {
     fn dir_entry_parse_error() {
         // validate() failures: short record, unaligned rec_len, name/len mismatch,
         // record spanning limit, and inode out of range.
-        assert_eq!(DirEntry::validate(8, 1, 0, 64, 128, 1).unwrap_err().error(),Errno::EIO);
-        assert_eq!(DirEntry::validate(14, 1, 0, 64, 128, 1).unwrap_err().error(),Errno::EIO);
-        assert_eq!(DirEntry::validate(12, 10, 0, 64, 128, 1).unwrap_err().error(),Errno::EIO);
-        assert_eq!(DirEntry::validate(16, 4, 56, 64, 128, 1).unwrap_err().error(),Errno::EIO);
-        assert_eq!(DirEntry::validate(12, 1, 0, 64, 8, 9).unwrap_err().error(),Errno::EIO);
+        assert_eq!(
+            DirEntry::validate(8, 1, 0, 64, 128, 1).unwrap_err().error(),
+            Errno::EIO
+        );
+        assert_eq!(
+            DirEntry::validate(14, 1, 0, 64, 128, 1)
+                .unwrap_err()
+                .error(),
+            Errno::EIO
+        );
+        assert_eq!(
+            DirEntry::validate(12, 10, 0, 64, 128, 1)
+                .unwrap_err()
+                .error(),
+            Errno::EIO
+        );
+        assert_eq!(
+            DirEntry::validate(16, 4, 56, 64, 128, 1)
+                .unwrap_err()
+                .error(),
+            Errno::EIO
+        );
+        assert_eq!(
+            DirEntry::validate(12, 1, 0, 64, 8, 9).unwrap_err().error(),
+            Errno::EIO
+        );
 
         // parse_at() boundary checks: offset==limit and header crossing limit.
         let mut valid_buf = [0u8; 16];
         encode_entry(&mut valid_buf, 0, 3, 12, b"ab", 1);
-        assert_eq!(DirEntry::parse_at(&valid_buf, 12, 12, 32).unwrap_err().error(),Errno::EIO);
-        assert_eq!(DirEntry::parse_at(&valid_buf, 8, 12, 32).unwrap_err().error(),Errno::EIO);
+        assert_eq!(
+            DirEntry::parse_at(&valid_buf, 12, 12, 32)
+                .unwrap_err()
+                .error(),
+            Errno::EIO
+        );
+        assert_eq!(
+            DirEntry::parse_at(&valid_buf, 8, 12, 32)
+                .unwrap_err()
+                .error(),
+            Errno::EIO
+        );
 
         // Corner case: raw entry exists but rec_len is below minimal legal size.
         let mut short_rec_len_buf = [0u8; 12];
@@ -251,19 +304,30 @@ mod test {
         short_rec_len_buf[4..6].copy_from_slice(&8u16.to_le_bytes());
         short_rec_len_buf[6] = 1;
         short_rec_len_buf[7] = 1;
-        assert_eq!(DirEntry::parse_at(&short_rec_len_buf, 0, 12, 32).unwrap_err().error(),Errno::EIO);
+        assert_eq!(
+            DirEntry::parse_at(&short_rec_len_buf, 0, 12, 32)
+                .unwrap_err()
+                .error(),
+            Errno::EIO
+        );
 
         // Iterator construction rejects empty limit and limit beyond buffer.
         let empty = [0u8; 8];
-        assert_eq!(DirEntryIter::new(&empty, 0, 16).unwrap_err().error(),Errno::EIO);
-        assert_eq!(DirEntryIter::new(&empty, 9, 16).unwrap_err().error(),Errno::EIO);
+        assert_eq!(
+            DirEntryIter::new(&empty, 0, 16).unwrap_err().error(),
+            Errno::EIO
+        );
+        assert_eq!(
+            DirEntryIter::new(&empty, 9, 16).unwrap_err().error(),
+            Errno::EIO
+        );
 
         // Corner case: first record valid, trailing bytes cannot hold next header.
         let mut malformed_tail = [0u8; 20];
         encode_entry(&mut malformed_tail, 0, 1, 16, b"a", 1);
         let mut iter = DirEntryIter::new(&malformed_tail, 20, 64).unwrap();
         assert!(iter.next_entry().unwrap().is_some());
-        assert_eq!(iter.next_entry().unwrap_err().error(),Errno::EIO);
+        assert_eq!(iter.next_entry().unwrap_err().error(), Errno::EIO);
 
         // Corner case: first entry malformed immediately (unaligned rec_len).
         let mut bad_first = [0u8; 16];
@@ -272,6 +336,6 @@ mod test {
         bad_first[6] = 1;
         bad_first[7] = 1;
         let mut iter = DirEntryIter::new(&bad_first, 16, 64).unwrap();
-        assert_eq!(iter.next_entry().unwrap_err().error(),Errno::EIO);
+        assert_eq!(iter.next_entry().unwrap_err().error(), Errno::EIO);
     }
 }

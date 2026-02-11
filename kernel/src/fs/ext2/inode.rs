@@ -5,7 +5,7 @@ use core::mem::size_of;
 use aster_virtio::device::socket::error;
 use ostd::const_assert;
 
-use super::{fs::Ext2, prelude::*};
+use super::{fs::Ext2, prelude::*, utils::now};
 use crate::fs::ext2::dir::{DirEntry, DirEntryIter};
 
 #[derive(Clone, Copy, Debug)]
@@ -715,7 +715,11 @@ impl InodeInner {
                 .ok_or_else(|| Error::new(Errno::EIO))?;
 
             let mut buf = vec![0u8; chunk_size];
-            if fs.block_device().read_bytes(bid.to_offset(), &mut buf).is_err() {
+            if fs
+                .block_device()
+                .read_bytes(bid.to_offset(), &mut buf)
+                .is_err()
+            {
                 return_errno!(Errno::EIO);
             }
 
@@ -816,7 +820,6 @@ impl InodeInner {
                 .checked_add(sectors_per_block)
                 .ok_or_else(|| Error::new(Errno::EIO))?;
         }
-
 
         self.update_dir_timestamps_and_flags()?;
         self.persist_inode_and_sync(&fs)?;
@@ -1100,23 +1103,18 @@ impl InodeInner {
     }
 
     fn update_dir_timestamps_and_flags(&mut self) -> Result<()> {
-        // TODO: update the timestamp
-        // if crate::time::START_TIME.get().is_none() {
-        //     return_errno!(Errno::EIO);
-        // }
-
-        // let now = crate::time::SystemTime::now()
-        //     .duration_since(&crate::time::SystemTime::UNIX_EPOCH)
-        //     .map(UnixTime::from)
-        //     .map_err(|_| Error::new(Errno::EIO))?;
-        // self.desc.ctime = now;
-        // self.desc.mtime = now;
+        let current = UnixTime::from(now());
+        self.desc.ctime = current;
+        self.desc.mtime = current;
         self.desc.flags.remove(FileFlags::INDEX_DIR);
         Ok(())
     }
 
     fn persist_inode_and_sync(&self, fs: &Ext2) -> Result<()> {
-        let inode = self.weak_self.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let inode = self
+            .weak_self
+            .upgrade()
+            .ok_or_else(|| Error::new(Errno::EIO))?;
         let raw = RawInode::from(&*self.desc);
         fs.write_inode_desc(inode.ino, &raw)?;
         fs.sync_metadata()?;
@@ -1410,14 +1408,19 @@ mod test {
     use core::{mem::size_of, time::Duration};
 
     use ostd::{mm::VmIo, prelude::ktest};
-    use crate::prelude::*;
 
     use super::*;
-    use crate::fs::ext2::{
-        fs::ROOT_INO,
-        SuperBlock,
-        block_group::RawGroupDesc,
-        test::{ErrorBioDisk, Ext2MemoryDisk, make_valid_group_desc, make_valid_raw_super_block},
+    use crate::{
+        fs::ext2::{
+            SuperBlock,
+            block_group::RawGroupDesc,
+            fs::ROOT_INO,
+            test::{
+                ErrorBioDisk, Ext2MemoryDisk, make_valid_group_desc, make_valid_raw_super_block,
+            },
+        },
+        prelude::*,
+        time::clocks,
     };
 
     fn make_raw_inode(mode: u16) -> RawInode {
@@ -1472,7 +1475,12 @@ mod test {
         InodeInner::new(Dirty::new(desc), Weak::new(), fs)
     }
 
-    fn make_dir_inode_inner(fs: Weak<Ext2>, size: usize, blocks: u32, block_ptrs: [u32; 15]) -> InodeInner {
+    fn make_dir_inode_inner(
+        fs: Weak<Ext2>,
+        size: usize,
+        blocks: u32,
+        block_ptrs: [u32; 15],
+    ) -> InodeInner {
         let mut raw = make_raw_inode(0o040755);
         raw.size_lo = size as u32;
         raw.blocks = blocks;
@@ -1527,7 +1535,13 @@ mod test {
     }
 
     impl DirentVisitor for StopAfterVisitor {
-        fn visit(&mut self, _name: &str, _ino: u64, _type_: InodeType, _offset: usize) -> Result<()> {
+        fn visit(
+            &mut self,
+            _name: &str,
+            _ino: u64,
+            _type_: InodeType,
+            _offset: usize,
+        ) -> Result<()> {
             if self.seen >= self.allow_count {
                 return_errno!(Errno::EINTR);
             }
@@ -1562,7 +1576,13 @@ mod test {
         raw.flags = flags.bits();
         raw.block = block_ptrs;
         let desc = InodeDesc::try_from(&raw).unwrap();
-        Inode::new(ino, InodeType::Dir, Dirty::new(desc), 0, Arc::downgrade(ext2))
+        Inode::new(
+            ino,
+            InodeType::Dir,
+            Dirty::new(desc),
+            0,
+            Arc::downgrade(ext2),
+        )
     }
 
     fn prepare_disk_with_block_accounting(
@@ -1603,7 +1623,10 @@ mod test {
         }
 
         disk.segment()
-            .write_bytes(Bid::new(desc.block_bitmap as u64).to_offset(), &bitmap_block)
+            .write_bytes(
+                Bid::new(desc.block_bitmap as u64).to_offset(),
+                &bitmap_block,
+            )
             .unwrap();
     }
 
@@ -1693,9 +1716,18 @@ mod test {
         assert_eq!(advanced, 64);
         assert_eq!(visitor.entries.len(), 4);
         assert_eq!(visitor.entries[0], (".".to_string(), 2, InodeType::Dir, 0));
-        assert_eq!(visitor.entries[1], ("foo".to_string(), 11, InodeType::File, 12));
-        assert_eq!(visitor.entries[2], ("unk".to_string(), 14, InodeType::Unknown, 24));
-        assert_eq!(visitor.entries[3], ("subdir".to_string(), 13, InodeType::Dir, 48));
+        assert_eq!(
+            visitor.entries[1],
+            ("foo".to_string(), 11, InodeType::File, 12)
+        );
+        assert_eq!(
+            visitor.entries[2],
+            ("unk".to_string(), 14, InodeType::Unknown, 24)
+        );
+        assert_eq!(
+            visitor.entries[3],
+            ("subdir".to_string(), 13, InodeType::Dir, 48)
+        );
 
         let mut stop_visitor = StopAfterVisitor::new(2);
         let stop_advanced = inode_inner.readdir_at(0, &mut stop_visitor).unwrap();
@@ -1717,25 +1749,36 @@ mod test {
         let mut file_ptrs = [0u32; 15];
         file_ptrs[0] = 80;
         let file_inode = make_inode_inner(Arc::downgrade(&ext2), file_ptrs);
-        assert_eq!(file_inode.find_entry("foo").unwrap_err().error(), Errno::ENOTDIR);
+        assert_eq!(
+            file_inode.find_entry("foo").unwrap_err().error(),
+            Errno::ENOTDIR
+        );
         let mut vec_visitor = Vec::<String>::new();
-        assert_eq!(file_inode.readdir_at(0, &mut vec_visitor).unwrap_err().error(), Errno::ENOTDIR);
+        assert_eq!(
+            file_inode
+                .readdir_at(0, &mut vec_visitor)
+                .unwrap_err()
+                .error(),
+            Errno::ENOTDIR
+        );
 
         let hole_inode = make_dir_inode_inner(Arc::downgrade(&ext2), 12, 8, [0u32; 15]);
-        assert_eq!(hole_inode.find_entry("foo").unwrap_err().error(), Errno::EIO);
+        assert_eq!(
+            hole_inode.find_entry("foo").unwrap_err().error(),
+            Errno::EIO
+        );
         let mut vec_visitor = Vec::<String>::new();
-        assert_eq!(hole_inode.readdir_at(0, &mut vec_visitor).unwrap_err().error(), Errno::EIO);
+        assert_eq!(
+            hole_inode
+                .readdir_at(0, &mut vec_visitor)
+                .unwrap_err()
+                .error(),
+            Errno::EIO
+        );
 
         let mut one_block = vec![0u8; block_size];
         write_dir_entry(&mut one_block, 0, 2, 12, b".", 2);
-        write_dir_entry(
-            &mut one_block,
-            12,
-            0,
-            (block_size - 12) as u16,
-            b"",
-            0,
-        );
+        write_dir_entry(&mut one_block, 12, 0, (block_size - 12) as u16, b"", 0);
         let data_bid = 81u32;
         disk.segment()
             .write_bytes(Bid::new(data_bid as u64).to_offset(), &one_block)
@@ -1743,14 +1786,13 @@ mod test {
 
         let mut ptrs = [0u32; 15];
         ptrs[0] = data_bid;
-        let limited_blocks_inode = make_dir_inode_inner(
-            Arc::downgrade(&ext2),
-            block_size * 2,
-            0,
-            ptrs,
-        );
+        let limited_blocks_inode =
+            make_dir_inode_inner(Arc::downgrade(&ext2), block_size * 2, 0, ptrs);
         assert_eq!(
-            limited_blocks_inode.find_entry("missing").unwrap_err().error(),
+            limited_blocks_inode
+                .find_entry("missing")
+                .unwrap_err()
+                .error(),
             Errno::ENOENT
         );
 
@@ -1782,12 +1824,17 @@ mod test {
         let bad_inode = make_dir_inode_inner(Arc::downgrade(&ext2), 12, 8, bad_ptrs);
         assert_eq!(bad_inode.find_entry(".").unwrap_err().error(), Errno::EIO);
         let mut vec_visitor = Vec::<String>::new();
-        assert_eq!(bad_inode.readdir_at(0, &mut vec_visitor).unwrap_err().error(), Errno::EIO);
+        assert_eq!(
+            bad_inode
+                .readdir_at(0, &mut vec_visitor)
+                .unwrap_err()
+                .error(),
+            Errno::EIO
+        );
     }
 
     #[ktest]
     fn dir_add_delete_entry_ok() {
-
         let (disk, _sb, _descs) = prepare_disk(2, 256);
         let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
         let block_size = ext2.block_size();
@@ -1803,14 +1850,7 @@ mod test {
 
         let mut block_ptrs = [0u32; 15];
         block_ptrs[0] = data_bid;
-        let inode = make_live_dir_inode(
-            &ext2,
-            2,
-            block_size,
-            8,
-            FileFlags::INDEX_DIR,
-            block_ptrs,
-        );
+        let inode = make_live_dir_inode(&ext2, 2, block_size, 8, FileFlags::INDEX_DIR, block_ptrs);
 
         {
             let mut inner = inode.inner.write();
@@ -1829,11 +1869,13 @@ mod test {
             .read_bytes(Bid::new(data_bid as u64).to_offset(), &mut post)
             .unwrap();
 
-        let dot = DirEntry::parse_at(&post, 0, block_size, ext2.super_block().total_inodes()).unwrap();
+        let dot =
+            DirEntry::parse_at(&post, 0, block_size, ext2.super_block().total_inodes()).unwrap();
         assert_eq!(dot.inode, 2);
         assert_eq!(dot.rec_len, 12);
 
-        let bar = DirEntry::parse_at(&post, 12, block_size, ext2.super_block().total_inodes()).unwrap();
+        let bar =
+            DirEntry::parse_at(&post, 12, block_size, ext2.super_block().total_inodes()).unwrap();
         assert_eq!(bar.inode, 13);
         assert_eq!(bar.name.as_bytes(), b"bar");
         assert_eq!(bar.rec_len, (block_size - 12) as u16);
@@ -1844,7 +1886,6 @@ mod test {
 
     #[ktest]
     fn dir_add_entry_grow_by_new_block_ok() {
-
         let (disk, sb, descs) = prepare_disk_with_block_accounting(256, 32, 32);
         let block_size = sb.block_size();
 
@@ -1859,7 +1900,8 @@ mod test {
             .saturating_add(sb.itb_per_group())
             .saturating_add(1);
         assert!(data_bid <= last);
-        write_valid_block_bitmap(disk.as_ref(), &sb, &descs[0], &[data_bid]);
+        // Let allocator choose one free data block; do not pre-occupy `data_bid`.
+        write_valid_block_bitmap(disk.as_ref(), &sb, &descs[0], &[]);
 
         let mut first_block = vec![0u8; block_size];
         write_dir_entry(&mut first_block, 0, 2, 12, b".", 2);
@@ -1870,14 +1912,7 @@ mod test {
 
         let mut block_ptrs = [0u32; 15];
         block_ptrs[0] = data_bid;
-        let inode = make_live_dir_inode(
-            &ext2,
-            2,
-            24,
-            8,
-            FileFlags::INDEX_DIR,
-            block_ptrs,
-        );
+        let inode = make_live_dir_inode(&ext2, 2, 24, 8, FileFlags::INDEX_DIR, block_ptrs);
 
         let new_bid = {
             let mut inner = inode.inner.write();
@@ -1892,7 +1927,9 @@ mod test {
         disk.segment()
             .read_bytes(Bid::new(new_bid as u64).to_offset(), &mut new_block)
             .unwrap();
-        let entry = DirEntry::parse_at(&new_block, 0, block_size, ext2.super_block().total_inodes()).unwrap();
+        let entry =
+            DirEntry::parse_at(&new_block, 0, block_size, ext2.super_block().total_inodes())
+                .unwrap();
         assert_eq!(entry.inode, 11);
         assert_eq!(entry.name.as_bytes(), b"foo");
     }
@@ -1910,7 +1947,10 @@ mod test {
                 .error(),
             Errno::ENOTDIR
         );
-        assert_eq!(file_inode.delete_entry("foo").unwrap_err().error(), Errno::ENOTDIR);
+        assert_eq!(
+            file_inode.delete_entry("foo").unwrap_err().error(),
+            Errno::ENOTDIR
+        );
 
         let mut dir_ptrs = [0u32; 15];
         dir_ptrs[0] = 80;
@@ -1922,11 +1962,15 @@ mod test {
                 .error(),
             Errno::EINVAL
         );
-        assert_eq!(dir_inode.delete_entry("").unwrap_err().error(), Errno::EINVAL);
+        assert_eq!(
+            dir_inode.delete_entry("").unwrap_err().error(),
+            Errno::EINVAL
+        );
     }
 
     #[ktest]
     fn dir_make_empty_and_empty_dir_ok() {
+        clocks::init_for_ktest();
         let (disk, sb, descs) = prepare_disk_with_block_accounting(256, 64, 64);
         let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
         let block_size = ext2.block_size();
@@ -1943,22 +1987,31 @@ mod test {
         let mut raw = make_raw_inode(0o040755);
         raw.links_count = 2;
         let desc = InodeDesc::try_from(&raw).unwrap();
-        let inode = Inode::new(12, InodeType::Dir, Dirty::new(desc), 0, Arc::downgrade(&ext2));
+        let inode = Inode::new(
+            12,
+            InodeType::Dir,
+            Dirty::new(desc),
+            0,
+            Arc::downgrade(&ext2),
+        );
 
-        {
+        let allocated_bid = {
             let mut inner = inode.inner.write();
             inner.make_empty(ROOT_INO).unwrap();
             assert!(inner.empty_dir());
             assert_eq!(inner.desc.size as usize, block_size);
             assert_eq!(inner.desc.blocks, (block_size / SECTOR_SIZE) as u32);
-        }
+            inner.desc.block_ptrs[0]
+        };
+        assert_ne!(allocated_bid, 0);
 
         let mut buf = vec![0u8; block_size];
         disk.segment()
-            .read_bytes(Bid::new(data_bid as u64).to_offset(), &mut buf)
+            .read_bytes(Bid::new(allocated_bid as u64).to_offset(), &mut buf)
             .unwrap();
 
-        let dot = DirEntry::parse_at(&buf, 0, block_size, ext2.super_block().total_inodes()).unwrap();
+        let dot =
+            DirEntry::parse_at(&buf, 0, block_size, ext2.super_block().total_inodes()).unwrap();
         assert_eq!(dot.inode, 12);
         assert_eq!(dot.name.as_bytes(), b".");
 
@@ -1983,14 +2036,7 @@ mod test {
         let mut block = vec![0u8; block_size];
         write_dir_entry(&mut block, 0, 2, 12, b".", 2);
         write_dir_entry(&mut block, 12, 2, 12, b"..", 2);
-        write_dir_entry(
-            &mut block,
-            24,
-            13,
-            (block_size - 24) as u16,
-            b"foo",
-            1,
-        );
+        write_dir_entry(&mut block, 24, 13, (block_size - 24) as u16, b"foo", 1);
         disk.segment()
             .write_bytes(Bid::new(data_bid as u64).to_offset(), &block)
             .unwrap();

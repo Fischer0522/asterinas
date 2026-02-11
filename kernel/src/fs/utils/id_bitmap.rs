@@ -107,7 +107,7 @@ impl IdBitmap {
         if count == 0 {
             return None;
         }
-        
+
         if self.first_available_id >= self.len {
             return None;
         }
