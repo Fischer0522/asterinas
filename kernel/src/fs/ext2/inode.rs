@@ -2016,8 +2016,9 @@ mod test {
             block_group::RawGroupDesc,
             fs::ROOT_INO,
             test::{
-                ErrorBioDisk, Ext2MemoryDisk, make_valid_group_desc, make_valid_raw_super_block,
-            },
+                ErrorBioDisk, Ext2MemoryDisk,
+
+            }, testkit::{self, Ext2FixtureBuilder},
         },
         prelude::*,
         time::clocks,
@@ -2055,17 +2056,8 @@ mod test {
         groups: u32,
         nblocks: usize,
     ) -> (Arc<Ext2MemoryDisk>, SuperBlock, Vec<RawGroupDesc>) {
-        let raw_sb = make_valid_raw_super_block(groups);
-        let sb = SuperBlock::try_from(raw_sb).unwrap();
-        let descs = (0..sb.block_groups_count() as usize)
-            .map(|idx| make_valid_group_desc(&sb, idx))
-            .collect::<Vec<_>>();
-
-        let disk = Arc::new(Ext2MemoryDisk::new(nblocks));
-        disk.write_super_block(&raw_sb);
-        disk.write_group_desc_table(&sb, &descs);
-
-        (disk, sb, descs)
+        let fixture = Ext2FixtureBuilder::new(groups, nblocks).build().unwrap();
+        (fixture.disk, fixture.sb, fixture.descs)
     }
 
     fn make_inode_inner(fs: Weak<Ext2>, block_ptrs: [u32; 15]) -> InodeInner {
@@ -2157,9 +2149,7 @@ mod test {
     }
 
     fn set_bit_lsb0(buf: &mut [u8], bit: usize) {
-        let byte = bit / 8;
-        let bit_in_byte = bit % 8;
-        buf[byte] |= 1u8 << bit_in_byte;
+        testkit::set_bit_lsb0(buf, bit);
     }
 
     fn make_live_dir_inode(
@@ -2190,18 +2180,11 @@ mod test {
         sb_free_blocks: u32,
         group_free_blocks: u16,
     ) -> (Arc<Ext2MemoryDisk>, SuperBlock, Vec<RawGroupDesc>) {
-        let mut raw_sb = make_valid_raw_super_block(1);
-        raw_sb.free_blocks_count = sb_free_blocks;
-        let sb = SuperBlock::try_from(raw_sb).unwrap();
-
-        let mut descs = vec![make_valid_group_desc(&sb, 0)];
-        descs[0].free_blocks_count = group_free_blocks;
-
-        let disk = Arc::new(Ext2MemoryDisk::new(nblocks));
-        disk.write_super_block(&raw_sb);
-        disk.write_group_desc_table(&sb, &descs);
-
-        (disk, sb, descs)
+        let fixture = Ext2FixtureBuilder::new(1, nblocks)
+            .with_free_blocks(sb_free_blocks, group_free_blocks)
+            .build()
+            .unwrap();
+        (fixture.disk, fixture.sb, fixture.descs)
     }
 
     fn write_valid_block_bitmap(
@@ -2210,37 +2193,7 @@ mod test {
         desc: &RawGroupDesc,
         allocated_blocks: &[u32],
     ) {
-        let mut bitmap_block = [0u8; BLOCK_SIZE];
-        let first = sb.group_first_block_no(0);
-        let last = sb.group_last_block_no(0);
-
-        let mut mark_block = |block: u32| {
-            if block < first || block > last {
-                return;
-            }
-            let bit = (block - first) as usize;
-            set_bit_lsb0(&mut bitmap_block, bit);
-        };
-
-        // Group descriptor table block for group 0.
-        mark_block(sb.group_descriptors_bid(0).to_raw() as u32);
-        // Per-group metadata blocks described by bg descriptor.
-        mark_block(desc.block_bitmap);
-        mark_block(desc.inode_bitmap);
-        for block in desc.inode_table..desc.inode_table.saturating_add(sb.itb_per_group()) {
-            mark_block(block);
-        }
-
-        for &block in allocated_blocks {
-            mark_block(block);
-        }
-
-        disk.segment()
-            .write_bytes(
-                Bid::new(desc.block_bitmap as u64).to_offset(),
-                &bitmap_block,
-            )
-            .unwrap();
+        testkit::write_block_bitmap(disk, sb, desc, allocated_blocks)
     }
 
     fn write_valid_inode_bitmap(
@@ -2249,89 +2202,22 @@ mod test {
         desc: &RawGroupDesc,
         allocated_inodes: &[u32],
     ) {
-        let mut bitmap = [0u8; BLOCK_SIZE];
-        for bit in 0..(sb.first_ino() as usize).saturating_sub(1) {
-            set_bit_lsb0(&mut bitmap, bit);
-        }
-
-        for &ino in allocated_inodes {
-            if ino == 0 || ino > sb.inodes_per_group() {
-                continue;
-            }
-            let bit = (ino - 1) as usize;
-            set_bit_lsb0(&mut bitmap, bit);
-        }
-
-        disk.segment()
-            .write_bytes(
-                Bid::new(desc.inode_bitmap as u64).to_offset(),
-                &bitmap,
-            )
-            .unwrap();
+        testkit::write_inode_bitmap(disk, sb, desc, allocated_inodes)
     }
 
     fn bit_is_set_lsb0(buf: &[u8], bit: usize) -> bool {
-        let byte = bit / 8;
-        let bit_in_byte = bit % 8;
-        (buf[byte] & (1u8 << bit_in_byte)) != 0
+        testkit::bit_is_set_lsb0(buf, bit)
     }
 
     fn prepare_namei_test_env() -> (Arc<Ext2MemoryDisk>, Arc<Ext2>, SuperBlock, Vec<RawGroupDesc>) {
-        let mut raw_sb = make_valid_raw_super_block(1);
-        raw_sb.free_blocks_count = 64;
-        raw_sb.free_inodes_count = 1000;
-        let sb = SuperBlock::try_from(raw_sb).unwrap();
-
-        let first = sb.group_first_block_no(0);
-        // Keep metadata blocks away from the group descriptor table block.
-        let block_bitmap = first.saturating_add(1);
-        let inode_bitmap = first.saturating_add(2);
-        let inode_table = first.saturating_add(3);
-
-        let mut descs = vec![make_valid_group_desc(&sb, 0)];
-        descs[0].block_bitmap = block_bitmap;
-        descs[0].inode_bitmap = inode_bitmap;
-        descs[0].inode_table = inode_table;
-        descs[0].free_blocks_count = 64;
-        descs[0].free_inodes_count = 1000;
-        descs[0].used_dirs_count = 1;
-
-        let disk = Arc::new(Ext2MemoryDisk::new(256));
-        disk.write_super_block(&raw_sb);
-        disk.write_group_desc_table(&sb, &descs);
-
-        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
-
-        let root_bid = inode_table
-            .saturating_add(sb.itb_per_group())
-            .saturating_add(1);
-
-        write_valid_block_bitmap(disk.as_ref(), &sb, &descs[0], &[root_bid]);
-        write_valid_inode_bitmap(disk.as_ref(), &sb, &descs[0], &[ROOT_INO]);
-
-        let block_size = sb.block_size();
-        let mut root_block = vec![0u8; block_size];
-        write_dir_entry(&mut root_block, 0, ROOT_INO, 12, b".", 2);
-        write_dir_entry(
-            &mut root_block,
-            12,
-            ROOT_INO,
-            (block_size - 12) as u16,
-            b"..",
-            2,
-        );
-        disk.segment()
-            .write_bytes(Bid::new(root_bid as u64).to_offset(), &root_block)
+        let fixture = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .with_free_inodes(1000, 1000)
+            .with_group0_used_dirs(1)
+            .with_root()
+            .build()
             .unwrap();
-
-        let mut root_raw = make_raw_inode(0o040755);
-        root_raw.size_lo = block_size as u32;
-        root_raw.blocks = (block_size / SECTOR_SIZE) as u32;
-        root_raw.links_count = 2;
-        root_raw.block[0] = root_bid;
-        ext2.write_inode_desc(ROOT_INO, &root_raw).unwrap();
-
-        (disk, ext2, sb, descs)
+        (fixture.disk, fixture.ext2, fixture.sb, fixture.descs)
     }
 
     #[ktest]

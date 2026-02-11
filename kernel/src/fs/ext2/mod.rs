@@ -53,6 +53,8 @@ mod inode;
 mod prelude;
 mod super_block;
 mod utils;
+#[cfg(ktest)]
+mod testkit;
 
 #[cfg(ktest)]
 pub(super) mod test {
