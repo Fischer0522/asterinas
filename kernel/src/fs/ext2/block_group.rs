@@ -75,7 +75,7 @@ impl BlockGroup {
         let offset = idx * size_of::<RawGroupDesc>();
         let raw = group_descs
             .read_val::<RawGroupDesc>(offset)
-            .map_err(|_| Error::new(Errno::EIO))?;
+            .map_err(|_| Error::with_message(Errno::EIO, "failed to read group descriptor"))?;
         let desc = GroupDesc::from(raw);
         Ok(Self {
             idx,
@@ -181,18 +181,18 @@ impl BlockGroup {
             .read_bytes(bitmap_bid.to_offset(), &mut buf)
             .is_err()
         {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "failed to read block bitmap");
         }
 
         let first_block = sb.group_first_block_no(self.idx());
         let last_block = sb.group_last_block_no(self.idx());
         if last_block < first_block {
-            return_errno!(Errno::EINVAL);
+            return_errno_with_message!(Errno::EINVAL, "block group has invalid block range");
         }
         let max_bit = last_block - first_block;
         let capacity = max_bit.saturating_add(1) as usize;
         if capacity > IdBitmap::capacity() as usize {
-            return_errno!(Errno::EINVAL);
+            return_errno_with_message!(Errno::EINVAL, "block bitmap capacity overflow");
         }
         let itb_per_group = sb.itb_per_group();
         let bitmap = IdBitmap::from_buf(buf.into_boxed_slice(), capacity as u16);
@@ -205,34 +205,34 @@ impl BlockGroup {
 
                 let mut offset = block_bitmap.wrapping_sub(first_block);
                 if block_bitmap < first_block || offset > max_bit {
-                    return_errno!(Errno::EINVAL);
+                    return_errno_with_message!(Errno::EINVAL, "block bitmap block out of group range");
                 }
                 if !bitmap.is_allocated(offset as u16) {
-                    return_errno!(Errno::EINVAL);
+                    return_errno_with_message!(Errno::EINVAL, "block bitmap block not marked in bitmap");
                 }
 
                 offset = inode_bitmap.wrapping_sub(first_block);
                 if inode_bitmap < first_block || offset > max_bit {
-                    return_errno!(Errno::EINVAL);
+                    return_errno_with_message!(Errno::EINVAL, "inode bitmap block out of group range");
                 }
                 if !bitmap.is_allocated(offset as u16) {
-                    return_errno!(Errno::EINVAL);
+                    return_errno_with_message!(Errno::EINVAL, "inode bitmap block not marked in bitmap");
                 }
 
                 offset = inode_table.wrapping_sub(first_block);
                 if inode_table < first_block || offset > max_bit {
-                    return_errno!(Errno::EINVAL);
+                    return_errno_with_message!(Errno::EINVAL, "inode table start out of group range");
                 }
                 let table_last = offset.saturating_add(itb_per_group.saturating_sub(1));
                 if table_last > max_bit {
-                    return_errno!(Errno::EINVAL);
+                    return_errno_with_message!(Errno::EINVAL, "inode table extends beyond group");
                 }
 
                 let end = offset.saturating_add(itb_per_group);
                 let mut bit = offset;
                 while bit < end {
                     if !bitmap.is_allocated(bit as u16) {
-                        return_errno!(Errno::EINVAL);
+                        return_errno_with_message!(Errno::EINVAL, "inode table block not marked in bitmap");
                     }
                     bit += 1;
                 }
@@ -257,12 +257,12 @@ impl BlockGroup {
             .read_bytes(bitmap_bid.to_offset(), &mut buf)
             .is_err()
         {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "failed to read inode bitmap");
         }
 
         let capacity = sb.inodes_per_group() as usize;
         if capacity > IdBitmap::capacity() as usize {
-            return_errno!(Errno::EINVAL);
+            return_errno_with_message!(Errno::EINVAL, "inode bitmap capacity overflow");
         }
 
         Ok(IdBitmap::from_buf(buf.into_boxed_slice(), capacity as u16))

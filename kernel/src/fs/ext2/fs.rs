@@ -132,7 +132,7 @@ impl Ext2 {
 
     /// Returns the root inode.
     pub fn root_inode(&self) -> Result<Arc<Inode>> {
-        return_errno!(Errno::ENOSYS);
+        return_errno_with_message!(Errno::ENOSYS, "root inode not yet implemented");
     }
 
     /// Reads an inode and constructs its in-memory representation.
@@ -148,7 +148,7 @@ impl Ext2 {
         let block_group_idx = ((ino - 1) / inodes_per_group) as usize;
 
         if self.self_ref.upgrade().is_none() {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "filesystem already dropped");
         }
 
         let inode = Inode::new(
@@ -172,7 +172,7 @@ impl Ext2 {
         let group = self
             .block_groups
             .get(group_idx)
-            .ok_or_else(|| Error::new(Errno::EIO))?;
+            .ok_or_else(|| Error::with_message(Errno::EIO, "block group index out of range"))?;
         Ok(group.inode_table_bid() + table_block_index as u64)
     }
 
@@ -183,7 +183,7 @@ impl Ext2 {
         let sb = self.super_block.read();
 
         if (ino != ROOT_INO && ino < sb.first_ino()) || ino > sb.total_inodes() {
-            return_errno!(Errno::EINVAL);
+            return_errno_with_message!(Errno::EINVAL, "inode number out of valid range");
         }
 
         let inodes_per_group = sb.inodes_per_group();
@@ -203,18 +203,18 @@ impl Ext2 {
             .read_bytes(block_bid.to_offset(), &mut buf)
             .is_err()
         {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "failed to read inode table block");
         }
 
         if offset_in_block + size_of::<RawInode>() > block_size {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "inode offset exceeds block boundary");
         }
 
         let mut reader = VmReader::from(buf.as_slice());
         let raw = reader
             .skip(offset_in_block)
             .read_val::<RawInode>()
-            .map_err(|_| Error::new(Errno::EIO))?;
+            .map_err(|_| Error::with_message(Errno::EIO, "failed to parse raw inode"))?;
         InodeDesc::try_from(&raw)
     }
 
@@ -225,7 +225,7 @@ impl Ext2 {
         let sb = self.super_block.read();
 
         if (ino != ROOT_INO && ino < sb.first_ino()) || ino > sb.total_inodes() {
-            return_errno!(Errno::EINVAL);
+            return_errno_with_message!(Errno::EINVAL, "inode number out of valid range");
         }
 
         let inodes_per_group = sb.inodes_per_group();
@@ -246,12 +246,12 @@ impl Ext2 {
             .read_bytes(block_bid.to_offset(), &mut buf)
             .is_err()
         {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "failed to read inode table block for write");
         }
 
         let inode_len = size_of::<RawInode>();
         if offset_in_block + inode_len > BLOCK_SIZE {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "inode offset exceeds block boundary");
         }
 
         buf[offset_in_block..offset_in_block + inode_len].copy_from_slice(raw.as_bytes());
@@ -261,7 +261,7 @@ impl Ext2 {
             .write_bytes(block_bid.to_offset(), &buf)
             .is_err()
         {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "failed to write inode table block");
         }
 
         Ok(())
@@ -318,16 +318,16 @@ impl Ext2 {
 
             if block_bitmap < first_block || block_bitmap > last_block {
                 error!("Ext2: Block bitmap out of range");
-                return_errno!(Errno::EINVAL);
+                return_errno_with_message!(Errno::EINVAL, "block bitmap out of group range");
             }
             if inode_bitmap < first_block || inode_bitmap > last_block {
                 error!("Ext2: Inode bitmap out of range");
-                return_errno!(Errno::EINVAL);
+                return_errno_with_message!(Errno::EINVAL, "inode bitmap out of group range");
             }
             let table_last = inode_table.saturating_add(itb_per_group.saturating_sub(1));
             if inode_table < first_block || table_last > last_block {
                 error!("Ext2: Inode table out of range");
-                return_errno!(Errno::EINVAL);
+                return_errno_with_message!(Errno::EINVAL, "inode table out of group range");
             }
         }
         Ok(())
@@ -349,7 +349,7 @@ impl Ext2 {
     /// Allocates up to `count` contiguous blocks.
     pub(super) fn alloc_blocks(&self, count: u32) -> Result<Range<u32>> {
         if count == 0 {
-            return_errno!(Errno::EINVAL);
+            return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
         }
 
         let (
@@ -371,10 +371,10 @@ impl Ext2 {
             )
         };
         if groups_count == 0 || self.block_groups.len() < groups_count {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "inconsistent block group count");
         }
         if sb_free_blocks == 0 {
-            return_errno!(Errno::ENOSPC);
+            return_errno_with_message!(Errno::ENOSPC, "no free blocks on device");
         }
 
         let mut saw_corruption = false;
@@ -382,7 +382,7 @@ impl Ext2 {
             let group = self
                 .block_groups
                 .get(group_idx)
-                .ok_or_else(|| Error::new(Errno::EIO))?;
+                .ok_or_else(|| Error::with_message(Errno::EIO, "block group index out of range"))?;
             if group.free_blocks_count() == 0 {
                 continue;
             }
@@ -407,9 +407,9 @@ impl Ext2 {
         }
 
         if saw_corruption {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "block bitmap corruption detected during alloc");
         }
-        return_errno!(Errno::ENOSPC);
+        return_errno_with_message!(Errno::ENOSPC, "no free blocks available in any group");
     }
 
     /// Frees a range of blocks starting at `start`.
@@ -437,7 +437,7 @@ impl Ext2 {
             )
         };
         if !Self::data_block_valid(first_data_block, total_blocks, block_size, start, count) {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "freeing invalid data block range");
         }
 
         let mut current = start;
@@ -448,7 +448,7 @@ impl Ext2 {
             let group = self
                 .block_groups
                 .get(group_idx)
-                .ok_or_else(|| Error::new(Errno::EIO))?;
+                .ok_or_else(|| Error::with_message(Errno::EIO, "block group index out of range"))?;
 
             let group_first =
                 Self::group_first_block_no(first_data_block, blocks_per_group, group_idx);
@@ -460,15 +460,15 @@ impl Ext2 {
                 group_idx,
             );
             if group_last < group_first {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "block group has invalid block range");
             }
             let group_size = group_last - group_first + 1;
             if group_size as usize > BLOCK_SIZE * 8 {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "block group size exceeds bitmap capacity");
             }
             let bit = current.saturating_sub(group_first);
             if bit >= group_size {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "block offset outside group boundary");
             }
             let group_count = remaining.min(group_size.saturating_sub(bit));
 
@@ -478,7 +478,7 @@ impl Ext2 {
             };
 
             if self.range_overlaps_system_zone(itb_per_group, group, current, group_count) {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "freeing blocks in system zone");
             }
 
             let mut freed = 0u32;
@@ -501,7 +501,7 @@ impl Ext2 {
                 .write_bytes(group.block_bitmap_bid().to_offset(), bitmap.as_bytes())
                 .is_err()
             {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "failed to write block bitmap");
             }
 
             if freed > 0 {
@@ -530,13 +530,13 @@ impl Ext2 {
             )
         };
         if groups_count == 0 || self.block_groups.len() < groups_count {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "inconsistent block group count");
         }
         if parent_ino < ROOT_INO || parent_ino > total_inodes {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "parent inode number out of range");
         }
         if free_inodes == 0 {
-            return_errno!(Errno::ENOSPC);
+            return_errno_with_message!(Errno::ENOSPC, "no free inodes on device");
         }
 
         let parent_group = ((parent_ino - 1) / inodes_per_group) as usize;
@@ -545,7 +545,7 @@ impl Ext2 {
             let group = self
                 .block_groups
                 .get(group_idx)
-                .ok_or_else(|| Error::new(Errno::EIO))?;
+                .ok_or_else(|| Error::with_message(Errno::EIO, "block group index out of range"))?;
             if group.free_inodes_count() == 0 {
                 continue;
             }
@@ -563,7 +563,7 @@ impl Ext2 {
                 .saturating_add(inode_idx as u32)
                 .saturating_add(1);
             if ino < first_ino || ino > total_inodes {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "allocated inode number out of valid range");
             }
 
             if self
@@ -571,7 +571,7 @@ impl Ext2 {
                 .write_bytes(group.inode_bitmap_bid().to_offset(), bitmap.as_bytes())
                 .is_err()
             {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "failed to write inode bitmap");
             }
 
             group.dec_free_inodes(1);
@@ -584,7 +584,7 @@ impl Ext2 {
             return Ok(ino);
         }
 
-        return_errno!(Errno::ENOSPC);
+        return_errno_with_message!(Errno::ENOSPC, "no free inodes available in any group");
     }
 
     /// Allocates and initializes a new inode.
@@ -597,7 +597,7 @@ impl Ext2 {
         perm: FilePerm,
     ) -> Result<Arc<Inode>> {
         if inode_type == InodeType::Unknown {
-            return_errno!(Errno::EINVAL);
+            return_errno_with_message!(Errno::EINVAL, "cannot create inode with unknown type");
         }
 
         let ino = self.alloc_inode(parent_ino, inode_type)?;
@@ -659,10 +659,10 @@ impl Ext2 {
             )
         };
         if ino < first_ino || ino > total_inodes {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "inode number out of valid range for free");
         }
         if groups_count == 0 || self.block_groups.len() < groups_count {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "inconsistent block group count");
         }
 
         let desc = self.read_inode_desc(ino)?;
@@ -674,7 +674,7 @@ impl Ext2 {
         let group = self
             .block_groups
             .get(group_idx)
-            .ok_or_else(|| Error::new(Errno::EIO))?;
+            .ok_or_else(|| Error::with_message(Errno::EIO, "block group index out of range"))?;
 
         let mut bitmap = {
             let sb_guard = self.super_block.read();
@@ -695,7 +695,7 @@ impl Ext2 {
             .write_bytes(group.inode_bitmap_bid().to_offset(), bitmap.as_bytes())
             .is_err()
         {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "failed to write inode bitmap");
         }
 
         if !freed {
@@ -730,7 +730,7 @@ impl Ext2 {
             sb_guard.block_groups_count() as usize
         };
         if groups_count == 0 || self.block_groups.len() < groups_count {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "inconsistent block group count");
         }
 
         for group in &self.block_groups {
@@ -747,7 +747,7 @@ impl Ext2 {
             .read_bytes(0, &mut desc_buf)
             .is_err()
         {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "failed to read group descriptor segment");
         }
         let mut sb_guard = self.super_block.write();
         sb_guard.set_wtime(now());
@@ -756,7 +756,7 @@ impl Ext2 {
             .write_bytes(sb_guard.group_descriptors_bid(0).to_offset(), &desc_buf)
             .is_err()
         {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "failed to write group descriptor table");
         }
 
         let mut raw_sb = RawSuperBlock::from(&**sb_guard);
@@ -765,7 +765,7 @@ impl Ext2 {
             .write_bytes(SUPER_BLOCK_OFFSET, raw_sb.as_bytes())
             .is_err()
         {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "failed to write superblock");
         }
 
         for idx in 1..groups_count {
@@ -778,14 +778,14 @@ impl Ext2 {
                 .write_bytes(sb_guard.bid(idx).to_offset(), raw_sb.as_bytes())
                 .is_err()
             {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "failed to write backup superblock");
             }
             if self
                 .block_device
                 .write_bytes(sb_guard.group_descriptors_bid(idx).to_offset(), &desc_buf)
                 .is_err()
             {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "failed to write backup group descriptors");
             }
         }
 
@@ -815,11 +815,11 @@ impl Ext2 {
             group_idx,
         );
         if group_last < group_first {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "block group has invalid block range");
         }
         let group_size = group_last - group_first + 1;
         if group_size as usize > BLOCK_SIZE * 8 {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "block group size exceeds bitmap capacity");
         }
 
         let mut saw_corruption = false;
@@ -866,7 +866,7 @@ impl Ext2 {
                 .write_bytes(group.block_bitmap_bid().to_offset(), bitmap.as_bytes())
                 .is_err()
             {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "failed to write block bitmap after alloc");
             }
 
             group.dec_free_blocks(alloc_len as u16);

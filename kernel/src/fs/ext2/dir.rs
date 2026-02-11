@@ -84,18 +84,18 @@ impl DirEntry {
         max_inumber: u32,
     ) -> Result<DirEntry> {
         if offset >= limit {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "dir entry offset beyond block limit");
         }
         let header_len = size_of::<RawDirEntry>();
         if offset.saturating_add(header_len) > limit {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "dir entry header crosses block limit");
         }
 
         let raw = {
             let mut reader = VmReader::from(&buf[offset..limit]);
             reader
                 .read_val::<RawDirEntry>()
-                .map_err(|_| Error::new(Errno::EIO))?
+                .map_err(|_| Error::with_message(Errno::EIO, "failed to read dir entry header"))?
         };
 
         let rec_len = Self::rec_len_from_disk(raw.rec_len);
@@ -105,7 +105,7 @@ impl DirEntry {
         let name_start = offset + header_len;
         let name_end = name_start.saturating_add(name_len);
         if name_end > limit {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "dir entry name extends beyond block limit");
         }
         let name = CStr256::from(&buf[name_start..name_end]);
 
@@ -131,7 +131,7 @@ pub(super) struct DirEntryIter<'a> {
 impl<'a> DirEntryIter<'a> {
     pub(super) fn new(buf: &'a [u8], limit: usize, max_inumber: u32) -> Result<Self> {
         if limit == 0 || limit > buf.len() {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "invalid dir block limit");
         }
         Ok(Self {
             buf,
@@ -146,13 +146,13 @@ impl<'a> DirEntryIter<'a> {
             return Ok(None);
         }
         if self.offset > self.limit {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "dir iterator offset past limit");
         }
 
         let entry = DirEntry::parse_at(self.buf, self.offset, self.limit, self.max_inumber)?;
         let rec_len = entry.rec_len as usize;
         if self.offset.saturating_add(rec_len) > self.limit {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "dir entry rec_len exceeds block limit");
         }
         self.offset += rec_len;
         Ok(Some(entry))

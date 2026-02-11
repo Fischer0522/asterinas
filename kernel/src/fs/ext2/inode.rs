@@ -83,7 +83,7 @@ impl InodeInner {
     }
 
     pub fn write_at(&self, _offset: usize, _data: &[u8]) -> Result<usize> {
-        return_errno!(Errno::ENOSYS);
+        return_errno_with_message!(Errno::ENOSYS, "write not yet implemented");
     }
 
     /// Initializes a newly allocated directory inode with `.` and `..` entries.
@@ -94,16 +94,16 @@ impl InodeInner {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let total_inodes = fs.super_block().total_inodes();
         if parent_ino == 0 || parent_ino > total_inodes {
-            return_errno!(Errno::EINVAL);
+            return_errno_with_message!(Errno::EINVAL, "parent inode number out of range");
         }
 
         let self_ino = self
             .weak_self
             .upgrade()
-            .ok_or_else(|| Error::new(Errno::EIO))?
+            .ok_or_else(|| Error::with_message(Errno::EIO, "inode already dropped"))?
             .ino();
 
         let chunk_size = fs.block_size();
@@ -112,7 +112,7 @@ impl InodeInner {
         // SPEC: allocate exactly one data block for the first directory chunk.
         let allocated = fs.alloc_blocks(1)?;
         if allocated.end != allocated.start.saturating_add(1) {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "unexpected multi-block allocation");
         }
         let new_bid = allocated.start;
 
@@ -123,7 +123,7 @@ impl InodeInner {
 
         if old_ptr0 != 0 {
             let _ = fs.free_blocks(new_bid, 1);
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "dir block pointer already occupied");
         }
         self.desc.block_ptrs[0] = new_bid;
 
@@ -155,7 +155,7 @@ impl InodeInner {
         {
             self.desc.block_ptrs[0] = old_ptr0;
             let _ = fs.free_blocks(new_bid, 1);
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "failed to write initial dir block");
         }
 
         self.desc.size = chunk_size as u64;
@@ -163,7 +163,7 @@ impl InodeInner {
             .desc
             .blocks
             .checked_add(sectors_per_block)
-            .ok_or_else(|| Error::new(Errno::EIO))?;
+            .ok_or_else(|| Error::with_message(Errno::EIO, "inode block count overflow"))?;
 
         if let Err(err) = self.persist_inode_and_sync(&fs) {
             // SPEC: cleanup allocation and restore pre-state if persistence failed.
@@ -271,11 +271,11 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let parent_ino = self
             .weak_self
             .upgrade()
-            .ok_or_else(|| Error::new(Errno::EIO))?
+            .ok_or_else(|| Error::with_message(Errno::EIO, "inode already dropped"))?
             .ino();
 
         // SPEC: reserve parent link for new subdir's `..`.
@@ -343,7 +343,7 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let child_ino = self.find_entry(name)?;
         let child = fs.read_inode(child_ino)?;
 
@@ -378,7 +378,7 @@ impl InodeInner {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let sb = fs.super_block();
         let block_size = fs.block_size();
         let size = self.desc.size;
@@ -399,14 +399,14 @@ impl InodeInner {
 
             let bid = self
                 .get_block(block_idx as u32)?
-                .ok_or_else(|| Error::new(Errno::EIO))?;
+                .ok_or_else(|| Error::with_message(Errno::EIO, "dir block not mapped"))?;
             let mut buf = vec![0u8; block_size];
             if fs
                 .block_device()
                 .read_bytes(bid.to_offset(), &mut buf)
                 .is_err()
             {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "failed to read dir block");
             }
 
             let mut iter = DirEntryIter::new(&buf, limit, max_inumber)?;
@@ -447,7 +447,7 @@ impl InodeInner {
             return Ok(0);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let sb = fs.super_block();
         let block_size = fs.block_size();
         let max_inumber = sb.total_inodes();
@@ -470,14 +470,14 @@ impl InodeInner {
 
             let bid = self
                 .get_block(block_idx as u32)?
-                .ok_or_else(|| Error::new(Errno::EIO))?;
+                .ok_or_else(|| Error::with_message(Errno::EIO, "dir block not mapped"))?;
             let mut buf = vec![0u8; block_size];
             if fs
                 .block_device()
                 .read_bytes(bid.to_offset(), &mut buf)
                 .is_err()
             {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "failed to read dir block");
             }
 
             let mut iter = DirEntryIter::new(&buf, limit, max_inumber)?;
@@ -527,11 +527,11 @@ impl InodeInner {
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:163 (ext2_block_to_path)
     pub(super) fn block_to_path(&self, iblock: u32) -> Result<BlockPath> {
-        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let sb = fs.super_block();
         let ptrs = (sb.block_size() / size_of::<u32>()) as u32;
         if ptrs == 0 {
-            return_errno!(Errno::EINVAL);
+            return_errno_with_message!(Errno::EINVAL, "block number out of range");
         }
 
         let ptrs_bits = ptrs.trailing_zeros();
@@ -539,7 +539,7 @@ impl InodeInner {
         let indirect_blocks = ptrs;
         let double_blocks = 1u32
             .checked_shl(ptrs_bits.saturating_mul(2))
-            .ok_or_else(|| Error::new(Errno::EINVAL))?;
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "block path shift overflow"))?;
 
         let mut offsets = [0u32; 4];
         let depth;
@@ -578,7 +578,7 @@ impl InodeInner {
             depth = 4usize;
             boundary = ptrs - 1 - (block & (ptrs - 1));
         } else {
-            return_errno!(Errno::EINVAL);
+            return_errno_with_message!(Errno::EINVAL, "block number exceeds maximum");
         }
 
         Ok(BlockPath {
@@ -602,7 +602,7 @@ impl InodeInner {
             return Ok(None);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         for level in 1..path.depth {
             let mut buf = vec![0u8; BLOCK_SIZE];
             if fs
@@ -610,7 +610,7 @@ impl InodeInner {
                 .read_bytes(Bid::new(bid as u64).to_offset(), &mut buf)
                 .is_err()
             {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "failed to read indirect block");
             }
 
             let mut reader = VmReader::from(buf.as_slice());
@@ -619,7 +619,7 @@ impl InodeInner {
             let next = reader
                 .skip(offset_bytes)
                 .read_val::<u32>()
-                .map_err(|_| Error::new(Errno::EIO))?;
+                .map_err(|_| Error::with_message(Errno::EIO, "failed to read indirect block pointer"))?;
             if next == 0 {
                 return Ok(None);
             }
@@ -647,7 +647,7 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let max_inumber = fs.super_block().total_inodes();
         if ino == 0 || ino > max_inumber {
             return_errno!(Errno::EINVAL);
@@ -656,7 +656,7 @@ impl InodeInner {
         let chunk_size = fs.block_size();
         let reclen = DirEntry::dir_rec_len(name_bytes.len()) as usize;
         if reclen > chunk_size {
-            return_errno!(Errno::ENOSPC);
+            return_errno_with_message!(Errno::ENOSPC, "dir entry too large for block");
         }
 
         let size = self.desc.size as usize;
@@ -687,7 +687,7 @@ impl InodeInner {
                 // No reusable slot found in existing blocks: grow directory by one block.
                 let allocated = fs.alloc_blocks(1)?;
                 if allocated.end != allocated.start.saturating_add(1) {
-                    return_errno!(Errno::EIO);
+                    return_errno_with_message!(Errno::EIO, "unexpected multi-block allocation");
                 }
 
                 if let Err(err) = self.link_new_data_block(block_idx as u32, allocated.start) {
@@ -711,7 +711,7 @@ impl InodeInner {
 
             let bid = self
                 .get_block(block_idx as u32)?
-                .ok_or_else(|| Error::new(Errno::EIO))?;
+                .ok_or_else(|| Error::with_message(Errno::EIO, "dir block not mapped"))?;
 
             let mut buf = vec![0u8; chunk_size];
             if fs
@@ -719,7 +719,7 @@ impl InodeInner {
                 .read_bytes(bid.to_offset(), &mut buf)
                 .is_err()
             {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "failed to read dir block");
             }
 
             let block_offset = block_idx.saturating_mul(chunk_size);
@@ -772,12 +772,12 @@ impl InodeInner {
             from_new_block,
         }) = selected
         else {
-            return_errno!(Errno::ENOSPC);
+            return_errno_with_message!(Errno::ENOSPC, "no space for new dir entry");
         };
 
         let (new_offset, new_rec_len) = if split_used_entry {
             if used_rec_len < DirEntry::dir_rec_len(1) as usize || used_rec_len >= slot_rec_len {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "corrupted dir entry split");
             }
             Self::write_rec_len(&mut block_buf, slot_offset, used_rec_len as u16)?;
             (slot_offset + used_rec_len, slot_rec_len - used_rec_len)
@@ -803,7 +803,7 @@ impl InodeInner {
             if from_new_block {
                 let _ = fs.free_blocks(block_bid.to_raw() as u32, 1);
             }
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "failed to write dir block");
         }
 
         if from_new_block {
@@ -812,12 +812,12 @@ impl InodeInner {
                 .desc
                 .size
                 .checked_add(chunk_size as u64)
-                .ok_or_else(|| Error::new(Errno::EIO))?;
+                .ok_or_else(|| Error::with_message(Errno::EIO, "inode size overflow"))?;
             self.desc.blocks = self
                 .desc
                 .blocks
                 .checked_add(sectors_per_block)
-                .ok_or_else(|| Error::new(Errno::EIO))?;
+                .ok_or_else(|| Error::with_message(Errno::EIO, "inode block count overflow"))?;
         }
 
         self.update_dir_timestamps_and_flags()?;
@@ -844,7 +844,7 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let max_inumber = fs.super_block().total_inodes();
         if new_ino < ROOT_INO || new_ino > max_inumber {
             return_errno!(Errno::EINVAL);
@@ -860,7 +860,7 @@ impl InodeInner {
 
         Self::write_inode_number(&mut target.block_buf, target.entry_offset, new_ino)?;
         if target.entry_offset.saturating_add(size_of::<RawDirEntry>()) > target.block_buf.len() {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "dir entry header out of bounds");
         }
         target.block_buf[target.entry_offset + 7] = file_type as u8;
 
@@ -869,7 +869,7 @@ impl InodeInner {
             .write_bytes(target.block_bid.to_offset(), &target.block_buf)
             .is_err()
         {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "failed to write dir block");
         }
 
         if update_times {
@@ -894,7 +894,7 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let max_inumber = fs.super_block().total_inodes();
         let chunk_size = fs.block_size();
         let size = self.desc.size as usize;
@@ -903,7 +903,7 @@ impl InodeInner {
         let Some(mut target) =
             self.find_entry_slot(name_bytes, &fs, max_inumber, chunk_size, size)?
         else {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "dir entry not found for delete");
         };
 
         Self::delete_entry_in_block(
@@ -919,7 +919,7 @@ impl InodeInner {
             .write_bytes(target.block_bid.to_offset(), &target.block_buf)
             .is_err()
         {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "failed to write dir block");
         }
 
         self.update_dir_timestamps_and_flags()?;
@@ -931,12 +931,12 @@ impl InodeInner {
         // TODO:
         // Current mutation path supports direct block growth only.
         if iblock >= 12 {
-            return_errno!(Errno::ENOSPC);
+            return_errno_with_message!(Errno::ENOSPC, "no direct block slots available");
         }
 
         let slot = &mut self.desc.block_ptrs[iblock as usize];
         if *slot != 0 {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "data block slot already occupied");
         }
         *slot = new_bid;
         Ok(())
@@ -973,7 +973,7 @@ impl InodeInner {
         for block_idx in 0..data_blocks {
             let block_bid = self
                 .get_block(block_idx as u32)?
-                .ok_or_else(|| Error::new(Errno::EIO))?;
+                .ok_or_else(|| Error::with_message(Errno::EIO, "dir block not mapped"))?;
 
             let mut block_buf = vec![0u8; chunk_size];
             if fs
@@ -981,7 +981,7 @@ impl InodeInner {
                 .read_bytes(block_bid.to_offset(), &mut block_buf)
                 .is_err()
             {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "failed to read dir block");
             }
 
             let block_offset = block_idx.saturating_mul(chunk_size);
@@ -1025,7 +1025,7 @@ impl InodeInner {
         // `to` is the end offset of the entry being removed.
         let to = entry_offset.saturating_add(entry_rec_len);
         if entry_rec_len == 0 || to > limit {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "invalid dir entry rec_len for delete");
         }
 
         // TODO: Maybe we can simplify the mask logic here.
@@ -1042,17 +1042,17 @@ impl InodeInner {
 
         while de_offset < entry_offset {
             if de_offset.saturating_add(size_of::<RawDirEntry>()) > limit {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "dir entry header out of bounds");
             }
 
             let rec_len = u16::from_le_bytes([block_buf[de_offset + 4], block_buf[de_offset + 5]]);
             if rec_len == 0 {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "zero rec_len in dir entry chain");
             }
 
             let next = de_offset.saturating_add(rec_len as usize);
             if next > limit {
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "dir entry chain exceeds block limit");
             }
 
             prev_offset = Some(de_offset);
@@ -1061,7 +1061,7 @@ impl InodeInner {
 
         // If traversal does not land exactly on the target entry, layout is corrupt.
         if de_offset != entry_offset {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "dir entry chain offset mismatch");
         }
 
         if let Some(prev) = prev_offset {
@@ -1087,24 +1087,24 @@ impl InodeInner {
     ) -> Result<()> {
         let header_len = size_of::<RawDirEntry>();
         if name.len() > u8::MAX as usize {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "dir entry name too long");
         }
 
         let rec_len_usize = rec_len as usize;
         if rec_len_usize < DirEntry::dir_rec_len(name.len()) as usize {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "dir entry rec_len too small");
         }
         if rec_len_usize & 3 != 0 {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "dir entry rec_len not aligned");
         }
         if offset.saturating_add(rec_len_usize) > buf.len() {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "dir entry exceeds buffer");
         }
 
         let name_start = offset + header_len;
         let name_end = name_start.saturating_add(name.len());
         if name_end > offset.saturating_add(rec_len_usize) {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "dir entry name exceeds rec_len");
         }
 
         buf[offset..offset + 4].copy_from_slice(&inode.to_le_bytes());
@@ -1117,13 +1117,13 @@ impl InodeInner {
 
     fn write_rec_len(buf: &mut [u8], offset: usize, rec_len: u16) -> Result<()> {
         if rec_len == 0 || rec_len & 3 != 0 {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "invalid rec_len value");
         }
         if offset.saturating_add(size_of::<RawDirEntry>()) > buf.len() {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "dir entry header out of bounds");
         }
         if offset.saturating_add(rec_len as usize) > buf.len() {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "rec_len exceeds buffer");
         }
         buf[offset + 4..offset + 6].copy_from_slice(&rec_len.to_le_bytes());
         Ok(())
@@ -1131,7 +1131,7 @@ impl InodeInner {
 
     fn write_inode_number(buf: &mut [u8], offset: usize, inode: u32) -> Result<()> {
         if offset.saturating_add(size_of::<RawDirEntry>()) > buf.len() {
-            return_errno!(Errno::EIO);
+            return_errno_with_message!(Errno::EIO, "dir entry header out of bounds");
         }
         buf[offset..offset + 4].copy_from_slice(&inode.to_le_bytes());
         Ok(())
@@ -1169,7 +1169,7 @@ impl InodeInner {
         let inode = self
             .weak_self
             .upgrade()
-            .ok_or_else(|| Error::new(Errno::EIO))?;
+            .ok_or_else(|| Error::with_message(Errno::EIO, "inode already dropped"))?;
         let raw = RawInode::from(&*self.desc);
         fs.write_inode_desc(inode.ino, &raw)?;
         fs.sync_metadata()?;
@@ -1310,7 +1310,7 @@ impl Inode {
             return Ok(ret);
         } else {
             // Linux: ext2_create → ext2_new_inode + ext2_add_nondir
-            let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+            let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
             let child = fs.create_inode(self.ino, type_, perm)?;
             let child_ino = child.ino();
             let dir_ft = Self::inode_type_to_dir_file_type(type_);
@@ -1350,8 +1350,8 @@ impl Inode {
         }
 
         // SPEC: cross-filesystem link check.
-        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
-        let old_fs = old.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let old_fs = old.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         if !Arc::ptr_eq(&fs, &old_fs) {
             return_errno!(Errno::EINVAL);
         }
@@ -1400,7 +1400,7 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
 
         // Acquire self write lock to resolve and delete entry.
         let mut self_inner = self.inner.write();
@@ -1471,8 +1471,8 @@ impl Inode {
         }
 
         // SPEC: cross-filesystem rename check.
-        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
-        let target_fs = target.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let fs = self.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let target_fs = target.fs.upgrade().ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         if !Arc::ptr_eq(&fs, &target_fs) {
             return_errno!(Errno::EINVAL);
         }
@@ -1612,7 +1612,7 @@ impl Inode {
             let dotdot_ino = old_inner.find_entry("..")?;
             if dotdot_ino != self_ino {
                 drop(old_inner);
-                return_errno!(Errno::EIO);
+                return_errno_with_message!(Errno::EIO, "failed to update dotdot entry");
             }
             drop(old_inner);
         }
@@ -1859,7 +1859,7 @@ impl TryFrom<&RawInode> for InodeDesc {
         let mode = raw.mode;
 
         if raw.links_count == 0 && (mode == 0 || raw.dtime != 0) {
-            return_errno!(Errno::ESTALE);
+            return_errno_with_message!(Errno::ESTALE, "inode has been deleted");
         }
 
         // TODO: Different from Linux
@@ -1881,14 +1881,14 @@ impl TryFrom<&RawInode> for InodeDesc {
             size |= (raw.size_high as u64) << 32;
         }
         if size > i64::MAX as u64 {
-            return_errno!(Errno::EUCLEAN);
+            return_errno_with_message!(Errno::EUCLEAN, "corrupted inode on disk");
         }
 
         let file_acl = raw.file_acl;
 
         let block_ptrs = raw.block;
 
-        let flags = FileFlags::from_bits(raw.flags).ok_or_else(|| Error::new(Errno::EIO))?;
+        let flags = FileFlags::from_bits(raw.flags).ok_or_else(|| Error::with_message(Errno::EIO, "invalid inode flags"))?;
 
         Ok(InodeDesc {
             type_,
@@ -2143,7 +2143,7 @@ mod test {
             _offset: usize,
         ) -> Result<()> {
             if self.seen >= self.allow_count {
-                return_errno!(Errno::EINTR);
+                return_errno_with_message!(Errno::EINTR, "operation interrupted");
             }
             self.seen += 1;
             Ok(())
