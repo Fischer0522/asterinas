@@ -972,35 +972,6 @@ impl Ext2 {
 
 #[cfg(ktest)]
 impl Ext2 {
-    /// Constructs an `Ext2` instance directly (bypassing `open`) for unit tests
-    /// that need to test internal methods like `check_group_desc_table`,
-    /// `load_block_groups`, `inode_table_block`, `read_inode_desc`, etc.
-    pub(super) fn new_test(sb: SuperBlock, block_device: Arc<dyn BlockDevice>) -> Self {
-        let group_descriptors_segment: USegment = FrameAllocOptions::new()
-            .zeroed(true)
-            .alloc_segment(1)
-            .unwrap()
-            .into();
-
-        Self {
-            block_device,
-            super_block: RwMutex::new(Dirty::new(sb)),
-            block_groups: Vec::new(),
-            inodes_per_group: sb.inodes_per_group(),
-            blocks_per_group: sb.blocks_per_group(),
-            inode_size: sb.inode_size(),
-            block_size: sb.block_size(),
-            group_descriptors_segment,
-            fs_event_subscriber_stats: FsEventSubscriberStats::new(),
-            self_ref: Weak::new(),
-        }
-    }
-
-    /// Sets the block groups (test only).
-    pub(super) fn set_block_groups(&mut self, groups: Vec<BlockGroup>) {
-        self.block_groups = groups;
-    }
-
     /// Returns a reference to the block groups (test only).
     pub(super) fn block_groups(&self) -> &[BlockGroup] {
         &self.block_groups
@@ -1009,11 +980,6 @@ impl Ext2 {
     /// Returns a write guard of the superblock (test only).
     pub(super) fn super_block_write(&self) -> RwMutexWriteGuard<'_, Dirty<SuperBlock>> {
         self.super_block.write()
-    }
-
-    /// Returns the block device as `Arc` (test only).
-    pub(super) fn block_device_arc(&self) -> &Arc<dyn BlockDevice> {
-        &self.block_device
     }
 }
 
@@ -1112,7 +1078,7 @@ mod test {
         let f = Ext2FixtureBuilder::new(1, 128)
             .with_free_blocks(31, 31)
             .with_metadata_block_bitmap()
-            .build_raw()
+            .build()
             .unwrap();
 
         let before_sb_free = f.ext2.super_block().free_blocks_count();
@@ -1150,7 +1116,7 @@ mod test {
         let f_nospc = Ext2FixtureBuilder::new(1, 128)
             .with_free_blocks(0, 0)
             .with_metadata_block_bitmap()
-            .build_raw()
+            .build()
             .unwrap();
         assert_eq!(
             f_nospc.ext2.alloc_blocks(1).unwrap_err().error(),
@@ -1165,7 +1131,7 @@ mod test {
         let f_corrupt = Ext2FixtureBuilder::new(1, 128)
             .with_free_blocks(1, 1)
             .with_filled_block_bitmap(true)
-            .build_raw()
+            .build()
             .unwrap();
         assert_eq!(
             f_corrupt.ext2.alloc_blocks(1).unwrap_err().error(),
@@ -1176,7 +1142,7 @@ mod test {
         let f_free = Ext2FixtureBuilder::new(1, 128)
             .with_free_blocks(31, 31)
             .with_metadata_block_bitmap()
-            .build_raw()
+            .build()
             .unwrap();
         assert!(f_free.ext2.free_blocks(10, 0).is_ok());
         assert_eq!(f_free.ext2.free_blocks(1, 1).unwrap_err().error(), Errno::EIO);
@@ -1198,7 +1164,7 @@ mod test {
         let f = Ext2FixtureBuilder::new(1, 128)
             .with_free_inodes(16, 16)
             .with_reserved_inode_bitmap()
-            .build_raw()
+            .build()
             .unwrap();
 
         let before_sb_free = f.ext2.super_block().free_inodes_count();
@@ -1243,7 +1209,7 @@ mod test {
         let f_nospc = Ext2FixtureBuilder::new(1, 128)
             .with_free_inodes(0, 0)
             .with_reserved_inode_bitmap()
-            .build_raw()
+            .build()
             .unwrap();
         assert_eq!(
             f_nospc.ext2.alloc_inode(ROOT_INO, InodeType::File)
@@ -1260,7 +1226,7 @@ mod test {
         let f_full = Ext2FixtureBuilder::new(1, 128)
             .with_free_inodes(8, 8)
             .with_filled_inode_bitmap(true)
-            .build_raw()
+            .build()
             .unwrap();
         assert_eq!(
             f_full.ext2.alloc_inode(ROOT_INO, InodeType::File)
@@ -1271,7 +1237,7 @@ mod test {
         let f_free = Ext2FixtureBuilder::new(1, 128)
             .with_free_inodes(8, 8)
             .with_reserved_inode_bitmap()
-            .build_raw()
+            .build()
             .unwrap();
         assert_eq!(
             f_free.ext2.free_inode(f_free.sb.first_ino() - 1)
@@ -1418,7 +1384,7 @@ mod test {
     #[ktest]
     fn read_inode_desc_ok() {
         let f = Ext2FixtureBuilder::new(2, 128)
-            .build_raw()
+            .build()
             .unwrap();
 
         let raw = make_raw_inode(0o040755, 2, 0);
@@ -1435,7 +1401,7 @@ mod test {
     #[ktest]
     fn read_inode_desc_error() {
         // Out-of-range group index.
-        let f = Ext2FixtureBuilder::new(2, 128).build_raw().unwrap();
+        let f = Ext2FixtureBuilder::new(2, 128).build().unwrap();
         let group_err = f.ext2.inode_table_block(2, 0).unwrap_err();
         assert_eq!(group_err.error(), Errno::EIO);
 
@@ -1447,16 +1413,23 @@ mod test {
             .unwrap_err();
         assert_eq!(invalid_high.error(), Errno::EINVAL);
 
-        // I/O error from block device.
-        let io_disk = ErrorBioDisk::new(BioStatus::IoError, 128 * BLOCK_SIZE / SECTOR_SIZE);
+        // I/O error from block device: use ErrorBioDisk that fails at inode table offset.
+        let f_base = Ext2FixtureBuilder::new(2, 128).build().unwrap();
+        let inode_table_offset = Bid::new(f_base.descs[0].inode_table as u64).to_offset();
+        let io_disk = ErrorBioDisk::with_read_error_at(
+            f_base.disk.clone(),
+            BioStatus::IoError,
+            inode_table_offset,
+        );
         let f_io = Ext2FixtureBuilder::new(2, 128)
-            .build_raw_with_device(Arc::new(io_disk))
+            .with_device(Arc::new(io_disk))
+            .build()
             .unwrap();
         let io_err = f_io.ext2.read_inode_desc(ROOT_INO).unwrap_err();
         assert_eq!(io_err.error(), Errno::EIO);
 
         // Deleted inode (dtime != 0, mode == 0) → ESTALE.
-        let f_parse = Ext2FixtureBuilder::new(2, 128).build_raw().unwrap();
+        let f_parse = Ext2FixtureBuilder::new(2, 128).build().unwrap();
         let ino = f_parse.sb.first_ino();
         let raw = make_raw_inode(0, 0, 1);
         write_raw_inode_to_disk(&f_parse.sb, &f_parse.descs, ino, &raw, &f_parse.disk);
@@ -1491,23 +1464,13 @@ mod test {
         );
         let deleted_err = f_deleted.ext2.read_inode(deleted_ino).unwrap_err();
         assert_eq!(deleted_err.error(), Errno::ESTALE);
-
-        // Raw ext2 without Arc (self_ref is Weak::new()) → EIO.
-        let f_unwired = Ext2FixtureBuilder::new(2, 128).build_raw().unwrap();
-        let raw_ok = make_raw_inode(0o040755, 2, 0);
-        write_raw_inode_to_disk(
-            &f_unwired.sb, &f_unwired.descs, ROOT_INO,
-            &raw_ok, &f_unwired.disk,
-        );
-        let unwired_err = f_unwired.ext2.read_inode(ROOT_INO).unwrap_err();
-        assert_eq!(unwired_err.error(), Errno::EIO);
     }
 
     #[ktest]
     fn load_block_bitmap_ok() {
         let f = Ext2FixtureBuilder::new(2, 128)
             .with_metadata_block_bitmap()
-            .build_raw()
+            .build()
             .unwrap();
         let group = &f.block_groups()[0];
         let sb_guard = f.ext2.super_block();
@@ -1525,7 +1488,7 @@ mod test {
 
     #[ktest]
     fn load_block_bitmap_bad_inode_table_bits() {
-        let f = Ext2FixtureBuilder::new(2, 128).build_raw().unwrap();
+        let f = Ext2FixtureBuilder::new(2, 128).build().unwrap();
         let group = &f.block_groups()[0];
         let first = f.sb.group_first_block_no(0);
 
@@ -1546,7 +1509,7 @@ mod test {
 
     #[ktest]
     fn load_inode_bitmap_ok() {
-        let f = Ext2FixtureBuilder::new(2, 128).build_raw().unwrap();
+        let f = Ext2FixtureBuilder::new(2, 128).build().unwrap();
         let group = &f.block_groups()[0];
 
         // Write custom inode bitmap with bits 0 and 8 set.

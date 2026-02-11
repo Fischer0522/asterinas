@@ -710,6 +710,10 @@ impl Ext2Fixture {
         self.ext2.read_inode(ROOT_INO)
     }
 
+    pub(super) fn block_groups(&self) -> &[super::block_group::BlockGroup] {
+        self.ext2.block_groups()
+    }
+
     pub(super) fn read_inode_bitmap(&self, group_idx: usize) -> Result<[u8; BLOCK_SIZE]> {
         let desc = self
             .descs
@@ -727,32 +731,6 @@ impl Ext2Fixture {
     }
 }
 
-/// A test fixture that bypasses `Ext2::open` for unit-testing internal methods
-/// like `check_group_desc_table`, `load_block_groups`, `inode_table_block`,
-/// `read_inode_desc`, bitmap loading, and block/inode allocation.
-pub(super) struct RawExt2Fixture {
-    pub disk: Arc<Ext2MemoryDisk>,
-    pub ext2: Ext2,
-    pub sb: SuperBlock,
-    pub descs: Vec<RawGroupDesc>,
-}
-
-impl RawExt2Fixture {
-    pub(super) fn block_groups(&self) -> &[super::block_group::BlockGroup] {
-        self.ext2.block_groups()
-    }
-
-    pub(super) fn super_block_write(
-        &self,
-    ) -> ostd::sync::RwMutexWriteGuard<'_, super::utils::Dirty<SuperBlock>> {
-        self.ext2.super_block_write()
-    }
-
-    pub(super) fn block_device_arc(&self) -> &Arc<dyn BlockDevice> {
-        self.ext2.block_device_arc()
-    }
-}
-
 pub(super) struct Ext2FixtureBuilder {
     groups: u32,
     nblocks: usize,
@@ -766,6 +744,7 @@ pub(super) struct Ext2FixtureBuilder {
     filled_inode_bitmap: bool,
     init_metadata_block_bitmap: bool,
     init_reserved_inode_bitmap: bool,
+    custom_device: Option<Arc<dyn BlockDevice>>,
 }
 
 impl Ext2FixtureBuilder {
@@ -783,6 +762,7 @@ impl Ext2FixtureBuilder {
             filled_inode_bitmap: false,
             init_metadata_block_bitmap: false,
             init_reserved_inode_bitmap: false,
+            custom_device: None,
         }
     }
 
@@ -828,6 +808,13 @@ impl Ext2FixtureBuilder {
     /// Writes reserved inode bits [0, first_ino) into the inode bitmap.
     pub(super) fn with_reserved_inode_bitmap(mut self) -> Self {
         self.init_reserved_inode_bitmap = true;
+        self
+    }
+
+    /// Uses a custom block device for the `Ext2` instance instead of the memory disk.
+    /// The memory disk is still used to prepare on-disk metadata.
+    pub(super) fn with_device(mut self, device: Arc<dyn BlockDevice>) -> Self {
+        self.custom_device = Some(device);
         self
     }
 
@@ -949,7 +936,10 @@ impl Ext2FixtureBuilder {
         let (raw_sb, sb, descs, disk, layout) = self.prepare()?;
         self.write_bitmaps(&sb, &descs, &disk, &layout);
 
-        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>)?;
+        let device: Arc<dyn BlockDevice> = self
+            .custom_device
+            .unwrap_or_else(|| disk.clone() as Arc<dyn BlockDevice>);
+        let ext2 = Ext2::open(device)?;
 
         let root_bid = layout.first_data.saturating_add(1);
         if self.init_root {
@@ -963,63 +953,6 @@ impl Ext2FixtureBuilder {
             sb,
             descs,
             root_bid,
-        })
-    }
-
-    /// Builds a raw fixture that bypasses `Ext2::open` for internal method testing.
-    pub(super) fn build_raw(self) -> Result<RawExt2Fixture> {
-        let (_raw_sb, sb, descs, disk, layout) = self.prepare()?;
-        self.write_bitmaps(&sb, &descs, &disk, &layout);
-
-        let group_descs = build_group_desc_segment(&sb, &descs);
-        let mut ext2 = Ext2::new_test(sb, disk.clone() as Arc<dyn BlockDevice>);
-        let groups = {
-            let guard = ext2.super_block();
-            Ext2::load_block_groups(&guard, &group_descs).unwrap()
-        };
-        ext2.set_block_groups(groups);
-
-        let sb = {
-            let g = ext2.super_block();
-            **g
-        };
-
-        Ok(RawExt2Fixture {
-            disk,
-            ext2,
-            sb,
-            descs,
-        })
-    }
-
-    /// Builds a raw fixture with a custom block device replacing the memory disk.
-    /// The memory disk is still used to prepare superblock/descriptors, but the
-    /// `Ext2` instance uses the provided device for all I/O.
-    pub(super) fn build_raw_with_device(
-        self,
-        device: Arc<dyn BlockDevice>,
-    ) -> Result<RawExt2Fixture> {
-        let (_raw_sb, sb, descs, disk, layout) = self.prepare()?;
-        self.write_bitmaps(&sb, &descs, &disk, &layout);
-
-        let group_descs = build_group_desc_segment(&sb, &descs);
-        let mut ext2 = Ext2::new_test(sb, device);
-        let groups = {
-            let guard = ext2.super_block();
-            Ext2::load_block_groups(&guard, &group_descs).unwrap()
-        };
-        ext2.set_block_groups(groups);
-
-        let sb = {
-            let g = ext2.super_block();
-            **g
-        };
-
-        Ok(RawExt2Fixture {
-            disk,
-            ext2,
-            sb,
-            descs,
         })
     }
 }
