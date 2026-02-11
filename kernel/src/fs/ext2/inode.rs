@@ -2,10 +2,13 @@
 
 use core::mem::size_of;
 
-use aster_virtio::device::socket::error;
 use ostd::const_assert;
 
-use super::{fs::Ext2, prelude::*, utils::now};
+use super::{
+    fs::{Ext2, ROOT_INO},
+    prelude::*,
+    utils::now,
+};
 use crate::fs::ext2::dir::{DirEntry, DirEntryIter};
 
 #[derive(Clone, Copy, Debug)]
@@ -77,10 +80,6 @@ impl InodeInner {
             weak_self,
             fs,
         }
-    }
-
-    pub fn create(&self, _name: &str, _type_: InodeType, _perm: FilePerm) -> Result<Arc<Inode>> {
-        return_errno!(Errno::ENOSYS);
     }
 
     pub fn write_at(&self, _offset: usize, _data: &[u8]) -> Result<usize> {
@@ -826,6 +825,62 @@ impl InodeInner {
         Ok(())
     }
 
+    /// Rewrites an existing entry's inode/type in-place.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:450 (ext2_set_link)
+    pub(super) fn set_link(
+        &mut self,
+        name: &str,
+        new_ino: u32,
+        file_type: DirEntryFileType,
+        update_times: bool,
+    ) -> Result<()> {
+        if self.desc.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty() || name_bytes.len() > u8::MAX as usize || name_bytes == b"." {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let fs = self.fs.upgrade().ok_or_else(|| Error::new(Errno::EIO))?;
+        let max_inumber = fs.super_block().total_inodes();
+        if new_ino < ROOT_INO || new_ino > max_inumber {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let chunk_size = fs.block_size();
+        let size = self.desc.size as usize;
+        let Some(mut target) =
+            self.find_entry_slot(name_bytes, &fs, max_inumber, chunk_size, size)?
+        else {
+            return_errno!(Errno::ENOENT);
+        };
+
+        Self::write_inode_number(&mut target.block_buf, target.entry_offset, new_ino)?;
+        if target.entry_offset.saturating_add(size_of::<RawDirEntry>()) > target.block_buf.len() {
+            return_errno!(Errno::EIO);
+        }
+        target.block_buf[target.entry_offset + 7] = file_type as u8;
+
+        if fs
+            .block_device()
+            .write_bytes(target.block_bid.to_offset(), &target.block_buf)
+            .is_err()
+        {
+            return_errno!(Errno::EIO);
+        }
+
+        if update_times {
+            self.update_dir_timestamps_and_flags()?;
+        } else {
+            self.desc.flags.remove(FileFlags::INDEX_DIR);
+        }
+        self.persist_inode_and_sync(&fs)?;
+        Ok(())
+    }
+
     /// Deletes a directory entry by name.
     ///
     /// Linux: /root/linux/fs/ext2/namei.c:272 (ext2_unlink)
@@ -1103,7 +1158,7 @@ impl InodeInner {
     }
 
     fn update_dir_timestamps_and_flags(&mut self) -> Result<()> {
-        let current = UnixTime::from(now());
+        let current = now();
         self.desc.ctime = current;
         self.desc.mtime = current;
         self.desc.flags.remove(FileFlags::INDEX_DIR);
@@ -1236,10 +1291,10 @@ pub(super) struct InodeDesc {
     uid: u32,
     gid: u32,
     size: u64,
-    atime: UnixTime,
-    ctime: UnixTime,
-    mtime: UnixTime,
-    dtime: UnixTime,
+    atime: Duration,
+    ctime: Duration,
+    mtime: Duration,
+    dtime: Duration,
     links_count: u16,
     blocks: u32,
     flags: FileFlags,
@@ -1270,9 +1325,9 @@ impl TryFrom<&RawInode> for InodeDesc {
         let uid = (raw.uid as u32) | ((raw.uid_high as u32) << 16);
         let gid = (raw.gid as u32) | ((raw.gid_high as u32) << 16);
 
-        let atime = UnixTime::from(Duration::from_secs(raw.atime as u64));
-        let ctime = UnixTime::from(Duration::from_secs(raw.ctime as u64));
-        let mtime = UnixTime::from(Duration::from_secs(raw.mtime as u64));
+        let atime = Duration::from_secs(raw.atime as u64);
+        let ctime = Duration::from_secs(raw.ctime as u64);
+        let mtime = Duration::from_secs(raw.mtime as u64);
 
         let blocks = raw.blocks;
 
@@ -1299,7 +1354,7 @@ impl TryFrom<&RawInode> for InodeDesc {
             atime,
             ctime,
             mtime,
-            dtime: UnixTime::from(Duration::from_secs(raw.dtime as u64)),
+            dtime: Duration::from_secs(raw.dtime as u64),
             links_count: raw.links_count,
             blocks,
             flags,
@@ -1317,10 +1372,10 @@ impl From<&InodeDesc> for RawInode {
         let uid_high = (desc.uid >> 16) as u16;
         let gid_high = (desc.gid >> 16) as u16;
 
-        let atime: Duration = desc.atime.into();
-        let ctime: Duration = desc.ctime.into();
-        let mtime: Duration = desc.mtime.into();
-        let dtime: Duration = desc.dtime.into();
+        let atime = desc.atime;
+        let ctime = desc.ctime;
+        let mtime = desc.mtime;
+        let dtime = desc.dtime;
 
         let (size_lo, size_high) = if desc.type_ == InodeType::File {
             (desc.size as u32, (desc.size >> 32) as u32)

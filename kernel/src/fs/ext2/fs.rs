@@ -238,7 +238,7 @@ impl Ext2 {
         let block_index = offset_bytes / block_size;
         let offset_in_block = offset_bytes % block_size;
 
-        // TODO: remove this read.
+        // TODO: remove this read when inode cache and page cache is enabled.
         let block_bid = self.inode_table_block(group_idx as usize, block_index as u32)?;
         let mut buf = vec![0u8; BLOCK_SIZE];
         if self
@@ -750,7 +750,7 @@ impl Ext2 {
             return_errno!(Errno::EIO);
         }
         let mut sb_guard = self.super_block.write();
-        sb_guard.set_wtime(UnixTime::from(now()));
+        sb_guard.set_wtime(now());
         if self
             .block_device
             .write_bytes(sb_guard.group_descriptors_bid(0).to_offset(), &desc_buf)

@@ -5,6 +5,7 @@ use core::mem::size_of;
 use ostd::const_assert;
 
 use super::prelude::*;
+use crate::time::UnixTime;
 
 /// The magic number of Ext2.
 pub const MAGIC_NUM: u16 = 0xef53;
@@ -44,9 +45,9 @@ pub struct SuperBlock {
     /// Number of inode table blocks in each group.
     itb_per_group: u32,
     /// Mount time.
-    mtime: UnixTime,
+    mtime: Duration,
     /// Write time.
-    wtime: UnixTime,
+    wtime: Duration,
     /// Mount count.
     mnt_count: u16,
     /// Maximal mount count.
@@ -58,7 +59,7 @@ pub struct SuperBlock {
     /// Behaviour when detecting errors.
     errors_behaviour: ErrorsBehaviour,
     /// Time of last check.
-    last_check_time: UnixTime,
+    last_check_time: Duration,
     /// Interval between checks.
     check_interval: Duration,
     /// Creator OS ID.
@@ -231,14 +232,14 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             frags_per_group: sb.frags_per_group,
             inodes_per_group: sb.inodes_per_group,
             itb_per_group,
-            mtime: sb.mtime,
-            wtime: sb.wtime,
+            mtime: Duration::from(sb.mtime),
+            wtime: Duration::from(sb.wtime),
             mnt_count: sb.mnt_count,
             max_mnt_count: sb.max_mnt_count,
             magic: MAGIC_NUM,
             state,
             errors_behaviour,
-            last_check_time: sb.last_check_time,
+            last_check_time: Duration::from(sb.last_check_time),
             check_interval: Duration::from_secs(sb.check_interval as _),
             creator_os,
             rev_level,
@@ -460,7 +461,7 @@ impl SuperBlock {
         self.free_inodes_count += 1;
     }
 
-    pub(super) fn set_wtime(&mut self, time: UnixTime) {
+    pub(super) fn set_wtime(&mut self, time: Duration) {
         self.wtime = time;
     }
 
@@ -699,15 +700,15 @@ impl From<&SuperBlock> for RawSuperBlock {
             blocks_per_group: sb.blocks_per_group,
             frags_per_group: sb.frags_per_group,
             inodes_per_group: sb.inodes_per_group,
-            mtime: sb.mtime,
-            wtime: sb.wtime,
+            mtime: UnixTime::from(sb.mtime),
+            wtime: UnixTime::from(sb.wtime),
             mnt_count: sb.mnt_count,
             max_mnt_count: sb.max_mnt_count,
             magic: sb.magic,
             state: sb.state.bits(),
             errors: sb.errors_behaviour as u16,
             min_rev_level: sb.min_rev_level,
-            last_check_time: sb.last_check_time,
+            last_check_time: UnixTime::from(sb.last_check_time),
             check_interval: sb.check_interval.as_secs() as u32,
             creator_os: sb.creator_os as u32,
             rev_level: sb.rev_level as u32,
