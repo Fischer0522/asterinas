@@ -1630,6 +1630,39 @@ mod test {
             .unwrap();
     }
 
+    fn write_valid_inode_bitmap(
+        disk: &Ext2MemoryDisk,
+        sb: &SuperBlock,
+        desc: &RawGroupDesc,
+        allocated_inodes: &[u32],
+    ) {
+        let mut bitmap = [0u8; BLOCK_SIZE];
+        for bit in 0..(sb.first_ino() as usize).saturating_sub(1) {
+            set_bit_lsb0(&mut bitmap, bit);
+        }
+
+        for &ino in allocated_inodes {
+            if ino == 0 || ino > sb.inodes_per_group() {
+                continue;
+            }
+            let bit = (ino - 1) as usize;
+            set_bit_lsb0(&mut bitmap, bit);
+        }
+
+        disk.segment()
+            .write_bytes(
+                Bid::new(desc.inode_bitmap as u64).to_offset(),
+                &bitmap,
+            )
+            .unwrap();
+    }
+
+    fn bit_is_set_lsb0(buf: &[u8], bit: usize) -> bool {
+        let byte = bit / 8;
+        let bit_in_byte = bit % 8;
+        (buf[byte] & (1u8 << bit_in_byte)) != 0
+    }
+
     #[ktest]
     fn inode_desc_try_from_success() {
         let mut raw = make_raw_inode(0o100644);
@@ -2046,6 +2079,181 @@ mod test {
         let inode = make_live_dir_inode(&ext2, 2, block_size, 8, FileFlags::empty(), ptrs);
 
         assert!(!inode.inner.read().empty_dir());
+    }
+
+    #[ktest]
+    fn dir_rmdir_ok() {
+        clocks::init_for_ktest();
+
+        let (disk, sb, descs) = prepare_disk_with_block_accounting(256, 64, 64);
+        let block_size = sb.block_size();
+        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+
+        let first = sb.group_first_block_no(0);
+        let last = sb.group_last_block_no(0);
+        let parent_bid = first
+            .saturating_add(2)
+            .saturating_add(sb.itb_per_group())
+            .saturating_add(1);
+        let child_bid = parent_bid.saturating_add(1);
+        assert!(child_bid <= last);
+
+        let child_ino = sb.first_ino().saturating_add(1);
+        assert!(child_ino <= sb.total_inodes());
+
+        write_valid_block_bitmap(disk.as_ref(), &sb, &descs[0], &[parent_bid, child_bid]);
+        write_valid_inode_bitmap(disk.as_ref(), &sb, &descs[0], &[ROOT_INO, child_ino]);
+
+        let mut parent_block = vec![0u8; block_size];
+        write_dir_entry(&mut parent_block, 0, ROOT_INO, 12, b".", 2);
+        write_dir_entry(&mut parent_block, 12, ROOT_INO, 12, b"..", 2);
+        write_dir_entry(
+            &mut parent_block,
+            24,
+            child_ino,
+            (block_size - 24) as u16,
+            b"sub",
+            2,
+        );
+        disk.segment()
+            .write_bytes(Bid::new(parent_bid as u64).to_offset(), &parent_block)
+            .unwrap();
+
+        let mut child_block = vec![0u8; block_size];
+        write_dir_entry(&mut child_block, 0, child_ino, 12, b".", 2);
+        write_dir_entry(
+            &mut child_block,
+            12,
+            ROOT_INO,
+            (block_size - 12) as u16,
+            b"..",
+            2,
+        );
+        disk.segment()
+            .write_bytes(Bid::new(child_bid as u64).to_offset(), &child_block)
+            .unwrap();
+
+        let mut parent_raw = make_raw_inode(0o040755);
+        parent_raw.size_lo = block_size as u32;
+        parent_raw.blocks = (block_size / SECTOR_SIZE) as u32;
+        parent_raw.links_count = 3;
+        parent_raw.block[0] = parent_bid;
+        ext2.write_inode_desc(ROOT_INO, &parent_raw).unwrap();
+
+        let mut child_raw = make_raw_inode(0o040755);
+        child_raw.size_lo = block_size as u32;
+        child_raw.blocks = (block_size / SECTOR_SIZE) as u32;
+        child_raw.links_count = 2;
+        child_raw.block[0] = child_bid;
+        ext2.write_inode_desc(child_ino, &child_raw).unwrap();
+
+        let parent = ext2.read_inode(ROOT_INO).unwrap();
+        {
+            let mut parent_inner = parent.inner.write();
+            parent_inner.rmdir("sub").unwrap();
+            assert_eq!(parent_inner.desc.links_count, 2);
+            assert_eq!(parent_inner.find_entry("sub").unwrap_err().error(), Errno::ENOENT);
+        }
+
+        let parent_desc = ext2.read_inode_desc(ROOT_INO).unwrap();
+        assert_eq!(parent_desc.links_count, 2);
+        let child_desc = ext2.read_inode_desc(child_ino).unwrap();
+        assert_eq!(child_desc.size, 0);
+        assert_eq!(child_desc.links_count, 0);
+
+        let mut inode_bitmap = [0u8; BLOCK_SIZE];
+        disk.segment()
+            .read_bytes(
+                Bid::new(descs[0].inode_bitmap as u64).to_offset(),
+                &mut inode_bitmap,
+            )
+            .unwrap();
+        assert!(!bit_is_set_lsb0(&inode_bitmap, (child_ino - 1) as usize));
+    }
+
+    #[ktest]
+    fn dir_rmdir_enotempty_keeps_parent_entry() {
+        clocks::init_for_ktest();
+
+        let (disk, sb, descs) = prepare_disk_with_block_accounting(256, 64, 64);
+        let block_size = sb.block_size();
+        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+
+        let first = sb.group_first_block_no(0);
+        let last = sb.group_last_block_no(0);
+        let parent_bid = first
+            .saturating_add(2)
+            .saturating_add(sb.itb_per_group())
+            .saturating_add(1);
+        let child_bid = parent_bid.saturating_add(1);
+        assert!(child_bid <= last);
+
+        let child_ino = sb.first_ino().saturating_add(1);
+        assert!(child_ino <= sb.total_inodes());
+
+        write_valid_block_bitmap(disk.as_ref(), &sb, &descs[0], &[parent_bid, child_bid]);
+        write_valid_inode_bitmap(disk.as_ref(), &sb, &descs[0], &[ROOT_INO, child_ino]);
+
+        let mut parent_block = vec![0u8; block_size];
+        write_dir_entry(&mut parent_block, 0, ROOT_INO, 12, b".", 2);
+        write_dir_entry(&mut parent_block, 12, ROOT_INO, 12, b"..", 2);
+        write_dir_entry(
+            &mut parent_block,
+            24,
+            child_ino,
+            (block_size - 24) as u16,
+            b"sub",
+            2,
+        );
+        disk.segment()
+            .write_bytes(Bid::new(parent_bid as u64).to_offset(), &parent_block)
+            .unwrap();
+
+        let mut child_block = vec![0u8; block_size];
+        write_dir_entry(&mut child_block, 0, child_ino, 12, b".", 2);
+        write_dir_entry(&mut child_block, 12, ROOT_INO, 12, b"..", 2);
+        write_dir_entry(
+            &mut child_block,
+            24,
+            ROOT_INO,
+            (block_size - 24) as u16,
+            b"foo",
+            1,
+        );
+        disk.segment()
+            .write_bytes(Bid::new(child_bid as u64).to_offset(), &child_block)
+            .unwrap();
+
+        let mut parent_raw = make_raw_inode(0o040755);
+        parent_raw.size_lo = block_size as u32;
+        parent_raw.blocks = (block_size / SECTOR_SIZE) as u32;
+        parent_raw.links_count = 3;
+        parent_raw.block[0] = parent_bid;
+        ext2.write_inode_desc(ROOT_INO, &parent_raw).unwrap();
+
+        let mut child_raw = make_raw_inode(0o040755);
+        child_raw.size_lo = block_size as u32;
+        child_raw.blocks = (block_size / SECTOR_SIZE) as u32;
+        child_raw.links_count = 2;
+        child_raw.block[0] = child_bid;
+        ext2.write_inode_desc(child_ino, &child_raw).unwrap();
+
+        let parent = ext2.read_inode(ROOT_INO).unwrap();
+        let err = parent.inner.write().rmdir("sub").unwrap_err();
+        assert_eq!(err.error(), Errno::ENOTEMPTY);
+
+        let parent_inner = parent.inner.read();
+        assert_eq!(parent_inner.find_entry("sub").unwrap(), child_ino);
+        assert_eq!(parent_inner.desc.links_count, 3);
+
+        let mut inode_bitmap = [0u8; BLOCK_SIZE];
+        disk.segment()
+            .read_bytes(
+                Bid::new(descs[0].inode_bitmap as u64).to_offset(),
+                &mut inode_bitmap,
+            )
+            .unwrap();
+        assert!(bit_is_set_lsb0(&inode_bitmap, (child_ino - 1) as usize));
     }
 
     #[ktest]
