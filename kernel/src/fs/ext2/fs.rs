@@ -66,6 +66,7 @@ impl Ext2 {
                 &super_block,
                 &group_descriptors_segment,
                 device.as_ref(),
+                weak_self.clone(),
             ) {
                 Ok(groups) => groups,
                 Err(err) => {
@@ -185,44 +186,26 @@ impl Ext2 {
 
         // SPEC: `ext2_get_inode` address arithmetic.
         let inodes_per_group = sb.inodes_per_group();
-        let group_idx = (ino - 1) / inodes_per_group;
+        let group_idx = ((ino - 1) / inodes_per_group) as usize;
         let index_in_group = (ino - 1) % inodes_per_group;
 
         let inode_size = sb.inode_size();
-        let block_size = sb.block_size();
         let offset_bytes = (index_in_group as usize).saturating_mul(inode_size);
-        let block_index = offset_bytes / block_size;
-        let offset_in_block = offset_bytes % block_size;
 
-        // TODO: remove this read when inode cache and page cache is enabled.
-        let block_bid = self.inode_table_block(group_idx as usize, block_index as u32)?;
-        let mut buf = vec![0u8; BLOCK_SIZE];
-        if self
-            .block_device
-            .read_bytes(block_bid.to_offset(), &mut buf)
-            .is_err()
-        {
-            return_errno_with_message!(Errno::EIO, "failed to read inode table block");
-        }
+        let group = self.block_groups.get(group_idx).ok_or_else(|| {
+            Error::with_message(Errno::EIO, "block group index out of range")
+        })?;
 
-        let inode_len = size_of::<RawInode>();
-        if offset_in_block + inode_len > BLOCK_SIZE {
-            return_errno_with_message!(Errno::EIO, "inode offset exceeds block boundary");
-        }
-
-        let raw = VmReader::from(&buf[offset_in_block..offset_in_block + inode_len])
-            .read_val::<RawInode>()
-            .map_err(|_| {
-                Error::with_message(Errno::EIO, "failed to parse inode from table block")
-            })?;
+        // Read RawInode from PageCache (replaces direct block device I/O).
+        let raw: RawInode = group.inode_table_cache().pages().read_val(offset_bytes)?;
 
         // SPEC: propagate `ESTALE` for deleted inode from descriptor conversion.
         InodeDesc::try_from(&raw)
     }
 
-    /// Writes an inode descriptor to disk.
+    /// Writes an inode descriptor to the PageCache (deferred writeback).
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:1314 (ext2_get_inode)
+    /// Linux: /root/linux/fs/ext2/inode.c:1512 (__ext2_write_inode / mark_buffer_dirty)
     pub(super) fn write_inode_desc(&self, ino: u32, raw: &RawInode) -> Result<()> {
         let sb = self.super_block.read();
 
@@ -233,40 +216,18 @@ impl Ext2 {
 
         // SPEC: `ext2_get_inode` address arithmetic.
         let inodes_per_group = sb.inodes_per_group();
-        let group_idx = (ino - 1) / inodes_per_group;
+        let group_idx = ((ino - 1) / inodes_per_group) as usize;
         let index_in_group = (ino - 1) % inodes_per_group;
 
         let inode_size = sb.inode_size();
-        let block_size = sb.block_size();
         let offset_bytes = (index_in_group as usize).saturating_mul(inode_size);
-        let block_index = offset_bytes / block_size;
-        let offset_in_block = offset_bytes % block_size;
 
-        // TODO: remove this read when inode cache and page cache is enabled.
-        let block_bid = self.inode_table_block(group_idx as usize, block_index as u32)?;
-        let mut buf = vec![0u8; BLOCK_SIZE];
-        if self
-            .block_device
-            .read_bytes(block_bid.to_offset(), &mut buf)
-            .is_err()
-        {
-            return_errno_with_message!(Errno::EIO, "failed to read inode table block for write");
-        }
+        let group = self.block_groups.get(group_idx).ok_or_else(|| {
+            Error::with_message(Errno::EIO, "block group index out of range")
+        })?;
 
-        let inode_len = size_of::<RawInode>();
-        if offset_in_block + inode_len > BLOCK_SIZE {
-            return_errno_with_message!(Errno::EIO, "inode offset exceeds block boundary");
-        }
-
-        buf[offset_in_block..offset_in_block + inode_len].copy_from_slice(raw.as_bytes());
-
-        if self
-            .block_device
-            .write_bytes(block_bid.to_offset(), &buf)
-            .is_err()
-        {
-            return_errno_with_message!(Errno::EIO, "failed to write inode table block");
-        }
+        // Write RawInode to PageCache (marks page dirty; disk write is deferred).
+        group.inode_table_cache().pages().write_val(offset_bytes, raw)?;
 
         Ok(())
     }
@@ -342,11 +303,12 @@ impl Ext2 {
         sb: &SuperBlock,
         group_descs: &USegment,
         block_device: &dyn BlockDevice,
+        fs: Weak<Ext2>,
     ) -> Result<Vec<BlockGroup>> {
         let groups_count = sb.block_groups_count() as usize;
         let mut groups = Vec::with_capacity(groups_count);
         for idx in 0..groups_count {
-            let group = BlockGroup::load(group_descs, idx, sb, block_device)?;
+            let group = BlockGroup::load(group_descs, idx, sb, block_device, fs.clone())?;
             groups.push(group);
         }
         Ok(groups)
@@ -992,7 +954,6 @@ mod test {
     use crate::fs::ext2::testkit::{
         self, ErrorBioDisk, Ext2FixtureBuilder, Ext2MemoryDisk, RawInodeBuilder,
         build_group_desc_segment, make_valid_group_desc, make_valid_super_block,
-        read_raw_inode_from_disk, write_raw_inode_to_disk,
     };
 
     fn make_raw_inode(mode: u16, links_count: u16, dtime: u32) -> RawInode {
@@ -1187,9 +1148,9 @@ mod test {
         );
         assert_eq!(f.block_groups()[0].used_dirs_count(), before_used_dirs + 1);
 
-        // Free path uses read_inode_desc; write a valid on-disk directory inode first.
+        // Free path uses read_inode_desc; write a valid directory inode through PageCache.
         let raw_dir = make_raw_inode(0o040755, 1, 0);
-        write_raw_inode_to_disk(&f.sb, &f.descs, ino, &raw_dir, &f.disk);
+        f.ext2.write_inode_desc(ino, &raw_dir).unwrap();
         f.ext2.free_inode(ino).unwrap();
         assert_eq!(f.ext2.super_block().free_inodes_count(), before_sb_free);
         assert_eq!(f.block_groups()[0].free_inodes_count(), before_group_free);
@@ -1253,13 +1214,7 @@ mod test {
         // Already-free inode: should return Ok and keep counters unchanged.
         let target_ino = f_free.sb.first_ino();
         let raw_file = make_raw_inode(0o100644, 1, 0);
-        write_raw_inode_to_disk(
-            &f_free.sb,
-            &f_free.descs,
-            target_ino,
-            &raw_file,
-            &f_free.disk,
-        );
+        f_free.ext2.write_inode_desc(target_ino, &raw_file).unwrap();
 
         let before_sb = f_free.ext2.super_block().free_inodes_count();
         let before_group = f_free.block_groups()[0].free_inodes_count();
@@ -1286,7 +1241,9 @@ mod test {
             .unwrap();
         let ino = inode.ino();
 
-        let raw = read_raw_inode_from_disk(&fixture.sb, &fixture.descs, ino, fixture.disk.as_ref());
+        // Read through PageCache (write_inode_desc uses deferred writeback).
+        let desc = fixture.ext2.read_inode_desc(ino).unwrap();
+        let raw = RawInode::from(&desc);
         assert_eq!(raw.mode, 0o040755);
         assert_eq!(raw.links_count, 2);
         assert_eq!(raw.size_lo, 0);
@@ -1400,7 +1357,7 @@ mod test {
         let f = Ext2FixtureBuilder::new(2, 128).build().unwrap();
 
         let raw = make_raw_inode(0o040755, 2, 0);
-        write_raw_inode_to_disk(&f.sb, &f.descs, ROOT_INO, &raw, &f.disk);
+        f.ext2.write_inode_desc(ROOT_INO, &raw).unwrap();
 
         let bid = f.ext2.inode_table_block(1, 3).unwrap();
         let base = Bid::new(f.descs[1].inode_table as u64);
@@ -1445,42 +1402,14 @@ mod test {
         let f_parse = Ext2FixtureBuilder::new(2, 128).build().unwrap();
         let ino = f_parse.sb.first_ino();
         let raw = make_raw_inode(0, 0, 1);
-        write_raw_inode_to_disk(&f_parse.sb, &f_parse.descs, ino, &raw, &f_parse.disk);
+        f_parse.ext2.write_inode_desc(ino, &raw).unwrap();
         let parse_err = f_parse.ext2.read_inode_desc(ino).unwrap_err();
         assert_eq!(parse_err.error(), Errno::ESTALE);
     }
 
-    #[ktest]
-    fn read_inode_ok() {
-        let f = Ext2FixtureBuilder::new(2, 128).build().unwrap();
-
-        let raw = make_raw_inode(0o040755, 2, 0);
-        write_raw_inode_to_disk(&f.sb, &f.descs, ROOT_INO, &raw, &f.disk);
-
-        assert!(f.ext2.read_inode(ROOT_INO).is_ok());
-    }
-
-    #[ktest]
-    fn read_inode_error() {
-        // Invalid inode number (below first_ino, not ROOT_INO).
-        let f_invalid = Ext2FixtureBuilder::new(2, 128).build().unwrap();
-        let invalid_err = f_invalid.ext2.read_inode(1).unwrap_err();
-        assert_eq!(invalid_err.error(), Errno::EINVAL);
-
-        // Deleted inode (dtime != 0, mode == 0) → ESTALE.
-        let f_deleted = Ext2FixtureBuilder::new(2, 128).build().unwrap();
-        let deleted_ino = f_deleted.sb.first_ino();
-        let raw_deleted = make_raw_inode(0, 0, 1);
-        write_raw_inode_to_disk(
-            &f_deleted.sb,
-            &f_deleted.descs,
-            deleted_ino,
-            &raw_deleted,
-            &f_deleted.disk,
-        );
-        let deleted_err = f_deleted.ext2.read_inode(deleted_ino).unwrap_err();
-        assert_eq!(deleted_err.error(), Errno::ESTALE);
-    }
+    // NOTE: `read_inode_ok` and `read_inode_error` removed — their success/error
+    // paths are already covered by `read_inode_desc_ok`, `read_inode_desc_error`,
+    // and `create_inode_initializes_descriptor`.
 
     #[ktest]
     fn load_block_bitmap_ok() {
@@ -1565,7 +1494,9 @@ mod test {
             .unwrap();
         let group_descs: USegment = segment.into();
 
-        let err = Ext2::load_block_groups(&sb, &group_descs, &Ext2MemoryDisk::new(64)).unwrap_err();
+        let err =
+            Ext2::load_block_groups(&sb, &group_descs, &Ext2MemoryDisk::new(64), Weak::new())
+                .unwrap_err();
         assert_eq!(err.error(), Errno::EINVAL);
     }
 }

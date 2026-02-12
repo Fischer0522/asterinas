@@ -1,18 +1,68 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::mem::size_of;
+use core::{fmt, mem::size_of};
 
 use ostd::const_assert;
 
 use super::{fs::Ext2, prelude::*, super_block::SuperBlock};
 use crate::fs::utils::IdBitmap;
 
-#[derive(Debug)]
+/// Backend that translates PageCache page indices to physical inode table blocks.
+///
+/// Linux: /root/linux/fs/ext2/inode.c:1314 (ext2_get_inode / sb_bread)
+struct InodeTableBackend {
+    inode_table_bid: Bid,
+    raw_inodes_size: usize,
+    fs: Weak<Ext2>,
+}
+
+impl PageCacheBackend for InodeTableBackend {
+    fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
+        let bid = self.inode_table_bid + idx as u64;
+        let bio_segment = BioSegment::new_from_segment(
+            Segment::from(frame.clone()).into(),
+            BioDirection::FromDevice,
+        );
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem dropped"))?;
+        Ok(fs.block_device().read_blocks_async(bid, bio_segment)?)
+    }
+
+    fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
+        let bid = self.inode_table_bid + idx as u64;
+        let bio_segment = BioSegment::new_from_segment(
+            Segment::from(frame.clone()).into(),
+            BioDirection::ToDevice,
+        );
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem dropped"))?;
+        Ok(fs.block_device().write_blocks_async(bid, bio_segment)?)
+    }
+
+    fn npages(&self) -> usize {
+        self.raw_inodes_size.div_ceil(BLOCK_SIZE)
+    }
+}
+
 pub struct BlockGroup {
     idx: usize,
     desc: RwMutex<Dirty<GroupDesc>>,
     block_bitmap: RwMutex<Dirty<IdBitmap>>,
     inode_bitmap: RwMutex<Dirty<IdBitmap>>,
+    inode_table_backend: Arc<InodeTableBackend>,
+    inode_table_cache: PageCache,
+}
+
+impl fmt::Debug for BlockGroup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BlockGroup")
+            .field("idx", &self.idx)
+            .finish()
+    }
 }
 
 /// On-disk block group descriptor (32 bytes).
@@ -78,6 +128,7 @@ impl BlockGroup {
         idx: usize,
         sb: &SuperBlock,
         block_device: &dyn BlockDevice,
+        fs: Weak<Ext2>,
     ) -> Result<Self> {
         let offset = idx * size_of::<RawGroupDesc>();
         let raw = group_descs
@@ -89,11 +140,23 @@ impl BlockGroup {
         let block_bitmap = Self::load_block_bitmap(block_device, sb, idx, &desc)?;
         let inode_bitmap = Self::load_inode_bitmap(block_device, sb, &desc)?;
 
+        // Create PageCache for inode table backed by InodeTableBackend.
+        let raw_inodes_size = (sb.inodes_per_group() as usize).saturating_mul(sb.inode_size());
+        let backend = Arc::new(InodeTableBackend {
+            inode_table_bid: desc.inode_table,
+            raw_inodes_size,
+            fs,
+        });
+        let inode_table_cache =
+            PageCache::with_capacity(raw_inodes_size, Arc::downgrade(&backend) as _)?;
+
         Ok(Self {
             idx,
             desc: RwMutex::new(Dirty::new(desc)),
             block_bitmap: RwMutex::new(Dirty::new(block_bitmap)),
             inode_bitmap: RwMutex::new(Dirty::new(inode_bitmap)),
+            inode_table_backend: backend,
+            inode_table_cache,
         })
     }
 
@@ -127,6 +190,10 @@ impl BlockGroup {
 
     pub fn inode_table_bid(&self) -> Bid {
         self.desc.read().inode_table
+    }
+
+    pub fn inode_table_cache(&self) -> &PageCache {
+        &self.inode_table_cache
     }
 
     pub fn free_blocks_count(&self) -> u16 {
