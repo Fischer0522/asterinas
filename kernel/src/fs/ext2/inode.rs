@@ -2055,11 +2055,9 @@ mod test {
     use super::*;
     use crate::{
         fs::ext2::{
-            SuperBlock,
-            block_group::RawGroupDesc,
             fs::ROOT_INO,
             testkit::{
-                self, CollectDirentVisitor, ErrorBioDisk, Ext2FixtureBuilder, Ext2MemoryDisk,
+                self, CollectDirentVisitor, ErrorBioDisk, Ext2FixtureBuilder,
                 RawInodeBuilder, StopAfterVisitor, encode_dir_entry, write_indirect_ptr,
             },
         },
@@ -2069,14 +2067,6 @@ mod test {
 
     fn make_raw_inode(mode: u16) -> RawInode {
         RawInodeBuilder::new(mode).build()
-    }
-
-    fn prepare_disk(
-        groups: u32,
-        nblocks: usize,
-    ) -> (Arc<Ext2MemoryDisk>, SuperBlock, Vec<RawGroupDesc>) {
-        let fixture = Ext2FixtureBuilder::new(groups, nblocks).build().unwrap();
-        (fixture.disk, fixture.sb, fixture.descs)
     }
 
     fn make_inode_inner(fs: Weak<Ext2>, block_ptrs: [u32; 15]) -> InodeInner {
@@ -2100,16 +2090,7 @@ mod test {
         InodeInner::new(Dirty::new(desc), Weak::new(), fs)
     }
 
-    fn write_dir_entry(
-        buf: &mut [u8],
-        offset: usize,
-        inode: u32,
-        rec_len: u16,
-        name: &[u8],
-        file_type: u8,
-    ) {
-        encode_dir_entry(buf, offset, inode, rec_len, name, file_type);
-    }
+
 
     fn make_live_dir_inode(
         ext2: &Arc<Ext2>,
@@ -2134,28 +2115,12 @@ mod test {
         )
     }
 
-    fn prepare_namei_test_env() -> (
-        Arc<Ext2MemoryDisk>,
-        Arc<Ext2>,
-        SuperBlock,
-        Vec<RawGroupDesc>,
-    ) {
-        let fixture = Ext2FixtureBuilder::new(1, 256)
-            .with_free_blocks(64, 64)
-            .with_free_inodes(1000, 1000)
-            .with_group0_used_dirs(1)
-            .with_root()
-            .build()
-            .unwrap();
-        (fixture.disk, fixture.ext2, fixture.sb, fixture.descs)
-    }
-
     #[ktest]
     fn namei_create_phase06_spec() {
         clocks::init_for_ktest();
 
-        let (_disk, ext2, _sb, _descs) = prepare_namei_test_env();
-        let root = ext2.read_inode(ROOT_INO).unwrap();
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
 
         // Linux ext2_create intent: allocate inode then publish dir entry.
         let created = root
@@ -2169,7 +2134,7 @@ mod test {
             root.inner.read().find_entry("alpha").unwrap(),
             created.ino()
         );
-        assert_eq!(ext2.read_inode_desc(created.ino()).unwrap().links_count, 1);
+        assert_eq!(f.ext2.read_inode_desc(created.ino()).unwrap().links_count, 1);
 
         // Linux ext2_mkdir intent: child links=2 and parent link count +1.
         let created_dir = root
@@ -2180,10 +2145,10 @@ mod test {
             created_dir.ino()
         );
         assert_eq!(
-            ext2.read_inode_desc(created_dir.ino()).unwrap().links_count,
+            f.ext2.read_inode_desc(created_dir.ino()).unwrap().links_count,
             2
         );
-        assert_eq!(ext2.read_inode_desc(ROOT_INO).unwrap().links_count, 3);
+        assert_eq!(f.ext2.read_inode_desc(ROOT_INO).unwrap().links_count, 3);
 
         assert_eq!(
             root.create(".", InodeType::File, FilePerm::from_bits_truncate(0o644))
@@ -2217,20 +2182,20 @@ mod test {
     fn namei_link_unlink_phase06_spec() {
         clocks::init_for_ktest();
 
-        let (disk, ext2, _sb, descs) = prepare_namei_test_env();
-        let root = ext2.read_inode(ROOT_INO).unwrap();
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
 
         let old = root
             .create("old", InodeType::File, FilePerm::from_bits_truncate(0o644))
             .unwrap();
         let old_ino = old.ino();
-        let old_links_before = ext2.read_inode_desc(old_ino).unwrap().links_count;
+        let old_links_before = f.ext2.read_inode_desc(old_ino).unwrap().links_count;
 
         // Linux ext2_link intent: increase nlink before publishing name.
         root.link(&old, "alias").unwrap();
         assert_eq!(root.inner.read().find_entry("alias").unwrap(), old_ino);
         assert_eq!(
-            ext2.read_inode_desc(old_ino).unwrap().links_count,
+            f.ext2.read_inode_desc(old_ino).unwrap().links_count,
             old_links_before + 1
         );
 
@@ -2249,7 +2214,7 @@ mod test {
             Errno::ENOENT
         );
         assert_eq!(
-            ext2.read_inode_desc(old_ino).unwrap().links_count,
+            f.ext2.read_inode_desc(old_ino).unwrap().links_count,
             old_links_before
         );
 
@@ -2257,13 +2222,7 @@ mod test {
         assert_eq!(root.unlink(".").unwrap_err().error(), Errno::EINVAL);
 
         root.unlink("old").unwrap();
-        let mut inode_bitmap = [0u8; BLOCK_SIZE];
-        disk.segment()
-            .read_bytes(
-                Bid::new(descs[0].inode_bitmap as u64).to_offset(),
-                &mut inode_bitmap,
-            )
-            .unwrap();
+        let inode_bitmap = f.read_inode_bitmap(0).unwrap();
         assert!(!testkit::bit_is_set_lsb0(
             &inode_bitmap,
             (old_ino - 1) as usize
@@ -2274,8 +2233,8 @@ mod test {
     fn namei_set_link_and_rename_phase06_spec() {
         clocks::init_for_ktest();
 
-        let (disk, ext2, _sb, descs) = prepare_namei_test_env();
-        let root = ext2.read_inode(ROOT_INO).unwrap();
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
 
         let src = root
             .create("src", InodeType::File, FilePerm::from_bits_truncate(0o644))
@@ -2337,13 +2296,7 @@ mod test {
             assert_eq!(guard.find_entry("old").unwrap_err().error(), Errno::ENOENT);
         }
 
-        let mut inode_bitmap = [0u8; BLOCK_SIZE];
-        disk.segment()
-            .read_bytes(
-                Bid::new(descs[0].inode_bitmap as u64).to_offset(),
-                &mut inode_bitmap,
-            )
-            .unwrap();
+        let inode_bitmap = f.read_inode_bitmap(0).unwrap();
         assert!(!testkit::bit_is_set_lsb0(
             &inode_bitmap,
             (replaced_ino - 1) as usize
@@ -2356,14 +2309,14 @@ mod test {
     fn namei_cross_fs_link_and_rename_rejected() {
         clocks::init_for_ktest();
 
-        let (_disk_a, ext2_a, _sb_a, _descs_a) = prepare_namei_test_env();
-        let root_a = ext2_a.read_inode(ROOT_INO).unwrap();
+        let f_a = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root_a = f_a.ext2.read_inode(ROOT_INO).unwrap();
         let inode_a = root_a
             .create("from", InodeType::File, FilePerm::from_bits_truncate(0o644))
             .unwrap();
 
-        let (_disk_b, ext2_b, _sb_b, _descs_b) = prepare_namei_test_env();
-        let root_b = ext2_b.read_inode(ROOT_INO).unwrap();
+        let f_b = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root_b = f_b.ext2.read_inode(ROOT_INO).unwrap();
 
         assert_eq!(
             root_b.link(&inode_a, "x").unwrap_err().error(),
@@ -2431,16 +2384,16 @@ mod test {
 
     #[ktest]
     fn dir_lookup_readdir_ok() {
-        let (disk, _sb, _descs) = prepare_disk(2, 256);
-        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
+        let (disk, ext2) = (&f.disk, &f.ext2);
         let block_size = ext2.block_size();
 
         let mut block = vec![0u8; block_size];
-        write_dir_entry(&mut block, 0, 2, 12, b".", 2);
-        write_dir_entry(&mut block, 12, 11, 12, b"foo", 1);
-        write_dir_entry(&mut block, 24, 14, 12, b"unk", 0);
-        write_dir_entry(&mut block, 36, 0, 12, b"hid", 1);
-        write_dir_entry(&mut block, 48, 13, 16, b"subdir", 2);
+        encode_dir_entry(&mut block, 0, 2, 12, b".", 2);
+        encode_dir_entry(&mut block, 12, 11, 12, b"foo", 1);
+        encode_dir_entry(&mut block, 24, 14, 12, b"unk", 0);
+        encode_dir_entry(&mut block, 36, 0, 12, b"hid", 1);
+        encode_dir_entry(&mut block, 48, 13, 16, b"subdir", 2);
 
         let data_bid = 80u32;
         disk.segment()
@@ -2487,8 +2440,8 @@ mod test {
 
     #[ktest]
     fn dir_lookup_readdir_error_cases() {
-        let (disk, _sb, _descs) = prepare_disk(2, 256);
-        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
+        let (disk, ext2) = (&f.disk, &f.ext2);
         let block_size = ext2.block_size();
 
         let mut file_ptrs = [0u32; 15];
@@ -2522,8 +2475,8 @@ mod test {
         );
 
         let mut one_block = vec![0u8; block_size];
-        write_dir_entry(&mut one_block, 0, 2, 12, b".", 2);
-        write_dir_entry(&mut one_block, 12, 0, (block_size - 12) as u16, b"", 0);
+        encode_dir_entry(&mut one_block, 0, 2, 12, b".", 2);
+        encode_dir_entry(&mut one_block, 12, 0, (block_size - 12) as u16, b"", 0);
         let data_bid = 81u32;
         disk.segment()
             .write_bytes(Bid::new(data_bid as u64).to_offset(), &one_block)
@@ -2580,13 +2533,13 @@ mod test {
 
     #[ktest]
     fn dir_add_delete_entry_ok() {
-        let (disk, _sb, _descs) = prepare_disk(2, 256);
-        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
+        let (disk, ext2) = (&f.disk, &f.ext2);
         let block_size = ext2.block_size();
 
         let mut block = vec![0u8; block_size];
-        write_dir_entry(&mut block, 0, 2, 12, b".", 2);
-        write_dir_entry(&mut block, 12, 13, (block_size - 12) as u16, b"bar", 1);
+        encode_dir_entry(&mut block, 0, 2, 12, b".", 2);
+        encode_dir_entry(&mut block, 12, 13, (block_size - 12) as u16, b"bar", 1);
 
         let data_bid = 80u32;
         disk.segment()
@@ -2631,37 +2584,34 @@ mod test {
 
     #[ktest]
     fn dir_add_entry_grow_by_new_block_ok() {
-        let fixture = Ext2FixtureBuilder::new(1, 256)
+        let f = Ext2FixtureBuilder::new(1, 256)
             .with_free_blocks(32, 32)
             .build()
             .unwrap();
-        let (disk, sb, descs) = (fixture.disk, fixture.sb, fixture.descs);
-        let block_size = sb.block_size();
-
-        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let block_size = f.sb.block_size();
 
         // Pick a data block inside group 0 and outside metadata area:
         // [block_bitmap, inode_bitmap, inode_table...].
-        let first = sb.group_first_block_no(0);
-        let last = sb.group_last_block_no(0);
+        let first = f.sb.group_first_block_no(0);
+        let last = f.sb.group_last_block_no(0);
         let data_bid = first
             .saturating_add(2)
-            .saturating_add(sb.itb_per_group())
+            .saturating_add(f.sb.itb_per_group())
             .saturating_add(1);
         assert!(data_bid <= last);
         // Let allocator choose one free data block; do not pre-occupy `data_bid`.
-        testkit::write_block_bitmap(disk.as_ref(), &sb, &descs[0], &[]);
+        testkit::write_block_bitmap(f.disk.as_ref(), &f.sb, &f.descs[0], &[]);
 
         let mut first_block = vec![0u8; block_size];
-        write_dir_entry(&mut first_block, 0, 2, 12, b".", 2);
-        write_dir_entry(&mut first_block, 12, 2, 12, b"..", 2);
-        disk.segment()
+        encode_dir_entry(&mut first_block, 0, 2, 12, b".", 2);
+        encode_dir_entry(&mut first_block, 12, 2, 12, b"..", 2);
+        f.disk.segment()
             .write_bytes(Bid::new(data_bid as u64).to_offset(), &first_block)
             .unwrap();
 
         let mut block_ptrs = [0u32; 15];
         block_ptrs[0] = data_bid;
-        let inode = make_live_dir_inode(&ext2, 2, 24, 8, FileFlags::INDEX_DIR, block_ptrs);
+        let inode = make_live_dir_inode(&f.ext2, 2, 24, 8, FileFlags::INDEX_DIR, block_ptrs);
 
         let new_bid = {
             let mut inner = inode.inner.write();
@@ -2673,11 +2623,11 @@ mod test {
         };
 
         let mut new_block = vec![0u8; block_size];
-        disk.segment()
+        f.disk.segment()
             .read_bytes(Bid::new(new_bid as u64).to_offset(), &mut new_block)
             .unwrap();
         let entry =
-            DirEntry::parse_at(&new_block, 0, block_size, ext2.super_block().total_inodes())
+            DirEntry::parse_at(&new_block, 0, block_size, f.ext2.super_block().total_inodes())
                 .unwrap();
         assert_eq!(entry.inode, 11);
         assert_eq!(entry.name.as_bytes(), b"foo");
@@ -2685,8 +2635,8 @@ mod test {
 
     #[ktest]
     fn dir_mutation_error_cases() {
-        let (disk, _sb, _descs) = prepare_disk(2, 256);
-        let ext2 = Ext2::open(disk as Arc<dyn BlockDevice>).unwrap();
+        let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
+        let ext2 = &f.ext2;
 
         let mut file_inode = make_inode_inner(Arc::downgrade(&ext2), [0u32; 15]);
         assert_eq!(
@@ -2720,22 +2670,20 @@ mod test {
     #[ktest]
     fn dir_make_empty_and_empty_dir_ok() {
         clocks::init_for_ktest();
-        let fixture = Ext2FixtureBuilder::new(1, 256)
+        let f = Ext2FixtureBuilder::new(1, 256)
             .with_free_blocks(64, 64)
             .build()
             .unwrap();
-        let (disk, sb, descs) = (fixture.disk, fixture.sb, fixture.descs);
-        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
-        let block_size = ext2.block_size();
+        let block_size = f.ext2.block_size();
 
-        let first = sb.group_first_block_no(0);
-        let last = sb.group_last_block_no(0);
+        let first = f.sb.group_first_block_no(0);
+        let last = f.sb.group_last_block_no(0);
         let data_bid = first
             .saturating_add(2)
-            .saturating_add(sb.itb_per_group())
+            .saturating_add(f.sb.itb_per_group())
             .saturating_add(1);
         assert!(data_bid <= last);
-        testkit::write_block_bitmap(disk.as_ref(), &sb, &descs[0], &[data_bid]);
+        testkit::write_block_bitmap(f.disk.as_ref(), &f.sb, &f.descs[0], &[data_bid]);
 
         let mut raw = make_raw_inode(0o040755);
         raw.links_count = 2;
@@ -2745,7 +2693,7 @@ mod test {
             InodeType::Dir,
             Dirty::new(desc),
             0,
-            Arc::downgrade(&ext2),
+            Arc::downgrade(&f.ext2),
         );
 
         let allocated_bid = {
@@ -2759,12 +2707,13 @@ mod test {
         assert_ne!(allocated_bid, 0);
 
         let mut buf = vec![0u8; block_size];
-        disk.segment()
+        f.disk
+            .segment()
             .read_bytes(Bid::new(allocated_bid as u64).to_offset(), &mut buf)
             .unwrap();
 
         let dot =
-            DirEntry::parse_at(&buf, 0, block_size, ext2.super_block().total_inodes()).unwrap();
+            DirEntry::parse_at(&buf, 0, block_size, f.ext2.super_block().total_inodes()).unwrap();
         assert_eq!(dot.inode, 12);
         assert_eq!(dot.name.as_bytes(), b".");
 
@@ -2772,7 +2721,7 @@ mod test {
             &buf,
             DirEntry::dir_rec_len(1) as usize,
             block_size,
-            ext2.super_block().total_inodes(),
+            f.ext2.super_block().total_inodes(),
         )
         .unwrap();
         assert_eq!(dotdot.inode, ROOT_INO);
@@ -2781,15 +2730,15 @@ mod test {
 
     #[ktest]
     fn empty_dir_false_on_non_dot_entries() {
-        let (disk, _sb, _descs) = prepare_disk(2, 256);
-        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
+        let (disk, ext2) = (&f.disk, &f.ext2);
         let block_size = ext2.block_size();
 
         let data_bid = 80u32;
         let mut block = vec![0u8; block_size];
-        write_dir_entry(&mut block, 0, 2, 12, b".", 2);
-        write_dir_entry(&mut block, 12, 2, 12, b"..", 2);
-        write_dir_entry(&mut block, 24, 13, (block_size - 24) as u16, b"foo", 1);
+        encode_dir_entry(&mut block, 0, 2, 12, b".", 2);
+        encode_dir_entry(&mut block, 12, 2, 12, b"..", 2);
+        encode_dir_entry(&mut block, 24, 13, (block_size - 24) as u16, b"foo", 1);
         disk.segment()
             .write_bytes(Bid::new(data_bid as u64).to_offset(), &block)
             .unwrap();
@@ -2801,37 +2750,42 @@ mod test {
         assert!(!inode.inner.read().empty_dir());
     }
 
-    #[ktest]
-    fn dir_rmdir_ok() {
-        clocks::init_for_ktest();
+    struct RmdirTestEnv {
+        f: testkit::Ext2Fixture,
+        child_ino: u32,
+    }
 
-        let fixture = Ext2FixtureBuilder::new(1, 256)
+    /// Sets up a parent directory (ROOT_INO) with a "sub" child directory.
+    /// `child_extra_entries` is written into the child block after "." and "..".
+    fn prepare_rmdir_env(
+        child_extra_entries: &[(u32, &[u8], u8)],
+    ) -> RmdirTestEnv {
+        let f = Ext2FixtureBuilder::new(1, 256)
             .with_free_blocks(64, 64)
             .build()
             .unwrap();
-        let (disk, sb, descs) = (fixture.disk, fixture.sb, fixture.descs);
-        let block_size = sb.block_size();
-        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let block_size = f.sb.block_size();
 
-        let first = sb.group_first_block_no(0);
-        let last = sb.group_last_block_no(0);
+        let first = f.sb.group_first_block_no(0);
+        let last = f.sb.group_last_block_no(0);
         let parent_bid = first
             .saturating_add(2)
-            .saturating_add(sb.itb_per_group())
+            .saturating_add(f.sb.itb_per_group())
             .saturating_add(1);
         let child_bid = parent_bid.saturating_add(1);
         assert!(child_bid <= last);
 
-        let child_ino = sb.first_ino().saturating_add(1);
-        assert!(child_ino <= sb.total_inodes());
+        let child_ino = f.sb.first_ino().saturating_add(1);
+        assert!(child_ino <= f.sb.total_inodes());
 
-        testkit::write_block_bitmap(disk.as_ref(), &sb, &descs[0], &[parent_bid, child_bid]);
-        testkit::write_inode_bitmap(disk.as_ref(), &sb, &descs[0], &[ROOT_INO, child_ino]);
+        testkit::write_block_bitmap(f.disk.as_ref(), &f.sb, &f.descs[0], &[parent_bid, child_bid]);
+        testkit::write_inode_bitmap(f.disk.as_ref(), &f.sb, &f.descs[0], &[ROOT_INO, child_ino]);
 
+        // Parent block: "." + ".." + "sub" -> child_ino.
         let mut parent_block = vec![0u8; block_size];
-        write_dir_entry(&mut parent_block, 0, ROOT_INO, 12, b".", 2);
-        write_dir_entry(&mut parent_block, 12, ROOT_INO, 12, b"..", 2);
-        write_dir_entry(
+        encode_dir_entry(&mut parent_block, 0, ROOT_INO, 12, b".", 2);
+        encode_dir_entry(&mut parent_block, 12, ROOT_INO, 12, b"..", 2);
+        encode_dir_entry(
             &mut parent_block,
             24,
             child_ino,
@@ -2839,39 +2793,63 @@ mod test {
             b"sub",
             2,
         );
-        disk.segment()
+        f.disk
+            .segment()
             .write_bytes(Bid::new(parent_bid as u64).to_offset(), &parent_block)
             .unwrap();
 
+        // Child block: "." + ".." + optional extra entries.
         let mut child_block = vec![0u8; block_size];
-        write_dir_entry(&mut child_block, 0, child_ino, 12, b".", 2);
-        write_dir_entry(
-            &mut child_block,
-            12,
-            ROOT_INO,
-            (block_size - 12) as u16,
-            b"..",
-            2,
-        );
-        disk.segment()
+        encode_dir_entry(&mut child_block, 0, child_ino, 12, b".", 2);
+        if child_extra_entries.is_empty() {
+            encode_dir_entry(&mut child_block, 12, ROOT_INO, (block_size - 12) as u16, b"..", 2);
+        } else {
+            encode_dir_entry(&mut child_block, 12, ROOT_INO, 12, b"..", 2);
+            let mut offset = 24;
+            for (i, &(ino, name, ft)) in child_extra_entries.iter().enumerate() {
+                let is_last = i == child_extra_entries.len() - 1;
+                let rec_len = if is_last {
+                    (block_size - offset) as u16
+                } else {
+                    DirEntry::dir_rec_len(name.len())
+                };
+                encode_dir_entry(&mut child_block, offset, ino, rec_len, name, ft);
+                offset += rec_len as usize;
+            }
+        }
+        f.disk
+            .segment()
             .write_bytes(Bid::new(child_bid as u64).to_offset(), &child_block)
             .unwrap();
 
+        // Parent raw inode: links=3 (self + "." + child "..").
         let mut parent_raw = make_raw_inode(0o040755);
         parent_raw.size_lo = block_size as u32;
         parent_raw.blocks = (block_size / SECTOR_SIZE) as u32;
         parent_raw.links_count = 3;
         parent_raw.block[0] = parent_bid;
-        ext2.write_inode_desc(ROOT_INO, &parent_raw).unwrap();
+        f.ext2.write_inode_desc(ROOT_INO, &parent_raw).unwrap();
 
+        // Child raw inode: links=2 ("." + parent "sub").
         let mut child_raw = make_raw_inode(0o040755);
         child_raw.size_lo = block_size as u32;
         child_raw.blocks = (block_size / SECTOR_SIZE) as u32;
         child_raw.links_count = 2;
         child_raw.block[0] = child_bid;
-        ext2.write_inode_desc(child_ino, &child_raw).unwrap();
+        f.ext2.write_inode_desc(child_ino, &child_raw).unwrap();
 
-        let parent = ext2.read_inode(ROOT_INO).unwrap();
+        RmdirTestEnv { f, child_ino }
+    }
+
+    #[ktest]
+    fn dir_rmdir_ok() {
+        clocks::init_for_ktest();
+
+        let env = prepare_rmdir_env(&[]);
+        let f = &env.f;
+        let child_ino = env.child_ino;
+
+        let parent = f.ext2.read_inode(ROOT_INO).unwrap();
         {
             let mut parent_inner = parent.inner.write();
             parent_inner.rmdir("sub").unwrap();
@@ -2882,19 +2860,13 @@ mod test {
             );
         }
 
-        let parent_desc = ext2.read_inode_desc(ROOT_INO).unwrap();
+        let parent_desc = f.ext2.read_inode_desc(ROOT_INO).unwrap();
         assert_eq!(parent_desc.links_count, 2);
-        let child_desc = ext2.read_inode_desc(child_ino).unwrap();
+        let child_desc = f.ext2.read_inode_desc(child_ino).unwrap();
         assert_eq!(child_desc.size, 0);
         assert_eq!(child_desc.links_count, 0);
 
-        let mut inode_bitmap = [0u8; BLOCK_SIZE];
-        disk.segment()
-            .read_bytes(
-                Bid::new(descs[0].inode_bitmap as u64).to_offset(),
-                &mut inode_bitmap,
-            )
-            .unwrap();
+        let inode_bitmap = f.read_inode_bitmap(0).unwrap();
         assert!(!testkit::bit_is_set_lsb0(
             &inode_bitmap,
             (child_ino - 1) as usize
@@ -2905,74 +2877,11 @@ mod test {
     fn dir_rmdir_enotempty_keeps_parent_entry() {
         clocks::init_for_ktest();
 
-        let fixture = Ext2FixtureBuilder::new(1, 256)
-            .with_free_blocks(64, 64)
-            .build()
-            .unwrap();
-        let (disk, sb, descs) = (fixture.disk, fixture.sb, fixture.descs);
-        let block_size = sb.block_size();
-        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let env = prepare_rmdir_env(&[(ROOT_INO, b"foo", 1)]);
+        let f = &env.f;
+        let child_ino = env.child_ino;
 
-        let first = sb.group_first_block_no(0);
-        let last = sb.group_last_block_no(0);
-        let parent_bid = first
-            .saturating_add(2)
-            .saturating_add(sb.itb_per_group())
-            .saturating_add(1);
-        let child_bid = parent_bid.saturating_add(1);
-        assert!(child_bid <= last);
-
-        let child_ino = sb.first_ino().saturating_add(1);
-        assert!(child_ino <= sb.total_inodes());
-
-        testkit::write_block_bitmap(disk.as_ref(), &sb, &descs[0], &[parent_bid, child_bid]);
-        testkit::write_inode_bitmap(disk.as_ref(), &sb, &descs[0], &[ROOT_INO, child_ino]);
-
-        let mut parent_block = vec![0u8; block_size];
-        write_dir_entry(&mut parent_block, 0, ROOT_INO, 12, b".", 2);
-        write_dir_entry(&mut parent_block, 12, ROOT_INO, 12, b"..", 2);
-        write_dir_entry(
-            &mut parent_block,
-            24,
-            child_ino,
-            (block_size - 24) as u16,
-            b"sub",
-            2,
-        );
-        disk.segment()
-            .write_bytes(Bid::new(parent_bid as u64).to_offset(), &parent_block)
-            .unwrap();
-
-        let mut child_block = vec![0u8; block_size];
-        write_dir_entry(&mut child_block, 0, child_ino, 12, b".", 2);
-        write_dir_entry(&mut child_block, 12, ROOT_INO, 12, b"..", 2);
-        write_dir_entry(
-            &mut child_block,
-            24,
-            ROOT_INO,
-            (block_size - 24) as u16,
-            b"foo",
-            1,
-        );
-        disk.segment()
-            .write_bytes(Bid::new(child_bid as u64).to_offset(), &child_block)
-            .unwrap();
-
-        let mut parent_raw = make_raw_inode(0o040755);
-        parent_raw.size_lo = block_size as u32;
-        parent_raw.blocks = (block_size / SECTOR_SIZE) as u32;
-        parent_raw.links_count = 3;
-        parent_raw.block[0] = parent_bid;
-        ext2.write_inode_desc(ROOT_INO, &parent_raw).unwrap();
-
-        let mut child_raw = make_raw_inode(0o040755);
-        child_raw.size_lo = block_size as u32;
-        child_raw.blocks = (block_size / SECTOR_SIZE) as u32;
-        child_raw.links_count = 2;
-        child_raw.block[0] = child_bid;
-        ext2.write_inode_desc(child_ino, &child_raw).unwrap();
-
-        let parent = ext2.read_inode(ROOT_INO).unwrap();
+        let parent = f.ext2.read_inode(ROOT_INO).unwrap();
         let err = parent.inner.write().rmdir("sub").unwrap_err();
         assert_eq!(err.error(), Errno::ENOTEMPTY);
 
@@ -2980,13 +2889,7 @@ mod test {
         assert_eq!(parent_inner.find_entry("sub").unwrap(), child_ino);
         assert_eq!(parent_inner.desc.links_count, 3);
 
-        let mut inode_bitmap = [0u8; BLOCK_SIZE];
-        disk.segment()
-            .read_bytes(
-                Bid::new(descs[0].inode_bitmap as u64).to_offset(),
-                &mut inode_bitmap,
-            )
-            .unwrap();
+        let inode_bitmap = f.read_inode_bitmap(0).unwrap();
         assert!(testkit::bit_is_set_lsb0(
             &inode_bitmap,
             (child_ino - 1) as usize
@@ -2995,8 +2898,8 @@ mod test {
 
     #[ktest]
     fn block_mapping_ok() {
-        let (disk, _sb, _descs) = prepare_disk(2, 256);
-        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
+        let (disk, ext2) = (&f.disk, &f.ext2);
 
         let ptrs = (ext2.block_size() / size_of::<u32>()) as u32;
         let ptrs_bits = ptrs.trailing_zeros();
@@ -3106,8 +3009,8 @@ mod test {
 
     #[ktest]
     fn block_mapping_error() {
-        let (disk, _sb, _descs) = prepare_disk(2, 256);
-        let ext2 = Ext2::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
+        let (disk, ext2) = (&f.disk, &f.ext2);
 
         let ptrs = (ext2.block_size() / size_of::<u32>()) as u64;
         let direct = 12u64;
@@ -3137,14 +3040,18 @@ mod test {
         assert_eq!(get_too_big_err.error(), Errno::EINVAL);
 
         // Inject a deterministic read failure on the indirect block read path.
-        let (io_disk_base, _io_sb, _io_descs) = prepare_disk(2, 256);
+        let io_base = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let io_fail_offset = Bid::new(40).to_offset();
         let io_disk = Arc::new(ErrorBioDisk::with_read_error_at(
-            io_disk_base,
+            io_base.disk.clone(),
             BioStatus::IoError,
             io_fail_offset,
         ));
-        let io_ext2 = Ext2::open(io_disk as Arc<dyn BlockDevice>).unwrap();
+        let io_f = Ext2FixtureBuilder::new(2, 256)
+            .with_device(io_disk)
+            .build()
+            .unwrap();
+        let io_ext2 = &io_f.ext2;
 
         let mut ptrs_for_io = [0u32; 15];
         ptrs_for_io[12] = 40;

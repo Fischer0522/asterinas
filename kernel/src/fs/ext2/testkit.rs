@@ -811,6 +811,16 @@ impl Ext2FixtureBuilder {
         self
     }
 
+    /// Preset for namei (create/link/unlink/rename) tests:
+    /// 1 group, 256 blocks, free blocks/inodes, root directory initialized.
+    pub(super) fn namei_env() -> Self {
+        Self::new(1, 256)
+            .with_free_blocks(64, 64)
+            .with_free_inodes(1000, 1000)
+            .with_group0_used_dirs(1)
+            .with_root()
+    }
+
     /// Uses a custom block device for the `Ext2` instance instead of the memory disk.
     /// The memory disk is still used to prepare on-disk metadata.
     pub(super) fn with_device(mut self, device: Arc<dyn BlockDevice>) -> Self {
