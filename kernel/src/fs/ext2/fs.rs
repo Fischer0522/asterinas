@@ -65,8 +65,7 @@ impl Ext2 {
             block_groups: match Self::load_block_groups(
                 &super_block,
                 &group_descriptors_segment,
-                device.as_ref(),
-                weak_self.clone(),
+                device.clone(),
             ) {
                 Ok(groups) => groups,
                 Err(err) => {
@@ -173,7 +172,10 @@ impl Ext2 {
         Ok(group.inode_table_bid() + table_block_index as u64)
     }
 
-    /// Reads an inode descriptor from disk.
+    /// Reads an inode descriptor from the group's PageCache.
+    ///
+    /// Thin orchestrator: validates ino, computes group/index, delegates to
+    /// `BlockGroup::read_inode_desc`.
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:1314 (ext2_get_inode)
     pub(super) fn read_inode_desc(&self, ino: u32) -> Result<InodeDesc> {
@@ -184,26 +186,23 @@ impl Ext2 {
             return_errno_with_message!(Errno::EINVAL, "inode number out of valid range");
         }
 
-        // SPEC: `ext2_get_inode` address arithmetic.
         let inodes_per_group = sb.inodes_per_group();
         let group_idx = ((ino - 1) / inodes_per_group) as usize;
         let index_in_group = (ino - 1) % inodes_per_group;
+        drop(sb);
 
-        let inode_size = sb.inode_size();
-        let offset_bytes = (index_in_group as usize).saturating_mul(inode_size);
+        let group = self
+            .block_groups
+            .get(group_idx)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "block group index out of range"))?;
 
-        let group = self.block_groups.get(group_idx).ok_or_else(|| {
-            Error::with_message(Errno::EIO, "block group index out of range")
-        })?;
-
-        // Read RawInode from PageCache (replaces direct block device I/O).
-        let raw: RawInode = group.inode_table_cache().pages().read_val(offset_bytes)?;
-
-        // SPEC: propagate `ESTALE` for deleted inode from descriptor conversion.
-        InodeDesc::try_from(&raw)
+        group.read_inode_desc(index_in_group)
     }
 
-    /// Writes an inode descriptor to the PageCache (deferred writeback).
+    /// Writes an inode descriptor to the group's PageCache (deferred writeback).
+    ///
+    /// Thin orchestrator: validates ino, computes group/index, delegates to
+    /// `BlockGroup::write_inode_desc`.
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:1512 (__ext2_write_inode / mark_buffer_dirty)
     pub(super) fn write_inode_desc(&self, ino: u32, raw: &RawInode) -> Result<()> {
@@ -214,22 +213,17 @@ impl Ext2 {
             return_errno_with_message!(Errno::EINVAL, "inode number out of valid range");
         }
 
-        // SPEC: `ext2_get_inode` address arithmetic.
         let inodes_per_group = sb.inodes_per_group();
         let group_idx = ((ino - 1) / inodes_per_group) as usize;
         let index_in_group = (ino - 1) % inodes_per_group;
+        drop(sb);
 
-        let inode_size = sb.inode_size();
-        let offset_bytes = (index_in_group as usize).saturating_mul(inode_size);
+        let group = self
+            .block_groups
+            .get(group_idx)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "block group index out of range"))?;
 
-        let group = self.block_groups.get(group_idx).ok_or_else(|| {
-            Error::with_message(Errno::EIO, "block group index out of range")
-        })?;
-
-        // Write RawInode to PageCache (marks page dirty; disk write is deferred).
-        group.inode_table_cache().pages().write_val(offset_bytes, raw)?;
-
-        Ok(())
+        group.write_inode_desc(index_in_group, raw)
     }
 
     /// Loads the group descriptor table into a segment.
@@ -302,40 +296,31 @@ impl Ext2 {
     pub(super) fn load_block_groups(
         sb: &SuperBlock,
         group_descs: &USegment,
-        block_device: &dyn BlockDevice,
-        fs: Weak<Ext2>,
+        block_device: Arc<dyn BlockDevice>,
     ) -> Result<Vec<BlockGroup>> {
         let groups_count = sb.block_groups_count() as usize;
         let mut groups = Vec::with_capacity(groups_count);
         for idx in 0..groups_count {
-            let group = BlockGroup::load(group_descs, idx, sb, block_device, fs.clone())?;
+            let group = BlockGroup::load(group_descs, idx, sb, block_device.clone())?;
             groups.push(group);
         }
         Ok(groups)
     }
 
     /// Allocates up to `count` contiguous blocks.
+    ///
+    /// Thin orchestrator: iterates groups, delegates to `BlockGroup::alloc_blocks`,
+    /// updates superblock counter on success.
     pub(super) fn alloc_blocks(&self, count: u32) -> Result<Range<u32>> {
         if count == 0 {
             return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
         }
 
-        let (
-            first_data_block,
-            blocks_per_group,
-            total_blocks,
-            groups_count,
-            sb_free_blocks,
-            itb_per_group,
-        ) = {
+        let (groups_count, sb_free_blocks) = {
             let guard = self.super_block.read();
             (
-                guard.first_data_block(),
-                guard.blocks_per_group(),
-                guard.total_blocks(),
                 guard.block_groups_count() as usize,
                 guard.free_blocks_count(),
-                guard.itb_per_group(),
             )
         };
         if groups_count == 0 || self.block_groups.len() < groups_count {
@@ -346,30 +331,19 @@ impl Ext2 {
         }
 
         let mut saw_corruption = false;
-        for group_idx in 0..groups_count {
-            let group = self
-                .block_groups
-                .get(group_idx)
-                .ok_or_else(|| Error::with_message(Errno::EIO, "block group index out of range"))?;
+        for group in &self.block_groups {
             if group.free_blocks_count() == 0 {
                 continue;
             }
 
-            let (range, corrupt) = self.try_alloc_in_group(
-                first_data_block,
-                blocks_per_group,
-                total_blocks,
-                groups_count,
-                itb_per_group,
-                sb_free_blocks,
-                group,
-                group_idx,
-                count,
-            )?;
+            let (range, corrupt) = group.alloc_blocks(count, sb_free_blocks)?;
             if corrupt {
                 saw_corruption = true;
             }
             if let Some(range) = range {
+                let alloc_len = range.end - range.start;
+                let mut sb_write = self.super_block.write();
+                sb_write.dec_free_blocks(alloc_len);
                 return Ok(range);
             }
         }
@@ -381,32 +355,21 @@ impl Ext2 {
     }
 
     /// Frees a range of blocks starting at `start`.
+    ///
+    /// Thin orchestrator: validates range, splits across group boundaries,
+    /// delegates to `BlockGroup::free_blocks`, updates superblock counter.
     pub(super) fn free_blocks(&self, start: u32, count: u32) -> Result<()> {
         if count == 0 {
             return Ok(());
         }
 
-        let (
-            first_data_block,
-            blocks_per_group,
-            total_blocks,
-            groups_count,
-            itb_per_group,
-            block_size,
-        ) = {
-            let guard = self.super_block.read();
-            (
-                guard.first_data_block(),
-                guard.blocks_per_group(),
-                guard.total_blocks(),
-                guard.block_groups_count() as usize,
-                guard.itb_per_group(),
-                guard.block_size(),
-            )
-        };
-        if !Self::data_block_valid(first_data_block, total_blocks, block_size, start, count) {
+        let sb = self.super_block.read();
+        if !sb.data_block_valid(start, count) {
             return_errno_with_message!(Errno::EIO, "freeing invalid data block range");
         }
+        let blocks_per_group = sb.blocks_per_group();
+        let first_data_block = sb.first_data_block();
+        drop(sb);
 
         let mut current = start;
         let mut remaining = count;
@@ -418,66 +381,21 @@ impl Ext2 {
                 .get(group_idx)
                 .ok_or_else(|| Error::with_message(Errno::EIO, "block group index out of range"))?;
 
-            let group_first =
-                Self::group_first_block_no(first_data_block, blocks_per_group, group_idx);
-            let group_last = Self::group_last_block_no(
-                first_data_block,
-                blocks_per_group,
-                total_blocks,
-                groups_count,
-                group_idx,
-            );
+            let group_first = group.first_block();
+            let group_last = group.last_block();
             if group_last < group_first {
                 return_errno_with_message!(Errno::EIO, "block group has invalid block range");
             }
             let group_size = group_last - group_first + 1;
-            if group_size as usize > BLOCK_SIZE * 8 {
-                return_errno_with_message!(Errno::EIO, "block group size exceeds bitmap capacity");
-            }
             let bit = current.saturating_sub(group_first);
             if bit >= group_size {
                 return_errno_with_message!(Errno::EIO, "block offset outside group boundary");
             }
             let group_count = remaining.min(group_size.saturating_sub(bit));
 
-            let block_bitmap = group.block_bitmap_bid().to_raw() as u32;
-            let inode_bitmap = group.inode_bitmap_bid().to_raw() as u32;
-            let inode_table = group.inode_table_bid().to_raw() as u32;
-
-            let mut bitmap = group.block_bitmap_mut();
-
-            if Self::range_overlaps_system_zone(
-                block_bitmap,
-                inode_bitmap,
-                inode_table,
-                itb_per_group,
-                current,
-                group_count,
-            ) {
-                return_errno_with_message!(Errno::EIO, "freeing blocks in system zone");
-            }
-
-            let mut freed = 0u32;
-            let range_start = bit as u16;
-            let range_end = (bit + group_count) as u16;
-
-            for idx in range_start..range_end {
-                if !bitmap.is_allocated(idx) {
-                    warn!(
-                        "ext2_free_blocks: bit already cleared for block {}",
-                        current.saturating_add((idx - range_start) as u32)
-                    );
-                }
-            }
-            bitmap.free_consecutive(range_start..range_end);
-            freed = group_count;
-
-            drop(bitmap);
-
-            // SPEC: persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
+            let freed = group.free_blocks(bit, group_count)?;
 
             if freed > 0 {
-                group.inc_free_blocks(freed as u16);
                 let mut sb_write = self.super_block.write();
                 sb_write.inc_free_blocks(freed);
             }
@@ -490,6 +408,9 @@ impl Ext2 {
     }
 
     /// Allocates a new inode number.
+    ///
+    /// Thin orchestrator: validates, iterates groups starting at parent's group,
+    /// delegates to `BlockGroup::alloc_inode`, updates group and superblock counters.
     pub(super) fn alloc_inode(&self, parent_ino: u32, inode_type: InodeType) -> Result<u32> {
         let (groups_count, inodes_per_group, total_inodes, first_ino, free_inodes) = {
             let sb_guard = self.super_block.read();
@@ -522,8 +443,7 @@ impl Ext2 {
                 continue;
             }
 
-            let mut bitmap = group.inode_bitmap_mut();
-            let Some(inode_idx) = bitmap.alloc() else {
+            let Some(inode_idx) = group.alloc_inode()? else {
                 continue;
             };
 
@@ -534,10 +454,6 @@ impl Ext2 {
             if ino < first_ino || ino > total_inodes {
                 return_errno_with_message!(Errno::EIO, "allocated inode number out of valid range");
             }
-
-            drop(bitmap);
-
-            // SPEC: persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
 
             group.dec_free_inodes(1);
             if inode_type.is_directory() {
@@ -613,6 +529,9 @@ impl Ext2 {
     }
 
     /// Frees an inode by number.
+    ///
+    /// Thin orchestrator: validates, delegates bitmap op to `BlockGroup::free_inode`,
+    /// updates group and superblock counters on success.
     pub(super) fn free_inode(&self, ino: u32) -> Result<()> {
         let (inodes_per_group, total_inodes, first_ino, groups_count) = {
             let sb_guard = self.super_block.read();
@@ -641,21 +560,9 @@ impl Ext2 {
             .get(group_idx)
             .ok_or_else(|| Error::with_message(Errno::EIO, "block group index out of range"))?;
 
-        let mut bitmap = group.inode_bitmap_mut();
-        let mut freed = false;
-        if !bitmap.is_allocated(bit) {
-            freed = true;
-            warn!("ext2_free_inode: inode {} already freed", ino);
-        }
-        if !freed {
-            bitmap.free(bit);
-        }
+        let was_allocated = group.free_inode(bit)?;
 
-        drop(bitmap);
-
-        // SPEC: persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
-
-        if !freed {
+        if was_allocated {
             group.inc_free_inodes(1);
             if is_dir {
                 group.dec_used_dirs();
@@ -693,7 +600,7 @@ impl Ext2 {
         for group in &self.block_groups {
             group.sync_metadata(&self.group_descriptors_segment)?;
             // SPEC: bitmap caches are persistent in-memory copies; flush if dirty.
-            group.sync_bitmaps(self)?;
+            group.sync_bitmaps()?;
         }
 
         let desc_bytes = groups_count * size_of::<RawGroupDesc>();
@@ -750,184 +657,6 @@ impl Ext2 {
 
         sb_guard.clear_dirty();
         Ok(())
-    }
-
-    // TODO: Move this method into BlockGroup?
-    fn try_alloc_in_group(
-        &self,
-        first_data_block: u32,
-        blocks_per_group: u32,
-        total_blocks: u32,
-        groups_count: usize,
-        itb_per_group: u32,
-        sb_free_blocks: u32,
-        group: &BlockGroup,
-        group_idx: usize,
-        count: u32,
-    ) -> Result<(Option<Range<u32>>, bool)> {
-        let group_first = Self::group_first_block_no(first_data_block, blocks_per_group, group_idx);
-        let group_last = Self::group_last_block_no(
-            first_data_block,
-            blocks_per_group,
-            total_blocks,
-            groups_count,
-            group_idx,
-        );
-        if group_last < group_first {
-            return_errno_with_message!(Errno::EIO, "block group has invalid block range");
-        }
-        let group_size = group_last - group_first + 1;
-        if group_size as usize > BLOCK_SIZE * 8 {
-            return_errno_with_message!(Errno::EIO, "block group size exceeds bitmap capacity");
-        }
-
-        let mut saw_corruption = false;
-        let block_bitmap = group.block_bitmap_bid().to_raw() as u32;
-        let inode_bitmap = group.inode_bitmap_bid().to_raw() as u32;
-        let inode_table = group.inode_table_bid().to_raw() as u32;
-
-        let mut bitmap = group.block_bitmap_mut();
-        if group.free_blocks_count() > 0 {
-            if let Some(range) = bitmap.alloc_consecutive(1) {
-                bitmap.free_consecutive(range);
-            } else {
-                saw_corruption = true;
-            }
-        }
-
-        let mut rejected = Vec::new();
-        let mut req = count.min(group_size) as u16;
-        while req > 0 {
-            let Some(range) = bitmap.alloc_consecutive(req) else {
-                req /= 2;
-                continue;
-            };
-            let alloc_len = range.len() as u32;
-            let run_start = range.start as u32;
-            let ret_block = group_first.saturating_add(run_start);
-
-            if Self::range_overlaps_system_zone(
-                block_bitmap,
-                inode_bitmap,
-                inode_table,
-                itb_per_group,
-                ret_block,
-                alloc_len,
-            ) {
-                saw_corruption = true;
-                rejected.push(range);
-                continue;
-            }
-            if group.free_blocks_count() < alloc_len as u16 || sb_free_blocks < alloc_len {
-                saw_corruption = true;
-                rejected.push(range);
-                continue;
-            }
-
-            for rejected_range in rejected.drain(..) {
-                bitmap.free_consecutive(rejected_range);
-            }
-
-            drop(bitmap);
-
-            // SPEC: persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
-
-            group.dec_free_blocks(alloc_len as u16);
-            let mut sb_write = self.super_block.write();
-            sb_write.dec_free_blocks(alloc_len);
-
-            let range = ret_block..ret_block.saturating_add(alloc_len);
-            return Ok((Some(range), saw_corruption));
-        }
-
-        Ok((None, saw_corruption))
-    }
-
-    fn range_overlaps_system_zone(
-        block_bitmap: u32,
-        inode_bitmap: u32,
-        inode_table: u32,
-        itb_per_group: u32,
-        start: u32,
-        count: u32,
-    ) -> bool {
-        let Some(end) = start.checked_add(count.saturating_sub(1)) else {
-            return true;
-        };
-
-        if Self::ranges_overlap(start, end, block_bitmap, 1) {
-            return true;
-        }
-        if Self::ranges_overlap(start, end, inode_bitmap, 1) {
-            return true;
-        }
-        if Self::ranges_overlap(start, end, inode_table, itb_per_group) {
-            return true;
-        }
-        false
-    }
-
-    fn group_first_block_no(first_data_block: u32, blocks_per_group: u32, group_idx: usize) -> u32 {
-        (group_idx as u32)
-            .saturating_mul(blocks_per_group)
-            .saturating_add(first_data_block)
-    }
-
-    fn group_last_block_no(
-        first_data_block: u32,
-        blocks_per_group: u32,
-        total_blocks: u32,
-        groups_count: usize,
-        group_idx: usize,
-    ) -> u32 {
-        if group_idx as u32 == (groups_count as u32).saturating_sub(1) {
-            total_blocks.saturating_sub(1)
-        } else {
-            Self::group_first_block_no(first_data_block, blocks_per_group, group_idx)
-                .saturating_add(blocks_per_group)
-                .saturating_sub(1)
-        }
-    }
-
-    fn data_block_valid(
-        first_data_block: u32,
-        total_blocks: u32,
-        block_size: usize,
-        start_blk: u32,
-        count: u32,
-    ) -> bool {
-        if count == 0 {
-            return false;
-        }
-
-        let Some(end_blk) = start_blk.checked_add(count.saturating_sub(1)) else {
-            return false;
-        };
-
-        if start_blk <= first_data_block || end_blk < start_blk || end_blk >= total_blocks {
-            return false;
-        }
-
-        let sb_block = if block_size == SUPER_BLOCK_OFFSET {
-            1u32
-        } else {
-            0u32
-        };
-        if start_blk <= sb_block && end_blk >= sb_block {
-            return false;
-        }
-
-        true
-    }
-
-    fn ranges_overlap(start: u32, end: u32, zone_start: u32, zone_len: u32) -> bool {
-        if zone_len == 0 {
-            return false;
-        }
-        let Some(zone_end) = zone_start.checked_add(zone_len.saturating_sub(1)) else {
-            return true;
-        };
-        !(end < zone_start || start > zone_end)
     }
 }
 
@@ -1494,9 +1223,8 @@ mod test {
             .unwrap();
         let group_descs: USegment = segment.into();
 
-        let err =
-            Ext2::load_block_groups(&sb, &group_descs, &Ext2MemoryDisk::new(64), Weak::new())
-                .unwrap_err();
+        let err = Ext2::load_block_groups(&sb, &group_descs, Arc::new(Ext2MemoryDisk::new(64)))
+            .unwrap_err();
         assert_eq!(err.error(), Errno::EINVAL);
     }
 }

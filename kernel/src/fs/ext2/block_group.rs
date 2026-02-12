@@ -4,16 +4,25 @@ use core::{fmt, mem::size_of};
 
 use ostd::const_assert;
 
-use super::{fs::Ext2, prelude::*, super_block::SuperBlock};
+use super::{
+    inode::{InodeDesc, RawInode},
+    prelude::*,
+    super_block::SuperBlock,
+};
 use crate::fs::utils::IdBitmap;
 
-/// Backend that translates PageCache page indices to physical inode table blocks.
+/// Backend of the inode table page cache in one block group.
 ///
-/// Linux: /root/linux/fs/ext2/inode.c:1314 (ext2_get_inode / sb_bread)
+/// Linux equivalent: `sb_bread()` buffer_head cache path in
+/// `/root/linux/fs/ext2/inode.c:1314` (`ext2_get_inode`).
+/// Asterinas equivalent: `PageCacheBackend` implementation.
 struct InodeTableBackend {
+    /// Physical block ID of `bg_inode_table`.
     inode_table_bid: Bid,
+    /// Total inode table size in bytes (`inodes_per_group * inode_size`).
     raw_inodes_size: usize,
-    fs: Weak<Ext2>,
+    /// Block device handle for I/O (replaces `Weak<Ext2>`).
+    block_device: Arc<dyn BlockDevice>,
 }
 
 impl PageCacheBackend for InodeTableBackend {
@@ -23,11 +32,7 @@ impl PageCacheBackend for InodeTableBackend {
             Segment::from(frame.clone()).into(),
             BioDirection::FromDevice,
         );
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem dropped"))?;
-        Ok(fs.block_device().read_blocks_async(bid, bio_segment)?)
+        Ok(self.block_device.read_blocks_async(bid, bio_segment)?)
     }
 
     fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
@@ -36,11 +41,7 @@ impl PageCacheBackend for InodeTableBackend {
             Segment::from(frame.clone()).into(),
             BioDirection::ToDevice,
         );
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem dropped"))?;
-        Ok(fs.block_device().write_blocks_async(bid, bio_segment)?)
+        Ok(self.block_device.write_blocks_async(bid, bio_segment)?)
     }
 
     fn npages(&self) -> usize {
@@ -48,12 +49,36 @@ impl PageCacheBackend for InodeTableBackend {
     }
 }
 
+/// A single Ext2 block group.
+///
+/// Owns all per-group state: descriptor, bitmaps, inode table cache,
+/// and the block device handle needed for I/O. Provides self-contained
+/// operations for block/inode allocation, deallocation, and inode
+/// descriptor read/write within this group.
 pub struct BlockGroup {
+    /// Block group index (0-based).
     idx: usize,
+    /// Group descriptor with dirty tracking.
     desc: RwMutex<Dirty<GroupDesc>>,
+    /// Block bitmap cached in memory.
     block_bitmap: RwMutex<Dirty<IdBitmap>>,
+    /// Inode bitmap cached in memory.
     inode_bitmap: RwMutex<Dirty<IdBitmap>>,
+    /// Backing block device (shared with Ext2 and other groups).
+    block_device: Arc<dyn BlockDevice>,
+    /// Cached geometry: first filesystem-wide block number of this group.
+    first_block: u32,
+    /// Cached geometry: last filesystem-wide block number of this group.
+    last_block: u32,
+    /// Cached geometry: inode table blocks per group.
+    itb_per_group: u32,
+    /// Cached geometry: inodes per group.
+    inodes_per_group: u32,
+    /// Cached geometry: inode size in bytes.
+    inode_size: usize,
+    /// Inode table page cache backend.
     inode_table_backend: Arc<InodeTableBackend>,
+    /// Inode table page cache.
     inode_table_cache: PageCache,
 }
 
@@ -123,12 +148,15 @@ impl From<GroupDesc> for RawGroupDesc {
 }
 
 impl BlockGroup {
+    /// Loads a block group from the descriptor table.
+    ///
+    /// Now takes `Arc<dyn BlockDevice>` directly instead of `Weak<Ext2>`.
+    /// Caches per-group geometry from `SuperBlock` at load time.
     pub fn load(
         group_descs: &USegment,
         idx: usize,
         sb: &SuperBlock,
-        block_device: &dyn BlockDevice,
-        fs: Weak<Ext2>,
+        block_device: Arc<dyn BlockDevice>,
     ) -> Result<Self> {
         let offset = idx * size_of::<RawGroupDesc>();
         let raw = group_descs
@@ -136,16 +164,29 @@ impl BlockGroup {
             .map_err(|_| Error::with_message(Errno::EIO, "failed to read group descriptor"))?;
         let desc = GroupDesc::from(raw);
 
+        // Cache geometry from SuperBlock at load time.
+        let first_block = sb.group_first_block_no(idx);
+        let last_block = sb.group_last_block_no(idx);
+        let itb_per_group = sb.itb_per_group();
+        let inodes_per_group = sb.inodes_per_group();
+        let inode_size = sb.inode_size();
+
         // SPEC: load and validate bitmaps once during mount, keep them cached in memory.
-        let block_bitmap = Self::load_block_bitmap(block_device, sb, idx, &desc)?;
-        let inode_bitmap = Self::load_inode_bitmap(block_device, sb, &desc)?;
+        let block_bitmap = Self::load_block_bitmap(
+            block_device.as_ref(),
+            first_block,
+            last_block,
+            itb_per_group,
+            &desc,
+        )?;
+        let inode_bitmap = Self::load_inode_bitmap(block_device.as_ref(), inodes_per_group, &desc)?;
 
         // Create PageCache for inode table backed by InodeTableBackend.
-        let raw_inodes_size = (sb.inodes_per_group() as usize).saturating_mul(sb.inode_size());
+        let raw_inodes_size = (inodes_per_group as usize).saturating_mul(inode_size);
         let backend = Arc::new(InodeTableBackend {
             inode_table_bid: desc.inode_table,
             raw_inodes_size,
-            fs,
+            block_device: block_device.clone(),
         });
         let inode_table_cache =
             PageCache::with_capacity(raw_inodes_size, Arc::downgrade(&backend) as _)?;
@@ -155,6 +196,12 @@ impl BlockGroup {
             desc: RwMutex::new(Dirty::new(desc)),
             block_bitmap: RwMutex::new(Dirty::new(block_bitmap)),
             inode_bitmap: RwMutex::new(Dirty::new(inode_bitmap)),
+            block_device,
+            first_block,
+            last_block,
+            itb_per_group,
+            inodes_per_group,
+            inode_size,
             inode_table_backend: backend,
             inode_table_cache,
         })
@@ -194,6 +241,16 @@ impl BlockGroup {
 
     pub fn inode_table_cache(&self) -> &PageCache {
         &self.inode_table_cache
+    }
+
+    /// Returns the first filesystem-wide block number of this group.
+    pub fn first_block(&self) -> u32 {
+        self.first_block
+    }
+
+    /// Returns the last filesystem-wide block number of this group.
+    pub fn last_block(&self) -> u32 {
+        self.last_block
     }
 
     pub fn free_blocks_count(&self) -> u16 {
@@ -269,7 +326,7 @@ impl BlockGroup {
         Ok(())
     }
 
-    pub fn sync_bitmaps(&self, fs: &Ext2) -> Result<()> {
+    pub fn sync_bitmaps(&self) -> Result<()> {
         let (block_bitmap_bid, inode_bitmap_bid) = {
             // SPEC: read descriptor block addresses before bitmap locks to keep lock ordering.
             let desc = self.desc.read();
@@ -279,8 +336,8 @@ impl BlockGroup {
         if self.block_bitmap.read().is_dirty() {
             let mut block_bitmap = self.block_bitmap.write();
             if block_bitmap.is_dirty() {
-                if fs
-                    .block_device()
+                if self
+                    .block_device
                     .write_bytes(block_bitmap_bid.to_offset(), block_bitmap.as_bytes())
                     .is_err()
                 {
@@ -294,8 +351,8 @@ impl BlockGroup {
         if self.inode_bitmap.read().is_dirty() {
             let mut inode_bitmap = self.inode_bitmap.write();
             if inode_bitmap.is_dirty() {
-                if fs
-                    .block_device()
+                if self
+                    .block_device
                     .write_bytes(inode_bitmap_bid.to_offset(), inode_bitmap.as_bytes())
                     .is_err()
                 {
@@ -314,8 +371,9 @@ impl BlockGroup {
     /// Linux: /root/linux/fs/ext2/balloc.c:129 (read_block_bitmap)
     fn load_block_bitmap(
         block_device: &dyn BlockDevice,
-        sb: &SuperBlock,
-        idx: usize,
+        first_block: u32,
+        last_block: u32,
+        itb_per_group: u32,
         desc: &GroupDesc,
     ) -> Result<IdBitmap> {
         let bitmap_bid = desc.block_bitmap;
@@ -328,8 +386,6 @@ impl BlockGroup {
             return_errno_with_message!(Errno::EIO, "failed to read block bitmap");
         }
 
-        let first_block = sb.group_first_block_no(idx);
-        let last_block = sb.group_last_block_no(idx);
         if last_block < first_block {
             return_errno_with_message!(Errno::EINVAL, "block group has invalid block range");
         }
@@ -338,7 +394,6 @@ impl BlockGroup {
         if capacity > IdBitmap::capacity() as usize {
             return_errno_with_message!(Errno::EINVAL, "block bitmap capacity overflow");
         }
-        let itb_per_group = sb.itb_per_group();
         let bitmap = IdBitmap::from_buf(buf.into_boxed_slice(), capacity as u16);
 
         let valid_block_bitmap = |first_block: u32,
@@ -405,7 +460,7 @@ impl BlockGroup {
     /// Linux: /root/linux/fs/ext2/ialloc.c:31 (read_inode_bitmap)
     fn load_inode_bitmap(
         block_device: &dyn BlockDevice,
-        sb: &SuperBlock,
+        inodes_per_group: u32,
         desc: &GroupDesc,
     ) -> Result<IdBitmap> {
         let bitmap_bid = desc.inode_bitmap;
@@ -418,12 +473,227 @@ impl BlockGroup {
             return_errno_with_message!(Errno::EIO, "failed to read inode bitmap");
         }
 
-        let capacity = sb.inodes_per_group() as usize;
+        let capacity = inodes_per_group as usize;
         if capacity > IdBitmap::capacity() as usize {
             return_errno_with_message!(Errno::EINVAL, "inode bitmap capacity overflow");
         }
 
         Ok(IdBitmap::from_buf(buf.into_boxed_slice(), capacity as u16))
+    }
+
+    /// Attempts to allocate up to `count` contiguous blocks within this group.
+    ///
+    /// Returns `Ok((Some(range), saw_corruption))` with filesystem-wide block numbers
+    /// on success, `Ok((None, saw_corruption))` if no allocatable blocks.
+    ///
+    /// Linux: /root/linux/fs/ext2/balloc.c:682 (ext2_try_to_allocate)
+    pub(super) fn alloc_blocks(
+        &self,
+        count: u32,
+        sb_free_blocks: u32,
+    ) -> Result<(Option<Range<u32>>, bool)> {
+        let group_size = self.last_block - self.first_block + 1;
+        if group_size as usize > BLOCK_SIZE * 8 {
+            return_errno_with_message!(Errno::EIO, "block group size exceeds bitmap capacity");
+        }
+
+        let mut saw_corruption = false;
+
+        let mut bitmap = self.block_bitmap.write();
+
+        // Corruption check: descriptor says free blocks but bitmap disagrees.
+        if self.free_blocks_count() > 0 {
+            if let Some(range) = bitmap.alloc_consecutive(1) {
+                bitmap.free_consecutive(range);
+            } else {
+                saw_corruption = true;
+            }
+        }
+
+        let mut rejected = Vec::new();
+        let mut req = count.min(group_size) as u16;
+        while req > 0 {
+            let Some(range) = bitmap.alloc_consecutive(req) else {
+                req /= 2;
+                continue;
+            };
+            let alloc_len = range.len() as u32;
+            let run_start = range.start as u32;
+            let ret_block = self.first_block.saturating_add(run_start);
+
+            if self.overlaps_system_zone(ret_block, alloc_len) {
+                saw_corruption = true;
+                rejected.push(range);
+                continue;
+            }
+            if self.free_blocks_count() < alloc_len as u16 || sb_free_blocks < alloc_len {
+                saw_corruption = true;
+                rejected.push(range);
+                continue;
+            }
+
+            // Restore any previously rejected ranges.
+            for rejected_range in rejected.drain(..) {
+                bitmap.free_consecutive(rejected_range);
+            }
+
+            drop(bitmap);
+
+            // SPEC: persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
+
+            self.dec_free_blocks(alloc_len as u16);
+
+            let range = ret_block..ret_block.saturating_add(alloc_len);
+            return Ok((Some(range), saw_corruption));
+        }
+
+        // No allocation possible; restore any rejected ranges.
+        for rejected_range in rejected.drain(..) {
+            bitmap.free_consecutive(rejected_range);
+        }
+
+        Ok((None, saw_corruption))
+    }
+
+    /// Frees a range of blocks within this group.
+    ///
+    /// `bit` is the group-relative start index, `group_count` is the number
+    /// of blocks to free. Returns the number of blocks actually freed.
+    ///
+    /// Linux: /root/linux/fs/ext2/balloc.c:482 (ext2_free_blocks, per-group portion)
+    pub(super) fn free_blocks(&self, bit: u32, group_count: u32) -> Result<u32> {
+        // Validate system zone overlap using filesystem-wide coordinates.
+        let abs_start = self.first_block.saturating_add(bit);
+        if self.overlaps_system_zone(abs_start, group_count) {
+            return_errno_with_message!(Errno::EIO, "freeing blocks in system zone");
+        }
+
+        let mut bitmap = self.block_bitmap.write();
+
+        // Linux: balloc.c:542-556 — per-bit clear, only count bits that actually
+        // transitioned allocated→free (group_freed pattern).
+        let range_start = bit as u16;
+        let range_end = (bit + group_count) as u16;
+        let mut actually_freed: u32 = 0;
+        for idx in range_start..range_end {
+            if !bitmap.is_allocated(idx) {
+                warn!(
+                    "ext2_free_blocks: bit already cleared for block {}",
+                    abs_start.saturating_add((idx - range_start) as u32)
+                );
+            } else {
+                bitmap.free(idx);
+                actually_freed += 1;
+            }
+        }
+
+        drop(bitmap);
+
+        // SPEC: persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
+
+        self.inc_free_blocks(actually_freed as u16);
+        Ok(actually_freed)
+    }
+
+    /// Attempts to allocate one inode within this group.
+    ///
+    /// Returns `Ok(Some(inode_idx))` with the 0-based group-relative inode index,
+    /// or `Ok(None)` if no free inode. Does NOT update counters.
+    ///
+    /// Linux: /root/linux/fs/ext2/ialloc.c:419 (ext2_new_inode, per-group portion)
+    pub(super) fn alloc_inode(&self) -> Result<Option<u16>> {
+        let mut bitmap = self.inode_bitmap.write();
+        let Some(inode_idx) = bitmap.alloc() else {
+            return Ok(None);
+        };
+        drop(bitmap);
+
+        // SPEC: persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
+
+        Ok(Some(inode_idx))
+    }
+
+    /// Frees one inode within this group.
+    ///
+    /// `bit` is the 0-based group-relative inode index.
+    /// Returns `true` if the bit transitioned allocated→free,
+    /// `false` if it was already free (logs warning). Does NOT update counters.
+    ///
+    /// Linux: /root/linux/fs/ext2/ialloc.c:79 (ext2_free_inode, per-group portion)
+    pub(super) fn free_inode(&self, bit: u16) -> Result<bool> {
+        let mut bitmap = self.inode_bitmap.write();
+        if !bitmap.is_allocated(bit) {
+            warn!("ext2_free_inode: inode bit {} already freed", bit);
+            return Ok(false);
+        }
+        bitmap.free(bit);
+        drop(bitmap);
+
+        // SPEC: persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
+
+        Ok(true)
+    }
+
+    /// Reads an inode descriptor from the group's inode table PageCache.
+    ///
+    /// `index_in_group` is the 0-based inode index within this group.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:1314 (ext2_get_inode)
+    pub(super) fn read_inode_desc(&self, index_in_group: u32) -> Result<InodeDesc> {
+        let offset_bytes = (index_in_group as usize).saturating_mul(self.inode_size);
+        let raw: RawInode = self.inode_table_cache.pages().read_val(offset_bytes)?;
+        InodeDesc::try_from(&raw)
+    }
+
+    /// Writes an inode descriptor to the group's inode table PageCache (deferred writeback).
+    ///
+    /// `index_in_group` is the 0-based inode index within this group.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:1512 (__ext2_write_inode / mark_buffer_dirty)
+    pub(super) fn write_inode_desc(&self, index_in_group: u32, raw: &RawInode) -> Result<()> {
+        let offset_bytes = (index_in_group as usize).saturating_mul(self.inode_size);
+        self.inode_table_cache
+            .pages()
+            .write_val(offset_bytes, raw)?;
+        Ok(())
+    }
+
+    /// Checks whether [start, start+count-1] overlaps any system metadata block
+    /// (block bitmap, inode bitmap, inode table) of this group.
+    ///
+    /// Linux: /root/linux/fs/ext2/balloc.c:115 (ext2_bg_has_super + system zone check)
+    fn overlaps_system_zone(&self, start: u32, count: u32) -> bool {
+        let Some(end) = start.checked_add(count.saturating_sub(1)) else {
+            return true;
+        };
+
+        let desc = self.desc.read();
+        let block_bitmap = desc.block_bitmap.to_raw() as u32;
+        let inode_bitmap = desc.inode_bitmap.to_raw() as u32;
+        let inode_table = desc.inode_table.to_raw() as u32;
+        drop(desc);
+
+        if Self::ranges_overlap(start, end, block_bitmap, 1) {
+            return true;
+        }
+        if Self::ranges_overlap(start, end, inode_bitmap, 1) {
+            return true;
+        }
+        if Self::ranges_overlap(start, end, inode_table, self.itb_per_group) {
+            return true;
+        }
+        false
+    }
+
+    /// Returns whether [start, end] overlaps [zone_start, zone_start+zone_len-1].
+    fn ranges_overlap(start: u32, end: u32, zone_start: u32, zone_len: u32) -> bool {
+        if zone_len == 0 {
+            return false;
+        }
+        let Some(zone_end) = zone_start.checked_add(zone_len.saturating_sub(1)) else {
+            return true;
+        };
+        !(end < zone_start || start > zone_end)
     }
 }
 
