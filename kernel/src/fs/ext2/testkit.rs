@@ -831,8 +831,13 @@ impl Ext2FixtureBuilder {
     /// Common setup: creates raw superblock, descriptors, and disk.
     fn prepare(
         &self,
-    ) -> Result<(RawSuperBlock, SuperBlock, Vec<RawGroupDesc>, Arc<Ext2MemoryDisk>, Group0Layout)>
-    {
+    ) -> Result<(
+        RawSuperBlock,
+        SuperBlock,
+        Vec<RawGroupDesc>,
+        Arc<Ext2MemoryDisk>,
+        Group0Layout,
+    )> {
         let mut raw_sb = make_valid_raw_super_block(self.groups);
         if let Some(sb_free_blocks) = self.sb_free_blocks {
             raw_sb.free_blocks_count = sb_free_blocks;
@@ -863,7 +868,10 @@ impl Ext2FixtureBuilder {
             descs[0].used_dirs_count = v;
         }
 
-        let disk = Arc::new(Ext2MemoryDisk::new(self.nblocks));
+        // Keep fixture disk capacity consistent with superblock geometry so
+        // mount-time bitmap loading/validation can read all declared groups.
+        let disk_blocks = self.nblocks.max(sb.total_blocks() as usize);
+        let disk = Arc::new(Ext2MemoryDisk::new(disk_blocks));
         disk.write_super_block(&raw_sb);
         disk.write_group_desc_table(&sb, &descs);
 
@@ -880,6 +888,35 @@ impl Ext2FixtureBuilder {
     ) {
         let root_bid = layout.first_data.saturating_add(1);
 
+        // Initialize per-group block bitmaps with required metadata bits so mount-time
+        // `ext2_valid_block_bitmap` checks pass for every group.
+        for (group_idx, desc) in descs.iter().enumerate() {
+            let first = sb.group_first_block_no(group_idx);
+            let last = sb.group_last_block_no(group_idx);
+            let mut bitmap_block = [0u8; BLOCK_SIZE];
+            set_bit_lsb0(&mut bitmap_block, (desc.block_bitmap - first) as usize);
+            set_bit_lsb0(&mut bitmap_block, (desc.inode_bitmap - first) as usize);
+
+            // Group descriptor table block(s) in group 0 must stay allocated.
+            if group_idx == 0 {
+                let group_desc_bid = sb.group_descriptors_bid(0).to_raw() as u32;
+                if group_desc_bid >= first && group_desc_bid <= last {
+                    set_bit_lsb0(&mut bitmap_block, (group_desc_bid - first) as usize);
+                }
+            }
+
+            let itb = sb.itb_per_group();
+            for i in 0..itb {
+                set_bit_lsb0(&mut bitmap_block, (desc.inode_table + i - first) as usize);
+            }
+            disk.segment()
+                .write_bytes(
+                    Bid::new(desc.block_bitmap as u64).to_offset(),
+                    &bitmap_block,
+                )
+                .unwrap();
+        }
+
         if self.init_root {
             write_block_bitmap(disk, sb, &descs[0], &[root_bid]);
             write_inode_bitmap(disk, sb, &descs[0], &[ROOT_INO]);
@@ -894,7 +931,10 @@ impl Ext2FixtureBuilder {
             set_bit_lsb0(&mut bitmap_block, (descs[0].inode_bitmap - first) as usize);
             let itb = sb.itb_per_group();
             for i in 0..itb {
-                set_bit_lsb0(&mut bitmap_block, (descs[0].inode_table + i - first) as usize);
+                set_bit_lsb0(
+                    &mut bitmap_block,
+                    (descs[0].inode_table + i - first) as usize,
+                );
             }
             disk.segment()
                 .write_bytes(
@@ -966,4 +1006,3 @@ impl Ext2FixtureBuilder {
         })
     }
 }
-

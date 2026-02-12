@@ -2054,12 +2054,15 @@ mod test {
 
     use super::*;
     use crate::{
-        fs::ext2::{
-            fs::ROOT_INO,
-            testkit::{
-                self, CollectDirentVisitor, ErrorBioDisk, Ext2FixtureBuilder,
-                RawInodeBuilder, StopAfterVisitor, encode_dir_entry, write_indirect_ptr,
+        fs::{
+            ext2::{
+                fs::ROOT_INO,
+                testkit::{
+                    self, CollectDirentVisitor, ErrorBioDisk, Ext2FixtureBuilder, RawInodeBuilder,
+                    StopAfterVisitor, encode_dir_entry, write_indirect_ptr,
+                },
             },
+            utils::IdBitmap,
         },
         prelude::*,
         time::clocks,
@@ -2090,8 +2093,6 @@ mod test {
         InodeInner::new(Dirty::new(desc), Weak::new(), fs)
     }
 
-
-
     fn make_live_dir_inode(
         ext2: &Arc<Ext2>,
         ino: u32,
@@ -2115,6 +2116,35 @@ mod test {
         )
     }
 
+    // TODO: refactor this with an end-to-end test
+    fn reload_group0_cached_bitmaps_from_disk(f: &testkit::Ext2Fixture) {
+        let group = &f.block_groups()[0];
+
+        let mut block_bitmap_buf = vec![0u8; BLOCK_SIZE];
+        f.disk
+            .segment()
+            .read_bytes(group.block_bitmap_bid().to_offset(), &mut block_bitmap_buf)
+            .unwrap();
+        let block_len = {
+            let bitmap = group.block_bitmap();
+            bitmap.len()
+        };
+        let mut block_bitmap = group.block_bitmap_mut();
+        **block_bitmap = IdBitmap::from_buf(block_bitmap_buf.into_boxed_slice(), block_len);
+
+        let mut inode_bitmap_buf = vec![0u8; BLOCK_SIZE];
+        f.disk
+            .segment()
+            .read_bytes(group.inode_bitmap_bid().to_offset(), &mut inode_bitmap_buf)
+            .unwrap();
+        let inode_len = {
+            let bitmap = group.inode_bitmap();
+            bitmap.len()
+        };
+        let mut inode_bitmap = group.inode_bitmap_mut();
+        **inode_bitmap = IdBitmap::from_buf(inode_bitmap_buf.into_boxed_slice(), inode_len);
+    }
+
     #[ktest]
     fn namei_create_phase06_spec() {
         clocks::init_for_ktest();
@@ -2134,7 +2164,10 @@ mod test {
             root.inner.read().find_entry("alpha").unwrap(),
             created.ino()
         );
-        assert_eq!(f.ext2.read_inode_desc(created.ino()).unwrap().links_count, 1);
+        assert_eq!(
+            f.ext2.read_inode_desc(created.ino()).unwrap().links_count,
+            1
+        );
 
         // Linux ext2_mkdir intent: child links=2 and parent link count +1.
         let created_dir = root
@@ -2145,7 +2178,10 @@ mod test {
             created_dir.ino()
         );
         assert_eq!(
-            f.ext2.read_inode_desc(created_dir.ino()).unwrap().links_count,
+            f.ext2
+                .read_inode_desc(created_dir.ino())
+                .unwrap()
+                .links_count,
             2
         );
         assert_eq!(f.ext2.read_inode_desc(ROOT_INO).unwrap().links_count, 3);
@@ -2222,11 +2258,8 @@ mod test {
         assert_eq!(root.unlink(".").unwrap_err().error(), Errno::EINVAL);
 
         root.unlink("old").unwrap();
-        let inode_bitmap = f.read_inode_bitmap(0).unwrap();
-        assert!(!testkit::bit_is_set_lsb0(
-            &inode_bitmap,
-            (old_ino - 1) as usize
-        ));
+        let inode_bitmap = f.block_groups()[0].inode_bitmap();
+        assert!(!inode_bitmap.is_allocated((old_ino - 1) as u16));
     }
 
     #[ktest]
@@ -2296,11 +2329,8 @@ mod test {
             assert_eq!(guard.find_entry("old").unwrap_err().error(), Errno::ENOENT);
         }
 
-        let inode_bitmap = f.read_inode_bitmap(0).unwrap();
-        assert!(!testkit::bit_is_set_lsb0(
-            &inode_bitmap,
-            (replaced_ino - 1) as usize
-        ));
+        let inode_bitmap = f.block_groups()[0].inode_bitmap();
+        assert!(!inode_bitmap.is_allocated((replaced_ino - 1) as u16));
 
         let _ = src;
     }
@@ -2601,11 +2631,13 @@ mod test {
         assert!(data_bid <= last);
         // Let allocator choose one free data block; do not pre-occupy `data_bid`.
         testkit::write_block_bitmap(f.disk.as_ref(), &f.sb, &f.descs[0], &[]);
+        reload_group0_cached_bitmaps_from_disk(&f);
 
         let mut first_block = vec![0u8; block_size];
         encode_dir_entry(&mut first_block, 0, 2, 12, b".", 2);
         encode_dir_entry(&mut first_block, 12, 2, 12, b"..", 2);
-        f.disk.segment()
+        f.disk
+            .segment()
             .write_bytes(Bid::new(data_bid as u64).to_offset(), &first_block)
             .unwrap();
 
@@ -2623,12 +2655,17 @@ mod test {
         };
 
         let mut new_block = vec![0u8; block_size];
-        f.disk.segment()
+        f.disk
+            .segment()
             .read_bytes(Bid::new(new_bid as u64).to_offset(), &mut new_block)
             .unwrap();
-        let entry =
-            DirEntry::parse_at(&new_block, 0, block_size, f.ext2.super_block().total_inodes())
-                .unwrap();
+        let entry = DirEntry::parse_at(
+            &new_block,
+            0,
+            block_size,
+            f.ext2.super_block().total_inodes(),
+        )
+        .unwrap();
         assert_eq!(entry.inode, 11);
         assert_eq!(entry.name.as_bytes(), b"foo");
     }
@@ -2684,6 +2721,7 @@ mod test {
             .saturating_add(1);
         assert!(data_bid <= last);
         testkit::write_block_bitmap(f.disk.as_ref(), &f.sb, &f.descs[0], &[data_bid]);
+        reload_group0_cached_bitmaps_from_disk(&f);
 
         let mut raw = make_raw_inode(0o040755);
         raw.links_count = 2;
@@ -2757,9 +2795,7 @@ mod test {
 
     /// Sets up a parent directory (ROOT_INO) with a "sub" child directory.
     /// `child_extra_entries` is written into the child block after "." and "..".
-    fn prepare_rmdir_env(
-        child_extra_entries: &[(u32, &[u8], u8)],
-    ) -> RmdirTestEnv {
+    fn prepare_rmdir_env(child_extra_entries: &[(u32, &[u8], u8)]) -> RmdirTestEnv {
         let f = Ext2FixtureBuilder::new(1, 256)
             .with_free_blocks(64, 64)
             .build()
@@ -2778,8 +2814,14 @@ mod test {
         let child_ino = f.sb.first_ino().saturating_add(1);
         assert!(child_ino <= f.sb.total_inodes());
 
-        testkit::write_block_bitmap(f.disk.as_ref(), &f.sb, &f.descs[0], &[parent_bid, child_bid]);
+        testkit::write_block_bitmap(
+            f.disk.as_ref(),
+            &f.sb,
+            &f.descs[0],
+            &[parent_bid, child_bid],
+        );
         testkit::write_inode_bitmap(f.disk.as_ref(), &f.sb, &f.descs[0], &[ROOT_INO, child_ino]);
+        reload_group0_cached_bitmaps_from_disk(&f);
 
         // Parent block: "." + ".." + "sub" -> child_ino.
         let mut parent_block = vec![0u8; block_size];
@@ -2802,7 +2844,14 @@ mod test {
         let mut child_block = vec![0u8; block_size];
         encode_dir_entry(&mut child_block, 0, child_ino, 12, b".", 2);
         if child_extra_entries.is_empty() {
-            encode_dir_entry(&mut child_block, 12, ROOT_INO, (block_size - 12) as u16, b"..", 2);
+            encode_dir_entry(
+                &mut child_block,
+                12,
+                ROOT_INO,
+                (block_size - 12) as u16,
+                b"..",
+                2,
+            );
         } else {
             encode_dir_entry(&mut child_block, 12, ROOT_INO, 12, b"..", 2);
             let mut offset = 24;
@@ -2866,11 +2915,8 @@ mod test {
         assert_eq!(child_desc.size, 0);
         assert_eq!(child_desc.links_count, 0);
 
-        let inode_bitmap = f.read_inode_bitmap(0).unwrap();
-        assert!(!testkit::bit_is_set_lsb0(
-            &inode_bitmap,
-            (child_ino - 1) as usize
-        ));
+        let inode_bitmap = f.block_groups()[0].inode_bitmap();
+        assert!(!inode_bitmap.is_allocated((child_ino - 1) as u16));
     }
 
     #[ktest]
@@ -2889,11 +2935,8 @@ mod test {
         assert_eq!(parent_inner.find_entry("sub").unwrap(), child_ino);
         assert_eq!(parent_inner.desc.links_count, 3);
 
-        let inode_bitmap = f.read_inode_bitmap(0).unwrap();
-        assert!(testkit::bit_is_set_lsb0(
-            &inode_bitmap,
-            (child_ino - 1) as usize
-        ));
+        let inode_bitmap = f.block_groups()[0].inode_bitmap();
+        assert!(inode_bitmap.is_allocated((child_ino - 1) as u16));
     }
 
     #[ktest]

@@ -11,6 +11,8 @@ use crate::fs::utils::IdBitmap;
 pub struct BlockGroup {
     idx: usize,
     desc: RwMutex<Dirty<GroupDesc>>,
+    block_bitmap: RwMutex<Dirty<IdBitmap>>,
+    inode_bitmap: RwMutex<Dirty<IdBitmap>>,
 }
 
 /// On-disk block group descriptor (32 bytes).
@@ -71,16 +73,44 @@ impl From<GroupDesc> for RawGroupDesc {
 }
 
 impl BlockGroup {
-    pub fn load(group_descs: &USegment, idx: usize) -> Result<Self> {
+    pub fn load(
+        group_descs: &USegment,
+        idx: usize,
+        sb: &SuperBlock,
+        block_device: &dyn BlockDevice,
+    ) -> Result<Self> {
         let offset = idx * size_of::<RawGroupDesc>();
         let raw = group_descs
             .read_val::<RawGroupDesc>(offset)
             .map_err(|_| Error::with_message(Errno::EIO, "failed to read group descriptor"))?;
         let desc = GroupDesc::from(raw);
+
+        // SPEC: load and validate bitmaps once during mount, keep them cached in memory.
+        let block_bitmap = Self::load_block_bitmap(block_device, sb, idx, &desc)?;
+        let inode_bitmap = Self::load_inode_bitmap(block_device, sb, &desc)?;
+
         Ok(Self {
             idx,
             desc: RwMutex::new(Dirty::new(desc)),
+            block_bitmap: RwMutex::new(Dirty::new(block_bitmap)),
+            inode_bitmap: RwMutex::new(Dirty::new(inode_bitmap)),
         })
+    }
+
+    pub fn block_bitmap(&self) -> RwMutexReadGuard<'_, Dirty<IdBitmap>> {
+        self.block_bitmap.read()
+    }
+
+    pub fn block_bitmap_mut(&self) -> RwMutexWriteGuard<'_, Dirty<IdBitmap>> {
+        self.block_bitmap.write()
+    }
+
+    pub fn inode_bitmap(&self) -> RwMutexReadGuard<'_, Dirty<IdBitmap>> {
+        self.inode_bitmap.read()
+    }
+
+    pub fn inode_bitmap_mut(&self) -> RwMutexWriteGuard<'_, Dirty<IdBitmap>> {
+        self.inode_bitmap.write()
     }
 
     pub fn idx(&self) -> usize {
@@ -151,6 +181,10 @@ impl BlockGroup {
         self.desc.read().is_dirty()
     }
 
+    pub(super) fn is_bitmap_dirty(&self) -> bool {
+        self.block_bitmap.read().is_dirty() || self.inode_bitmap.read().is_dirty()
+    }
+
     pub(super) fn sync_metadata(&self, group_descs: &USegment) -> Result<()> {
         if !self.desc.read().is_dirty() {
             return Ok(());
@@ -168,24 +202,67 @@ impl BlockGroup {
         Ok(())
     }
 
+    pub fn sync_bitmaps(&self, fs: &Ext2) -> Result<()> {
+        let (block_bitmap_bid, inode_bitmap_bid) = {
+            // SPEC: read descriptor block addresses before bitmap locks to keep lock ordering.
+            let desc = self.desc.read();
+            (desc.block_bitmap, desc.inode_bitmap)
+        };
+
+        if self.block_bitmap.read().is_dirty() {
+            let mut block_bitmap = self.block_bitmap.write();
+            if block_bitmap.is_dirty() {
+                if fs
+                    .block_device()
+                    .write_bytes(block_bitmap_bid.to_offset(), block_bitmap.as_bytes())
+                    .is_err()
+                {
+                    // SPEC: keep dirty bit set on writeback failure for retry.
+                    return_errno_with_message!(Errno::EIO, "failed to write block bitmap");
+                }
+                block_bitmap.clear_dirty();
+            }
+        }
+
+        if self.inode_bitmap.read().is_dirty() {
+            let mut inode_bitmap = self.inode_bitmap.write();
+            if inode_bitmap.is_dirty() {
+                if fs
+                    .block_device()
+                    .write_bytes(inode_bitmap_bid.to_offset(), inode_bitmap.as_bytes())
+                    .is_err()
+                {
+                    // SPEC: keep dirty bit set on writeback failure for retry.
+                    return_errno_with_message!(Errno::EIO, "failed to write inode bitmap");
+                }
+                inode_bitmap.clear_dirty();
+            }
+        }
+
+        Ok(())
+    }
+
     /// Loads and validates the block bitmap for this group.
     ///
     /// Linux: /root/linux/fs/ext2/balloc.c:129 (read_block_bitmap)
-    pub fn load_block_bitmap(&self, fs: &Ext2, sb: &SuperBlock) -> Result<IdBitmap> {
-        let desc = self.desc.read();
+    fn load_block_bitmap(
+        block_device: &dyn BlockDevice,
+        sb: &SuperBlock,
+        idx: usize,
+        desc: &GroupDesc,
+    ) -> Result<IdBitmap> {
         let bitmap_bid = desc.block_bitmap;
 
         let mut buf = vec![0u8; BLOCK_SIZE];
-        if fs
-            .block_device()
+        if block_device
             .read_bytes(bitmap_bid.to_offset(), &mut buf)
             .is_err()
         {
             return_errno_with_message!(Errno::EIO, "failed to read block bitmap");
         }
 
-        let first_block = sb.group_first_block_no(self.idx());
-        let last_block = sb.group_last_block_no(self.idx());
+        let first_block = sb.group_first_block_no(idx);
+        let last_block = sb.group_last_block_no(idx);
         if last_block < first_block {
             return_errno_with_message!(Errno::EINVAL, "block group has invalid block range");
         }
@@ -251,7 +328,7 @@ impl BlockGroup {
             Ok(())
         };
 
-        valid_block_bitmap(first_block, max_bit, &desc, &bitmap)?;
+        valid_block_bitmap(first_block, max_bit, desc, &bitmap)?;
 
         Ok(bitmap)
     }
@@ -259,13 +336,15 @@ impl BlockGroup {
     /// Loads the inode bitmap for this group.
     ///
     /// Linux: /root/linux/fs/ext2/ialloc.c:31 (read_inode_bitmap)
-    pub fn load_inode_bitmap(&self, fs: &Ext2, sb: &SuperBlock) -> Result<IdBitmap> {
-        let desc = self.desc.read();
+    fn load_inode_bitmap(
+        block_device: &dyn BlockDevice,
+        sb: &SuperBlock,
+        desc: &GroupDesc,
+    ) -> Result<IdBitmap> {
         let bitmap_bid = desc.inode_bitmap;
 
         let mut buf = vec![0u8; BLOCK_SIZE];
-        if fs
-            .block_device()
+        if block_device
             .read_bytes(bitmap_bid.to_offset(), &mut buf)
             .is_err()
         {
@@ -283,24 +362,26 @@ impl BlockGroup {
 
 #[cfg(ktest)]
 mod test {
-    use ostd::{
-        mm::{FrameAllocOptions, VmIo},
-        prelude::*,
-    };
+    use ostd::prelude::ktest;
 
     use super::*;
     use crate::fs::ext2::testkit::{
-        build_group_desc_segment, make_valid_group_desc, make_valid_super_block,
+        Ext2FixtureBuilder, make_valid_group_desc, make_valid_super_block,
     };
+
     #[ktest]
     fn block_group_load_and_accessors_ok() {
         let sb = make_valid_super_block(2);
         let descs = (0..sb.block_groups_count() as usize)
             .map(|idx| make_valid_group_desc(&sb, idx))
             .collect::<Vec<_>>();
-        let group_descs = build_group_desc_segment(&sb, &descs);
-
-        let group = BlockGroup::load(&group_descs, 1).unwrap();
+        let fixture = Ext2FixtureBuilder::new(2, 256)
+            .with_metadata_block_bitmap()
+            .with_free_blocks(32, 32)
+            .with_free_inodes(64, 64)
+            .build()
+            .unwrap();
+        let group = &fixture.block_groups()[1];
 
         assert_eq!(group.idx(), 1);
         assert_eq!(
@@ -323,14 +404,13 @@ mod test {
     #[ktest]
     fn block_group_free_block_counters_update_and_mark_dirty() {
         // Counter update helpers should adjust value and mark descriptor dirty.
-        let sb = make_valid_super_block(2);
-        let mut descs = (0..sb.block_groups_count() as usize)
-            .map(|idx| make_valid_group_desc(&sb, idx))
-            .collect::<Vec<_>>();
-        descs[0].free_blocks_count = 20;
-        let group_descs = build_group_desc_segment(&sb, &descs);
-
-        let group = BlockGroup::load(&group_descs, 0).unwrap();
+        let fixture = Ext2FixtureBuilder::new(2, 256)
+            .with_metadata_block_bitmap()
+            .with_free_blocks(20, 20)
+            .with_free_inodes(64, 64)
+            .build()
+            .unwrap();
+        let group = &fixture.block_groups()[0];
         assert_eq!(group.free_blocks_count(), 20);
         assert!(!group.is_desc_dirty());
 
