@@ -207,6 +207,12 @@ impl InodeInner {
         }
 
         // TODO: refactor this into a new func
+        // FIXME: Linux ext2_inode_is_fast_symlink (fs/ext2/inode.c:48-55) uses:
+        //   S_ISLNK && (i_blocks - ea_blocks == 0),
+        // where ea_blocks depends on i_file_acl:
+        //   ea_blocks = i_file_acl != 0 ? (block_size >> 9) : 0.
+        // ACL/EA accounting is not implemented in this path yet, so this remains
+        // an approximation until ACL support is added.
         // SPEC: reject fast symlink (inline data in i_block[]).
         if self.desc.type_ == InodeType::SymLink && self.desc.blocks == 0 && self.desc.size <= 60 {
             return_errno!(Errno::EINVAL);
@@ -266,17 +272,9 @@ impl InodeInner {
             }
         }
 
-        if new_size > old_size {
-            // SPEC: extension creates sparse hole without preallocation.
-            self.desc.size = new_size as u64;
-            let current = now();
-            self.desc.mtime = current;
-            self.desc.ctime = current;
-            self.persist_inode_and_sync(&fs)?;
-            return Ok(());
-        }
-
         // SPEC: Linux truncate_setsize updates i_size before block release.
+        // Linux ext2_setsize then always calls __ext2_truncate_blocks, even on
+        // extension, so keep the same control-flow here.
         self.desc.size = new_size as u64;
         self.truncate_blocks(new_size)?;
         let current = now();
@@ -555,24 +553,24 @@ impl InodeInner {
             // Truncation in direct blocks: free single, double, triple indirect.
             let nr = self.desc.block_ptrs[12];
             if nr != 0 {
-                self.free_branches(&fs, nr, 1);
                 self.desc.block_ptrs[12] = 0;
+                self.free_branches(&fs, nr, 1);
             }
         }
         if path.offsets[0] <= 12 {
             // Truncation in direct or single indirect: free double, triple indirect.
             let nr = self.desc.block_ptrs[13];
             if nr != 0 {
-                self.free_branches(&fs, nr, 2);
                 self.desc.block_ptrs[13] = 0;
+                self.free_branches(&fs, nr, 2);
             }
         }
         if path.offsets[0] <= 13 {
             // Truncation in direct, single, or double indirect: free triple indirect.
             let nr = self.desc.block_ptrs[14];
             if nr != 0 {
-                self.free_branches(&fs, nr, 3);
                 self.desc.block_ptrs[14] = 0;
+                self.free_branches(&fs, nr, 3);
             }
         }
 
