@@ -82,6 +82,109 @@ impl InodeInner {
         }
     }
 
+    /// Reads file data into `buf` starting at byte `offset`.
+    ///
+    /// Linux: /root/linux/fs/ext2/file.c:283 (ext2_file_read_iter)
+    /// Linux: /root/linux/fs/ext2/inode.c:917 (ext2_read_folio)
+    /// Linux: /root/linux/fs/ext2/inode.c:624 (ext2_get_blocks, read-only path)
+    pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        // SPEC: directories must use readdir path, not regular file reads.
+        if self.desc.type_ == InodeType::Dir {
+            return_errno!(Errno::EISDIR);
+        }
+
+        let file_size = self.desc.size as usize;
+        if offset >= file_size || buf.is_empty() {
+            // SPEC: reads at/after EOF or into empty buffer return 0.
+            return Ok(0);
+        }
+
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let block_size = fs.block_size();
+        if block_size == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+        }
+
+        // SPEC: clamp returned byte count to EOF window.
+        let read_len = buf.len().min(file_size.saturating_sub(offset));
+        let mut current_offset = offset;
+        let mut buf_pos = 0usize;
+        let mut remaining = read_len;
+
+        while remaining > 0 {
+            let iblock = u32::try_from(current_offset / block_size)
+                .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
+            let offset_in_block = current_offset % block_size;
+            let bytes_this_block = (block_size - offset_in_block).min(remaining);
+            let next_buf_pos = buf_pos.saturating_add(bytes_this_block);
+            let dst = &mut buf[buf_pos..next_buf_pos];
+
+            match self.get_block(iblock)? {
+                Some(bid) => {
+                    // DIFF from Linux ext2_read_folio/mpage: this phase does direct
+                    // block-device reads instead of populating page cache folios.
+                    //
+                    // DIFF from spec pseudocode: BlockDevice::read_bytes requires
+                    // sector-aligned offset/length. For unaligned file ranges we read
+                    // the minimal aligned sector window and copy the requested subrange.
+                    let end_in_block = offset_in_block.checked_add(bytes_this_block).ok_or_else(
+                        || Error::with_message(Errno::EINVAL, "block read range overflow"),
+                    )?;
+                    let aligned_start = offset_in_block.align_down(SECTOR_SIZE);
+                    let aligned_end = end_in_block.align_up(SECTOR_SIZE);
+                    let aligned_len = aligned_end.saturating_sub(aligned_start);
+                    let block_offset = bid
+                        .to_offset()
+                        .checked_add(aligned_start)
+                        .ok_or_else(|| {
+                            Error::with_message(Errno::EINVAL, "data block offset overflow")
+                        })?;
+
+                    if aligned_start == offset_in_block && aligned_len == bytes_this_block {
+                        if fs.block_device().read_bytes(block_offset, dst).is_err() {
+                            // SPEC: fail fast on data I/O error with EIO.
+                            return_errno_with_message!(Errno::EIO, "failed to read data block");
+                        }
+                    } else {
+                        let mut aligned_buf = vec![0u8; aligned_len];
+                        if fs
+                            .block_device()
+                            .read_bytes(block_offset, &mut aligned_buf)
+                            .is_err()
+                        {
+                            // SPEC: fail fast on data I/O error with EIO.
+                            return_errno_with_message!(Errno::EIO, "failed to read data block");
+                        }
+                        let copy_start = offset_in_block.saturating_sub(aligned_start);
+                        let copy_end = copy_start.checked_add(bytes_this_block).ok_or_else(|| {
+                            Error::with_message(Errno::EIO, "aligned read copy range overflow")
+                        })?;
+                        if copy_end > aligned_buf.len() {
+                            return_errno_with_message!(
+                                Errno::EIO,
+                                "aligned read copy range out of bounds"
+                            );
+                        }
+                        dst.copy_from_slice(&aligned_buf[copy_start..copy_end]);
+                    }
+                }
+                None => {
+                    // SPEC: sparse hole blocks read as zero-filled bytes.
+                    dst.fill(0);
+                }
+            }
+
+            current_offset = current_offset.saturating_add(bytes_this_block);
+            buf_pos = next_buf_pos;
+            remaining = remaining.saturating_sub(bytes_this_block);
+        }
+
+        Ok(read_len)
+    }
+
     /// Writes file data starting at byte `offset`.
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:928 (ext2_write_begin)
@@ -4471,6 +4574,77 @@ mod test {
         let root = f.ext2.read_inode(ROOT_INO).unwrap();
         let err = root.inner.write().write_at(0, b"x").unwrap_err();
         assert_eq!(err.error(), Errno::EISDIR);
+    }
+
+    #[ktest]
+    fn read_at_sparse_hole_and_eof_clamp() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .build()
+            .unwrap();
+        let file = make_live_file_inode(&f.ext2, 29, 0, 0, FileFlags::empty(), [0; 15]);
+        let block_size = f.ext2.block_size();
+        let write_off = block_size * 2 + 128;
+        let payload = (0..256u16).map(|v| v as u8).collect::<Vec<_>>();
+
+        let mut inner = file.inner.write();
+        inner.write_at(write_off, &payload).unwrap();
+
+        let mut buf = vec![0xa5u8; block_size + 256];
+        let bytes_read = inner.read_at(block_size, &mut buf).unwrap();
+        assert_eq!(bytes_read, buf.len());
+        assert!(buf[..block_size].iter().all(|b| *b == 0));
+        assert!(buf[block_size..block_size + 128].iter().all(|b| *b == 0));
+        assert_eq!(&buf[block_size + 128..], &payload[..128]);
+
+        let mut eof_buf = [0x5au8; 16];
+        let eof_read = inner.read_at(inner.desc.size as usize, &mut eof_buf).unwrap();
+        assert_eq!(eof_read, 0);
+        assert_eq!(eof_buf, [0x5au8; 16]);
+
+        let mut empty = [];
+        assert_eq!(inner.read_at(0, &mut empty).unwrap(), 0);
+    }
+
+    #[ktest]
+    fn read_at_directory_rejected() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let mut buf = [0u8; 1];
+        let err = root.inner.read().read_at(0, &mut buf).unwrap_err();
+        assert_eq!(err.error(), Errno::EISDIR);
+    }
+
+    #[ktest]
+    fn read_at_io_error_propagates() {
+        clocks::init_for_ktest();
+
+        let base = Ext2FixtureBuilder::new(2, 256).build().unwrap();
+        let fail_bid = 40u32;
+        let fail_offset = Bid::new(fail_bid as u64).to_offset();
+        let io_disk = Arc::new(ErrorBioDisk::with_read_error_at(
+            base.disk.clone(),
+            BioStatus::IoError,
+            fail_offset,
+        ));
+        let io_f = Ext2FixtureBuilder::new(2, 256)
+            .with_device(io_disk)
+            .build()
+            .unwrap();
+
+        let block_size = io_f.ext2.block_size();
+        let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
+        let mut ptrs = [0u32; 15];
+        ptrs[0] = fail_bid;
+        let file = make_live_file_inode(&io_f.ext2, 30, 64, sectors_per_block, FileFlags::empty(), ptrs);
+
+        let mut buf = [0u8; 32];
+        let err = file.inner.read().read_at(0, &mut buf).unwrap_err();
+        assert_eq!(err.error(), Errno::EIO);
     }
 
     #[ktest]
