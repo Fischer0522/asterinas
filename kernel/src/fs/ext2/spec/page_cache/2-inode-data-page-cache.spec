@@ -1,5 +1,5 @@
 [PROMPT]
-Provide modifications to `kernel/src/fs/ext2/inode.rs` and `kernel/src/fs/ext2/fs.rs`.
+Provide modifications to `kernel/src/fs/ext2/inode.rs`.
 Output Rust code only. No unsafe.
 All functions must be methods in `impl` blocks.
 Implementation logic MUST follow [SOURCE] Linux code.
@@ -7,10 +7,11 @@ Implementation logic MUST follow [SOURCE] Linux code.
 [SOURCE]
 ext2_read_folio      → fs/ext2/inode.c:917
 ext2_write_begin     → fs/ext2/inode.c:928
+ext2_write_end       → fs/ext2/inode.c:939
+ext2_write_failed    → fs/ext2/inode.c:59
 ext2_get_block       → fs/ext2/inode.c:783
-ext2_get_folio       → fs/ext2/dir.c:189
 ext2_aops            → fs/ext2/inode.c:965
-InodeBlockManager (ext2_old) → kernel/src/fs/ext2_old/inode.rs:1855
+ExfatInode (style)   → kernel/src/fs/exfat/inode.rs:136
 
 [RELY]
 ```rust
@@ -37,12 +38,18 @@ pub trait PageCacheBackend: Sync + Send {
 
 ```rust
 /// The Ext2 inode public handle.
+/// PageCacheBackend is implemented directly on Inode (exFAT pattern).
 #[derive(Debug)]
 pub struct Inode {
+    /// 1-based inode number.
     ino: u32,
+    /// Inode type (file, directory, symlink, etc.).
     type_: InodeType,
+    /// Mutable inode state, protected by RwMutex.
     inner: RwMutex<InodeInner>,
+    /// Index of the block group this inode belongs to.
     block_group_idx: usize,
+    /// Weak reference to the owning Ext2 filesystem.
     fs: Weak<Ext2>,
 }
 ```
@@ -51,10 +58,17 @@ pub struct Inode {
 /// Mutable inode state.
 #[derive(Debug)]
 pub struct InodeInner {
+    /// In-memory inode descriptor wrapped in Dirty tracker.
     desc: Dirty<InodeDesc>,
+    /// Whether this inode has been freed (unlinked + nlink=0).
     is_freed: bool,
+    /// Weak back-reference to the owning Inode Arc.
     weak_self: Weak<Inode>,
+    /// Weak reference to the filesystem.
     fs: Weak<Ext2>,
+    /// Per-inode data PageCache for file/directory content.
+    /// Backend is Weak<Inode> as Weak<dyn PageCacheBackend>.
+    page_cache: PageCache,
 }
 ```
 
@@ -81,33 +95,31 @@ pub(super) struct InodeDesc {
 
 ```rust
 impl InodeInner {
+    /// Resolves logical block number to block path through indirect tree.
     pub(super) fn block_to_path(&self, iblock: u32) -> Result<BlockPath>;
+    /// Returns the physical Bid for a logical block, or None for sparse holes.
     pub(super) fn get_block(&self, iblock: u32) -> Result<Option<Bid>>;
+    /// Returns the physical Bid for a logical block, allocating if `create` is true.
+    pub(super) fn get_or_alloc_block(&mut self, iblock: u32, create: bool) -> Result<Option<Bid>>;
+    /// Truncates blocks beyond `new_size` bytes.
+    pub(super) fn truncate_blocks(&mut self, new_size: usize) -> Result<()>;
+    /// Persists inode descriptor to disk.
+    pub(super) fn persist_inode_and_sync(&self, fs: &Ext2) -> Result<()>;
 }
 ```
 
 ```rust
 impl Ext2 {
+    /// Returns a reference to the underlying block device.
     pub fn block_device(&self) -> &dyn BlockDevice;
+    /// Returns the filesystem block size in bytes.
     pub fn block_size(&self) -> usize;
-}
-```
-
-[NEW STRUCT]
-```rust
-/// Backend for inode data PageCache, translating page indices to physical blocks.
-///
-/// Each file/directory inode owns a PageCache backed by this struct.
-/// On cache miss, it resolves logical block → physical block via the inode's
-/// block pointer tree, then issues block device I/O.
-///
-/// Linux equivalent: address_space_operations (ext2_aops) with ext2_get_block.
-/// Asterinas equivalent: ext2_old InodeBlockManager (kernel/src/fs/ext2_old/inode.rs:1855).
-struct InodeDataBackend {
-    /// Weak reference to the owning Inode, used to access block_ptrs via InodeInner.
-    inode: Weak<Inode>,
-    /// Weak reference to the filesystem for block device access.
-    fs: Weak<Ext2>,
+    /// Returns the SuperBlock (for total_inodes, etc.).
+    pub fn super_block(&self) -> &SuperBlock;
+    /// Allocates contiguous blocks, returns the allocated range.
+    pub fn alloc_blocks(&self, count: u32) -> Result<Range<u32>>;
+    /// Frees `count` blocks starting at `start`.
+    pub fn free_blocks(&self, start: u32, count: u32) -> Result<()>;
 }
 ```
 
@@ -116,10 +128,9 @@ struct InodeDataBackend {
 impl Inode {
     /// Creates a new Inode with an associated data PageCache.
     ///
-    /// The PageCache is backed by `InodeDataBackend` which uses the inode's
-    /// block pointer tree for logical→physical block mapping.
     /// Uses `Arc::new_cyclic` to resolve the self-referential dependency:
-    /// Inode holds PageCache, PageCache backend holds Weak<Inode>.
+    /// Inode is the PageCacheBackend, PageCache holds Weak<Inode>.
+    /// Follows the ExfatInode construction pattern (exfat/inode.rs:840).
     ///
     /// # Arguments
     /// * `ino` - 1-based inode number.
@@ -144,33 +155,43 @@ impl Inode {
 ```
 
 ```rust
-impl PageCacheBackend for InodeDataBackend {
-    /// Reads one data block for this inode from disk into the cache page.
+impl PageCacheBackend for Inode {
+    /// Reads one data block from disk into the cache page.
+    ///
+    /// Called by PageCache on cache miss during read operations.
+    /// Acquires inner read lock to resolve logical→physical block mapping.
     ///
     /// # Arguments
     /// * `idx` - Logical block number (0-based) within the inode's data.
     /// * `frame` - Target CachePage to fill.
     ///
-    /// Translates: logical block idx → physical block via get_block(),
-    /// then issues async read. For sparse holes (get_block returns None),
-    /// the frame is zero-filled and no I/O is issued.
+    /// # Lock
+    /// Acquires inner read lock (compatible with caller's read lock).
     fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter>;
 
-    /// Writes one data block for this inode from cache page to disk.
+    /// Writes one data block from cache page to disk.
+    ///
+    /// Called by PageCache during writeback of dirty pages.
+    /// Physical block MUST already be allocated by write_at before writeback.
     ///
     /// # Arguments
     /// * `idx` - Logical block number (0-based) within the inode's data.
     /// * `frame` - Source CachePage containing dirty data.
+    ///
+    /// # Lock
+    /// Acquires inner read lock.
     fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter>;
 
-    /// Returns the number of pages (blocks) for this inode's data.
-    /// Computed from inode size: `size.align_up(BLOCK_SIZE) / BLOCK_SIZE`.
+    /// Returns the number of data blocks for this inode.
+    ///
+    /// # Lock
+    /// Acquires inner read lock.
     fn npages(&self) -> usize;
 }
 ```
 
 ```rust
-impl InodeInner {
+impl Inode {
     /// Reads file data from the PageCache into the provided buffer.
     ///
     /// Replaces direct block device I/O with cached page access.
@@ -184,11 +205,15 @@ impl InodeInner {
     /// * `Ok(usize)` - Number of bytes read (may be < buf.len() near EOF).
     /// * `Err(EISDIR)` - Inode is a directory.
     /// * `Err(EIO)` - I/O failure or filesystem dropped.
+    ///
+    /// # Lock
+    /// Acquires inner read lock for metadata, then accesses PageCache
+    /// (cache miss callback re-acquires read lock — safe, read locks are reentrant).
     pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize>;
 
     /// Writes file data through the PageCache from the provided buffer.
     ///
-    /// Linux equivalent: generic_file_write_iter → ext2_write_begin.
+    /// Linux equivalent: generic_file_write_iter → ext2_write_begin/end.
     ///
     /// # Arguments
     /// * `offset` - Byte offset within the file to start writing.
@@ -198,7 +223,25 @@ impl InodeInner {
     /// * `Ok(usize)` - Number of bytes written.
     /// * `Err(EISDIR)` - Inode is a directory.
     /// * `Err(EIO)` - I/O failure or filesystem dropped.
+    /// * `Err(ENOSPC)` - Block allocation failed.
+    ///
+    /// # Lock
+    /// Phase 1: write lock — alloc blocks, resize PageCache, update size.
+    /// Phase 2: release write lock → read lock — write data to PageCache.
+    /// Phase 3: write lock — update timestamps, persist inode.
     pub fn write_at(&self, offset: usize, data: &[u8]) -> Result<usize>;
+
+    /// Resizes this inode to `new_size` bytes.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:1275 (ext2_setsize)
+    ///
+    /// # Arguments
+    /// * `new_size` - Target size in bytes.
+    ///
+    /// # Lock
+    /// Acquires write lock for the entire operation.
+    /// PageCache resize happens inside the write lock.
+    pub fn resize(&self, new_size: usize) -> Result<()>;
 }
 ```
 
@@ -211,129 +254,210 @@ Pre (Inode::new):
 Post (Inode::new: success):
 - Uses `Arc::new_cyclic` to construct the Inode:
   1. Inside the closure, receives `weak_self: Weak<Inode>`.
-  2. Creates `InodeDataBackend { inode: weak_self.clone(), fs: fs.clone() }`.
-  3. Wraps backend in `Arc`, creates `PageCache::with_capacity(desc.num_page_bytes(), backend)`.
-     - `num_page_bytes = desc.size as usize` aligned up to PAGE_SIZE.
-     - For new inodes with size 0, uses `PageCache::new(backend)`.
-  4. Stores `page_cache` in the Inode struct alongside existing fields.
+  2. Computes `num_page_bytes` from `desc.blocks`:
+     - `nblocks = desc.blocks as usize / (BLOCK_SIZE / SECTOR_SIZE)`
+     - `num_page_bytes = nblocks * BLOCK_SIZE`
+  3. Creates PageCache:
+     - If `num_page_bytes == 0`: `PageCache::new(weak_self.clone() as _)`.
+     - Else: `PageCache::with_capacity(num_page_bytes, weak_self.clone() as _)`.
+  4. Stores `page_cache` in InodeInner alongside existing fields.
 - Returns `Arc<Inode>` with fully initialized PageCache.
 
 Post (Inode::new: failure):
-- Panics only if PageCache allocation fails (system OOM, should not happen normally).
+- Panics only if PageCache allocation fails (system OOM).
 
-Pre (InodeDataBackend::read_page_async):
+Pre (Inode::read_page_async):
 - `frame` is a valid allocated CachePage.
-- `self.inode` and `self.fs` can be upgraded.
 
 Post (read_page_async: success):
-- Upgrades `self.inode` to `Arc<Inode>`.
-- Acquires read lock on `inode.inner`.
+- Acquires `self.inner` read lock.
 - Calls `inner.get_block(idx as u32)`:
-  - If `Ok(Some(bid))`: creates BioSegment from frame with `BioDirection::FromDevice`,
-    submits async read via `fs.block_device().read_blocks_async(bid, bio_segment)`.
-  - If `Ok(None)`: sparse hole — zero-fills the frame, returns empty BioWaiter.
+  - If `Ok(Some(bid))`: creates `BioSegment::new_from_segment` from frame
+    with `BioDirection::FromDevice`, submits async read via
+    `fs.block_device().read_blocks_async(bid, bio_segment)`.
+  - If `Ok(None)`: sparse hole — zero-fills the frame via
+    `frame.writer().write(...)`, returns empty `BioWaiter`.
 - Returns the BioWaiter.
 
 Post (read_page_async: failure):
-- `Err(EIO)` if inode or fs weak reference cannot be upgraded.
+- `Err(EIO)` if `self.fs` weak reference cannot be upgraded.
 - Propagates errors from `get_block` or block device I/O.
 
-Pre (InodeDataBackend::write_page_async):
+Pre (Inode::write_page_async):
 - `frame` contains dirty data to write back.
-- `self.inode` and `self.fs` can be upgraded.
+- Physical block for `idx` MUST already be allocated.
 
 Post (write_page_async: success):
-- Same upgrade and lock acquisition as read path.
+- Acquires `self.inner` read lock.
 - Calls `inner.get_block(idx as u32)`:
-  - If `Ok(Some(bid))`: creates BioSegment from frame with `BioDirection::ToDevice`,
-    submits async write via `fs.block_device().write_blocks_async(bid, bio_segment)`.
-  - If `Ok(None)`: no physical block allocated — returns empty BioWaiter.
-    (Block allocation for write is handled separately before page writeback.)
+  - If `Ok(Some(bid))`: creates `BioSegment::new_from_segment` from frame
+    with `BioDirection::ToDevice`, submits async write via
+    `fs.block_device().write_blocks_async(bid, bio_segment)`.
+  - If `Ok(None)`: `error!("write_page_async: no block mapping for idx {}", idx)`,
+    returns `Err(EIO)`.
 
 Post (write_page_async: failure):
-- `Err(EIO)` if references cannot be upgraded or block device write fails.
+- `Err(EIO)` if fs reference dead, block not mapped, or device write fails.
 
 Pre (npages):
-- `self.inode` can be upgraded.
+- (none, always callable)
 
 Post (npages):
-- Returns `inode.inner.read().desc.size.align_up(BLOCK_SIZE) / BLOCK_SIZE`.
-- If inode reference is dead, returns 0.
+- Acquires `self.inner` read lock.
+- Returns `inner.desc.blocks as usize / (BLOCK_SIZE / SECTOR_SIZE)`.
+- Converts 512-byte sector count to block count.
 
 Pre (read_at):
-- `self` refers to a valid, non-freed `InodeInner`.
-- `self.fs` can be upgraded to a live `Arc<Ext2>`.
-- The owning `Inode` has an initialized `page_cache`.
+- `self` is a valid, non-freed Inode.
 
 Post (read_at: success):
-- Rejects directories: if `self.desc.type_ == InodeType::Dir`, returns `Err(EISDIR)`.
-- Obtains `file_size = self.desc.size as usize`.
+- Rejects directories: if `self.type_ == InodeType::Dir`, returns `Err(EISDIR)`.
+- Acquires inner read lock, obtains `file_size = desc.size as usize`.
 - If `offset >= file_size` or `buf.is_empty()`, returns `Ok(0)`.
 - Computes `read_len = min(buf.len(), file_size - offset)`.
-- Reads data via PageCache:
-  - `inode.page_cache().pages().read_bytes(offset, &mut buf[..read_len])`.
-  - PageCache automatically triggers `read_page_async` on cache miss,
-    which calls `get_block` for logical→physical mapping.
+- Reads data via `inner.page_cache.pages().read_bytes(offset, &mut buf[..read_len])`.
+  - PageCache automatically triggers `read_page_async` on cache miss.
+  - `read_page_async` acquires inner read lock again (reentrant, no deadlock).
 - Returns `Ok(read_len)`.
 
 Post (read_at: failure):
 - `Err(EISDIR)` if inode is a directory.
-- `Err(EIO)` if `self.fs.upgrade()` fails or PageCache I/O fails.
-- Propagates errors from `get_block` via PageCache backend.
+- `Err(EIO)` if PageCache I/O fails.
 
 Pre (write_at):
-- `self` refers to a valid, non-freed `InodeInner`.
-- `self.fs` can be upgraded to a live `Arc<Ext2>`.
-- The owning `Inode` has an initialized `page_cache`.
+- `self` is a valid, non-freed Inode.
 
 Post (write_at: success):
-- Rejects directories: if `self.desc.type_ == InodeType::Dir`, returns `Err(EISDIR)`.
+- Rejects directories: if `self.type_ == InodeType::Dir`, returns `Err(EISDIR)`.
 - If `data.is_empty()`, returns `Ok(0)`.
 - Computes `end = offset + data.len()`.
-- If `end > current file size`, extends the PageCache via `page_cache.resize(end)`.
-  (Block allocation for new blocks is a separate concern handled by alloc_block.)
-- Writes data via PageCache:
-  - `inode.page_cache().pages().write_bytes(offset, data)`.
-  - PageCache marks affected pages as Dirty via `update_page`.
-- Updates `self.desc.size = max(self.desc.size, end as u64)`.
-- Marks `self.desc` dirty.
+- Phase 1 (write lock):
+  - Acquires inner write lock.
+  - For each logical block in `[offset/block_size .. end.div_ceil(block_size)]`:
+    calls `get_or_alloc_block(iblock, true)` to ensure physical block exists.
+  - If `end > current file size`:
+    - Calls `page_cache.resize(end.align_up(BLOCK_SIZE))` to extend PageCache.
+    - Updates `desc.size = end as u64`.
+  - Releases write lock.
+  - On alloc failure: calls `write_failed_cleanup` (truncate back to old size),
+    returns error.
+- Phase 2 (read lock):
+  - Acquires inner read lock.
+  - Writes data via `page_cache.pages().write_bytes(offset, data)`.
+  - Releases read lock.
+- Phase 3 (write lock):
+  - Acquires inner write lock.
+  - Updates `desc.mtime` and `desc.ctime` to current time.
+  - Calls `persist_inode_and_sync`.
+  - Releases write lock.
 - Returns `Ok(data.len())`.
 
 Post (write_at: failure):
 - `Err(EISDIR)` if inode is a directory.
-- `Err(EIO)` if `self.fs.upgrade()` fails or PageCache I/O fails.
-- `Err(ENOSPC)` if block allocation fails during page cache extension.
-- On partial failure, pages already written remain dirty in cache.
+- `Err(EIO)` if fs dropped or PageCache I/O fails.
+- `Err(ENOSPC)` if block allocation fails.
+- On allocation failure mid-write: `write_failed_cleanup` truncates back to
+  original size (Linux ext2_write_failed, fs/ext2/inode.c:59).
+
+Pre (resize):
+- `self` is a valid, non-freed Inode.
+
+Post (resize: success):
+- Acquires inner write lock for entire operation.
+- Rejects non-regular/dir/symlink types: returns `Err(EINVAL)`.
+- Rejects fast symlinks (blocks==0 && size<=60): returns `Err(EINVAL)`.
+- Rejects APPEND_ONLY/IMMUTABLE flags: returns `Err(EPERM)`.
+- If `new_size == old_size`, returns `Ok(())`.
+- If shrinking and `new_size % block_size != 0`:
+  zeroes tail of last block via PageCache (read page, zero from offset, write back).
+- Calls `page_cache.resize(new_size.align_up(BLOCK_SIZE))`.
+- Updates `desc.size = new_size as u64`.
+- Calls `truncate_blocks(new_size)`.
+- Updates timestamps, persists inode.
+
+Post (resize: failure):
+- `Err(EINVAL)` for invalid inode type or fast symlink.
+- `Err(EPERM)` for immutable/append-only.
+- `Err(EIO)` for I/O failures.
 
 Invariant:
-- All file/directory data I/O goes through PageCache, never direct block device access.
-- PageCache backend resolves logical→physical blocks via `get_block` on every cache miss.
-- Sparse holes (unallocated blocks) are zero-filled on read, consistent with POSIX semantics.
-- The `page_cache` field is immutable after Inode construction; only page contents change.
-- `InodeDataBackend` holds only Weak references, preventing reference cycles.
+- All file data I/O goes through PageCache, never direct block device access.
+- PageCacheBackend is implemented on Inode (outer struct), not InodeInner.
+- read_page_async acquires inner read lock; callers holding read lock are safe (reentrant).
+- write_at MUST release write lock before accessing PageCache to avoid deadlock.
+- write_page_async expects blocks to be pre-allocated; None mapping is a bug (error! + EIO).
+- Sparse holes (unallocated blocks) are zero-filled on read only.
+- PageCache capacity is synchronized with inode size on resize/truncate/write-extend.
+- No separate Backend struct needed; Inode itself is the PageCacheBackend.
 
 [DIFF]
 Linux: File data I/O uses VFS page cache with `address_space_operations` (ext2_aops).
   `ext2_read_folio` calls `mpage_read_folio(folio, ext2_get_block)` which fills
   page cache folios via the block mapping callback.
-  → Asterinas: Uses per-Inode `PageCache` with `InodeDataBackend` implementing
-  `PageCacheBackend`. `read_page_async` calls `get_block` for the same mapping.
-  Reason: Asterinas PageCache is the equivalent of Linux's address_space page cache.
+  → Asterinas: `impl PageCacheBackend for Inode` directly. `read_page_async`
+  acquires inner read lock and calls `get_block` for the same mapping.
+  Reason: Follows ExfatInode pattern (exfat/inode.rs:136). No separate backend struct.
 
 Linux: `ext2_write_begin` calls `block_write_begin(mapping, pos, len, foliop, ext2_get_block)`
   which allocates blocks via `ext2_get_block(create=1)` and prepares the folio.
-  → Asterinas: `write_at` writes through `PageCache::pages().write_bytes()`.
-  Block allocation is a separate step, not integrated into the PageCache backend.
-  Reason: Separation of concerns; block allocation is handled by alloc_block module.
+  → Asterinas: `write_at` pre-allocates blocks in Phase 1 (write lock), then writes
+  through PageCache in Phase 2 (read lock). Block allocation is separated from
+  PageCache writeback.
+  Reason: Avoids deadlock — write lock cannot be held when PageCache triggers
+  `write_page_async` callback which needs read lock.
 
-Linux: Directory data is accessed via `ext2_get_folio` (dir.c:189) which calls
-  `read_mapping_folio(mapping, n, NULL)` — same page cache as file data.
-  → Asterinas: Directory data uses the same Inode PageCache. Directory operations
-  (find_entry, add_entry, readdir) read/write through `page_cache.pages()`.
-  Reason: Unified caching for both file and directory data, matching Linux's model.
+Linux: `ext2_write_failed` truncates back to i_size on write failure.
+  → Asterinas: `write_failed_cleanup` in write_at does the same rollback.
+  Reason: Direct equivalent.
 
-Linux: `InodeBlockManager` in ext2_old implements `PageCacheBackend` as a separate
-  struct with its own block mapping logic and indirect block cache.
-  → Asterinas (new): `InodeDataBackend` is a lightweight struct that delegates
-  block mapping to `InodeInner::get_block()`.
-  Reason: Block mapping logic already exists in InodeInner; no need to duplicate.
+Linux: ext2_old `InodeBlockManager` implements `PageCacheBackend` as a separate
+  struct with its own block_ptrs copy and IndirectBlockCache.
+  → Asterinas (new): No separate backend struct. Inode itself implements
+  PageCacheBackend, delegating to `InodeInner::get_block()` via read lock.
+  Reason: Simpler architecture, no block_ptrs duplication, follows exFAT precedent.
+
+[TEST]
+## Inode::new
+- Construct inode with size > 0 → PageCache created with correct capacity (blocks-based)
+- Construct inode with size == 0 (new empty file) → PageCache created empty
+- Verify page_cache() returns valid reference after construction
+
+## PageCacheBackend::read_page_async
+- Read mapped block → BioWaiter returned, frame filled with block data
+- Read sparse hole (get_block returns None) → frame zero-filled, empty BioWaiter
+- fs Weak reference dead → Err(EIO)
+- get_block returns error → error propagated
+
+## PageCacheBackend::write_page_async
+- Write mapped block → BioWaiter returned, data written to device
+- Block not mapped (get_block returns None) → error!() logged, Err(EIO)
+- fs Weak reference dead → Err(EIO)
+
+## PageCacheBackend::npages
+- Inode with blocks=16 (block_size=4096, sector_size=512) → returns 2
+- Inode with blocks=0 → returns 0
+
+## Inode::read_at
+- Read from file with data → correct bytes returned via PageCache
+- Read at offset >= file_size → Ok(0)
+- Read with empty buffer → Ok(0)
+- Read near EOF (buf extends past EOF) → clamped to file_size - offset
+- Read from directory → Err(EISDIR)
+- Read triggers cache miss → read_page_async called, data loaded from disk
+
+## Inode::write_at
+- Write within existing file size → data written via PageCache, timestamps updated
+- Write extending file → blocks allocated, PageCache resized, size updated
+- Write to directory → Err(EISDIR)
+- Write empty data → Ok(0)
+- Block allocation fails mid-write → write_failed_cleanup truncates back, Err(ENOSPC)
+- Verify 3-phase lock protocol: no deadlock on cache miss during Phase 2
+
+## Inode::resize
+- Truncate file to smaller size → PageCache shrunk, blocks freed, tail zeroed
+- Extend file to larger size → PageCache extended, size updated
+- Resize to same size → Ok(()), no-op
+- Resize non-regular/dir/symlink → Err(EINVAL)
+- Resize fast symlink → Err(EINVAL)
+- Resize immutable file → Err(EPERM)
+- Resize append-only file → Err(EPERM)
