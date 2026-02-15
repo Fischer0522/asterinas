@@ -1699,20 +1699,17 @@ impl InodeInner {
         for block_idx in 0..=data_blocks {
             if block_idx == data_blocks {
                 // No reusable slot found in existing blocks: grow directory by one block.
-                let allocated = fs.alloc_blocks(1)?;
-                if allocated.end != allocated.start.saturating_add(1) {
-                    return_errno_with_message!(Errno::EIO, "unexpected multi-block allocation");
-                }
-
-                if let Err(err) = self.link_new_data_block(block_idx as u32, allocated.start) {
-                    let _ = fs.free_blocks(allocated.start, 1);
-                    return Err(err);
-                }
+                let growth_iblock = u32::try_from(block_idx)
+                    .map_err(|_| Error::with_message(Errno::EINVAL, "directory block index overflow"))?;
+                // SPEC: growth must use full-tree allocation path (direct + indirect).
+                let growth_bid = self
+                    .get_or_alloc_block(growth_iblock, true)?
+                    .ok_or_else(|| Error::with_message(Errno::EIO, "missing block mapping after allocation"))?;
 
                 let mut buf = vec![0u8; chunk_size];
                 Self::write_dir_entry_bytes(&mut buf, 0, 0, chunk_size as u16, b"", 0)?;
                 selected = Some(InsertSlot {
-                    block_bid: Bid::new(allocated.start as u64),
+                    block_bid: growth_bid,
                     block_buf: buf,
                     slot_offset: 0,
                     slot_rec_len: chunk_size,
@@ -1813,25 +1810,20 @@ impl InodeInner {
             .write_bytes(block_bid.to_offset(), &block_buf)
             .is_err()
         {
-            // SPEC: cleanup newly allocated data block if writing the new chunk fails.
-            if from_new_block {
-                let _ = fs.free_blocks(block_bid.to_raw() as u32, 1);
-            }
+            // SPEC: after get_or_alloc_block(create=true), the growth block is already
+            // linked into the inode tree. Keep it linked on write failure; truncation
+            // or inode cleanup paths will reclaim it.
             return_errno_with_message!(Errno::EIO, "failed to write dir block");
         }
 
         if from_new_block {
-            let sectors_per_block = (chunk_size / SECTOR_SIZE) as u32;
+            // SPEC: get_or_alloc_block already accounts for data/indirect blocks.
+            // Directory growth only needs to extend i_size by one chunk.
             self.desc.size = self
                 .desc
                 .size
                 .checked_add(chunk_size as u64)
                 .ok_or_else(|| Error::with_message(Errno::EIO, "inode size overflow"))?;
-            self.desc.blocks = self
-                .desc
-                .blocks
-                .checked_add(sectors_per_block)
-                .ok_or_else(|| Error::with_message(Errno::EIO, "inode block count overflow"))?;
         }
 
         self.update_dir_timestamps_and_flags()?;
@@ -1944,21 +1936,6 @@ impl InodeInner {
 
         self.update_dir_timestamps_and_flags()?;
         self.persist_inode_and_sync(&fs)?;
-        Ok(())
-    }
-
-    fn link_new_data_block(&mut self, iblock: u32, new_bid: u32) -> Result<()> {
-        // TODO:
-        // Current mutation path supports direct block growth only.
-        if iblock >= 12 {
-            return_errno_with_message!(Errno::ENOSPC, "no direct block slots available");
-        }
-
-        let slot = &mut self.desc.block_ptrs[iblock as usize];
-        if *slot != 0 {
-            return_errno_with_message!(Errno::EIO, "data block slot already occupied");
-        }
-        *slot = new_bid;
         Ok(())
     }
 
@@ -2157,23 +2134,18 @@ impl InodeInner {
         Ok(())
     }
 
-    fn release_dir_data_blocks_for_cleanup(&mut self, fs: &Ext2) -> Result<()> {
+    fn release_dir_data_blocks_for_cleanup(&mut self, _fs: &Ext2) -> Result<()> {
         // DIFF from Linux:
         // Linux mkdir-failure/rmdir cleanup reaches block release through
         // discard_new_inode()/iput() -> ext2_evict_inode() -> ext2_truncate_blocks().
         // Asterinas currently has no unified inode evict+truncate path, so we
-        // explicitly release directory data blocks here on rollback/removal paths.
+        // explicitly trigger truncate-based release on rollback/removal paths.
         // TODO: Move this logic into a shared truncate/evict pipeline, and make
         // free_inode trigger it instead of per-call-site cleanup.
-        for bid in self.desc.block_ptrs.iter_mut().take(12) {
-            if *bid == 0 {
-                continue;
-            }
-            fs.free_blocks(*bid, 1)?;
-            *bid = 0;
-        }
+        // SPEC: delegate to full indirect-tree truncation path.
+        self.truncate_blocks(0)?;
+        // SPEC: cleanup path must leave directory size at zero.
         self.desc.size = 0;
-        self.desc.blocks = 0;
         Ok(())
     }
 
@@ -3729,6 +3701,140 @@ mod test {
         .unwrap();
         assert_eq!(entry.inode, 11);
         assert_eq!(entry.name.as_bytes(), b"foo");
+    }
+
+    #[ktest]
+    fn dir_add_entry_grow_into_single_indirect_ok() {
+        let f = Ext2FixtureBuilder::new(1, 512)
+            .with_free_blocks(256, 256)
+            .build()
+            .unwrap();
+        let block_size = f.ext2.block_size();
+        let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
+
+        let first = f.sb.group_first_block_no(0);
+        let last = f.sb.group_last_block_no(0);
+        let data_base = first
+            .saturating_add(2)
+            .saturating_add(f.sb.itb_per_group())
+            .saturating_add(2);
+        let direct_bids = (0..12usize)
+            .map(|idx| data_base.saturating_add(idx as u32))
+            .collect::<Vec<_>>();
+        assert_eq!(direct_bids.len(), 12);
+        assert!(direct_bids[11] <= last);
+
+        testkit::write_block_bitmap(f.disk.as_ref(), &f.sb, &f.descs[0], &direct_bids);
+        reload_group0_cached_bitmaps_from_disk(&f);
+
+        // Fill each direct block with packed live entries (rec_len == used_len),
+        // leaving no reusable or splittable space.
+        for bid in &direct_bids {
+            let mut block = vec![0u8; block_size];
+            let mut offset = 0usize;
+            while offset < block_size {
+                encode_dir_entry(
+                    &mut block,
+                    offset,
+                    ROOT_INO,
+                    16,
+                    b"ent00000",
+                    DirEntryFileType::File as u8,
+                );
+                offset = offset.saturating_add(16);
+            }
+            f.disk
+                .segment()
+                .write_bytes(Bid::new(*bid as u64).to_offset(), &block)
+                .unwrap();
+        }
+
+        let mut block_ptrs = [0u32; 15];
+        for (idx, bid) in direct_bids.iter().enumerate() {
+            block_ptrs[idx] = *bid;
+        }
+        let inode = make_live_dir_inode(
+            &f.ext2,
+            ROOT_INO,
+            block_size * 12,
+            sectors_per_block * 12,
+            FileFlags::INDEX_DIR,
+            block_ptrs,
+        );
+
+        let (new_data_bid, single_indirect_bid, old_size, new_size, old_blocks, new_blocks) = {
+            let mut inner = inode.inner.write();
+            let old_size = inner.desc.size;
+            let old_blocks = inner.desc.blocks;
+            inner.add_entry("foo", 11, DirEntryFileType::File).unwrap();
+            let new_data_bid = inner.get_block(12).unwrap().unwrap().to_raw() as u32;
+            (
+                new_data_bid,
+                inner.desc.block_ptrs[12],
+                old_size,
+                inner.desc.size,
+                old_blocks,
+                inner.desc.blocks,
+            )
+        };
+
+        assert_ne!(single_indirect_bid, 0);
+        assert_eq!(new_size, old_size + block_size as u64);
+        assert_eq!(new_blocks, old_blocks + sectors_per_block * 2);
+
+        let mut new_block = vec![0u8; block_size];
+        f.disk
+            .segment()
+            .read_bytes(Bid::new(new_data_bid as u64).to_offset(), &mut new_block)
+            .unwrap();
+        let entry = DirEntry::parse_at(
+            &new_block,
+            0,
+            block_size,
+            f.ext2.super_block().total_inodes(),
+        )
+        .unwrap();
+        assert_eq!(entry.inode, 11);
+        assert_eq!(entry.name.as_bytes(), b"foo");
+    }
+
+    #[ktest]
+    fn release_dir_data_blocks_for_cleanup_truncates_full_tree() {
+        let f = Ext2FixtureBuilder::new(1, 512)
+            .with_free_blocks(256, 256)
+            .build()
+            .unwrap();
+        let block_size = f.ext2.block_size();
+        let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
+        let inode = make_live_dir_inode(&f.ext2, 40, 0, 0, FileFlags::empty(), [0; 15]);
+
+        let (old_block_sectors, free_before, free_after) = {
+            let mut inner = inode.inner.write();
+            for iblock in 0..13u32 {
+                inner.get_or_alloc_block(iblock, true).unwrap().unwrap();
+            }
+            inner.desc.size = (13 * block_size) as u64;
+
+            let old_block_sectors = inner.desc.blocks;
+            assert!(inner.desc.block_ptrs[12] != 0);
+            assert!(inner.get_block(12).unwrap().is_some());
+            let free_before = f.ext2.super_block().free_blocks_count();
+
+            inner.release_dir_data_blocks_for_cleanup(&f.ext2).unwrap();
+            assert_eq!(inner.desc.size, 0);
+            assert_eq!(inner.desc.blocks, 0);
+            assert!(inner.desc.block_ptrs.iter().all(|ptr| *ptr == 0));
+            assert_eq!(inner.get_block(0).unwrap(), None);
+            assert_eq!(inner.get_block(12).unwrap(), None);
+
+            let free_after = f.ext2.super_block().free_blocks_count();
+            (old_block_sectors, free_before, free_after)
+        };
+
+        assert_eq!(
+            free_after.saturating_sub(free_before),
+            old_block_sectors / sectors_per_block
+        );
     }
 
     #[ktest]
