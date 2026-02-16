@@ -46,6 +46,7 @@ pub fn init() {
     devpts::init();
     pseudofs::init();
 
+    ext2::init();
     exfat::init();
     overlayfs::init();
 

@@ -10,6 +10,10 @@ use super::{
     utils::now,
 };
 use crate::fs::ext2::dir::{DirEntry, DirEntryIter};
+use crate::{
+    fs::utils::{Extension, InodeMode, Metadata},
+    process::{Gid, Uid},
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct FilePerm(u16);
@@ -31,10 +35,11 @@ pub struct Inode {
     inner: RwMutex<InodeInner>,
     block_group_idx: usize,
     fs: Weak<Ext2>,
+    extension: Extension,
 }
 
 impl Inode {
-    pub fn new(
+    pub(super) fn new(
         ino: u32,
         type_: InodeType,
         desc: Dirty<InodeDesc>,
@@ -47,11 +52,191 @@ impl Inode {
             inner: RwMutex::new(InodeInner::new(desc, weak_self.clone(), fs.clone())),
             block_group_idx,
             fs,
+            extension: Extension::new(),
         })
     }
 
     pub(super) fn ino(&self) -> u32 {
         self.ino
+    }
+
+    pub(super) fn fs_arc(&self) -> Result<Arc<Ext2>> {
+        self.fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))
+    }
+
+    pub(super) fn file_size(&self) -> usize {
+        self.inner.read().desc.size as usize
+    }
+
+    pub(super) fn resize(&self, new_size: usize) -> Result<()> {
+        let mut inner = self.inner.write();
+        inner.resize(new_size)
+    }
+
+    pub(super) fn metadata(&self) -> Metadata {
+        let inner = self.inner.read();
+        let (dev, blk_size) = match self.fs.upgrade() {
+            Some(fs) => (fs.block_device().id().as_encoded_u64(), fs.block_size()),
+            None => (0, BLOCK_SIZE),
+        };
+        Metadata {
+            dev,
+            ino: self.ino as u64,
+            size: inner.desc.size as usize,
+            blk_size,
+            blocks: inner.desc.blocks as usize,
+            atime: inner.desc.atime,
+            mtime: inner.desc.mtime,
+            ctime: inner.desc.ctime,
+            type_: self.type_,
+            mode: InodeMode::from_bits_truncate(inner.desc.perm.bits() as _),
+            nlinks: inner.desc.links_count as usize,
+            uid: Uid::new(inner.desc.uid),
+            gid: Gid::new(inner.desc.gid),
+            rdev: 0,
+        }
+    }
+
+    pub(super) fn inode_type(&self) -> InodeType {
+        self.type_
+    }
+
+    pub(super) fn mode(&self) -> InodeMode {
+        InodeMode::from_bits_truncate(self.inner.read().desc.perm.bits() as _)
+    }
+
+    pub(super) fn set_mode(&self, mode: InodeMode) -> Result<()> {
+        let fs = self.fs_arc()?;
+        let mut inner = self.inner.write();
+        inner.desc.perm = FilePerm::from_bits_truncate(mode.bits() as u16);
+        inner.desc.ctime = now();
+        inner.persist_inode_and_sync(&fs)
+    }
+
+    pub(super) fn uid(&self) -> u32 {
+        self.inner.read().desc.uid
+    }
+
+    pub(super) fn set_uid(&self, uid: u32) -> Result<()> {
+        let fs = self.fs_arc()?;
+        let mut inner = self.inner.write();
+        inner.desc.uid = uid;
+        inner.desc.ctime = now();
+        inner.persist_inode_and_sync(&fs)
+    }
+
+    pub(super) fn gid(&self) -> u32 {
+        self.inner.read().desc.gid
+    }
+
+    pub(super) fn set_gid(&self, gid: u32) -> Result<()> {
+        let fs = self.fs_arc()?;
+        let mut inner = self.inner.write();
+        inner.desc.gid = gid;
+        inner.desc.ctime = now();
+        inner.persist_inode_and_sync(&fs)
+    }
+
+    pub(super) fn atime(&self) -> Duration {
+        self.inner.read().desc.atime
+    }
+
+    pub(super) fn set_atime(&self, time: Duration) {
+        self.inner.write().desc.atime = time;
+    }
+
+    pub(super) fn mtime(&self) -> Duration {
+        self.inner.read().desc.mtime
+    }
+
+    pub(super) fn set_mtime(&self, time: Duration) {
+        self.inner.write().desc.mtime = time;
+    }
+
+    pub(super) fn ctime(&self) -> Duration {
+        self.inner.read().desc.ctime
+    }
+
+    pub(super) fn set_ctime(&self, time: Duration) {
+        self.inner.write().desc.ctime = time;
+    }
+
+    pub(super) fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
+        let read_cap = writer.avail();
+        if read_cap == 0 {
+            return Ok(0);
+        }
+
+        let mut buf = vec![0u8; read_cap];
+        let read_len = self.inner.read().read_at(offset, &mut buf)?;
+        let mut src = VmReader::from(&buf[..read_len]);
+        let copied = writer.write_fallible(&mut src)?;
+        if copied != read_len {
+            return_errno_with_message!(Errno::EIO, "short vm write while reading inode data");
+        }
+
+        self.set_atime(now());
+        Ok(read_len)
+    }
+
+    pub(super) fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
+        let write_len = reader.remain();
+        if write_len == 0 {
+            return Ok(0);
+        }
+
+        let mut buf = vec![0u8; write_len];
+        let mut dst = VmWriter::from(buf.as_mut_slice());
+        let copied = reader.read_fallible(&mut dst)?;
+        if copied != write_len {
+            return_errno_with_message!(Errno::EIO, "short vm read while writing inode data");
+        }
+
+        let mut inner = self.inner.write();
+        inner.write_at(offset, &buf)
+    }
+
+    pub(super) fn lookup(&self, name: &str) -> Result<Arc<Inode>> {
+        if self.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let ino = self.inner.read().find_entry(name)?;
+        self.fs_arc()?.read_inode(ino)
+    }
+
+    pub(super) fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize> {
+        if self.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        self.inner.read().readdir_at(offset, visitor)
+    }
+
+    pub(super) fn rmdir(&self, name: &str) -> Result<()> {
+        if self.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        self.inner.write().rmdir(name)
+    }
+
+    pub(super) fn sync_all(&self) -> Result<()> {
+        let fs = self.fs_arc()?;
+        self.inner.read().persist_inode_and_sync(&fs)?;
+        fs.block_device().sync()?;
+        Ok(())
+    }
+
+    pub(super) fn sync_data(&self) -> Result<()> {
+        self.fs_arc()?.block_device().sync()?;
+        Ok(())
+    }
+
+    pub(super) fn extension(&self) -> &Extension {
+        &self.extension
     }
 }
 
@@ -2330,7 +2515,7 @@ impl Inode {
     /// Adds a hard link in this directory to an existing non-directory inode.
     ///
     /// Linux: /root/linux/fs/ext2/namei.c:204 (ext2_link)
-    pub(super) fn link(&self, old: &Arc<Inode>, name: &str) -> Result<()> {
+    pub(super) fn link(&self, old: &Inode, name: &str) -> Result<()> {
         // SPEC: self must be a directory.
         if self.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
@@ -2449,7 +2634,7 @@ impl Inode {
     /// Renames or moves an entry from this directory to `target` directory.
     ///
     /// Linux: /root/linux/fs/ext2/namei.c:318 (ext2_rename)
-    pub(super) fn rename(&self, old_name: &str, target: &Arc<Inode>, new_name: &str) -> Result<()> {
+    pub(super) fn rename(&self, old_name: &str, target: &Inode, new_name: &str) -> Result<()> {
         // SPEC: both self and target must be directories.
         if self.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);

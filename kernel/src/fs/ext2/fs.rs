@@ -9,7 +9,7 @@ use super::{
     super_block::{RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
     utils::{Dirty, now},
 };
-use crate::fs::{ext2::inode::InodeInner, utils::FsEventSubscriberStats};
+use crate::fs::utils::FsEventSubscriberStats;
 
 /// The root inode number (Linux EXT2_ROOT_INO).
 pub const ROOT_INO: u32 = 2;
@@ -33,6 +33,8 @@ pub struct Ext2 {
     block_size: usize,
     /// Group descriptor table segment.
     group_descriptors_segment: USegment,
+    /// Cached root inode for VFS `root_inode()` calls.
+    root_inode: Arc<Inode>,
     /// FS event stats for VFS.
     fs_event_subscriber_stats: FsEventSubscriberStats,
     /// Weak self reference for inode back-pointers.
@@ -58,21 +60,13 @@ impl Ext2 {
         let blocks_per_group = super_block.blocks_per_group();
         let inode_size = super_block.inode_size();
 
-        //TODO: load root inode, aligning with Linux's ext2_fill_super
+        let block_groups =
+            Self::load_block_groups(&super_block, &group_descriptors_segment, device.clone())?;
+        let root_desc = Self::read_inode_desc_from_parts(&super_block, &block_groups, ROOT_INO)?;
+        let root_block_group_idx = ((ROOT_INO - 1) / inodes_per_group) as usize;
 
-        let mut load_block_groups_err = None;
         let ext2 = Arc::new_cyclic(|weak_self| Ext2 {
-            block_groups: match Self::load_block_groups(
-                &super_block,
-                &group_descriptors_segment,
-                device.clone(),
-            ) {
-                Ok(groups) => groups,
-                Err(err) => {
-                    load_block_groups_err = Some(err);
-                    Vec::new()
-                }
-            },
+            block_groups,
             block_device: device,
             super_block: RwMutex::new(Dirty::new(super_block)),
             inodes_per_group,
@@ -80,13 +74,16 @@ impl Ext2 {
             inode_size,
             block_size,
             group_descriptors_segment,
+            root_inode: Inode::new(
+                ROOT_INO,
+                root_desc.type_(),
+                Dirty::new(root_desc),
+                root_block_group_idx,
+                weak_self.clone(),
+            ),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             self_ref: weak_self.clone(),
         });
-
-        if let Some(err) = load_block_groups_err {
-            return Err(err);
-        }
 
         Ok(ext2)
     }
@@ -127,8 +124,8 @@ impl Ext2 {
     }
 
     /// Returns the root inode.
-    pub fn root_inode(&self) -> Result<Arc<Inode>> {
-        return_errno_with_message!(Errno::ENOSYS, "root inode not yet implemented");
+    pub fn root_inode(&self) -> Arc<Inode> {
+        self.root_inode.clone()
     }
 
     /// Reads an inode and constructs its in-memory representation.
@@ -180,7 +177,15 @@ impl Ext2 {
     /// Linux: /root/linux/fs/ext2/inode.c:1314 (ext2_get_inode)
     pub(super) fn read_inode_desc(&self, ino: u32) -> Result<InodeDesc> {
         let sb = self.super_block.read();
+        Self::read_inode_desc_from_parts(&sb, &self.block_groups, ino)
+    }
 
+        /// Reads an inode descriptor from preloaded superblock and block groups.
+    fn read_inode_desc_from_parts(
+        sb: &SuperBlock,
+        block_groups: &[BlockGroup],
+        ino: u32,
+    ) -> Result<InodeDesc> {
         // SPEC: same inode number validity condition as Linux `ext2_get_inode`.
         if (ino != ROOT_INO && ino < sb.first_ino()) || ino > sb.total_inodes() {
             return_errno_with_message!(Errno::EINVAL, "inode number out of valid range");
@@ -189,10 +194,8 @@ impl Ext2 {
         let inodes_per_group = sb.inodes_per_group();
         let group_idx = ((ino - 1) / inodes_per_group) as usize;
         let index_in_group = (ino - 1) % inodes_per_group;
-        drop(sb);
 
-        let group = self
-            .block_groups
+        let group = block_groups
             .get(group_idx)
             .ok_or_else(|| Error::with_message(Errno::EIO, "block group index out of range"))?;
 

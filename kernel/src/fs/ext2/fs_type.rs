@@ -2,7 +2,7 @@
 
 use aster_systree::SysNode;
 
-use super::prelude::*;
+use super::{fs::Ext2, prelude::*};
 use crate::fs::{
     registry::{FsProperties, FsType},
     utils::{FileSystem, FsFlags},
@@ -27,10 +27,13 @@ impl FsType for Ext2Type {
         &self,
         _flags: FsFlags,
         _args: Option<CString>,
-        _disk: Option<Arc<dyn BlockDevice>>,
+        disk: Option<Arc<dyn BlockDevice>>,
     ) -> Result<Arc<dyn FileSystem>> {
         // Linux: /root/linux/fs/ext2/super.c:1703 (init_fs_context -> mount flow)
-        return_errno_with_message!(Errno::ENOSYS, "ext2 mount not yet implemented");
+        let disk = disk.ok_or_else(|| {
+            Error::with_message(Errno::EINVAL, "the ext2 filesystem requires a block device")
+        })?;
+        Ext2::open(disk).map(|fs| fs as Arc<dyn FileSystem>)
     }
 
     fn sysnode(&self) -> Option<Arc<dyn SysNode>> {

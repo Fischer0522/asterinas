@@ -21,7 +21,7 @@
 //! // Opens an Ext2 from the block device.
 //! let ext2 = Ext2::open(block_device)?;
 //! // Lookup the root inode.
-//! let root = ext2.root_inode()?;
+//! let root = ext2.root_inode();
 //! // Create a file inside root directory.
 //! let file = root.create("file", InodeType::File, FilePerm::from_bits_truncate(0o666))?;
 //! // Write data into the file.
@@ -49,6 +49,7 @@ mod block_group;
 mod dir;
 mod fs;
 mod fs_type;
+mod impl_for_vfs;
 mod inode;
 mod prelude;
 mod super_block;
