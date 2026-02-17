@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::fs::{
-    ext2::{Ext2, MAGIC_NUM},
-    utils::{FileSystem, FsEventSubscriberStats, Inode as VfsInode, NAME_MAX, SuperBlock},
+use crate::{
+    fs::{
+        ext2::{Ext2, MAGIC_NUM},
+        utils::{FileSystem, FsEventSubscriberStats, Inode as VfsInode, NAME_MAX, SuperBlock},
+    },
+    prelude::*,
 };
-use crate::prelude::*;
 
 impl FileSystem for Ext2 {
     fn name(&self) -> &'static str {

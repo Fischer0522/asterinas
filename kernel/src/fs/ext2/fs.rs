@@ -6,8 +6,8 @@ use super::{
     block_group::{BlockGroup, RawGroupDesc},
     inode::{FilePerm, Inode, InodeDesc, RawInode},
     prelude::*,
-    super_block::{RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
-    utils::{Dirty, now},
+    super_block::{RawSuperBlock, SuperBlock, SUPER_BLOCK_OFFSET},
+    utils::{now, Dirty},
 };
 use crate::fs::utils::FsEventSubscriberStats;
 
@@ -180,7 +180,7 @@ impl Ext2 {
         Self::read_inode_desc_from_parts(&sb, &self.block_groups, ino)
     }
 
-        /// Reads an inode descriptor from preloaded superblock and block groups.
+    /// Reads an inode descriptor from preloaded superblock and block groups.
     fn read_inode_desc_from_parts(
         sb: &SuperBlock,
         block_groups: &[BlockGroup],
@@ -684,8 +684,8 @@ mod test {
 
     use super::*;
     use crate::fs::ext2::testkit::{
-        self, ErrorBioDisk, Ext2FixtureBuilder, Ext2MemoryDisk, RawInodeBuilder,
-        build_group_desc_segment, make_valid_group_desc, make_valid_super_block,
+        self, build_group_desc_segment, make_valid_group_desc, make_valid_super_block,
+        ErrorBioDisk, Ext2FixtureBuilder, Ext2MemoryDisk, RawInodeBuilder,
     };
 
     fn make_raw_inode(mode: u16, links_count: u16, dtime: u32) -> RawInode {
@@ -1115,9 +1115,10 @@ mod test {
             .unwrap_err();
         assert_eq!(invalid_high.error(), Errno::EINVAL);
 
-        // I/O error from block device: use ErrorBioDisk that fails at inode table offset.
+        // I/O error from block device: fail group-1 inode-table reads so mount
+        // (which reads ROOT_INO from group 0) still succeeds.
         let f_base = Ext2FixtureBuilder::new(2, 128).build().unwrap();
-        let inode_table_offset = Bid::new(f_base.descs[0].inode_table as u64).to_offset();
+        let inode_table_offset = Bid::new(f_base.descs[1].inode_table as u64).to_offset();
         let io_disk = ErrorBioDisk::with_read_error_at(
             f_base.disk.clone(),
             BioStatus::IoError,
@@ -1127,7 +1128,8 @@ mod test {
             .with_device(Arc::new(io_disk))
             .build()
             .unwrap();
-        let io_err = f_io.ext2.read_inode_desc(ROOT_INO).unwrap_err();
+        let group1_ino = f_io.sb.inodes_per_group().saturating_add(1);
+        let io_err = f_io.ext2.read_inode_desc(group1_ino).unwrap_err();
         assert_eq!(io_err.error(), Errno::EIO);
 
         // Deleted inode (dtime != 0, mode == 0) → ESTALE.

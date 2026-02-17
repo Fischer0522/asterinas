@@ -716,6 +716,7 @@ mod test {
             .with_metadata_block_bitmap()
             .with_free_blocks(32, 32)
             .with_free_inodes(64, 64)
+            .with_root()
             .build()
             .unwrap();
         let group = &fixture.block_groups()[1];

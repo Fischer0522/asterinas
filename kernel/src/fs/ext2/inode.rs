@@ -2,16 +2,18 @@
 
 use core::mem::size_of;
 
-use ostd::const_assert;
+use ostd::{const_assert, mm::io_util::HasVmReaderWriter};
 
 use super::{
     fs::{Ext2, ROOT_INO},
     prelude::*,
     utils::now,
 };
-use crate::fs::ext2::dir::{DirEntry, DirEntryIter};
 use crate::{
-    fs::utils::{Extension, InodeMode, Metadata},
+    fs::{
+        ext2::dir::{DirEntry, DirEntryIter},
+        utils::{Extension, InodeMode, Metadata},
+    },
     process::{Gid, Uid},
 };
 
@@ -46,7 +48,9 @@ impl Inode {
         block_group_idx: usize,
         fs: Weak<Ext2>,
     ) -> Arc<Self> {
-        Arc::new_cyclic(|weak_self| Self {
+        // Use `new_cyclic` so `InodeInner` can build a `PageCache` backend that
+        // points back to this inode via `Weak<dyn PageCacheBackend>`.
+        Arc::new_cyclic(|weak_self: &Weak<Self>| Self {
             ino,
             type_,
             inner: RwMutex::new(InodeInner::new(desc, weak_self.clone(), fs.clone())),
@@ -71,8 +75,77 @@ impl Inode {
     }
 
     pub(super) fn resize(&self, new_size: usize) -> Result<()> {
+        let fs = self.fs_arc()?;
+        let block_size = fs.block_size();
+        if block_size == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+        }
+
+        let old_size = {
+            let inner = self.inner.read();
+            if inner.desc.type_ != InodeType::File
+                && inner.desc.type_ != InodeType::Dir
+                && inner.desc.type_ != InodeType::SymLink
+            {
+                return_errno!(Errno::EINVAL);
+            }
+
+            if inner.desc.type_ == InodeType::SymLink
+                && inner.desc.blocks == 0
+                && inner.desc.size <= 60
+            {
+                return_errno!(Errno::EINVAL);
+            }
+
+            if inner
+                .desc
+                .flags
+                .intersects(FileFlags::APPEND_ONLY | FileFlags::IMMUTABLE)
+            {
+                return_errno!(Errno::EPERM);
+            }
+
+            let old_size = inner.desc.size as usize;
+            if new_size == old_size {
+                return Ok(());
+            }
+            old_size
+        };
+
+        if new_size < old_size && new_size % block_size != 0 {
+            // Linux-compatible shrink semantics: zero the truncated tail in the
+            // last partial block before dropping cache pages / blocks.
+            let zero_to = new_size.align_up(block_size);
+            let inner = self.inner.read();
+            inner.page_cache.fill_zeros(new_size..zero_to)?;
+        }
+
         let mut inner = self.inner.write();
-        inner.resize(new_size)
+        let old_size = inner.desc.size as usize;
+        if new_size == old_size {
+            return Ok(());
+        }
+
+        if new_size < old_size {
+            let old_size_aligned = old_size.align_up(block_size);
+            let new_size_aligned = new_size.align_up(block_size);
+            if new_size_aligned < old_size_aligned {
+                inner
+                    .page_cache
+                    .discard_range(new_size_aligned..old_size_aligned);
+            }
+            inner.page_cache.resize(new_size_aligned)?;
+            inner.desc.size = new_size as u64;
+            inner.truncate_blocks(new_size)?;
+        } else {
+            inner.page_cache.resize(new_size.align_up(block_size))?;
+            inner.desc.size = new_size as u64;
+        }
+
+        let current = now();
+        inner.desc.mtime = current;
+        inner.desc.ctime = current;
+        inner.persist_inode_and_sync(&fs)
     }
 
     pub(super) fn metadata(&self) -> Metadata {
@@ -164,38 +237,130 @@ impl Inode {
     }
 
     pub(super) fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
-        let read_cap = writer.avail();
-        if read_cap == 0 {
+        if self.type_ == InodeType::Dir {
+            return_errno!(Errno::EISDIR);
+        }
+
+        if writer.avail() == 0 {
             return Ok(0);
         }
 
-        let mut buf = vec![0u8; read_cap];
-        let read_len = self.inner.read().read_at(offset, &mut buf)?;
-        let mut src = VmReader::from(&buf[..read_len]);
-        let copied = writer.write_fallible(&mut src)?;
-        if copied != read_len {
-            return_errno_with_message!(Errno::EIO, "short vm write while reading inode data");
-        }
+        let read_len = {
+            let inner = self.inner.read();
+            let file_size = inner.desc.size as usize;
+            if offset >= file_size {
+                return Ok(0);
+            }
+            let read_len = writer.avail().min(file_size.saturating_sub(offset));
+            writer.limit(read_len);
+            inner.page_cache.pages().read(offset, writer)?;
+            read_len
+        };
 
         self.set_atime(now());
         Ok(read_len)
     }
 
     pub(super) fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
+        if self.type_ == InodeType::Dir {
+            return_errno!(Errno::EISDIR);
+        }
+
         let write_len = reader.remain();
         if write_len == 0 {
             return Ok(0);
         }
 
-        let mut buf = vec![0u8; write_len];
-        let mut dst = VmWriter::from(buf.as_mut_slice());
-        let copied = reader.read_fallible(&mut dst)?;
-        if copied != write_len {
-            return_errno_with_message!(Errno::EIO, "short vm read while writing inode data");
+        let fs = self.fs_arc()?;
+        let block_size = fs.block_size();
+        if block_size == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+        }
+
+        let end = offset
+            .checked_add(write_len)
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
+
+        {
+            let mut inner = self.inner.write();
+            let old_size = inner.desc.size as usize;
+            let start_block = offset / block_size;
+            let end_block = end.div_ceil(block_size);
+
+            // Phase 1: ensure all target blocks exist and grow page-cache/file size
+            // first, so data write (phase 2) only touches mapped pages.
+            let phase1_result = (|| -> Result<()> {
+                for iblock in start_block..end_block {
+                    let iblock = u32::try_from(iblock).map_err(|_| {
+                        Error::with_message(Errno::EINVAL, "logical block number overflow")
+                    })?;
+                    if inner.get_or_alloc_block(iblock, true)?.is_none() {
+                        return_errno_with_message!(
+                            Errno::EIO,
+                            "missing block mapping after allocation"
+                        );
+                    }
+                }
+
+                if end > old_size {
+                    inner.page_cache.resize(end.align_up(block_size))?;
+                    inner.desc.size = end as u64;
+                }
+
+                Ok(())
+            })();
+
+            if let Err(err) = phase1_result {
+                Self::write_failed_cleanup(&mut inner, old_size, end, block_size);
+                return Err(err);
+            }
+        }
+
+        {
+            let inner = self.inner.read();
+            // Phase 2: copy user data through VMO-backed page cache.
+            inner.page_cache.pages().write(offset, reader)?;
         }
 
         let mut inner = self.inner.write();
-        inner.write_at(offset, &buf)
+        let current = now();
+        inner.desc.mtime = current;
+        inner.desc.ctime = current;
+        inner.persist_inode_and_sync(&fs)?;
+        Ok(write_len)
+    }
+
+    fn write_failed_cleanup(
+        inner: &mut InodeInner,
+        old_size: usize,
+        end: usize,
+        block_size: usize,
+    ) {
+        if end <= old_size {
+            return;
+        }
+
+        let old_size_aligned = old_size.align_up(block_size);
+        let end_aligned = end.align_up(block_size);
+        // Mirrors Linux ext2 write failure rollback: drop speculative cache range
+        // and truncate newly allocated blocks back to the old size.
+        inner
+            .page_cache
+            .discard_range(old_size_aligned..end_aligned);
+
+        if let Err(err) = inner.page_cache.resize(old_size_aligned) {
+            error!(
+                "ext2: write_at cleanup page cache resize failed: old_size_aligned={}, err={:?}",
+                old_size_aligned, err
+            );
+        }
+        if let Err(err) = inner.truncate_blocks(old_size) {
+            error!(
+                "ext2: write_at cleanup truncate_blocks failed: old_size={}, err={:?}",
+                old_size, err
+            );
+        }
+        inner.desc.size = old_size as u64;
     }
 
     pub(super) fn lookup(&self, name: &str) -> Result<Arc<Inode>> {
@@ -207,7 +372,11 @@ impl Inode {
         self.fs_arc()?.read_inode(ino)
     }
 
-    pub(super) fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize> {
+    pub(super) fn readdir_at(
+        &self,
+        offset: usize,
+        visitor: &mut dyn DirentVisitor,
+    ) -> Result<usize> {
         if self.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
@@ -240,12 +409,66 @@ impl Inode {
     }
 }
 
+impl PageCacheBackend for Inode {
+    fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
+        let inner = self.inner.read();
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let iblock = u32::try_from(idx)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
+
+        match inner.get_block(iblock)? {
+            Some(bid) => {
+                let bio_segment = BioSegment::new_from_segment(
+                    Segment::from(frame.clone()).into(),
+                    BioDirection::FromDevice,
+                );
+                Ok(fs.block_device().read_blocks_async(bid, bio_segment)?)
+            }
+            None => {
+                // Sparse hole: return a zero-filled page without issuing BIO.
+                frame.writer().fill_zeros(BLOCK_SIZE);
+                Ok(BioWaiter::new())
+            }
+        }
+    }
+
+    fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
+        let inner = self.inner.read();
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let iblock = u32::try_from(idx)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
+
+        let bid = inner.get_block(iblock)?.ok_or_else(|| {
+            error!("write_page_async: no block mapping for idx {}", idx);
+            Error::with_message(Errno::EIO, "missing block mapping for writeback")
+        })?;
+
+        let bio_segment = BioSegment::new_from_segment(
+            Segment::from(frame.clone()).into(),
+            BioDirection::ToDevice,
+        );
+        Ok(fs.block_device().write_blocks_async(bid, bio_segment)?)
+    }
+
+    fn npages(&self) -> usize {
+        let inner = self.inner.read();
+        (inner.desc.size as usize).align_up(BLOCK_SIZE) / BLOCK_SIZE
+    }
+}
+
 #[derive(Debug)]
 pub struct InodeInner {
     desc: Dirty<InodeDesc>,
     is_freed: bool,
     weak_self: Weak<Inode>,
     fs: Weak<Ext2>,
+    page_cache: PageCache,
 }
 
 #[derive(Debug)]
@@ -259,11 +482,23 @@ struct DeleteTarget {
 
 impl InodeInner {
     pub fn new(desc: Dirty<InodeDesc>, weak_self: Weak<Inode>, fs: Weak<Ext2>) -> Self {
+        let num_page_bytes = (desc.size as usize).align_up(BLOCK_SIZE);
+        let backend: Weak<dyn PageCacheBackend> = weak_self.clone();
+        // Keep page-cache capacity aligned with inode size so `npages`/VMO window
+        // and on-disk data extent stay consistent from mount time.
+        let page_cache = if num_page_bytes == 0 {
+            PageCache::new(backend)
+        } else {
+            PageCache::with_capacity(num_page_bytes, backend)
+        }
+        .expect("ext2 inode page cache allocation failed");
+
         Self {
             desc,
             is_freed: false,
             weak_self,
             fs,
+            page_cache,
         }
     }
 
@@ -315,16 +550,17 @@ impl InodeInner {
                     // DIFF from spec pseudocode: BlockDevice::read_bytes requires
                     // sector-aligned offset/length. For unaligned file ranges we read
                     // the minimal aligned sector window and copy the requested subrange.
-                    let end_in_block = offset_in_block.checked_add(bytes_this_block).ok_or_else(
-                        || Error::with_message(Errno::EINVAL, "block read range overflow"),
-                    )?;
+                    let end_in_block =
+                        offset_in_block
+                            .checked_add(bytes_this_block)
+                            .ok_or_else(|| {
+                                Error::with_message(Errno::EINVAL, "block read range overflow")
+                            })?;
                     let aligned_start = offset_in_block.align_down(SECTOR_SIZE);
                     let aligned_end = end_in_block.align_up(SECTOR_SIZE);
                     let aligned_len = aligned_end.saturating_sub(aligned_start);
-                    let block_offset = bid
-                        .to_offset()
-                        .checked_add(aligned_start)
-                        .ok_or_else(|| {
+                    let block_offset =
+                        bid.to_offset().checked_add(aligned_start).ok_or_else(|| {
                             Error::with_message(Errno::EINVAL, "data block offset overflow")
                         })?;
 
@@ -344,9 +580,10 @@ impl InodeInner {
                             return_errno_with_message!(Errno::EIO, "failed to read data block");
                         }
                         let copy_start = offset_in_block.saturating_sub(aligned_start);
-                        let copy_end = copy_start.checked_add(bytes_this_block).ok_or_else(|| {
-                            Error::with_message(Errno::EIO, "aligned read copy range overflow")
-                        })?;
+                        let copy_end =
+                            copy_start.checked_add(bytes_this_block).ok_or_else(|| {
+                                Error::with_message(Errno::EIO, "aligned read copy range overflow")
+                            })?;
                         if copy_end > aligned_buf.len() {
                             return_errno_with_message!(
                                 Errno::EIO,
@@ -451,7 +688,10 @@ impl InodeInner {
                     .is_err()
                 {
                     write_failed_cleanup(self);
-                    return_errno_with_message!(Errno::EIO, "failed to read block for partial write");
+                    return_errno_with_message!(
+                        Errno::EIO,
+                        "failed to read block for partial write"
+                    );
                 }
             }
             block_buf[offset_in_block..offset_in_block + bytes_this_block]
@@ -678,10 +918,7 @@ impl InodeInner {
                 let keep_entries = path.offsets[partial] as usize;
                 let keep_bytes = keep_entries.saturating_mul(size_of::<u32>());
                 if keep_bytes > buf.len() {
-                    return_errno_with_message!(
-                        Errno::EIO,
-                        "all-zeroes check offset out of bounds"
-                    );
+                    return_errno_with_message!(Errno::EIO, "all-zeroes check offset out of bounds");
                 }
 
                 let mut all_zero = true;
@@ -887,7 +1124,10 @@ impl InodeInner {
         if depth == 0 {
             if let Err(err) = fs.free_blocks(block_nr, 1) {
                 // SPEC: best-effort free path logs errors and proceeds.
-                error!("ext2: free_branches: failed to free data block {}: {:?}", block_nr, err);
+                error!(
+                    "ext2: free_branches: failed to free data block {}: {:?}",
+                    block_nr, err
+                );
                 return;
             }
             self.desc.blocks = self.desc.blocks.saturating_sub(sectors_per_block);
@@ -1884,12 +2124,18 @@ impl InodeInner {
         for block_idx in 0..=data_blocks {
             if block_idx == data_blocks {
                 // No reusable slot found in existing blocks: grow directory by one block.
-                let growth_iblock = u32::try_from(block_idx)
-                    .map_err(|_| Error::with_message(Errno::EINVAL, "directory block index overflow"))?;
+                let growth_iblock = u32::try_from(block_idx).map_err(|_| {
+                    Error::with_message(Errno::EINVAL, "directory block index overflow")
+                })?;
                 // SPEC: growth must use full-tree allocation path (direct + indirect).
-                let growth_bid = self
-                    .get_or_alloc_block(growth_iblock, true)?
-                    .ok_or_else(|| Error::with_message(Errno::EIO, "missing block mapping after allocation"))?;
+                let growth_bid =
+                    self.get_or_alloc_block(growth_iblock, true)?
+                        .ok_or_else(|| {
+                            Error::with_message(
+                                Errno::EIO,
+                                "missing block mapping after allocation",
+                            )
+                        })?;
 
                 let mut buf = vec![0u8; chunk_size];
                 Self::write_dir_entry_bytes(&mut buf, 0, 0, chunk_size as u16, b"", 0)?;
@@ -3239,8 +3485,8 @@ mod test {
             ext2::{
                 fs::ROOT_INO,
                 testkit::{
-                    self, CollectDirentVisitor, ErrorBioDisk, Ext2FixtureBuilder, RawInodeBuilder,
-                    StopAfterVisitor, encode_dir_entry, write_indirect_ptr,
+                    self, encode_dir_entry, write_indirect_ptr, CollectDirentVisitor, ErrorBioDisk,
+                    Ext2FixtureBuilder, RawInodeBuilder, StopAfterVisitor,
                 },
             },
             utils::IdBitmap,
@@ -4711,8 +4957,7 @@ mod test {
         raw_fast_symlink.size_lo = 10;
         raw_fast_symlink.blocks = 0;
         let symlink_desc = InodeDesc::try_from(&raw_fast_symlink).unwrap();
-        let mut symlink_inner =
-            InodeInner::new(Dirty::new(symlink_desc), Weak::new(), Weak::new());
+        let mut symlink_inner = InodeInner::new(Dirty::new(symlink_desc), Weak::new(), Weak::new());
         assert_eq!(symlink_inner.resize(4).unwrap_err().error(), Errno::EINVAL);
     }
 
@@ -4741,7 +4986,10 @@ mod test {
             .read_bytes(bid.to_offset(), &mut on_disk)
             .unwrap();
         assert_eq!(&on_disk[..patch_off], &original[..patch_off]);
-        assert_eq!(&on_disk[patch_off..patch_off + patch.len()], patch.as_slice());
+        assert_eq!(
+            &on_disk[patch_off..patch_off + patch.len()],
+            patch.as_slice()
+        );
         assert_eq!(
             &on_disk[patch_off + patch.len()..],
             &original[patch_off + patch.len()..]
@@ -4759,7 +5007,9 @@ mod test {
         let file = make_live_file_inode(&f.ext2, 21, 0, 0, FileFlags::empty(), [0; 15]);
         let block_size = f.ext2.block_size();
         let crossing_off = block_size - 64;
-        let crossing_data = (0..128).map(|i| (i as u8).wrapping_add(1)).collect::<Vec<_>>();
+        let crossing_data = (0..128)
+            .map(|i| (i as u8).wrapping_add(1))
+            .collect::<Vec<_>>();
 
         let mut inner = file.inner.write();
         inner.write_at(0, &vec![0u8; block_size * 2]).unwrap();
@@ -4891,7 +5141,9 @@ mod test {
         assert_eq!(&buf[block_size + 128..], &payload[..128]);
 
         let mut eof_buf = [0x5au8; 16];
-        let eof_read = inner.read_at(inner.desc.size as usize, &mut eof_buf).unwrap();
+        let eof_read = inner
+            .read_at(inner.desc.size as usize, &mut eof_buf)
+            .unwrap();
         assert_eq!(eof_read, 0);
         assert_eq!(eof_buf, [0x5au8; 16]);
 
@@ -4931,7 +5183,14 @@ mod test {
         let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
         let mut ptrs = [0u32; 15];
         ptrs[0] = fail_bid;
-        let file = make_live_file_inode(&io_f.ext2, 30, 64, sectors_per_block, FileFlags::empty(), ptrs);
+        let file = make_live_file_inode(
+            &io_f.ext2,
+            30,
+            64,
+            sectors_per_block,
+            FileFlags::empty(),
+            ptrs,
+        );
 
         let mut buf = [0u8; 32];
         let err = file.inner.read().read_at(0, &mut buf).unwrap_err();
@@ -5001,8 +5260,12 @@ mod test {
 
         let mut inner = file.inner.write();
         inner.get_or_alloc_block(first_double_iblock, true).unwrap();
-        inner.get_or_alloc_block(first_double_iblock + 1, true).unwrap();
-        inner.get_or_alloc_block(first_double_iblock + 2, true).unwrap();
+        inner
+            .get_or_alloc_block(first_double_iblock + 1, true)
+            .unwrap();
+        inner
+            .get_or_alloc_block(first_double_iblock + 2, true)
+            .unwrap();
         inner.desc.size = ((first_double_iblock as usize + 3) * block_size) as u64;
 
         inner
@@ -5072,5 +5335,114 @@ mod test {
 
         assert_eq!(free_after.saturating_sub(free_before), 4);
         assert_eq!(inner.desc.blocks, 0);
+    }
+
+    #[ktest]
+    fn inode_new_initializes_page_cache_capacity() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256).build().unwrap();
+        let block_size = f.ext2.block_size();
+
+        let inode_empty = make_live_file_inode(&f.ext2, 60, 0, 0, FileFlags::empty(), [0; 15]);
+        assert_eq!(inode_empty.inner.read().page_cache.pages().size(), 0);
+
+        let inode_non_empty =
+            make_live_file_inode(&f.ext2, 61, block_size + 1, 0, FileFlags::empty(), [0; 15]);
+        assert_eq!(
+            inode_non_empty.inner.read().page_cache.pages().size(),
+            (block_size + 1).align_up(BLOCK_SIZE)
+        );
+    }
+
+    #[ktest]
+    fn page_cache_backend_npages_matches_desc_size() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256).build().unwrap();
+        let block_size = f.ext2.block_size();
+
+        let inode =
+            make_live_file_inode(&f.ext2, 62, block_size + 1, 0, FileFlags::empty(), [0; 15]);
+        assert_eq!(<Inode as PageCacheBackend>::npages(&inode), 2);
+
+        let inode_zero = make_live_file_inode(&f.ext2, 63, 0, 0, FileFlags::empty(), [0; 15]);
+        assert_eq!(<Inode as PageCacheBackend>::npages(&inode_zero), 0);
+    }
+
+    #[ktest]
+    fn inode_read_write_via_page_cache_path() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .build()
+            .unwrap();
+        let file = make_live_file_inode(&f.ext2, 64, 0, 0, FileFlags::empty(), [0; 15]);
+
+        let payload = b"hello-page-cache";
+        let mut reader = VmReader::from(payload.as_slice()).to_fallible();
+        let written = file.write_at(0, &mut reader).unwrap();
+        assert_eq!(written, payload.len());
+
+        let mut out = vec![0u8; payload.len()];
+        let mut writer = VmWriter::from(out.as_mut_slice()).to_fallible();
+        let read = file.read_at(0, &mut writer).unwrap();
+        assert_eq!(read, payload.len());
+        assert_eq!(out.as_slice(), payload.as_slice());
+    }
+
+    #[ktest]
+    fn inode_write_at_directory_rejected() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let mut reader = VmReader::from(b"x".as_slice()).to_fallible();
+        let err = root.write_at(0, &mut reader).unwrap_err();
+        assert_eq!(err.error(), Errno::EISDIR);
+    }
+
+    #[ktest]
+    fn inode_resize_extend_sparse_without_block_allocation() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .build()
+            .unwrap();
+        let file = make_live_file_inode(&f.ext2, 65, 0, 0, FileFlags::empty(), [0; 15]);
+        let block_size = f.ext2.block_size();
+
+        file.resize(block_size * 2 + 7).unwrap();
+
+        let inner = file.inner.read();
+        assert_eq!(inner.desc.size as usize, block_size * 2 + 7);
+        assert_eq!(inner.desc.blocks, 0);
+        assert!(inner.desc.block_ptrs.iter().all(|ptr| *ptr == 0));
+    }
+
+    #[ktest]
+    fn page_cache_writeback_without_mapping_returns_eio() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .build()
+            .unwrap();
+        let block_size = f.ext2.block_size();
+        let file = make_live_file_inode(&f.ext2, 66, block_size, 0, FileFlags::empty(), [0; 15]);
+
+        {
+            let inner = file.inner.read();
+            inner.page_cache.resize(block_size).unwrap();
+
+            let one_byte = [0x5au8];
+            let mut reader = VmReader::from(one_byte.as_slice()).to_fallible();
+            inner.page_cache.pages().write(0, &mut reader).unwrap();
+
+            let err = inner.page_cache.evict_range(0..block_size).unwrap_err();
+            assert_eq!(err.error(), Errno::EIO);
+        }
     }
 }

@@ -6,28 +6,28 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{fmt, mem::size_of};
 
 use aster_block::{
-    BLOCK_SIZE, BlockDevice, BlockDeviceMeta, SECTOR_SIZE,
     bio::{BioEnqueueError, BioStatus, BioType, SubmittedBio},
     id::Bid,
+    BlockDevice, BlockDeviceMeta, BLOCK_SIZE, SECTOR_SIZE,
 };
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::{
-    mm::{FrameAllocOptions, PAGE_SIZE, Segment, USegment, VmIo, io_util::HasVmReaderWriter},
+    mm::{io_util::HasVmReaderWriter, FrameAllocOptions, Segment, USegment, VmIo, PAGE_SIZE},
     prelude::*,
 };
 
 use super::{
-    SuperBlock,
     block_group::RawGroupDesc,
     fs::{Ext2, ROOT_INO},
     inode::{RawDirEntry, RawInode},
     super_block::{
-        ErrorsBehaviour, FsState, MAGIC_NUM, OsId, RawSuperBlock, RevLevel, SUPER_BLOCK_OFFSET,
+        ErrorsBehaviour, FsState, OsId, RawSuperBlock, RevLevel, MAGIC_NUM, SUPER_BLOCK_OFFSET,
     },
+    SuperBlock,
 };
 use crate::{
     fs::utils::{DirentVisitor, InodeType},
-    prelude::{Errno, Error, Result, return_errno_with_message, *},
+    prelude::{return_errno_with_message, Errno, Error, Result, *},
 };
 
 // ---------------------------------------------------------------------------
@@ -757,7 +757,7 @@ impl Ext2FixtureBuilder {
             group0_free_blocks: None,
             group0_free_inodes: None,
             group0_used_dirs: None,
-            init_root: false,
+            init_root: true,
             filled_block_bitmap: false,
             filled_inode_bitmap: false,
             init_metadata_block_bitmap: false,
@@ -986,16 +986,18 @@ impl Ext2FixtureBuilder {
         let (raw_sb, sb, descs, disk, layout) = self.prepare()?;
         self.write_bitmaps(&sb, &descs, &disk, &layout);
 
+        // Ext2::open reads ROOT_INO during mount, so fixtures that request
+        // root initialization must place a valid root inode on disk first.
+        let root_bid = layout.first_data.saturating_add(1);
+        if self.init_root {
+            let root_raw = make_root_raw_inode(root_bid, sb.block_size());
+            write_raw_inode_to_disk(&sb, &descs, ROOT_INO, &root_raw, &disk);
+        }
+
         let device: Arc<dyn BlockDevice> = self
             .custom_device
             .unwrap_or_else(|| disk.clone() as Arc<dyn BlockDevice>);
         let ext2 = Ext2::open(device)?;
-
-        let root_bid = layout.first_data.saturating_add(1);
-        if self.init_root {
-            let root_raw = make_root_raw_inode(root_bid, sb.block_size());
-            ext2.write_inode_desc(ROOT_INO, &root_raw)?;
-        }
 
         Ok(Ext2Fixture {
             disk,

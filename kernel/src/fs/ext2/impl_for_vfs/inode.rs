@@ -205,11 +205,7 @@ impl VfsInode for Inode {
         return_errno_with_message!(Errno::EOPNOTSUPP, "xattr is not supported yet");
     }
 
-    fn list_xattr(
-        &self,
-        _namespace: XattrNamespace,
-        _list_writer: &mut VmWriter,
-    ) -> Result<usize> {
+    fn list_xattr(&self, _namespace: XattrNamespace, _list_writer: &mut VmWriter) -> Result<usize> {
         return_errno_with_message!(Errno::EOPNOTSUPP, "xattr is not supported yet");
     }
 
