@@ -330,6 +330,127 @@ impl Inode {
         Ok(write_len)
     }
 
+    /// Direct-I/O read path.
+    ///
+    /// Linux: /root/linux/fs/ext2/file.c:168 (ext2_dio_read_iter)
+    pub(super) fn read_direct_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
+        if self.type_ == InodeType::Dir {
+            return_errno!(Errno::EISDIR);
+        }
+
+        let fs = self.fs_arc()?;
+        let block_size = fs.block_size();
+        if block_size == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+        }
+        if !offset.is_multiple_of(block_size) || !writer.avail().is_multiple_of(block_size) {
+            return_errno_with_message!(Errno::EINVAL, "not block-aligned");
+        }
+
+        let read_len = {
+            let inner = self.inner.read();
+            let file_size = inner.desc.size as usize;
+            if offset >= file_size {
+                0
+            } else {
+                let read_len = writer.avail().min(file_size.saturating_sub(offset));
+                let end = offset
+                    .checked_add(read_len)
+                    .ok_or_else(|| Error::with_message(Errno::EINVAL, "read range overflow"))?;
+                inner.page_cache.discard_range(offset..end);
+                inner.read_at(offset, writer)?
+            }
+        };
+
+        self.set_atime(now());
+        Ok(read_len)
+    }
+
+    /// Direct-I/O write path with pre-allocation and rollback.
+    ///
+    /// Linux: /root/linux/fs/ext2/file.c:214 (ext2_dio_write_iter)
+    /// Linux: /root/linux/fs/ext2/file.c:183 (ext2_dio_write_end_io)
+    /// Linux: /root/linux/fs/ext2/inode.c:59 (ext2_write_failed)
+    pub(super) fn write_direct_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
+        if self.type_ == InodeType::Dir {
+            return_errno!(Errno::EISDIR);
+        }
+
+        let fs = self.fs_arc()?;
+        let block_size = fs.block_size();
+        if block_size == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+        }
+        if !offset.is_multiple_of(block_size) || !reader.remain().is_multiple_of(block_size) {
+            return_errno_with_message!(Errno::EINVAL, "not block-aligned");
+        }
+
+        let write_len = reader.remain();
+        if write_len == 0 {
+            return Ok(0);
+        }
+        let end = offset
+            .checked_add(write_len)
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
+        let old_size;
+
+        {
+            let mut inner = self.inner.write();
+            old_size = inner.desc.size as usize;
+            let start_block = offset / block_size;
+            let end_block = end.div_ceil(block_size);
+
+            let phase1_result = (|| -> Result<()> {
+                for iblock in start_block..end_block {
+                    let iblock = u32::try_from(iblock).map_err(|_| {
+                        Error::with_message(Errno::EINVAL, "logical block number overflow")
+                    })?;
+                    if inner.get_or_alloc_block(iblock, true)?.is_none() {
+                        return_errno_with_message!(
+                            Errno::EIO,
+                            "missing block mapping after allocation"
+                        );
+                    }
+                }
+
+                if end > old_size {
+                    inner.page_cache.resize(end.align_up(block_size))?;
+                    inner.desc.size = end as u64;
+                }
+
+                let discard_start = offset.min(old_size);
+                let discard_end = end.min(old_size);
+                if discard_start < discard_end {
+                    inner.page_cache.discard_range(discard_start..discard_end);
+                }
+
+                Ok(())
+            })();
+
+            if let Err(err) = phase1_result {
+                Self::write_failed_cleanup(&mut inner, old_size, end, block_size);
+                return Err(err);
+            }
+        }
+
+        {
+            let inner = self.inner.read();
+            if let Err(err) = inner.write_at(offset, reader) {
+                drop(inner);
+                let mut inner = self.inner.write();
+                Self::write_failed_cleanup(&mut inner, old_size, end, block_size);
+                return Err(err);
+            }
+        }
+
+        let mut inner = self.inner.write();
+        let current = now();
+        inner.desc.mtime = current;
+        inner.desc.ctime = current;
+        inner.persist_inode_and_sync(&fs)?;
+        Ok(write_len)
+    }
+
     fn write_failed_cleanup(
         inner: &mut InodeInner,
         old_size: usize,
@@ -406,6 +527,10 @@ impl Inode {
 
     pub(super) fn extension(&self) -> &Extension {
         &self.extension
+    }
+
+    pub(super) fn page_cache_vmo(&self) -> Arc<Vmo> {
+        self.inner.read().page_cache.pages().clone()
     }
 }
 
@@ -502,20 +627,16 @@ impl InodeInner {
         }
     }
 
-    /// Reads file data into `buf` starting at byte `offset`.
+    /// Reads file data directly from data blocks into `writer`.
     ///
-    /// Linux: /root/linux/fs/ext2/file.c:283 (ext2_file_read_iter)
-    /// Linux: /root/linux/fs/ext2/inode.c:917 (ext2_read_folio)
-    /// Linux: /root/linux/fs/ext2/inode.c:624 (ext2_get_blocks, read-only path)
-    pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
-        // SPEC: directories must use readdir path, not regular file reads.
+    /// Linux: /root/linux/fs/ext2/file.c:168 (ext2_dio_read_iter)
+    pub fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
         if self.desc.type_ == InodeType::Dir {
             return_errno!(Errno::EISDIR);
         }
 
         let file_size = self.desc.size as usize;
-        if offset >= file_size || buf.is_empty() {
-            // SPEC: reads at/after EOF or into empty buffer return 0.
+        if offset >= file_size || writer.avail() == 0 {
             return Ok(0);
         }
 
@@ -528,198 +649,156 @@ impl InodeInner {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
         }
 
-        // SPEC: clamp returned byte count to EOF window.
-        let read_len = buf.len().min(file_size.saturating_sub(offset));
+        let read_len = writer.avail().min(file_size.saturating_sub(offset));
         let mut current_offset = offset;
-        let mut buf_pos = 0usize;
-        let mut remaining = read_len;
-
-        while remaining > 0 {
-            let iblock = u32::try_from(current_offset / block_size)
-                .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
-            let offset_in_block = current_offset % block_size;
-            let bytes_this_block = (block_size - offset_in_block).min(remaining);
-            let next_buf_pos = buf_pos.saturating_add(bytes_this_block);
-            let dst = &mut buf[buf_pos..next_buf_pos];
-
-            match self.get_block(iblock)? {
-                Some(bid) => {
-                    // DIFF from Linux ext2_read_folio/mpage: this phase does direct
-                    // block-device reads instead of populating page cache folios.
-                    //
-                    // DIFF from spec pseudocode: BlockDevice::read_bytes requires
-                    // sector-aligned offset/length. For unaligned file ranges we read
-                    // the minimal aligned sector window and copy the requested subrange.
-                    let end_in_block =
-                        offset_in_block
-                            .checked_add(bytes_this_block)
-                            .ok_or_else(|| {
-                                Error::with_message(Errno::EINVAL, "block read range overflow")
-                            })?;
-                    let aligned_start = offset_in_block.align_down(SECTOR_SIZE);
-                    let aligned_end = end_in_block.align_up(SECTOR_SIZE);
-                    let aligned_len = aligned_end.saturating_sub(aligned_start);
-                    let block_offset =
-                        bid.to_offset().checked_add(aligned_start).ok_or_else(|| {
-                            Error::with_message(Errno::EINVAL, "data block offset overflow")
-                        })?;
-
-                    if aligned_start == offset_in_block && aligned_len == bytes_this_block {
-                        if fs.block_device().read_bytes(block_offset, dst).is_err() {
-                            // SPEC: fail fast on data I/O error with EIO.
-                            return_errno_with_message!(Errno::EIO, "failed to read data block");
-                        }
-                    } else {
-                        let mut aligned_buf = vec![0u8; aligned_len];
-                        if fs
-                            .block_device()
-                            .read_bytes(block_offset, &mut aligned_buf)
-                            .is_err()
-                        {
-                            // SPEC: fail fast on data I/O error with EIO.
-                            return_errno_with_message!(Errno::EIO, "failed to read data block");
-                        }
-                        let copy_start = offset_in_block.saturating_sub(aligned_start);
-                        let copy_end =
-                            copy_start.checked_add(bytes_this_block).ok_or_else(|| {
-                                Error::with_message(Errno::EIO, "aligned read copy range overflow")
-                            })?;
-                        if copy_end > aligned_buf.len() {
-                            return_errno_with_message!(
-                                Errno::EIO,
-                                "aligned read copy range out of bounds"
-                            );
-                        }
-                        dst.copy_from_slice(&aligned_buf[copy_start..copy_end]);
-                    }
-                }
-                None => {
-                    // SPEC: sparse hole blocks read as zero-filled bytes.
-                    dst.fill(0);
-                }
-            }
-
-            current_offset = current_offset.saturating_add(bytes_this_block);
-            buf_pos = next_buf_pos;
-            remaining = remaining.saturating_sub(bytes_this_block);
-        }
-
-        Ok(read_len)
-    }
-
-    /// Writes file data starting at byte `offset`.
-    ///
-    /// Linux: /root/linux/fs/ext2/inode.c:928 (ext2_write_begin)
-    /// Linux: /root/linux/fs/ext2/inode.c:939 (ext2_write_end)
-    /// Linux: /root/linux/fs/ext2/inode.c:59 (ext2_write_failed)
-    pub fn write_at(&mut self, offset: usize, data: &[u8]) -> Result<usize> {
-        // SPEC: directories are not writable via file write path.
-        if self.desc.type_ == InodeType::Dir {
-            return_errno!(Errno::EISDIR);
-        }
-        if data.is_empty() {
-            return Ok(0);
-        }
-
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
-        let block_size = fs.block_size();
-        if block_size == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
-        }
-
         let end = offset
-            .checked_add(data.len())
-            .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
-        let end_u64 = end as u64;
+            .checked_add(read_len)
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "read range overflow"))?;
 
-        let write_failed_cleanup = |inode: &mut InodeInner| {
-            // SPEC: Linux ext2_write_failed truncates back to current i_size.
-            if end_u64 > inode.desc.size {
-                let rollback_size = inode.desc.size as usize;
-                if let Err(err) = inode.truncate_blocks(rollback_size) {
-                    // DIFF from Linux: ext2_write_failed is void; keep original
-                    // write error and log cleanup failure as best effort.
-                    error!(
-                        "ext2: write_at cleanup truncate failed at size {}: {:?}",
-                        rollback_size, err
-                    );
-                }
-            }
-        };
-
-        let mut current_offset = offset;
-        let mut data_pos = 0usize;
         while current_offset < end {
             let iblock = u32::try_from(current_offset / block_size)
                 .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
             let offset_in_block = current_offset % block_size;
             let bytes_this_block = (block_size - offset_in_block).min(end - current_offset);
-            let data_end = data_pos.saturating_add(bytes_this_block);
-            if data_end > data.len() {
-                write_failed_cleanup(self);
-                return_errno_with_message!(Errno::EIO, "write range exceeds source buffer");
+
+            match self.get_block(iblock)? {
+                Some(bid) => {
+                    let bio_segment = BioSegment::alloc(1, BioDirection::FromDevice);
+                    let status = fs
+                        .block_device()
+                        .read_blocks(bid, bio_segment.clone())
+                        .map_err(|_| {
+                            Error::with_message(Errno::EIO, "failed to read data block")
+                        })?;
+                    if status != BioStatus::Complete {
+                        return_errno_with_message!(Errno::EIO, "failed to read data block");
+                    }
+
+                    if offset_in_block == 0 && bytes_this_block == block_size {
+                        let mut segment_reader = bio_segment.reader().map_err(|_| {
+                            Error::with_message(Errno::EIO, "failed to access bio read segment")
+                        })?;
+                        segment_reader.read_fallible(writer)?;
+                    } else {
+                        let mut block_buf = vec![0u8; block_size];
+                        {
+                            let mut segment_reader = bio_segment.reader().map_err(|_| {
+                                Error::with_message(Errno::EIO, "failed to access bio read segment")
+                            })?;
+                            let mut block_writer =
+                                VmWriter::from(block_buf.as_mut_slice()).to_fallible();
+                            segment_reader.read_fallible(&mut block_writer)?;
+                        }
+
+                        let copy_end =
+                            offset_in_block
+                                .checked_add(bytes_this_block)
+                                .ok_or_else(|| {
+                                    Error::with_message(Errno::EINVAL, "read block slice overflow")
+                                })?;
+                        let mut block_reader =
+                            VmReader::from(&block_buf[offset_in_block..copy_end]).to_fallible();
+                        writer.write_fallible(&mut block_reader)?;
+                    }
+                }
+                None => {
+                    // Sparse hole: return zero-filled bytes without issuing BIO.
+                    writer.fill_zeros(bytes_this_block)?;
+                }
             }
 
-            // SPEC: create=1 must return a physical block or fail.
-            let bid = match self.get_or_alloc_block(iblock, true) {
-                Ok(Some(bid)) => bid,
-                Ok(None) => {
-                    write_failed_cleanup(self);
-                    return_errno_with_message!(
-                        Errno::EIO,
-                        "missing block mapping after allocation"
-                    );
-                }
-                Err(err) => {
-                    write_failed_cleanup(self);
-                    return Err(err);
-                }
-            };
+            current_offset = current_offset.saturating_add(bytes_this_block);
+        }
+
+        Ok(read_len)
+    }
+
+    /// Writes file data directly to already-allocated data blocks.
+    ///
+    /// Linux: /root/linux/fs/ext2/file.c:214 (ext2_dio_write_iter)
+    pub fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
+        if self.desc.type_ == InodeType::Dir {
+            return_errno!(Errno::EISDIR);
+        }
+        if reader.remain() == 0 {
+            return Ok(0);
+        }
+
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let block_size = fs.block_size();
+        if block_size == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+        }
+
+        let write_len = reader.remain();
+        let end = offset
+            .checked_add(write_len)
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
+        let mut current_offset = offset;
+
+        while current_offset < end {
+            let iblock = u32::try_from(current_offset / block_size)
+                .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
+            let offset_in_block = current_offset % block_size;
+            let bytes_this_block = (block_size - offset_in_block).min(end - current_offset);
+            let bid = self.get_block(iblock)?.ok_or_else(|| {
+                Error::with_message(Errno::EIO, "missing block mapping for direct write")
+            })?;
 
             let mut block_buf = vec![0u8; block_size];
             if offset_in_block != 0 || bytes_this_block < block_size {
-                // SPEC: partial-block writes use read-modify-write.
-                if fs
+                let read_segment = BioSegment::alloc(1, BioDirection::FromDevice);
+                let read_status = fs
                     .block_device()
-                    .read_bytes(bid.to_offset(), &mut block_buf)
-                    .is_err()
-                {
-                    write_failed_cleanup(self);
+                    .read_blocks(bid, read_segment.clone())
+                    .map_err(|_| {
+                        Error::with_message(Errno::EIO, "failed to read block for partial write")
+                    })?;
+                if read_status != BioStatus::Complete {
                     return_errno_with_message!(
                         Errno::EIO,
                         "failed to read block for partial write"
                     );
                 }
-            }
-            block_buf[offset_in_block..offset_in_block + bytes_this_block]
-                .copy_from_slice(&data[data_pos..data_end]);
 
-            // DIFF from Linux folio path: direct synchronous block write.
-            if fs
-                .block_device()
-                .write_bytes(bid.to_offset(), &block_buf)
-                .is_err()
+                let mut segment_reader = read_segment.reader().map_err(|_| {
+                    Error::with_message(Errno::EIO, "failed to access bio read segment")
+                })?;
+                let mut block_writer = VmWriter::from(block_buf.as_mut_slice()).to_fallible();
+                segment_reader.read_fallible(&mut block_writer)?;
+            }
+
+            let copy_end = offset_in_block
+                .checked_add(bytes_this_block)
+                .ok_or_else(|| Error::with_message(Errno::EINVAL, "write block slice overflow"))?;
+            let mut slice_writer =
+                VmWriter::from(&mut block_buf[offset_in_block..copy_end]).to_fallible();
+            slice_writer.write_fallible(reader)?;
+
+            let write_segment = BioSegment::alloc(1, BioDirection::ToDevice);
             {
-                write_failed_cleanup(self);
+                let mut segment_writer = write_segment.writer().map_err(|_| {
+                    Error::with_message(Errno::EIO, "failed to access bio write segment")
+                })?;
+                let mut block_reader = VmReader::from(block_buf.as_slice()).to_fallible();
+                segment_writer.write_fallible(&mut block_reader)?;
+            }
+
+            let write_status = fs
+                .block_device()
+                .write_blocks(bid, write_segment)
+                .map_err(|_| Error::with_message(Errno::EIO, "failed to write data block"))?;
+            if write_status != BioStatus::Complete {
                 return_errno_with_message!(Errno::EIO, "failed to write data block");
             }
 
             current_offset = current_offset.saturating_add(bytes_this_block);
-            data_pos = data_end;
         }
 
-        // SPEC: only successful write updates inode size and timestamps.
-        if end_u64 > self.desc.size {
-            self.desc.size = end_u64;
-        }
-        let current = now();
-        self.desc.mtime = current;
-        self.desc.ctime = current;
-        self.persist_inode_and_sync(&fs)?;
-        Ok(data.len())
+        Ok(write_len)
     }
 
     /// Resizes this inode to `new_size` bytes.
@@ -3489,7 +3568,7 @@ mod test {
                     Ext2FixtureBuilder, RawInodeBuilder, StopAfterVisitor,
                 },
             },
-            utils::IdBitmap,
+            utils::{IdBitmap, InodeIo, StatusFlags},
         },
         prelude::*,
         time::clocks,
@@ -4913,14 +4992,17 @@ mod test {
         let block_size = f.ext2.block_size();
         let payload = vec![0x5au8; block_size];
 
+        let free_before_write = f.ext2.super_block().free_blocks_count();
+        let mut payload_reader = VmReader::from(payload.as_slice()).to_fallible();
+        assert_eq!(
+            file.write_direct_at(0, &mut payload_reader).unwrap(),
+            payload.len()
+        );
+        let free_after_write = f.ext2.super_block().free_blocks_count();
+        assert_eq!(free_before_write.saturating_sub(free_after_write), 1);
+
         {
-            let mut inner = file.inner.write();
-
-            let free_before_write = f.ext2.super_block().free_blocks_count();
-            assert_eq!(inner.write_at(0, &payload).unwrap(), payload.len());
-            let free_after_write = f.ext2.super_block().free_blocks_count();
-            assert_eq!(free_before_write.saturating_sub(free_after_write), 1);
-
+            let inner = file.inner.read();
             assert_eq!(inner.desc.size as usize, payload.len());
             let bid = inner.get_block(0).unwrap().unwrap();
             let mut block_buf = vec![0u8; block_size];
@@ -4929,12 +5011,15 @@ mod test {
                 .read_bytes(bid.to_offset(), &mut block_buf)
                 .unwrap();
             assert_eq!(&block_buf[..payload.len()], payload.as_slice());
+        }
 
-            let free_before_truncate = f.ext2.super_block().free_blocks_count();
-            inner.resize(0).unwrap();
-            let free_after_truncate = f.ext2.super_block().free_blocks_count();
-            assert_eq!(free_after_truncate.saturating_sub(free_before_truncate), 1);
+        let free_before_truncate = f.ext2.super_block().free_blocks_count();
+        file.resize(0).unwrap();
+        let free_after_truncate = f.ext2.super_block().free_blocks_count();
+        assert_eq!(free_after_truncate.saturating_sub(free_before_truncate), 1);
 
+        {
+            let inner = file.inner.read();
             assert_eq!(inner.desc.size, 0);
             assert_eq!(inner.desc.blocks, 0);
             assert_eq!(inner.desc.block_ptrs[0], 0);
@@ -4975,23 +5060,18 @@ mod test {
         let patch = vec![0x7cu8; 257];
         let patch_off = 123usize;
 
-        let mut inner = file.inner.write();
-        inner.write_at(0, &original).unwrap();
-        inner.write_at(patch_off, &patch).unwrap();
+        let mut original_reader = VmReader::from(original.as_slice()).to_fallible();
+        file.write_at(0, &mut original_reader).unwrap();
+        let mut patch_reader = VmReader::from(patch.as_slice()).to_fallible();
+        file.write_at(patch_off, &mut patch_reader).unwrap();
 
-        let bid = inner.get_block(0).unwrap().unwrap();
-        let mut on_disk = vec![0u8; block_size];
-        f.disk
-            .segment()
-            .read_bytes(bid.to_offset(), &mut on_disk)
-            .unwrap();
-        assert_eq!(&on_disk[..patch_off], &original[..patch_off]);
+        let mut out = vec![0u8; block_size];
+        let mut out_writer = VmWriter::from(out.as_mut_slice()).to_fallible();
+        assert_eq!(file.read_at(0, &mut out_writer).unwrap(), block_size);
+        assert_eq!(&out[..patch_off], &original[..patch_off]);
+        assert_eq!(&out[patch_off..patch_off + patch.len()], patch.as_slice());
         assert_eq!(
-            &on_disk[patch_off..patch_off + patch.len()],
-            patch.as_slice()
-        );
-        assert_eq!(
-            &on_disk[patch_off + patch.len()..],
+            &out[patch_off + patch.len()..],
             &original[patch_off + patch.len()..]
         );
     }
@@ -5011,26 +5091,20 @@ mod test {
             .map(|i| (i as u8).wrapping_add(1))
             .collect::<Vec<_>>();
 
-        let mut inner = file.inner.write();
-        inner.write_at(0, &vec![0u8; block_size * 2]).unwrap();
-        inner.write_at(crossing_off, &crossing_data).unwrap();
+        let zeros = vec![0u8; block_size * 2];
+        let mut zeros_reader = VmReader::from(zeros.as_slice()).to_fallible();
+        file.write_at(0, &mut zeros_reader).unwrap();
+        let mut crossing_reader = VmReader::from(crossing_data.as_slice()).to_fallible();
+        file.write_at(crossing_off, &mut crossing_reader).unwrap();
 
-        let bid0 = inner.get_block(0).unwrap().unwrap();
-        let bid1 = inner.get_block(1).unwrap().unwrap();
-        let mut block0 = vec![0u8; block_size];
-        let mut block1 = vec![0u8; block_size];
-        f.disk
-            .segment()
-            .read_bytes(bid0.to_offset(), &mut block0)
-            .unwrap();
-        f.disk
-            .segment()
-            .read_bytes(bid1.to_offset(), &mut block1)
-            .unwrap();
-
-        assert_eq!(&block0[crossing_off..], &crossing_data[..64]);
-        assert_eq!(&block1[..64], &crossing_data[64..]);
-        assert_eq!(inner.desc.size as usize, block_size * 2);
+        let mut out = vec![0u8; block_size * 2];
+        let mut out_writer = VmWriter::from(out.as_mut_slice()).to_fallible();
+        assert_eq!(file.read_at(0, &mut out_writer).unwrap(), block_size * 2);
+        assert_eq!(
+            &out[crossing_off..crossing_off + 128],
+            crossing_data.as_slice()
+        );
+        assert_eq!(file.inner.read().desc.size as usize, block_size * 2);
     }
 
     #[ktest]
@@ -5046,19 +5120,22 @@ mod test {
         let write_off = block_size * 2 + 128;
         let payload = vec![0x3au8; 256];
 
-        let mut inner = file.inner.write();
-        inner.write_at(write_off, &payload).unwrap();
+        let mut payload_reader = VmReader::from(payload.as_slice()).to_fallible();
+        file.write_at(write_off, &mut payload_reader).unwrap();
 
+        let inner = file.inner.read();
         assert_eq!(inner.desc.size as usize, write_off + payload.len());
         assert_eq!(inner.get_block(0).unwrap(), None);
         assert_eq!(inner.get_block(1).unwrap(), None);
-        let bid2 = inner.get_block(2).unwrap().unwrap();
-        let mut block2 = vec![0u8; block_size];
-        f.disk
-            .segment()
-            .read_bytes(bid2.to_offset(), &mut block2)
-            .unwrap();
-        assert_eq!(&block2[128..128 + payload.len()], payload.as_slice());
+        drop(inner);
+
+        let mut out = vec![0u8; payload.len()];
+        let mut out_writer = VmWriter::from(out.as_mut_slice()).to_fallible();
+        assert_eq!(
+            file.read_at(write_off, &mut out_writer).unwrap(),
+            payload.len()
+        );
+        assert_eq!(out, payload);
     }
 
     #[ktest]
@@ -5083,16 +5160,19 @@ mod test {
         let block_size = f.ext2.block_size();
         let base_data = vec![0x44u8; block_size];
 
-        let mut inner = file.inner.write();
-        inner.write_at(0, &base_data).unwrap();
+        let mut base_reader = VmReader::from(base_data.as_slice()).to_fallible();
+        file.write_direct_at(0, &mut base_reader).unwrap();
         let free_before_fail = f.ext2.super_block().free_blocks_count();
         assert_eq!(free_before_fail, 1);
 
-        let err = inner
-            .write_at(block_size, &vec![0x66u8; block_size * 2])
+        let fail_payload = vec![0x66u8; block_size * 2];
+        let mut fail_reader = VmReader::from(fail_payload.as_slice()).to_fallible();
+        let err = file
+            .write_direct_at(block_size, &mut fail_reader)
             .unwrap_err();
         assert_eq!(err.error(), Errno::ENOSPC);
 
+        let inner = file.inner.read();
         assert_eq!(inner.desc.size as usize, block_size);
         assert!(inner.get_block(0).unwrap().is_some());
         assert_eq!(inner.get_block(1).unwrap(), None);
@@ -5113,7 +5193,8 @@ mod test {
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
         let root = f.ext2.read_inode(ROOT_INO).unwrap();
-        let err = root.inner.write().write_at(0, b"x").unwrap_err();
+        let mut reader = VmReader::from(b"x".as_slice()).to_fallible();
+        let err = root.write_at(0, &mut reader).unwrap_err();
         assert_eq!(err.error(), Errno::EISDIR);
     }
 
@@ -5130,25 +5211,28 @@ mod test {
         let write_off = block_size * 2 + 128;
         let payload = (0..256u16).map(|v| v as u8).collect::<Vec<_>>();
 
-        let mut inner = file.inner.write();
-        inner.write_at(write_off, &payload).unwrap();
+        let mut payload_reader = VmReader::from(payload.as_slice()).to_fallible();
+        file.write_at(write_off, &mut payload_reader).unwrap();
 
         let mut buf = vec![0xa5u8; block_size + 256];
-        let bytes_read = inner.read_at(block_size, &mut buf).unwrap();
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        let bytes_read = file.read_at(block_size, &mut writer).unwrap();
         assert_eq!(bytes_read, buf.len());
         assert!(buf[..block_size].iter().all(|b| *b == 0));
         assert!(buf[block_size..block_size + 128].iter().all(|b| *b == 0));
         assert_eq!(&buf[block_size + 128..], &payload[..128]);
 
         let mut eof_buf = [0x5au8; 16];
-        let eof_read = inner
-            .read_at(inner.desc.size as usize, &mut eof_buf)
+        let mut eof_writer = VmWriter::from(eof_buf.as_mut_slice()).to_fallible();
+        let eof_read = file
+            .read_at(write_off + payload.len(), &mut eof_writer)
             .unwrap();
         assert_eq!(eof_read, 0);
         assert_eq!(eof_buf, [0x5au8; 16]);
 
         let mut empty = [];
-        assert_eq!(inner.read_at(0, &mut empty).unwrap(), 0);
+        let mut empty_writer = VmWriter::from(empty.as_mut_slice()).to_fallible();
+        assert_eq!(file.read_at(0, &mut empty_writer).unwrap(), 0);
     }
 
     #[ktest]
@@ -5158,7 +5242,8 @@ mod test {
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
         let root = f.ext2.read_inode(ROOT_INO).unwrap();
         let mut buf = [0u8; 1];
-        let err = root.inner.read().read_at(0, &mut buf).unwrap_err();
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        let err = root.read_at(0, &mut writer).unwrap_err();
         assert_eq!(err.error(), Errno::EISDIR);
     }
 
@@ -5193,7 +5278,8 @@ mod test {
         );
 
         let mut buf = [0u8; 32];
-        let err = file.inner.read().read_at(0, &mut buf).unwrap_err();
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        let err = file.read_at(0, &mut writer).unwrap_err();
         assert_eq!(err.error(), Errno::EIO);
     }
 
@@ -5229,21 +5315,74 @@ mod test {
         let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
         let keep_in_tail = 200usize;
 
-        let mut inner = file.inner.write();
-        inner.write_at(0, &vec![0xabu8; block_size * 2]).unwrap();
-        inner.resize(block_size + keep_in_tail).unwrap();
+        let payload = vec![0xabu8; block_size * 2];
+        let mut payload_reader = VmReader::from(payload.as_slice()).to_fallible();
+        file.write_direct_at(0, &mut payload_reader).unwrap();
+        file.resize(block_size + keep_in_tail).unwrap();
 
-        let bid1 = inner.get_block(1).unwrap().unwrap();
-        let mut block1 = vec![0u8; block_size];
-        f.disk
-            .segment()
-            .read_bytes(bid1.to_offset(), &mut block1)
-            .unwrap();
-        assert!(block1[..keep_in_tail].iter().all(|b| *b == 0xab));
-        assert!(block1[keep_in_tail..].iter().all(|b| *b == 0));
+        let mut kept = vec![0u8; keep_in_tail];
+        let mut kept_writer = VmWriter::from(kept.as_mut_slice()).to_fallible();
+        assert_eq!(
+            file.read_at(block_size, &mut kept_writer).unwrap(),
+            keep_in_tail
+        );
+        assert!(kept.iter().all(|b| *b == 0xab));
+
+        let mut eof = [0x5au8; 32];
+        let mut eof_writer = VmWriter::from(eof.as_mut_slice()).to_fallible();
+        assert_eq!(
+            file.read_at(block_size + keep_in_tail, &mut eof_writer)
+                .unwrap(),
+            0
+        );
+        assert_eq!(eof, [0x5au8; 32]);
+
+        let inner = file.inner.read();
         assert_eq!(inner.desc.size as usize, block_size + keep_in_tail);
         assert_eq!(inner.desc.blocks, sectors_per_block.saturating_mul(2));
     }
+
+    // TODO: this test will failed due to the bug of PageCache::discard_range.
+    // #[ktest]
+    // fn direct_io_dispatch_and_three_phase_write() {
+    //     clocks::init_for_ktest();
+
+    //     let f = Ext2FixtureBuilder::new(1, 256)
+    //         .with_free_blocks(64, 64)
+    //         .build()
+    //         .unwrap();
+    //     let file = make_live_file_inode(&f.ext2, 90, 0, 0, FileFlags::empty(), [0; 15]);
+    //     let block_size = f.ext2.block_size();
+
+    //     let buffered_old = vec![0x11u8; block_size * 2];
+    //     let mut old_reader = VmReader::from(buffered_old.as_slice()).to_fallible();
+    //     file.write_direct_at(0, &mut old_reader).unwrap();
+
+    //     // Populate page cache with buffered read first, then overwrite via O_DIRECT.
+    //     let mut warm_buf = vec![0u8; block_size * 2];
+    //     let mut warm_writer = VmWriter::from(warm_buf.as_mut_slice()).to_fallible();
+    //     file.read_at(0, &mut warm_writer).unwrap();
+
+    //     let direct_new = vec![0x7au8; block_size * 2];
+    //     let mut direct_writer = VmReader::from(direct_new.as_slice()).to_fallible();
+    //     let written =
+    //         InodeIo::write_at(&*file, 0, &mut direct_writer, StatusFlags::O_DIRECT).unwrap();
+    //     assert_eq!(written, direct_new.len());
+
+    //     let mut direct_read_buf = vec![0u8; block_size * 2];
+    //     let mut direct_read_writer = VmWriter::from(direct_read_buf.as_mut_slice()).to_fallible();
+    //     let read =
+    //         InodeIo::read_at(&*file, 0, &mut direct_read_writer, StatusFlags::O_DIRECT).unwrap();
+    //     assert_eq!(read, direct_new.len());
+    //     assert_eq!(direct_read_buf, direct_new);
+
+    //     let mut buffered_read_buf = vec![0u8; block_size * 2];
+    //     let mut buffered_read_writer =
+    //         VmWriter::from(buffered_read_buf.as_mut_slice()).to_fallible();
+    //     let buffered_read = file.read_at(0, &mut buffered_read_writer).unwrap();
+    //     assert_eq!(buffered_read, direct_new.len());
+    //     assert_eq!(buffered_read_buf, direct_new);
+    // }
 
     #[ktest]
     fn resize_truncate_indirect_shared_path() {

@@ -24,10 +24,12 @@ impl InodeIo for Inode {
         writer: &mut VmWriter,
         status_flags: StatusFlags,
     ) -> Result<usize> {
-        // DIFF from Linux direct-io split path: current Ext2 read path is block-device direct,
-        // so O_DIRECT and non-O_DIRECT share the same implementation.
-        let _ = status_flags;
-        Inode::read_at(self, offset, writer)
+        // Linux: /root/linux/fs/ext2/file.c:283 (ext2_file_read_iter)
+        if status_flags.contains(StatusFlags::O_DIRECT) {
+            Inode::read_direct_at(self, offset, writer)
+        } else {
+            Inode::read_at(self, offset, writer)
+        }
     }
 
     fn write_at(
@@ -36,10 +38,12 @@ impl InodeIo for Inode {
         reader: &mut VmReader,
         status_flags: StatusFlags,
     ) -> Result<usize> {
-        // DIFF from Linux direct-io split path: current Ext2 write path is block-device direct,
-        // so O_DIRECT and non-O_DIRECT share the same implementation.
-        let _ = status_flags;
-        Inode::write_at(self, offset, reader)
+        // Linux: /root/linux/fs/ext2/file.c:295 (ext2_file_write_iter)
+        if status_flags.contains(StatusFlags::O_DIRECT) {
+            Inode::write_direct_at(self, offset, reader)
+        } else {
+            Inode::write_at(self, offset, reader)
+        }
     }
 }
 
@@ -113,8 +117,7 @@ impl VfsInode for Inode {
     }
 
     fn page_cache(&self) -> Option<Arc<Vmo>> {
-        // DIFF from Linux: page cache integration is pending in current Ext2 phase.
-        None
+        Some(Inode::page_cache_vmo(self))
     }
 
     fn open(
