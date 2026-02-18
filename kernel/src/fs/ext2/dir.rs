@@ -178,7 +178,7 @@ mod test {
     }
 
     #[ktest]
-    fn dir_entry_parse_ok() {
+    fn parse_valid_entries_ok() {
         // Linux helper semantics: rec_len decode and EXT2_DIR_REC_LEN rounding.
         assert_eq!(DirEntry::rec_len_from_disk(0x1234), 0x1234);
         assert_eq!(DirEntry::dir_rec_len(0), 8);
@@ -240,7 +240,7 @@ mod test {
     }
 
     #[ktest]
-    fn dir_entry_parse_error() {
+    fn parse_invalid_entries_returns_err() {
         // validate() failures: short record, unaligned rec_len, name/len mismatch,
         // record spanning limit, and inode out of range.
         assert_eq!(

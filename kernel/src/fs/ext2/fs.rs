@@ -696,7 +696,7 @@ mod test {
     }
 
     #[ktest]
-    fn sync_metadata_flushes_primary_and_backup_copies() {
+    fn sync_metadata_writes_primary_and_backup() {
         let fixture = Ext2FixtureBuilder::new(3, 512)
             .with_free_blocks(0, 10)
             .build()
@@ -765,7 +765,7 @@ mod test {
     }
 
     #[ktest]
-    fn block_alloc_free_ok() {
+    fn block_alloc_and_free_single_group_ok() {
         // Happy path: allocate a contiguous run and then free it back.
         let f = Ext2FixtureBuilder::new(1, 128)
             .with_free_blocks(31, 31)
@@ -803,7 +803,7 @@ mod test {
     }
 
     #[ktest]
-    fn block_alloc_free_error_cases() {
+    fn block_alloc_and_free_invalid_returns_err() {
         // No-space and invalid-request checks.
         let f_nospc = Ext2FixtureBuilder::new(1, 128)
             .with_free_blocks(0, 0)
@@ -854,7 +854,7 @@ mod test {
     }
 
     #[ktest]
-    fn inode_alloc_free_ok() {
+    fn inode_alloc_and_free_single_group_ok() {
         // Allocate one directory inode and verify bitmap/counter transitions.
         let f = Ext2FixtureBuilder::new(1, 128)
             .with_free_inodes(16, 16)
@@ -890,7 +890,7 @@ mod test {
     }
 
     #[ktest]
-    fn inode_alloc_free_error_cases() {
+    fn inode_alloc_and_free_invalid_returns_err() {
         // No free inode counter means ENOSPC without bitmap scan.
         let f_nospc = Ext2FixtureBuilder::new(1, 128)
             .with_free_inodes(0, 0)
@@ -956,7 +956,7 @@ mod test {
     }
 
     #[ktest]
-    fn create_inode_initializes_descriptor() {
+    fn alloc_inode_initializes_descriptor_on_disk() {
         let fixture = Ext2FixtureBuilder::new(1, 128)
             .with_free_inodes(16, 16)
             .with_reserved_inode_bitmap()
@@ -997,7 +997,7 @@ mod test {
     }
 
     #[ktest]
-    fn group_bounds_ok() {
+    fn group_bounds_first_last_block_ok() {
         let sb = make_valid_super_block(3);
 
         assert_eq!(sb.group_first_block_no(0), 1);
@@ -1012,7 +1012,7 @@ mod test {
     }
 
     #[ktest]
-    fn reject_bad_bitmap() {
+    fn check_group_desc_bad_bitmap_returns_einval() {
         let sb = make_valid_super_block(2);
         let mut descs = (0..sb.block_groups_count() as usize)
             .map(|idx| make_valid_group_desc(&sb, idx))
@@ -1026,7 +1026,7 @@ mod test {
     }
 
     #[ktest]
-    fn reject_bad_inode_table() {
+    fn check_group_desc_bad_inode_table_returns_einval() {
         let sb = make_valid_super_block(2);
         let mut descs = (0..sb.block_groups_count() as usize)
             .map(|idx| make_valid_group_desc(&sb, idx))
@@ -1044,7 +1044,7 @@ mod test {
     }
 
     #[ktest]
-    fn load_descriptors_ok() {
+    fn load_group_descs_valid_image_ok() {
         let sb = make_valid_super_block(3);
         let descs = (0..sb.block_groups_count() as usize)
             .map(|idx| make_valid_group_desc(&sb, idx))
@@ -1061,7 +1061,7 @@ mod test {
     }
 
     #[ktest]
-    fn load_descriptors_io_error() {
+    fn load_group_descs_io_error_returns_eio() {
         let sb = make_valid_super_block(1);
         let disk = ErrorBioDisk::new(BioStatus::IoError, 64 * BLOCK_SIZE / SECTOR_SIZE);
 
@@ -1070,7 +1070,7 @@ mod test {
     }
 
     #[ktest]
-    fn load_descriptors_bad_descriptor() {
+    fn load_group_descs_invalid_desc_returns_einval() {
         let sb = make_valid_super_block(2);
         let mut descs = (0..sb.block_groups_count() as usize)
             .map(|idx| make_valid_group_desc(&sb, idx))
@@ -1085,7 +1085,7 @@ mod test {
     }
 
     #[ktest]
-    fn read_inode_desc_ok() {
+    fn read_inode_desc_valid_ino_ok() {
         let f = Ext2FixtureBuilder::new(2, 128).build().unwrap();
 
         let raw = make_raw_inode(0o040755, 2, 0);
@@ -1100,7 +1100,7 @@ mod test {
     }
 
     #[ktest]
-    fn read_inode_desc_error() {
+    fn read_inode_desc_deleted_ino_returns_err() {
         // Out-of-range group index.
         let f = Ext2FixtureBuilder::new(2, 128).build().unwrap();
         let group_err = f.ext2.inode_table_block(2, 0).unwrap_err();
@@ -1142,11 +1142,12 @@ mod test {
     }
 
     // NOTE: `read_inode_ok` and `read_inode_error` removed — their success/error
-    // paths are already covered by `read_inode_desc_ok`, `read_inode_desc_error`,
-    // and `create_inode_initializes_descriptor`.
+    // paths are already covered by `read_inode_desc_valid_ino_ok`,
+    // `read_inode_desc_deleted_ino_returns_err`, and
+    // `alloc_inode_initializes_descriptor_on_disk`.
 
     #[ktest]
-    fn load_block_bitmap_ok() {
+    fn load_block_bitmap_valid_image_ok() {
         let f = Ext2FixtureBuilder::new(2, 128)
             .with_metadata_block_bitmap()
             .build()
@@ -1165,7 +1166,7 @@ mod test {
     }
 
     #[ktest]
-    fn load_block_bitmap_bad_inode_table_bits() {
+    fn load_block_bitmap_missing_itable_bits_returns_err() {
         let f = Ext2FixtureBuilder::new(2, 128).build().unwrap();
         let group = &f.block_groups()[0];
         let first = f.sb.group_first_block_no(0);
@@ -1197,7 +1198,7 @@ mod test {
     }
 
     #[ktest]
-    fn load_inode_bitmap_ok() {
+    fn load_inode_bitmap_valid_image_ok() {
         let f = Ext2FixtureBuilder::new(2, 128)
             .with_reserved_inode_bitmap()
             .build()
@@ -1220,7 +1221,7 @@ mod test {
     }
 
     #[ktest]
-    fn load_block_groups_bad_table() {
+    fn load_block_groups_bad_desc_table_returns_err() {
         let sb = make_valid_super_block(200);
         let segment = FrameAllocOptions::new()
             .zeroed(true)

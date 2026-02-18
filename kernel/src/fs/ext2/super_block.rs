@@ -760,7 +760,7 @@ mod test {
     use crate::fs::ext2::testkit::{Ext2MemoryDisk, make_valid_raw_super_block};
 
     #[ktest]
-    fn load_super_block_ok() {
+    fn try_from_valid_raw_ok() {
         let raw = make_valid_raw_super_block(2);
         let disk_size_blocks = raw.blocks_count as usize;
         let disk = Ext2MemoryDisk::new(disk_size_blocks);
@@ -773,7 +773,7 @@ mod test {
     }
 
     #[ktest]
-    fn reject_cases() {
+    fn try_from_invalid_fields_returns_einval() {
         {
             let mut raw = make_valid_raw_super_block(1);
             raw.magic = 0;
@@ -807,7 +807,7 @@ mod test {
     }
 
     #[ktest]
-    fn allow_read_only_with_bad_compat() {
+    fn try_from_bad_compat_allows_read_only() {
         let mut raw = make_valid_raw_super_block(1);
         raw.feature_ro_compat = FeatureRoCompatSet::BTREE_DIR.bits();
 

@@ -3689,7 +3689,7 @@ mod test {
     }
 
     #[ktest]
-    fn namei_create_phase06_spec() {
+    fn namei_create_adds_entry_and_inits_inode() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -3758,7 +3758,7 @@ mod test {
     }
 
     #[ktest]
-    fn namei_link_unlink_phase06_spec() {
+    fn namei_link_unlink_updates_nlinks() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -3806,7 +3806,7 @@ mod test {
     }
 
     #[ktest]
-    fn namei_set_link_and_rename_phase06_spec() {
+    fn namei_set_link_and_rename_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -3879,7 +3879,7 @@ mod test {
     }
 
     #[ktest]
-    fn namei_cross_fs_link_and_rename_rejected() {
+    fn namei_cross_fs_link_and_rename_returns_exdev() {
         clocks::init_for_ktest();
 
         let f_a = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -3902,7 +3902,7 @@ mod test {
     }
 
     #[ktest]
-    fn inode_desc_try_from_success() {
+    fn desc_try_from_valid_raw_ok() {
         let mut raw = make_raw_inode(0o100644);
         raw.size_lo = 0x1122_3344;
         raw.size_high = 0x5566_7788;
@@ -3932,7 +3932,7 @@ mod test {
     }
 
     #[ktest]
-    fn inode_desc_try_from_error_cases() {
+    fn desc_try_from_invalid_raw_returns_err() {
         let mut deleted_inode = make_raw_inode(0);
         deleted_inode.links_count = 0;
         deleted_inode.dtime = 1;
@@ -3956,7 +3956,7 @@ mod test {
     }
 
     #[ktest]
-    fn dir_lookup_readdir_ok() {
+    fn dir_lookup_and_readdir_ok() {
         let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let (disk, ext2) = (&f.disk, &f.ext2);
         let block_size = ext2.block_size();
@@ -4012,7 +4012,7 @@ mod test {
     }
 
     #[ktest]
-    fn dir_lookup_readdir_error_cases() {
+    fn dir_lookup_and_readdir_invalid_returns_err() {
         let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let (disk, ext2) = (&f.disk, &f.ext2);
         let block_size = ext2.block_size();
@@ -4105,7 +4105,7 @@ mod test {
     }
 
     #[ktest]
-    fn dir_add_delete_entry_ok() {
+    fn dir_add_and_delete_entry_ok() {
         let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let (disk, ext2) = (&f.disk, &f.ext2);
         let block_size = ext2.block_size();
@@ -4156,7 +4156,7 @@ mod test {
     }
 
     #[ktest]
-    fn dir_add_entry_grow_by_new_block_ok() {
+    fn dir_add_entry_grows_by_new_block_ok() {
         let f = Ext2FixtureBuilder::new(1, 256)
             .with_free_blocks(32, 32)
             .build()
@@ -4214,7 +4214,7 @@ mod test {
     }
 
     #[ktest]
-    fn dir_add_entry_grow_into_single_indirect_ok() {
+    fn dir_add_entry_grows_into_indirect_block_ok() {
         let f = Ext2FixtureBuilder::new(1, 512)
             .with_free_blocks(256, 256)
             .build()
@@ -4309,7 +4309,7 @@ mod test {
     }
 
     #[ktest]
-    fn release_dir_data_blocks_for_cleanup_truncates_full_tree() {
+    fn dir_release_data_blocks_truncates_full_tree() {
         let f = Ext2FixtureBuilder::new(1, 512)
             .with_free_blocks(256, 256)
             .build()
@@ -4348,7 +4348,7 @@ mod test {
     }
 
     #[ktest]
-    fn dir_mutation_error_cases() {
+    fn dir_mutation_invalid_ops_return_err() {
         let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let ext2 = &f.ext2;
 
@@ -4382,7 +4382,7 @@ mod test {
     }
 
     #[ktest]
-    fn dir_make_empty_and_empty_dir_ok() {
+    fn dir_make_empty_and_is_empty_ok() {
         clocks::init_for_ktest();
         let f = Ext2FixtureBuilder::new(1, 256)
             .with_free_blocks(64, 64)
@@ -4444,7 +4444,7 @@ mod test {
     }
 
     #[ktest]
-    fn empty_dir_false_on_non_dot_entries() {
+    fn dir_is_empty_with_extra_entries_returns_false() {
         let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let (disk, ext2) = (&f.disk, &f.ext2);
         let block_size = ext2.block_size();
@@ -4568,7 +4568,7 @@ mod test {
     }
 
     #[ktest]
-    fn dir_rmdir_ok() {
+    fn dir_rmdir_removes_child_and_updates_nlinks() {
         clocks::init_for_ktest();
 
         let env = prepare_rmdir_env(&[]);
@@ -4597,7 +4597,7 @@ mod test {
     }
 
     #[ktest]
-    fn dir_rmdir_enotempty_keeps_parent_entry() {
+    fn dir_rmdir_notempty_returns_enotempty() {
         clocks::init_for_ktest();
 
         let env = prepare_rmdir_env(&[(ROOT_INO, b"foo", 1)]);
@@ -4617,7 +4617,7 @@ mod test {
     }
 
     #[ktest]
-    fn block_mapping_ok() {
+    fn block_mapping_direct_and_indirect_ok() {
         let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let (disk, ext2) = (&f.disk, &f.ext2);
 
@@ -4728,7 +4728,7 @@ mod test {
     }
 
     #[ktest]
-    fn block_mapping_error() {
+    fn block_mapping_invalid_depth_returns_err() {
         let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let (disk, ext2) = (&f.disk, &f.ext2);
 
@@ -4813,7 +4813,7 @@ mod test {
     }
 
     #[ktest]
-    fn block_allocation_direct_path_ok() {
+    fn block_alloc_direct_path_ok() {
         let f = Ext2FixtureBuilder::new(1, 256)
             .with_free_blocks(64, 64)
             .build()
@@ -4836,7 +4836,7 @@ mod test {
     }
 
     #[ktest]
-    fn block_allocation_indirect_path_ok() {
+    fn block_alloc_indirect_path_ok() {
         let f = Ext2FixtureBuilder::new(1, 256)
             .with_free_blocks(64, 64)
             .build()
@@ -4872,7 +4872,7 @@ mod test {
     }
 
     #[ktest]
-    fn block_allocation_enospc_keeps_inode_state() {
+    fn block_alloc_enospc_preserves_inode_state() {
         let f = Ext2FixtureBuilder::new(1, 256)
             .with_free_blocks(0, 0)
             .with_filled_block_bitmap(true)
@@ -4888,7 +4888,7 @@ mod test {
     }
 
     #[ktest]
-    fn block_allocation_fragmented_chain() {
+    fn block_alloc_fragmented_chain_ok() {
         // Corner case: total free blocks are enough, but no contiguous run can satisfy
         // the full request in one call. This forces get_or_alloc_block() to loop and
         // accumulate allocations across multiple fs.alloc_blocks() calls.
@@ -4976,7 +4976,7 @@ mod test {
     }
 
     #[ktest]
-    fn file_write_resize_truncate() {
+    fn write_and_resize_truncate_round_trip_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -5031,7 +5031,7 @@ mod test {
     }
 
     #[ktest]
-    fn resize_guard_checks() {
+    fn resize_guard_rejects_invalid_ops() {
         let mut raw_append = make_raw_inode(0o100644);
         raw_append.flags = FileFlags::APPEND_ONLY.bits();
         let append_desc = InodeDesc::try_from(&raw_append).unwrap();
@@ -5047,7 +5047,7 @@ mod test {
     }
 
     #[ktest]
-    fn write_at_partial_block_read_modify() {
+    fn write_at_partial_block_preserves_rest() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
@@ -5077,7 +5077,7 @@ mod test {
     }
 
     #[ktest]
-    fn write_at_cross_block() {
+    fn write_at_cross_block_boundary_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
@@ -5108,7 +5108,7 @@ mod test {
     }
 
     #[ktest]
-    fn write_at_sparse_hole_extension() {
+    fn write_at_sparse_hole_extends_file_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
@@ -5139,7 +5139,7 @@ mod test {
     }
 
     #[ktest]
-    fn write_at_enospc_rollback() {
+    fn write_at_enospc_rolls_back_state() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
@@ -5188,7 +5188,7 @@ mod test {
     }
 
     #[ktest]
-    fn write_at_directory_rejected() {
+    fn write_at_directory_returns_eisdir() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -5199,7 +5199,7 @@ mod test {
     }
 
     #[ktest]
-    fn read_at_sparse_hole_and_eof_clamp() {
+    fn read_at_sparse_hole_returns_zeros_and_clamps_eof() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
@@ -5236,7 +5236,7 @@ mod test {
     }
 
     #[ktest]
-    fn read_at_directory_rejected() {
+    fn read_at_directory_returns_eisdir() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -5248,7 +5248,7 @@ mod test {
     }
 
     #[ktest]
-    fn read_at_io_error_propagates() {
+    fn read_at_io_error_returns_eio() {
         clocks::init_for_ktest();
 
         let base = Ext2FixtureBuilder::new(2, 256).build().unwrap();
@@ -5284,7 +5284,7 @@ mod test {
     }
 
     #[ktest]
-    fn resize_extend_sparse_no_alloc() {
+    fn resize_extend_sparse_skips_alloc() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
@@ -5303,7 +5303,7 @@ mod test {
     }
 
     #[ktest]
-    fn resize_shrink_zero_partial_tail() {
+    fn resize_shrink_zeroes_partial_tail_block() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
@@ -5385,7 +5385,7 @@ mod test {
     // }
 
     #[ktest]
-    fn resize_truncate_indirect_shared_path() {
+    fn resize_truncate_indirect_frees_shared_path() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
@@ -5416,7 +5416,7 @@ mod test {
     }
 
     #[ktest]
-    fn resize_truncate_do_indirects_release_all() {
+    fn resize_truncate_releases_all_indirect_blocks() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
@@ -5448,7 +5448,7 @@ mod test {
     }
 
     #[ktest]
-    fn free_branches_recursive_release() {
+    fn free_branches_recursively_releases_blocks() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
@@ -5477,7 +5477,7 @@ mod test {
     }
 
     #[ktest]
-    fn inode_new_initializes_page_cache_capacity() {
+    fn new_inode_initializes_page_cache_capacity() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256).build().unwrap();
@@ -5495,7 +5495,7 @@ mod test {
     }
 
     #[ktest]
-    fn page_cache_backend_npages_matches_desc_size() {
+    fn page_cache_npages_matches_desc_size() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256).build().unwrap();
@@ -5510,7 +5510,7 @@ mod test {
     }
 
     #[ktest]
-    fn inode_read_write_via_page_cache_path() {
+    fn read_write_via_page_cache_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
@@ -5532,7 +5532,7 @@ mod test {
     }
 
     #[ktest]
-    fn inode_write_at_directory_rejected() {
+    fn page_cache_write_at_directory_returns_eisdir() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -5543,7 +5543,7 @@ mod test {
     }
 
     #[ktest]
-    fn inode_resize_extend_sparse_without_block_allocation() {
+    fn page_cache_resize_extend_sparse_skips_alloc() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
@@ -5562,7 +5562,7 @@ mod test {
     }
 
     #[ktest]
-    fn page_cache_writeback_without_mapping_returns_eio() {
+    fn page_cache_writeback_unmapped_returns_eio() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)

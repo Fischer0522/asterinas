@@ -707,7 +707,7 @@ mod test {
     };
 
     #[ktest]
-    fn block_group_load_and_accessors_ok() {
+    fn load_and_accessors_ok() {
         let sb = make_valid_super_block(2);
         let descs = (0..sb.block_groups_count() as usize)
             .map(|idx| make_valid_group_desc(&sb, idx))
@@ -740,7 +740,7 @@ mod test {
     }
 
     #[ktest]
-    fn block_group_free_block_counters_update_and_mark_dirty() {
+    fn free_block_counter_update_marks_dirty() {
         // Counter update helpers should adjust value and mark descriptor dirty.
         let fixture = Ext2FixtureBuilder::new(2, 256)
             .with_metadata_block_bitmap()
