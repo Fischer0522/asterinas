@@ -2469,7 +2469,6 @@ impl InodeInner {
             }
 
             let mut buf = vec![0u8; block_size];
-            ostd::early_println!("Scanning block  at offset ");
             // SPEC: directory scan reads through inode page cache.
             self.page_cache.pages().read_bytes(block_offset, &mut buf)?;
 
@@ -2502,7 +2501,6 @@ impl InodeInner {
                 }
             }
         }
-        ostd::early_println!("No slot found, need growth");
 
         Ok(DirScanResult::NeedGrowth)
     }
@@ -2533,7 +2531,6 @@ impl InodeInner {
             return Err(err);
         }
 
-        ostd::early_println!("Grew directory from  to  bytes");
         Ok(DirSlotInfo {
             dir_offset: old_size,
             slot_rec_len: block_size,
@@ -2715,14 +2712,12 @@ impl InodeInner {
             .upgrade()
             .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
 
-        ostd::early_println!("Adding entry with inode");
         // SPEC: ext2_add_link-style scan then growth if needed.
         let slot = match self.scan_dir_for_slot(name, &fs)? {
             DirScanResult::Slot(slot) => slot,
             DirScanResult::NeedGrowth => self.grow_dir_block(&fs)?,
         };
         self.write_dir_entry_to_cache(&slot, name, ino, file_type as u8)?;
-        ostd::early_println!("Committed metadata");
         self.commit_dir_metadata(&fs)
     }
 
@@ -3079,13 +3074,11 @@ impl Inode {
             || name_bytes == b"."
             || name_bytes == b".."
         {
-            ostd::early_println!("ext2: create: invalid name: {:?}", name_bytes);
             return_errno!(Errno::EINVAL);
         }
 
         // SPEC: Phase 6.3 supports File and Dir only.
         if type_ != InodeType::File && type_ != InodeType::Dir {
-            ostd::early_println!("ext2: create: unsupported type: {:?}", type_);
             return_errno!(Errno::EINVAL);
         }
 
@@ -4262,15 +4255,16 @@ mod test {
 
         let mut block_ptrs = [0u32; 15];
         block_ptrs[0] = data_bid;
-        let inode_inner = make_dir_inode_inner(Arc::downgrade(&ext2), 64, 8, block_ptrs);
+        let inode = make_live_dir_inode(ext2, 2, 64, 8, FileFlags::empty(), block_ptrs);
 
-        assert_eq!(inode_inner.find_entry("foo").unwrap(), 11);
-        assert_eq!(inode_inner.find_entry("subdir").unwrap(), 13);
-        let miss = inode_inner.find_entry("missing").unwrap_err();
+        let inner = inode.inner.read();
+        assert_eq!(inner.find_entry("foo").unwrap(), 11);
+        assert_eq!(inner.find_entry("subdir").unwrap(), 13);
+        let miss = inner.find_entry("missing").unwrap_err();
         assert_eq!(miss.error(), Errno::ENOENT);
 
         let mut visitor = CollectDirentVisitor::default();
-        let advanced = inode_inner.readdir_at(0, &mut visitor).unwrap();
+        let advanced = inner.readdir_at(0, &mut visitor).unwrap();
         assert_eq!(advanced, 64);
         assert_eq!(visitor.entries.len(), 4);
         assert_eq!(visitor.entries[0], (".".to_string(), 2, InodeType::Dir, 0));
@@ -4288,11 +4282,11 @@ mod test {
         );
 
         let mut stop_visitor = StopAfterVisitor::new(2);
-        let stop_advanced = inode_inner.readdir_at(0, &mut stop_visitor).unwrap();
+        let stop_advanced = inner.readdir_at(0, &mut stop_visitor).unwrap();
         assert_eq!(stop_advanced, 24);
 
         let mut offset_visitor = CollectDirentVisitor::default();
-        let offset_advanced = inode_inner.readdir_at(5, &mut offset_visitor).unwrap();
+        let offset_advanced = inner.readdir_at(5, &mut offset_visitor).unwrap();
         assert_eq!(offset_advanced, 59);
         assert_eq!(offset_visitor.entries.len(), 3);
         assert_eq!(offset_visitor.entries[0].0, "foo");
@@ -4306,33 +4300,37 @@ mod test {
 
         let mut file_ptrs = [0u32; 15];
         file_ptrs[0] = 80;
-        let file_inode = make_inode_inner(Arc::downgrade(&ext2), file_ptrs);
+        let file_inode = make_live_file_inode(ext2, 50, 0, 0, FileFlags::empty(), file_ptrs);
+        let file_inner = file_inode.inner.read();
         assert_eq!(
-            file_inode.find_entry("foo").unwrap_err().error(),
+            file_inner.find_entry("foo").unwrap_err().error(),
             Errno::ENOTDIR
         );
         let mut vec_visitor = Vec::<String>::new();
         assert_eq!(
-            file_inode
+            file_inner
                 .readdir_at(0, &mut vec_visitor)
                 .unwrap_err()
                 .error(),
             Errno::ENOTDIR
         );
+        drop(file_inner);
 
-        let hole_inode = make_dir_inode_inner(Arc::downgrade(&ext2), 12, 8, [0u32; 15]);
+        let hole_inode = make_live_dir_inode(ext2, 3, 12, 8, FileFlags::empty(), [0u32; 15]);
+        let hole_inner = hole_inode.inner.read();
         assert_eq!(
-            hole_inode.find_entry("foo").unwrap_err().error(),
+            hole_inner.find_entry("foo").unwrap_err().error(),
             Errno::EIO
         );
         let mut vec_visitor = Vec::<String>::new();
         assert_eq!(
-            hole_inode
+            hole_inner
                 .readdir_at(0, &mut vec_visitor)
                 .unwrap_err()
                 .error(),
             Errno::EIO
         );
+        drop(hole_inner);
 
         let mut one_block = vec![0u8; block_size];
         encode_dir_entry(&mut one_block, 0, 2, 12, b".", 2);
@@ -4345,26 +4343,30 @@ mod test {
         let mut ptrs = [0u32; 15];
         ptrs[0] = data_bid;
         let limited_blocks_inode =
-            make_dir_inode_inner(Arc::downgrade(&ext2), block_size * 2, 0, ptrs);
+            make_live_dir_inode(ext2, 4, block_size, 0, FileFlags::empty(), ptrs);
+        let limited_inner = limited_blocks_inode.inner.read();
         assert_eq!(
-            limited_blocks_inode
+            limited_inner
                 .find_entry("missing")
                 .unwrap_err()
                 .error(),
             Errno::ENOENT
         );
 
-        let tiny_dir_inode = make_dir_inode_inner(Arc::downgrade(&ext2), 11, 8, ptrs);
+        let tiny_dir_inode = make_live_dir_inode(ext2, 5, 11, 8, FileFlags::empty(), ptrs);
+        let tiny_inner = tiny_dir_inode.inner.read();
         let mut vec_visitor = Vec::<String>::new();
-        assert_eq!(tiny_dir_inode.readdir_at(0, &mut vec_visitor).unwrap(), 0);
+        assert_eq!(tiny_inner.readdir_at(0, &mut vec_visitor).unwrap(), 0);
+        drop(tiny_inner);
 
         let mut vec_visitor = Vec::<String>::new();
         assert_eq!(
-            limited_blocks_inode
-                .readdir_at(2 * block_size - 11, &mut vec_visitor)
+            limited_inner
+                .readdir_at(block_size - 11, &mut vec_visitor)
                 .unwrap(),
             0
         );
+        drop(limited_inner);
 
         let mut bad_block = vec![0u8; block_size];
         bad_block[0..4].copy_from_slice(&2u32.to_le_bytes());
@@ -4379,11 +4381,12 @@ mod test {
 
         let mut bad_ptrs = [0u32; 15];
         bad_ptrs[0] = bad_bid;
-        let bad_inode = make_dir_inode_inner(Arc::downgrade(&ext2), 12, 8, bad_ptrs);
-        assert_eq!(bad_inode.find_entry(".").unwrap_err().error(), Errno::EIO);
+        let bad_inode = make_live_dir_inode(ext2, 6, 12, 8, FileFlags::empty(), bad_ptrs);
+        let bad_inner = bad_inode.inner.read();
+        assert_eq!(bad_inner.find_entry(".").unwrap_err().error(), Errno::EIO);
         let mut vec_visitor = Vec::<String>::new();
         assert_eq!(
-            bad_inode
+            bad_inner
                 .readdir_at(0, &mut vec_visitor)
                 .unwrap_err()
                 .error(),
@@ -4410,43 +4413,23 @@ mod test {
         block_ptrs[0] = data_bid;
         let inode = make_live_dir_inode(&ext2, 2, block_size, 8, FileFlags::INDEX_DIR, block_ptrs);
 
-        {
-            let mut inner = inode.inner.write();
-            inner.add_entry("foo", 11, DirEntryFileType::File).unwrap();
-            ostd::early_println!("Added entry 'foo' with inode 11");
-            let dup = inner
-                .add_entry("foo", 12, DirEntryFileType::File)
-                .unwrap_err();
-            ostd::early_println!("Duplicate entry 'foo' failed with {:?}", dup.error());
-            assert_eq!(dup.error(), Errno::EEXIST);
-
-            assert!(!inner.desc.flags.contains(FileFlags::INDEX_DIR));
-            inner.delete_entry("foo").unwrap();
-            ostd::early_println!("Deleted entry 'foo'");
-        }
-
-        let mut post = vec![0u8; block_size];
-        disk.segment()
-            .read_bytes(Bid::new(data_bid as u64).to_offset(), &mut post)
-            .unwrap();
-
-        let dot =
-            DirEntry::parse_at(&post, 0, block_size, ext2.super_block().total_inodes()).unwrap();
-        assert_eq!(dot.inode, 2);
-        assert_eq!(dot.rec_len, 12);
-
-        let bar =
-            DirEntry::parse_at(&post, 12, block_size, ext2.super_block().total_inodes()).unwrap();
-        assert_eq!(bar.inode, 13);
-        assert_eq!(bar.name.as_bytes(), b"bar");
-        assert_eq!(bar.rec_len, (block_size - 12) as u16);
+        inode.add_entry("foo", 11, DirEntryFileType::File).unwrap();
+        let dup = inode
+            .add_entry("foo", 12, DirEntryFileType::File)
+            .unwrap_err();
+        assert_eq!(dup.error(), Errno::EEXIST);
+        assert!(!inode.inner.read().desc.flags.contains(FileFlags::INDEX_DIR));
+        inode.delete_entry("foo").unwrap();
 
         let inner = inode.inner.read();
+        assert_eq!(inner.find_entry(".").unwrap(), 2);
+        assert_eq!(inner.find_entry("bar").unwrap(), 13);
         assert_eq!(inner.find_entry("foo").unwrap_err().error(), Errno::ENOENT);
     }
 
     #[ktest]
     fn dir_add_entry_grows_by_new_block_ok() {
+        clocks::init_for_ktest();
         let f = Ext2FixtureBuilder::new(1, 256)
             .with_free_blocks(32, 32)
             .build()
@@ -4462,45 +4445,58 @@ mod test {
             .saturating_add(f.sb.itb_per_group())
             .saturating_add(1);
         assert!(data_bid <= last);
-        // Let allocator choose one free data block; do not pre-occupy `data_bid`.
-        testkit::write_block_bitmap(f.disk.as_ref(), &f.sb, &f.descs[0], &[]);
+        // Mark data_bid as occupied so the allocator won't reuse it.
+        testkit::write_block_bitmap(f.disk.as_ref(), &f.sb, &f.descs[0], &[data_bid]);
         reload_group0_cached_bitmaps_from_disk(&f);
 
+        // Fill the block with packed live entries so no slot can fit "foo".
+        // Each entry uses exactly dir_rec_len bytes, leaving no splittable gap.
         let mut first_block = vec![0u8; block_size];
-        encode_dir_entry(&mut first_block, 0, 2, 12, b".", 2);
-        encode_dir_entry(&mut first_block, 12, 2, 12, b"..", 2);
+        let mut offset = 0usize;
+        let mut entry_idx = 0u32;
+        while offset < block_size {
+            let remaining = block_size - offset;
+            // Last entry gets all remaining space, but its used_len leaves < 12 bytes free.
+            let rec_len = if remaining <= 16 {
+                remaining as u16
+            } else {
+                16 // dir_rec_len for 8-byte name "ent00000"
+            };
+            let ino = if entry_idx == 0 { 2 } else { 2 + entry_idx };
+            encode_dir_entry(
+                &mut first_block,
+                offset,
+                ino,
+                rec_len,
+                b"ent00000",
+                DirEntryFileType::File as u8,
+            );
+            offset += rec_len as usize;
+            entry_idx += 1;
+        }
         f.disk
             .segment()
             .write_bytes(Bid::new(data_bid as u64).to_offset(), &first_block)
             .unwrap();
 
+        let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
         let mut block_ptrs = [0u32; 15];
         block_ptrs[0] = data_bid;
-        let inode = make_live_dir_inode(&f.ext2, 2, 24, 8, FileFlags::INDEX_DIR, block_ptrs);
-
-        let new_bid = {
-            let mut inner = inode.inner.write();
-            inner.add_entry("foo", 11, DirEntryFileType::File).unwrap();
-            assert_eq!(inner.desc.size, (24 + block_size) as u64);
-            assert_eq!(inner.desc.blocks, 16);
-            assert_ne!(inner.desc.block_ptrs[1], 0);
-            inner.desc.block_ptrs[1]
-        };
-
-        let mut new_block = vec![0u8; block_size];
-        f.disk
-            .segment()
-            .read_bytes(Bid::new(new_bid as u64).to_offset(), &mut new_block)
-            .unwrap();
-        let entry = DirEntry::parse_at(
-            &new_block,
-            0,
+        let inode = make_live_dir_inode(
+            &f.ext2,
+            2,
             block_size,
-            f.ext2.super_block().total_inodes(),
-        )
-        .unwrap();
-        assert_eq!(entry.inode, 11);
-        assert_eq!(entry.name.as_bytes(), b"foo");
+            sectors_per_block,
+            FileFlags::INDEX_DIR,
+            block_ptrs,
+        );
+
+        inode.add_entry("foo", 11, DirEntryFileType::File).unwrap();
+        let inner = inode.inner.read();
+        assert_eq!(inner.desc.size, (block_size * 2) as u64);
+        assert_eq!(inner.desc.blocks, sectors_per_block * 2);
+        assert_ne!(inner.desc.block_ptrs[1], 0);
+        assert_eq!(inner.find_entry("foo").unwrap(), 11);
     }
 
     #[ktest]
@@ -4562,40 +4558,23 @@ mod test {
             block_ptrs,
         );
 
-        let (new_data_bid, single_indirect_bid, old_size, new_size, old_blocks, new_blocks) = {
-            let mut inner = inode.inner.write();
-            let old_size = inner.desc.size;
-            let old_blocks = inner.desc.blocks;
-            inner.add_entry("foo", 11, DirEntryFileType::File).unwrap();
-            let new_data_bid = inner.get_block(12).unwrap().unwrap().to_raw() as u32;
-            (
-                new_data_bid,
-                inner.desc.block_ptrs[12],
-                old_size,
-                inner.desc.size,
-                old_blocks,
-                inner.desc.blocks,
-            )
+        let (old_size, old_blocks) = {
+            let inner = inode.inner.read();
+            (inner.desc.size, inner.desc.blocks)
         };
+        inode.add_entry("foo", 11, DirEntryFileType::File).unwrap();
+        let inner = inode.inner.read();
+        let single_indirect_bid = inner.desc.block_ptrs[12];
+        let new_size = inner.desc.size;
+        let new_blocks = inner.desc.blocks;
+        drop(inner);
 
         assert_ne!(single_indirect_bid, 0);
         assert_eq!(new_size, old_size + block_size as u64);
         assert_eq!(new_blocks, old_blocks + sectors_per_block * 2);
 
-        let mut new_block = vec![0u8; block_size];
-        f.disk
-            .segment()
-            .read_bytes(Bid::new(new_data_bid as u64).to_offset(), &mut new_block)
-            .unwrap();
-        let entry = DirEntry::parse_at(
-            &new_block,
-            0,
-            block_size,
-            f.ext2.super_block().total_inodes(),
-        )
-        .unwrap();
-        assert_eq!(entry.inode, 11);
-        assert_eq!(entry.name.as_bytes(), b"foo");
+        let inner = inode.inner.read();
+        assert_eq!(inner.find_entry("foo").unwrap(), 11);
     }
 
     #[ktest]
@@ -4642,7 +4621,7 @@ mod test {
         let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let ext2 = &f.ext2;
 
-        let mut file_inode = make_inode_inner(Arc::downgrade(&ext2), [0u32; 15]);
+        let file_inode = make_live_file_inode(ext2, 50, 0, 0, FileFlags::empty(), [0u32; 15]);
         assert_eq!(
             file_inode
                 .add_entry("foo", 2, DirEntryFileType::File)
@@ -4657,7 +4636,7 @@ mod test {
 
         let mut dir_ptrs = [0u32; 15];
         dir_ptrs[0] = 80;
-        let mut dir_inode = make_dir_inode_inner(Arc::downgrade(&ext2), 0, 8, dir_ptrs);
+        let dir_inode = make_live_dir_inode(ext2, 2, 0, 8, FileFlags::empty(), dir_ptrs);
         assert_eq!(
             dir_inode
                 .add_entry("", 2, DirEntryFileType::File)
@@ -4701,9 +4680,9 @@ mod test {
             Arc::downgrade(&f.ext2),
         );
 
+        inode.make_empty(ROOT_INO).unwrap();
         let allocated_bid = {
-            let mut inner = inode.inner.write();
-            inner.make_empty(ROOT_INO).unwrap();
+            let inner = inode.inner.read();
             assert!(inner.empty_dir());
             assert_eq!(inner.desc.size as usize, block_size);
             assert_eq!(inner.desc.blocks, (block_size / SECTOR_SIZE) as u32);
@@ -4711,26 +4690,9 @@ mod test {
         };
         assert_ne!(allocated_bid, 0);
 
-        let mut buf = vec![0u8; block_size];
-        f.disk
-            .segment()
-            .read_bytes(Bid::new(allocated_bid as u64).to_offset(), &mut buf)
-            .unwrap();
-
-        let dot =
-            DirEntry::parse_at(&buf, 0, block_size, f.ext2.super_block().total_inodes()).unwrap();
-        assert_eq!(dot.inode, 12);
-        assert_eq!(dot.name.as_bytes(), b".");
-
-        let dotdot = DirEntry::parse_at(
-            &buf,
-            DirEntry::dir_rec_len(1) as usize,
-            block_size,
-            f.ext2.super_block().total_inodes(),
-        )
-        .unwrap();
-        assert_eq!(dotdot.inode, ROOT_INO);
-        assert_eq!(dotdot.name.as_bytes(), b"..");
+        let inner = inode.inner.read();
+        assert_eq!(inner.find_entry(".").unwrap(), 12);
+        assert_eq!(inner.find_entry("..").unwrap(), ROOT_INO);
     }
 
     #[ktest]
@@ -4866,9 +4828,9 @@ mod test {
         let child_ino = env.child_ino;
 
         let parent = f.ext2.read_inode(ROOT_INO).unwrap();
+        parent.rmdir("sub").unwrap();
         {
-            let mut parent_inner = parent.inner.write();
-            parent_inner.rmdir("sub").unwrap();
+            let parent_inner = parent.inner.read();
             assert_eq!(parent_inner.desc.links_count, 2);
             assert_eq!(
                 parent_inner.find_entry("sub").unwrap_err().error(),
@@ -4895,7 +4857,7 @@ mod test {
         let child_ino = env.child_ino;
 
         let parent = f.ext2.read_inode(ROOT_INO).unwrap();
-        let err = parent.inner.write().rmdir("sub").unwrap_err();
+        let err = parent.rmdir("sub").unwrap_err();
         assert_eq!(err.error(), Errno::ENOTEMPTY);
 
         let parent_inner = parent.inner.read();
