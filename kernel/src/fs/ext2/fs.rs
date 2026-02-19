@@ -6,8 +6,8 @@ use super::{
     block_group::{BlockGroup, RawGroupDesc},
     inode::{FilePerm, Inode, InodeDesc, RawInode},
     prelude::*,
-    super_block::{RawSuperBlock, SuperBlock, SUPER_BLOCK_OFFSET},
-    utils::{now, Dirty},
+    super_block::{RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
+    utils::{Dirty, now},
 };
 use crate::fs::utils::FsEventSubscriberStats;
 
@@ -684,8 +684,8 @@ mod test {
 
     use super::*;
     use crate::fs::ext2::testkit::{
-        self, build_group_desc_segment, make_valid_group_desc, make_valid_super_block,
-        ErrorBioDisk, Ext2FixtureBuilder, Ext2MemoryDisk, RawInodeBuilder,
+        self, ErrorBioDisk, Ext2FixtureBuilder, Ext2MemoryDisk, RawInodeBuilder,
+        build_group_desc_segment, make_valid_group_desc, make_valid_super_block,
     };
 
     fn make_raw_inode(mode: u16, links_count: u16, dtime: u32) -> RawInode {

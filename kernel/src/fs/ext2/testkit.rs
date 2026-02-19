@@ -6,28 +6,28 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{fmt, mem::size_of};
 
 use aster_block::{
+    BLOCK_SIZE, BlockDevice, BlockDeviceMeta, SECTOR_SIZE,
     bio::{BioEnqueueError, BioStatus, BioType, SubmittedBio},
     id::Bid,
-    BlockDevice, BlockDeviceMeta, BLOCK_SIZE, SECTOR_SIZE,
 };
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::{
-    mm::{io_util::HasVmReaderWriter, FrameAllocOptions, Segment, USegment, VmIo, PAGE_SIZE},
+    mm::{FrameAllocOptions, PAGE_SIZE, Segment, USegment, VmIo, io_util::HasVmReaderWriter},
     prelude::*,
 };
 
 use super::{
+    SuperBlock,
     block_group::RawGroupDesc,
     fs::{Ext2, ROOT_INO},
     inode::{RawDirEntry, RawInode},
     super_block::{
-        ErrorsBehaviour, FsState, OsId, RawSuperBlock, RevLevel, MAGIC_NUM, SUPER_BLOCK_OFFSET,
+        ErrorsBehaviour, FsState, MAGIC_NUM, OsId, RawSuperBlock, RevLevel, SUPER_BLOCK_OFFSET,
     },
-    SuperBlock,
 };
 use crate::{
     fs::utils::{DirentVisitor, InodeType},
-    prelude::{return_errno_with_message, Errno, Error, Result, *},
+    prelude::{Errno, Error, Result, return_errno_with_message, *},
 };
 
 // ---------------------------------------------------------------------------

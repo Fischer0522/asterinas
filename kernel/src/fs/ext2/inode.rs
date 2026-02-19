@@ -1573,96 +1573,96 @@ impl InodeInner {
     /// Initializes a newly allocated directory inode with `.` and `..` entries.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:617 (ext2_make_empty)
-    pub(super) fn make_empty(&mut self, parent_ino: u32) -> Result<()> {
-        if self.desc.type_ != InodeType::Dir {
-            return_errno!(Errno::ENOTDIR);
-        }
+    // pub(super) fn make_empty(&mut self, parent_ino: u32) -> Result<()> {
+    //     if self.desc.type_ != InodeType::Dir {
+    //         return_errno!(Errno::ENOTDIR);
+    //     }
 
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
-        let total_inodes = fs.super_block().total_inodes();
-        if parent_ino == 0 || parent_ino > total_inodes {
-            return_errno_with_message!(Errno::EINVAL, "parent inode number out of range");
-        }
+    //     let fs = self
+    //         .fs
+    //         .upgrade()
+    //         .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+    //     let total_inodes = fs.super_block().total_inodes();
+    //     if parent_ino == 0 || parent_ino > total_inodes {
+    //         return_errno_with_message!(Errno::EINVAL, "parent inode number out of range");
+    //     }
 
-        let self_ino = self
-            .weak_self
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "inode already dropped"))?
-            .ino();
+    //     let self_ino = self
+    //         .weak_self
+    //         .upgrade()
+    //         .ok_or_else(|| Error::with_message(Errno::EIO, "inode already dropped"))?
+    //         .ino();
 
-        let chunk_size = fs.block_size();
-        let sectors_per_block = (chunk_size / SECTOR_SIZE) as u32;
+    //     let chunk_size = fs.block_size();
+    //     let sectors_per_block = (chunk_size / SECTOR_SIZE) as u32;
 
-        // SPEC: allocate exactly one data block for the first directory chunk.
-        let allocated = fs.alloc_blocks(1)?;
-        if allocated.end != allocated.start.saturating_add(1) {
-            return_errno_with_message!(Errno::EIO, "unexpected multi-block allocation");
-        }
-        let new_bid = allocated.start;
+    //     // SPEC: allocate exactly one data block for the first directory chunk.
+    //     let allocated = fs.alloc_blocks(1)?;
+    //     if allocated.end != allocated.start.saturating_add(1) {
+    //         return_errno_with_message!(Errno::EIO, "unexpected multi-block allocation");
+    //     }
+    //     let new_bid = allocated.start;
 
-        // Preserve old state for rollback.
-        let old_ptr0 = self.desc.block_ptrs[0];
-        let old_size = self.desc.size;
-        let old_blocks = self.desc.blocks;
+    //     // Preserve old state for rollback.
+    //     let old_ptr0 = self.desc.block_ptrs[0];
+    //     let old_size = self.desc.size;
+    //     let old_blocks = self.desc.blocks;
 
-        if old_ptr0 != 0 {
-            let _ = fs.free_blocks(new_bid, 1);
-            return_errno_with_message!(Errno::EIO, "dir block pointer already occupied");
-        }
-        self.desc.block_ptrs[0] = new_bid;
+    //     if old_ptr0 != 0 {
+    //         let _ = fs.free_blocks(new_bid, 1);
+    //         return_errno_with_message!(Errno::EIO, "dir block pointer already occupied");
+    //     }
+    //     self.desc.block_ptrs[0] = new_bid;
 
-        let mut buf = vec![0u8; chunk_size];
-        // SPEC: zero-filled chunk and canonical `.`/`..` layout.
-        Self::write_dir_entry_bytes(
-            &mut buf,
-            0,
-            self_ino,
-            DirEntry::dir_rec_len(1),
-            b".",
-            DirEntryFileType::Dir as u8,
-        )?;
-        let dot_len = DirEntry::dir_rec_len(1) as usize;
-        let dotdot_len = (chunk_size.saturating_sub(dot_len)) as u16;
-        Self::write_dir_entry_bytes(
-            &mut buf,
-            dot_len,
-            parent_ino,
-            dotdot_len,
-            b"..",
-            DirEntryFileType::Dir as u8,
-        )?;
+    //     let mut buf = vec![0u8; chunk_size];
+    //     // SPEC: zero-filled chunk and canonical `.`/`..` layout.
+    //     Self::write_dir_entry_bytes(
+    //         &mut buf,
+    //         0,
+    //         self_ino,
+    //         DirEntry::dir_rec_len(1),
+    //         b".",
+    //         DirEntryFileType::Dir as u8,
+    //     )?;
+    //     let dot_len = DirEntry::dir_rec_len(1) as usize;
+    //     let dotdot_len = (chunk_size.saturating_sub(dot_len)) as u16;
+    //     Self::write_dir_entry_bytes(
+    //         &mut buf,
+    //         dot_len,
+    //         parent_ino,
+    //         dotdot_len,
+    //         b"..",
+    //         DirEntryFileType::Dir as u8,
+    //     )?;
 
-        if fs
-            .block_device()
-            .write_bytes(Bid::new(new_bid as u64).to_offset(), &buf)
-            .is_err()
-        {
-            self.desc.block_ptrs[0] = old_ptr0;
-            let _ = fs.free_blocks(new_bid, 1);
-            return_errno_with_message!(Errno::EIO, "failed to write initial dir block");
-        }
+    //     if fs
+    //         .block_device()
+    //         .write_bytes(Bid::new(new_bid as u64).to_offset(), &buf)
+    //         .is_err()
+    //     {
+    //         self.desc.block_ptrs[0] = old_ptr0;
+    //         let _ = fs.free_blocks(new_bid, 1);
+    //         return_errno_with_message!(Errno::EIO, "failed to write initial dir block");
+    //     }
 
-        self.desc.size = chunk_size as u64;
-        self.desc.blocks = self
-            .desc
-            .blocks
-            .checked_add(sectors_per_block)
-            .ok_or_else(|| Error::with_message(Errno::EIO, "inode block count overflow"))?;
+    //     self.desc.size = chunk_size as u64;
+    //     self.desc.blocks = self
+    //         .desc
+    //         .blocks
+    //         .checked_add(sectors_per_block)
+    //         .ok_or_else(|| Error::with_message(Errno::EIO, "inode block count overflow"))?;
 
-        if let Err(err) = self.persist_inode_and_sync(&fs) {
-            // SPEC: cleanup allocation and restore pre-state if persistence failed.
-            self.desc.block_ptrs[0] = old_ptr0;
-            self.desc.size = old_size;
-            self.desc.blocks = old_blocks;
-            let _ = fs.free_blocks(new_bid, 1);
-            return Err(err);
-        }
+    //     if let Err(err) = self.persist_inode_and_sync(&fs) {
+    //         // SPEC: cleanup allocation and restore pre-state if persistence failed.
+    //         self.desc.block_ptrs[0] = old_ptr0;
+    //         self.desc.size = old_size;
+    //         self.desc.blocks = old_blocks;
+    //         let _ = fs.free_blocks(new_bid, 1);
+    //         return Err(err);
+    //     }
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     /// Checks whether this directory contains only `.` and `..` as live entries.
     ///
@@ -1741,124 +1741,124 @@ impl InodeInner {
     /// Creates a subdirectory under this directory inode.
     ///
     /// Linux: /root/linux/fs/ext2/namei.c:228 (ext2_mkdir)
-    pub(super) fn mkdir(&mut self, name: &str, perm: FilePerm) -> Result<Arc<Inode>> {
-        if self.desc.type_ != InodeType::Dir {
-            return_errno!(Errno::ENOTDIR);
-        }
+    // pub(super) fn mkdir(&mut self, name: &str, perm: FilePerm) -> Result<Arc<Inode>> {
+    //     if self.desc.type_ != InodeType::Dir {
+    //         return_errno!(Errno::ENOTDIR);
+    //     }
 
-        let name_bytes = name.as_bytes();
-        if name_bytes.is_empty()
-            || name_bytes.len() > u8::MAX as usize
-            || name_bytes == b"."
-            || name_bytes == b".."
-        {
-            return_errno!(Errno::EINVAL);
-        }
+    //     let name_bytes = name.as_bytes();
+    //     if name_bytes.is_empty()
+    //         || name_bytes.len() > u8::MAX as usize
+    //         || name_bytes == b"."
+    //         || name_bytes == b".."
+    //     {
+    //         return_errno!(Errno::EINVAL);
+    //     }
 
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
-        let parent_ino = self
-            .weak_self
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "inode already dropped"))?
-            .ino();
+    //     let fs = self
+    //         .fs
+    //         .upgrade()
+    //         .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+    //     let parent_ino = self
+    //         .weak_self
+    //         .upgrade()
+    //         .ok_or_else(|| Error::with_message(Errno::EIO, "inode already dropped"))?
+    //         .ino();
 
-        // SPEC: reserve parent link for new subdir's `..`.
-        self.desc.links_count = self.desc.links_count.saturating_add(1);
+    //     // SPEC: reserve parent link for new subdir's `..`.
+    //     self.desc.links_count = self.desc.links_count.saturating_add(1);
 
-        let child = match fs.create_inode(parent_ino, InodeType::Dir, perm) {
-            Ok(child) => child,
-            Err(err) => {
-                // SPEC: rollback parent link reservation on failure.
-                self.desc.links_count = self.desc.links_count.saturating_sub(1);
-                return Err(err);
-            }
-        };
-        let child_ino = child.ino();
+    //     let child = match fs.create_inode(parent_ino, InodeType::Dir, perm) {
+    //         Ok(child) => child,
+    //         Err(err) => {
+    //             // SPEC: rollback parent link reservation on failure.
+    //             self.desc.links_count = self.desc.links_count.saturating_sub(1);
+    //             return Err(err);
+    //         }
+    //     };
+    //     let child_ino = child.ino();
 
-        {
-            let mut child_inner = child.inner.write();
-            if let Err(err) = child_inner.make_empty(parent_ino) {
-                let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
-                let _ = fs.free_inode(child_ino);
-                self.desc.links_count = self.desc.links_count.saturating_sub(1);
-                return Err(err);
-            }
-        }
+    //     {
+    //         let mut child_inner = child.inner.write();
+    //         if let Err(err) = child_inner.make_empty(parent_ino) {
+    //             let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
+    //             let _ = fs.free_inode(child_ino);
+    //             self.desc.links_count = self.desc.links_count.saturating_sub(1);
+    //             return Err(err);
+    //         }
+    //     }
 
-        if let Err(err) = self.add_entry(name, child_ino, DirEntryFileType::Dir) {
-            {
-                let mut child_inner = child.inner.write();
-                let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
-            }
-            let _ = fs.free_inode(child_ino);
-            self.desc.links_count = self.desc.links_count.saturating_sub(1);
-            return Err(err);
-        }
+    //     if let Err(err) = self.add_entry(name, child_ino, DirEntryFileType::Dir) {
+    //         {
+    //             let mut child_inner = child.inner.write();
+    //             let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
+    //         }
+    //         let _ = fs.free_inode(child_ino);
+    //         self.desc.links_count = self.desc.links_count.saturating_sub(1);
+    //         return Err(err);
+    //     }
 
-        // SPEC: persist parent link count update.
-        if let Err(err) = self.persist_inode_and_sync(&fs) {
-            let _ = self.delete_entry(name);
-            {
-                let mut child_inner = child.inner.write();
-                let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
-            }
-            let _ = fs.free_inode(child_ino);
-            self.desc.links_count = self.desc.links_count.saturating_sub(1);
-            return Err(err);
-        }
+    //     // SPEC: persist parent link count update.
+    //     if let Err(err) = self.persist_inode_and_sync(&fs) {
+    //         let _ = self.delete_entry(name);
+    //         {
+    //             let mut child_inner = child.inner.write();
+    //             let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
+    //         }
+    //         let _ = fs.free_inode(child_ino);
+    //         self.desc.links_count = self.desc.links_count.saturating_sub(1);
+    //         return Err(err);
+    //     }
 
-        Ok(child)
-    }
+    //     Ok(child)
+    // }
 
     /// Removes an existing empty subdirectory.
     ///
     /// Linux: /root/linux/fs/ext2/namei.c:302 (ext2_rmdir)
-    pub(super) fn rmdir(&mut self, name: &str) -> Result<()> {
-        if self.desc.type_ != InodeType::Dir {
-            return_errno!(Errno::ENOTDIR);
-        }
+    // pub(super) fn rmdir(&mut self, name: &str) -> Result<()> {
+    //     if self.desc.type_ != InodeType::Dir {
+    //         return_errno!(Errno::ENOTDIR);
+    //     }
 
-        let name_bytes = name.as_bytes();
-        if name_bytes.is_empty()
-            || name_bytes.len() > u8::MAX as usize
-            || name_bytes == b"."
-            || name_bytes == b".."
-        {
-            return_errno!(Errno::EINVAL);
-        }
+    //     let name_bytes = name.as_bytes();
+    //     if name_bytes.is_empty()
+    //         || name_bytes.len() > u8::MAX as usize
+    //         || name_bytes == b"."
+    //         || name_bytes == b".."
+    //     {
+    //         return_errno!(Errno::EINVAL);
+    //     }
 
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
-        let child_ino = self.find_entry(name)?;
-        let child = fs.read_inode(child_ino)?;
+    //     let fs = self
+    //         .fs
+    //         .upgrade()
+    //         .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+    //     let child_ino = self.find_entry(name)?;
+    //     let child = fs.read_inode(child_ino)?;
 
-        {
-            let mut child_inner = child.inner.write();
-            if child_inner.desc.type_ != InodeType::Dir {
-                return_errno!(Errno::ENOTDIR);
-            }
-            if !child_inner.empty_dir() {
-                return_errno!(Errno::ENOTEMPTY);
-            }
+    //     {
+    //         let mut child_inner = child.inner.write();
+    //         if child_inner.desc.type_ != InodeType::Dir {
+    //             return_errno!(Errno::ENOTDIR);
+    //         }
+    //         if !child_inner.empty_dir() {
+    //             return_errno!(Errno::ENOTEMPTY);
+    //         }
 
-            self.delete_entry(name)?;
+    //         self.delete_entry(name)?;
 
-            child_inner.release_dir_data_blocks_for_cleanup(&fs)?;
-            child_inner.desc.size = 0;
-            child_inner.desc.links_count = child_inner.desc.links_count.saturating_sub(2);
-            child_inner.persist_inode_and_sync(&fs)?;
-        }
+    //         child_inner.release_dir_data_blocks_for_cleanup(&fs)?;
+    //         child_inner.desc.size = 0;
+    //         child_inner.desc.links_count = child_inner.desc.links_count.saturating_sub(2);
+    //         child_inner.persist_inode_and_sync(&fs)?;
+    //     }
 
-        self.desc.links_count = self.desc.links_count.saturating_sub(1);
-        self.persist_inode_and_sync(&fs)?;
+    //     self.desc.links_count = self.desc.links_count.saturating_sub(1);
+    //     self.persist_inode_and_sync(&fs)?;
 
-        fs.free_inode(child_ino)
-    }
+    //     fs.free_inode(child_ino)
+    // }
 
     /// Finds a directory entry by name and returns its inode number.
     ///
@@ -3844,8 +3844,8 @@ mod test {
             ext2::{
                 fs::ROOT_INO,
                 testkit::{
-                    self, encode_dir_entry, write_indirect_ptr, CollectDirentVisitor, ErrorBioDisk,
-                    Ext2FixtureBuilder, RawInodeBuilder, StopAfterVisitor,
+                    self, CollectDirentVisitor, ErrorBioDisk, Ext2FixtureBuilder, RawInodeBuilder,
+                    StopAfterVisitor, encode_dir_entry, write_indirect_ptr,
                 },
             },
             utils::{IdBitmap, InodeIo, StatusFlags},
