@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::mem::size_of;
+use core::{mem::size_of};
 
 use ostd::{const_assert, mm::io_util::HasVmReaderWriter};
 
@@ -493,6 +493,50 @@ impl Inode {
         self.fs_arc()?.read_inode(ino)
     }
 
+    /// Adds a new directory entry using upread/upgrade phases.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link)
+    pub(super) fn add_entry(
+        &self,
+        name: &str,
+        ino: u32,
+        file_type: DirEntryFileType,
+    ) -> Result<()> {
+        if self.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty() || name_bytes.len() > u8::MAX as usize {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let fs = self.fs_arc()?;
+        let max_inumber = fs.super_block().total_inodes();
+        if ino == 0 || ino > max_inumber {
+            return_errno!(Errno::EINVAL);
+        }
+
+        // SPEC: keep upread while doing all PageCache I/O.
+        let mut inner = self.inner.upread();
+        let slot = match inner.scan_dir_for_slot(name, &fs)? {
+            DirScanResult::Slot(slot) => slot,
+            DirScanResult::NeedGrowth => {
+                // SPEC: upgrade only for metadata/block allocation mutation.
+                let mut write_inner = inner.upgrade();
+                let grown = write_inner.grow_dir_block(&fs)?;
+                inner = write_inner.downgrade();
+                grown
+            }
+        };
+
+        inner.write_dir_entry_to_cache(&slot, name, ino, file_type as u8)?;
+
+        // SPEC: upgrade after cache write to commit inode metadata.
+        let mut write_inner = inner.upgrade();
+        write_inner.commit_dir_metadata(&fs)
+    }
+
     pub(super) fn readdir_at(
         &self,
         offset: usize,
@@ -505,12 +549,253 @@ impl Inode {
         self.inner.read().readdir_at(offset, visitor)
     }
 
+    /// Deletes a directory entry by name using upread/upgrade phases.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:560 (ext2_delete_entry)
+    pub(super) fn delete_entry(&self, name: &str) -> Result<()> {
+        if self.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty() || name_bytes.len() > u8::MAX as usize {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let fs = self.fs_arc()?;
+        let inner = self.inner.upread();
+        let target = inner.find_entry_target(name).map_err(|err| {
+            if err.error() == Errno::ENOENT {
+                Error::with_message(Errno::EIO, "dir entry not found for delete")
+            } else {
+                err
+            }
+        })?;
+        inner.delete_entry_in_cache(&target)?;
+
+        let mut write_inner = inner.upgrade();
+        write_inner.commit_dir_metadata(&fs)
+    }
+
+    /// Initializes a directory with `.` and `..` using write->upread->write phases.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:617 (ext2_make_empty)
+    pub(super) fn make_empty(&self, parent_ino: u32) -> Result<()> {
+        if self.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let fs = self.fs_arc()?;
+        let total_inodes = fs.super_block().total_inodes();
+        if parent_ino == 0 || parent_ino > total_inodes {
+            return_errno_with_message!(Errno::EINVAL, "parent inode number out of range");
+        }
+
+        let block_size = fs.block_size();
+        let mut write_inner = self.inner.write();
+        if write_inner.desc.block_ptrs[0] != 0 {
+            return_errno_with_message!(Errno::EIO, "dir block pointer already occupied");
+        }
+
+        let old_ptr0 = write_inner.desc.block_ptrs[0];
+        let old_size = write_inner.desc.size;
+        let old_blocks = write_inner.desc.blocks;
+
+        // SPEC: allocate first data block under write lock (&mut self required).
+        let new_bid = write_inner
+            .get_or_alloc_block(0, true)?
+            .ok_or_else(|| {
+                Error::with_message(Errno::ENOSPC, "failed to allocate first dir block")
+            })?
+            .to_raw() as u32;
+        write_inner.desc.size = block_size as u64;
+
+        if let Err(err) = write_inner.page_cache.resize(block_size) {
+            write_inner.page_cache.discard_range(0..block_size);
+            write_inner.desc.block_ptrs[0] = old_ptr0;
+            write_inner.desc.size = old_size;
+            write_inner.desc.blocks = old_blocks;
+            let _ = fs.free_blocks(new_bid, 1);
+            return Err(err);
+        }
+
+        // SPEC: downgrade for PageCache write path.
+        let upread_inner = write_inner.downgrade();
+        let mut buf = vec![0u8; block_size];
+        InodeInner::write_dir_entry_bytes(
+            &mut buf,
+            0,
+            self.ino,
+            DirEntry::dir_rec_len(1),
+            b".",
+            DirEntryFileType::Dir as u8,
+        )?;
+        let dot_len = DirEntry::dir_rec_len(1) as usize;
+        InodeInner::write_dir_entry_bytes(
+            &mut buf,
+            dot_len,
+            parent_ino,
+            (block_size.saturating_sub(dot_len)) as u16,
+            b"..",
+            DirEntryFileType::Dir as u8,
+        )?;
+
+        if let Err(err) = upread_inner.page_cache.pages().write_bytes(0, &buf) {
+            let mut write_inner = upread_inner.upgrade();
+            write_inner.page_cache.discard_range(0..block_size);
+            write_inner.desc.block_ptrs[0] = old_ptr0;
+            write_inner.desc.size = old_size;
+            write_inner.desc.blocks = old_blocks;
+            let _ = fs.free_blocks(new_bid, 1);
+            return Err(err.into());
+        }
+
+        let write_inner = upread_inner.upgrade();
+        if let Err(err) = write_inner.persist_inode_and_sync(&fs) {
+            let mut write_inner = write_inner;
+            write_inner.page_cache.discard_range(0..block_size);
+            write_inner.desc.block_ptrs[0] = old_ptr0;
+            write_inner.desc.size = old_size;
+            write_inner.desc.blocks = old_blocks;
+            let _ = fs.free_blocks(new_bid, 1);
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn empty_dir(&self) -> bool {
+        self.inner.read().empty_dir()
+    }
+
     pub(super) fn rmdir(&self, name: &str) -> Result<()> {
         if self.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
 
-        self.inner.write().rmdir(name)
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty()
+            || name_bytes.len() > u8::MAX as usize
+            || name_bytes == b"."
+            || name_bytes == b".."
+        {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let fs = self.fs_arc()?;
+        let parent_upread = self.inner.upread();
+        let child_ino = parent_upread.find_entry(name)?;
+        let child = fs.read_inode(child_ino)?;
+
+        {
+            let child_read = child.inner.read();
+            if child_read.desc.type_ != InodeType::Dir {
+                return_errno!(Errno::ENOTDIR);
+            }
+            if !child_read.empty_dir() {
+                return_errno!(Errno::ENOTEMPTY);
+            }
+        }
+
+        let target = parent_upread.find_entry_target(name)?;
+        parent_upread.delete_entry_in_cache(&target)?;
+        let mut parent_write = parent_upread.upgrade();
+        parent_write.commit_dir_metadata(&fs)?;
+
+        {
+            let mut child_write = child.inner.write();
+            child_write.release_dir_data_blocks_for_cleanup(&fs)?;
+            child_write.desc.links_count = child_write.desc.links_count.saturating_sub(2);
+            child_write.desc.dtime = now();
+            child_write.persist_inode_and_sync(&fs)?;
+        }
+
+        parent_write.desc.links_count = parent_write.desc.links_count.saturating_sub(1);
+        parent_write.persist_inode_and_sync(&fs)?;
+        fs.free_inode(child_ino)
+    }
+
+    /// Creates a subdirectory under this directory using phased locking.
+    ///
+    /// Linux: /root/linux/fs/ext2/namei.c:228 (ext2_mkdir)
+    pub(super) fn mkdir(&self, name: &str, perm: FilePerm) -> Result<Arc<Inode>> {
+        if self.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty()
+            || name_bytes.len() > u8::MAX as usize
+            || name_bytes == b"."
+            || name_bytes == b".."
+        {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let fs = self.fs_arc()?;
+
+        // SPEC: hold upread for directory-data phases and upgrade for metadata phases.
+        let mut parent_guard = self.inner.upread();
+        let slot = match parent_guard.scan_dir_for_slot(name, &fs)? {
+            DirScanResult::Slot(slot) => slot,
+            DirScanResult::NeedGrowth => {
+                let mut parent_write = parent_guard.upgrade();
+                let grown = parent_write.grow_dir_block(&fs)?;
+                parent_guard = parent_write.downgrade();
+                grown
+            }
+        };
+
+        let mut parent_write = parent_guard.upgrade();
+        parent_write.desc.links_count = parent_write.desc.links_count.saturating_add(1);
+        parent_guard = parent_write.downgrade();
+
+        let child = match fs.create_inode(self.ino, InodeType::Dir, perm) {
+            Ok(child) => child,
+            Err(err) => {
+                let mut parent_write = parent_guard.upgrade();
+                parent_write.desc.links_count = parent_write.desc.links_count.saturating_sub(1);
+                return Err(err);
+            }
+        };
+        let child_ino = child.ino();
+
+        if let Err(err) = child.make_empty(self.ino) {
+            let _ = fs.free_inode(child_ino);
+            let mut parent_write = parent_guard.upgrade();
+            parent_write.desc.links_count = parent_write.desc.links_count.saturating_sub(1);
+            return Err(err);
+        }
+
+        if let Err(err) = parent_guard.write_dir_entry_to_cache(
+            &slot,
+            name,
+            child_ino,
+            DirEntryFileType::Dir as u8,
+        ) {
+            {
+                let mut child_inner = child.inner.write();
+                let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
+            }
+            let _ = fs.free_inode(child_ino);
+            let mut parent_write = parent_guard.upgrade();
+            parent_write.desc.links_count = parent_write.desc.links_count.saturating_sub(1);
+            return Err(err);
+        }
+
+        let mut parent_write = parent_guard.upgrade();
+        if let Err(err) = parent_write.commit_dir_metadata(&fs) {
+            let _ = self.delete_entry(name);
+            {
+                let mut child_inner = child.inner.write();
+                let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
+            }
+            let _ = fs.free_inode(child_ino);
+            parent_write.desc.links_count = parent_write.desc.links_count.saturating_sub(1);
+            return Err(err);
+        }
+
+        Ok(child)
     }
 
     pub(super) fn sync_all(&self) -> Result<()> {
@@ -596,12 +881,32 @@ pub struct InodeInner {
     page_cache: PageCache,
 }
 
+/// Scan result for directory slot search.
 #[derive(Debug)]
-struct DeleteTarget {
-    block_bid: Bid,
-    block_buf: Vec<u8>,
-    limit: usize,
-    entry_offset: usize,
+enum DirScanResult {
+    /// Found a usable slot in an existing block.
+    Slot(DirSlotInfo),
+    /// No slot found; directory must grow by one block.
+    NeedGrowth,
+}
+
+/// Information about a candidate directory entry slot.
+#[derive(Clone, Copy, Debug)]
+struct DirSlotInfo {
+    /// Byte offset within the directory (block_idx * block_size + offset_in_block).
+    dir_offset: usize,
+    /// Current rec_len of the candidate slot.
+    slot_rec_len: usize,
+    /// Minimal occupied length of the existing entry head (0 if slot is free).
+    used_rec_len: usize,
+}
+
+/// Located directory entry for delete/set_link.
+#[derive(Clone, Copy, Debug)]
+struct DirEntryTarget {
+    /// Byte offset of the target entry within the directory.
+    dir_offset: usize,
+    /// rec_len of the target entry.
     entry_rec_len: usize,
 }
 
@@ -1383,15 +1688,12 @@ impl InodeInner {
         let data_blocks = size.div_ceil(block_size);
 
         for block_idx in 0..data_blocks {
-            let bid = match self.get_block(block_idx as u32) {
-                Ok(Some(bid)) => bid,
-                _ => return false,
-            };
-
             let mut buf = vec![0u8; block_size];
-            if fs
-                .block_device()
-                .read_bytes(bid.to_offset(), &mut buf)
+            let block_offset = block_idx.saturating_mul(block_size);
+            if self
+                .page_cache
+                .pages()
+                .read_bytes(block_offset, &mut buf)
                 .is_err()
             {
                 return false;
@@ -1574,30 +1876,24 @@ impl InodeInner {
         let block_size = fs.block_size();
         let size = self.desc.size;
         let max_inumber = sb.total_inodes();
-        let max_blocks = (self.desc.blocks as u64) >> 3;
         let mut block_idx = 0usize;
 
         while (block_idx as u64).saturating_mul(block_size as u64) < size {
-            if (block_idx as u64) > max_blocks {
-                return_errno!(Errno::ENOENT);
-            }
-            let block_offset = (block_idx as u64).saturating_mul(block_size as u64);
-            let remain = size.saturating_sub(block_offset);
-            let limit = (remain.min(block_size as u64)) as usize;
+            let block_offset = block_idx.saturating_mul(block_size);
+            let remain = (size as usize).saturating_sub(block_offset);
+            let limit = remain.min(block_size);
             if limit == 0 {
                 break;
             }
 
-            let bid = self
-                .get_block(block_idx as u32)?
-                .ok_or_else(|| Error::with_message(Errno::EIO, "dir block not mapped"))?;
             let mut buf = vec![0u8; block_size];
-            if fs
-                .block_device()
-                .read_bytes(bid.to_offset(), &mut buf)
+            if self
+                .page_cache
+                .pages()
+                .read_bytes(block_offset, &mut buf)
                 .is_err()
             {
-                return_errno_with_message!(Errno::EIO, "failed to read dir block");
+                return_errno_with_message!(Errno::EIO, "failed to read dir block via page cache");
             }
 
             let mut iter = DirEntryIter::new(&buf, limit, max_inumber)?;
@@ -1662,16 +1958,14 @@ impl InodeInner {
                 break;
             }
 
-            let bid = self
-                .get_block(block_idx as u32)?
-                .ok_or_else(|| Error::with_message(Errno::EIO, "dir block not mapped"))?;
             let mut buf = vec![0u8; block_size];
-            if fs
-                .block_device()
-                .read_bytes(bid.to_offset(), &mut buf)
+            if self
+                .page_cache
+                .pages()
+                .read_bytes(block_offset, &mut buf)
                 .is_err()
             {
-                return_errno_with_message!(Errno::EIO, "failed to read dir block");
+                return_errno_with_message!(Errno::EIO, "failed to read dir block via page cache");
             }
 
             let mut iter = DirEntryIter::new(&buf, limit, max_inumber)?;
@@ -2144,15 +2438,10 @@ impl InodeInner {
         Ok(Some(bid))
     }
 
-    /// Adds a new directory entry to this directory inode.
+    /// Phase 1: scan directory blocks for reusable slot or duplicate.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link)
-    pub(super) fn add_entry(
-        &mut self,
-        name: &str,
-        ino: u32,
-        file_type: DirEntryFileType,
-    ) -> Result<()> {
+    /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link scan loop)
+    fn scan_dir_for_slot(&self, name: &str, fs: &Ext2) -> Result<DirScanResult> {
         if self.desc.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
@@ -2162,6 +2451,106 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
+        let block_size = fs.block_size();
+        let reclen = DirEntry::dir_rec_len(name_bytes.len()) as usize;
+        if reclen > block_size {
+            return_errno_with_message!(Errno::ENOSPC, "dir entry too large for block");
+        }
+
+        let size = self.desc.size as usize;
+        let max_inumber = fs.super_block().total_inodes();
+        let data_blocks = size.div_ceil(block_size);
+
+        for block_idx in 0..data_blocks {
+            let block_offset = block_idx.saturating_mul(block_size);
+            let limit = size.saturating_sub(block_offset).min(block_size);
+            if limit == 0 {
+                continue;
+            }
+
+            let mut buf = vec![0u8; block_size];
+            ostd::early_println!("Scanning block  at offset ");
+            // SPEC: directory scan reads through inode page cache.
+            self.page_cache.pages().read_bytes(block_offset, &mut buf)?;
+
+            let entries = Self::collect_dir_entries_with_offsets(&buf, limit, max_inumber)?;
+            for (entry_offset, entry) in entries {
+                if entry.inode != 0
+                    && entry.name_len as usize == name_bytes.len()
+                    && entry.name.as_bytes() == name_bytes
+                {
+                    // SPEC: duplicate names fail with EEXIST.
+                    return_errno!(Errno::EEXIST);
+                }
+
+                let rec_len = entry.rec_len as usize;
+                let used_len = if entry.inode == 0 {
+                    0
+                } else {
+                    DirEntry::dir_rec_len(entry.name_len as usize) as usize
+                };
+
+                // SPEC: free entry can be reused, occupied entry can be split.
+                if (entry.inode == 0 && rec_len >= reclen)
+                    || (entry.inode != 0 && rec_len >= used_len.saturating_add(reclen))
+                {
+                    return Ok(DirScanResult::Slot(DirSlotInfo {
+                        dir_offset: block_offset + entry_offset,
+                        slot_rec_len: rec_len,
+                        used_rec_len: used_len,
+                    }));
+                }
+            }
+        }
+        ostd::early_println!("No slot found, need growth");
+
+        Ok(DirScanResult::NeedGrowth)
+    }
+
+    /// Phase 2: grow directory by one data block.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link growth path)
+    fn grow_dir_block(&mut self, fs: &Ext2) -> Result<DirSlotInfo> {
+        let block_size = fs.block_size();
+        let old_size = self.desc.size as usize;
+        let old_blocks = self.desc.blocks;
+        let data_blocks = old_size.div_ceil(block_size);
+        let growth_iblock = u32::try_from(data_blocks)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "directory block index overflow"))?;
+
+        // SPEC: allocation under write lock; no PageCache I/O.
+        self.get_or_alloc_block(growth_iblock, true)?
+            .ok_or_else(|| Error::with_message(Errno::ENOSPC, "failed to grow directory block"))?;
+
+        let new_size = old_size.saturating_add(block_size);
+        self.desc.size = new_size as u64;
+        if let Err(err) = self.page_cache.resize(new_size) {
+            // SPEC: rollback allocated growth on resize failure.
+            self.page_cache.discard_range(old_size..new_size);
+            self.desc.size = old_size as u64;
+            self.desc.blocks = old_blocks;
+            self.truncate_blocks(old_size)?;
+            return Err(err);
+        }
+
+        ostd::early_println!("Grew directory from  to  bytes");
+        Ok(DirSlotInfo {
+            dir_offset: old_size,
+            slot_rec_len: block_size,
+            used_rec_len: 0,
+        })
+    }
+
+    /// Phase 3: write a new entry into a selected slot via PageCache.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link commit)
+    fn write_dir_entry_to_cache(
+        &self,
+        slot: &DirSlotInfo,
+        name: &str,
+        ino: u32,
+        ft: u8,
+    ) -> Result<()> {
         let fs = self
             .fs
             .upgrade()
@@ -2171,174 +2560,170 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
-        let chunk_size = fs.block_size();
-        let reclen = DirEntry::dir_rec_len(name_bytes.len()) as usize;
-        if reclen > chunk_size {
-            return_errno_with_message!(Errno::ENOSPC, "dir entry too large for block");
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty() || name_bytes.len() > u8::MAX as usize {
+            return_errno!(Errno::EINVAL);
         }
 
+        let entry_reclen = DirEntry::dir_rec_len(name_bytes.len()) as usize;
+        if entry_reclen > slot.slot_rec_len {
+            return_errno_with_message!(Errno::ENOSPC, "slot too small for dir entry");
+        }
+
+        let mut offset = slot.dir_offset;
+        let mut rec_len = slot.slot_rec_len;
+        if slot.used_rec_len != 0 {
+            if slot.used_rec_len >= slot.slot_rec_len {
+                return_errno_with_message!(Errno::EIO, "corrupted dir entry split");
+            }
+            // SPEC: when splitting, commit predecessor rec_len before writing new entry.
+            let split_len = (slot.used_rec_len as u16).to_le_bytes();
+            self.page_cache
+                .pages()
+                .write_bytes(slot.dir_offset.saturating_add(4), &split_len)?;
+            offset = slot.dir_offset.saturating_add(slot.used_rec_len);
+            rec_len = slot.slot_rec_len.saturating_sub(slot.used_rec_len);
+        }
+
+        let mut entry_buf = vec![0u8; rec_len];
+        Self::write_dir_entry_bytes(&mut entry_buf, 0, ino, rec_len as u16, name_bytes, ft)?;
+        self.page_cache.pages().write_bytes(offset, &entry_buf)?;
+        Ok(())
+    }
+
+    /// Phase 4: update directory ctime/mtime and persist inode.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:84 (ext2_commit_chunk)
+    fn commit_dir_metadata(&mut self, fs: &Ext2) -> Result<()> {
+        self.update_dir_timestamps_and_flags()?;
+        self.persist_inode_and_sync(fs)
+    }
+
+    /// Locate a target entry by name for delete/set_link operations.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:342 (ext2_find_entry)
+    fn find_entry_target(&self, name: &str) -> Result<DirEntryTarget> {
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let max_inumber = fs.super_block().total_inodes();
+        let block_size = fs.block_size();
         let size = self.desc.size as usize;
-        let data_blocks = size.div_ceil(chunk_size);
+        let name_bytes = name.as_bytes();
 
-        // Candidate insertion slot selected during the ext2_add_link-style scan.
-        struct InsertSlot {
-            // Physical block that will be rewritten.
-            block_bid: Bid,
-            // Full block buffer containing the candidate slot.
-            block_buf: Vec<u8>,
-            // Byte offset of the candidate dirent slot within `block_buf`.
-            slot_offset: usize,
-            // Current rec_len of the candidate slot.
-            slot_rec_len: usize,
-            // Minimal occupied length of the existing entry head.
-            used_rec_len: usize,
-            // True when we insert by splitting an occupied entry.
-            split_used_entry: bool,
-            // True when the slot comes from a newly allocated directory block.
-            from_new_block: bool,
-        }
-
-        let mut selected: Option<InsertSlot> = None;
-        // SPEC: scan in ascending logical block order and include one growth slot.
-        for block_idx in 0..=data_blocks {
-            if block_idx == data_blocks {
-                // No reusable slot found in existing blocks: grow directory by one block.
-                let growth_iblock = u32::try_from(block_idx).map_err(|_| {
-                    Error::with_message(Errno::EINVAL, "directory block index overflow")
-                })?;
-                // SPEC: growth must use full-tree allocation path (direct + indirect).
-                let growth_bid =
-                    self.get_or_alloc_block(growth_iblock, true)?
-                        .ok_or_else(|| {
-                            Error::with_message(
-                                Errno::EIO,
-                                "missing block mapping after allocation",
-                            )
-                        })?;
-
-                let mut buf = vec![0u8; chunk_size];
-                Self::write_dir_entry_bytes(&mut buf, 0, 0, chunk_size as u16, b"", 0)?;
-                selected = Some(InsertSlot {
-                    block_bid: growth_bid,
-                    block_buf: buf,
-                    slot_offset: 0,
-                    slot_rec_len: chunk_size,
-                    used_rec_len: 0,
-                    split_used_entry: false,
-                    from_new_block: true,
-                });
-                break;
-            }
-
-            let bid = self
-                .get_block(block_idx as u32)?
-                .ok_or_else(|| Error::with_message(Errno::EIO, "dir block not mapped"))?;
-
-            let mut buf = vec![0u8; chunk_size];
-            if fs
-                .block_device()
-                .read_bytes(bid.to_offset(), &mut buf)
-                .is_err()
-            {
-                return_errno_with_message!(Errno::EIO, "failed to read dir block");
-            }
-
-            let block_offset = block_idx.saturating_mul(chunk_size);
-            let limit = size.saturating_sub(block_offset).min(chunk_size);
+        for block_idx in 0..size.div_ceil(block_size) {
+            let block_offset = block_idx.saturating_mul(block_size);
+            let limit = size.saturating_sub(block_offset).min(block_size);
             if limit == 0 {
                 continue;
             }
 
+            let mut buf = vec![0u8; block_size];
+            self.page_cache.pages().read_bytes(block_offset, &mut buf)?;
+
             let entries = Self::collect_dir_entries_with_offsets(&buf, limit, max_inumber)?;
             for (entry_offset, entry) in entries {
-                let rec_len = entry.rec_len as usize;
-                let used_len = DirEntry::dir_rec_len(entry.name_len as usize) as usize;
-
-                if entry.inode != 0
-                    && entry.name_len as usize == name_bytes.len()
-                    && entry.name.as_bytes() == name_bytes
-                {
-                    return_errno!(Errno::EEXIST);
+                if entry.inode == 0 {
+                    continue;
                 }
-
-                if (entry.inode == 0 && rec_len >= reclen)
-                    || (entry.inode != 0 && rec_len >= used_len.saturating_add(reclen))
-                {
-                    // Reuse free slot or split an occupied slot with enough tail space.
-                    selected = Some(InsertSlot {
-                        block_bid: bid,
-                        block_buf: buf,
-                        slot_offset: entry_offset,
-                        slot_rec_len: rec_len,
-                        used_rec_len: used_len,
-                        split_used_entry: entry.inode != 0,
-                        from_new_block: false,
+                if entry.name_len as usize != name_bytes.len() {
+                    continue;
+                }
+                if entry.name.as_bytes() == name_bytes {
+                    return Ok(DirEntryTarget {
+                        dir_offset: block_offset + entry_offset,
+                        entry_rec_len: entry.rec_len as usize,
                     });
-                    break;
                 }
             }
-
-            if selected.is_some() {
-                break;
-            }
         }
 
-        let Some(InsertSlot {
-            block_bid,
-            mut block_buf,
-            slot_offset,
-            slot_rec_len,
-            used_rec_len,
-            split_used_entry,
-            from_new_block,
-        }) = selected
-        else {
-            return_errno_with_message!(Errno::ENOSPC, "no space for new dir entry");
-        };
+        return_errno!(Errno::ENOENT)
+    }
 
-        let (new_offset, new_rec_len) = if split_used_entry {
-            if used_rec_len < DirEntry::dir_rec_len(1) as usize || used_rec_len >= slot_rec_len {
-                return_errno_with_message!(Errno::EIO, "corrupted dir entry split");
-            }
-            Self::write_rec_len(&mut block_buf, slot_offset, used_rec_len as u16)?;
-            (slot_offset + used_rec_len, slot_rec_len - used_rec_len)
-        } else {
-            (slot_offset, slot_rec_len)
-        };
+    /// Delete a located entry by zeroing inode and merging rec_len.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:560 (ext2_delete_entry)
+    fn delete_entry_in_cache(&self, target: &DirEntryTarget) -> Result<()> {
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let block_size = fs.block_size();
+        let block_base = (target.dir_offset / block_size).saturating_mul(block_size);
+        let entry_offset = target.dir_offset.saturating_sub(block_base);
+        let limit = (self.desc.size as usize)
+            .saturating_sub(block_base)
+            .min(block_size);
 
-        Self::write_dir_entry_bytes(
+        let mut block_buf = vec![0u8; block_size];
+        self.page_cache
+            .pages()
+            .read_bytes(block_base, &mut block_buf)?;
+        Self::delete_entry_in_block(
             &mut block_buf,
-            new_offset,
-            ino,
-            new_rec_len as u16,
-            name_bytes,
-            file_type as u8,
+            limit,
+            block_size,
+            entry_offset,
+            target.entry_rec_len,
         )?;
-
-        if fs
-            .block_device()
-            .write_bytes(block_bid.to_offset(), &block_buf)
-            .is_err()
-        {
-            // SPEC: after get_or_alloc_block(create=true), the growth block is already
-            // linked into the inode tree. Keep it linked on write failure; truncation
-            // or inode cleanup paths will reclaim it.
-            return_errno_with_message!(Errno::EIO, "failed to write dir block");
-        }
-
-        if from_new_block {
-            // SPEC: get_or_alloc_block already accounts for data/indirect blocks.
-            // Directory growth only needs to extend i_size by one chunk.
-            self.desc.size = self
-                .desc
-                .size
-                .checked_add(chunk_size as u64)
-                .ok_or_else(|| Error::with_message(Errno::EIO, "inode size overflow"))?;
-        }
-
-        self.update_dir_timestamps_and_flags()?;
-        self.persist_inode_and_sync(&fs)?;
+        self.page_cache
+            .pages()
+            .write_bytes(block_base, &block_buf)?;
         Ok(())
+    }
+
+    /// Rewrite a located entry's inode/type via PageCache.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:450 (ext2_set_link)
+    fn set_link_in_cache(&self, target: &DirEntryTarget, new_ino: u32, ft: u8) -> Result<()> {
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let block_size = fs.block_size();
+        let block_base = (target.dir_offset / block_size).saturating_mul(block_size);
+        let entry_offset = target.dir_offset.saturating_sub(block_base);
+
+        let mut block_buf = vec![0u8; block_size];
+        self.page_cache
+            .pages()
+            .read_bytes(block_base, &mut block_buf)?;
+        Self::write_inode_number(&mut block_buf, entry_offset, new_ino)?;
+        if entry_offset.saturating_add(size_of::<RawDirEntry>()) > block_buf.len() {
+            return_errno_with_message!(Errno::EIO, "dir entry header out of bounds");
+        }
+        block_buf[entry_offset + 7] = ft;
+        self.page_cache
+            .pages()
+            .write_bytes(block_base, &block_buf)?;
+        Ok(())
+    }
+
+    /// Adds a new directory entry to this directory inode.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link)
+    pub(super) fn add_entry(
+        &mut self,
+        name: &str,
+        ino: u32,
+        file_type: DirEntryFileType,
+    ) -> Result<()> {
+        let fs = self
+            .fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+
+        ostd::early_println!("Adding entry with inode");
+        // SPEC: ext2_add_link-style scan then growth if needed.
+        let slot = match self.scan_dir_for_slot(name, &fs)? {
+            DirScanResult::Slot(slot) => slot,
+            DirScanResult::NeedGrowth => self.grow_dir_block(&fs)?,
+        };
+        self.write_dir_entry_to_cache(&slot, name, ino, file_type as u8)?;
+        ostd::early_println!("Committed metadata");
+        self.commit_dir_metadata(&fs)
     }
 
     /// Rewrites an existing entry's inode/type in-place.
@@ -2369,35 +2754,15 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
-        let chunk_size = fs.block_size();
-        let size = self.desc.size as usize;
-        let Some(mut target) =
-            self.find_entry_slot(name_bytes, &fs, max_inumber, chunk_size, size)?
-        else {
-            return_errno!(Errno::ENOENT);
-        };
-
-        Self::write_inode_number(&mut target.block_buf, target.entry_offset, new_ino)?;
-        if target.entry_offset.saturating_add(size_of::<RawDirEntry>()) > target.block_buf.len() {
-            return_errno_with_message!(Errno::EIO, "dir entry header out of bounds");
-        }
-        target.block_buf[target.entry_offset + 7] = file_type as u8;
-
-        if fs
-            .block_device()
-            .write_bytes(target.block_bid.to_offset(), &target.block_buf)
-            .is_err()
-        {
-            return_errno_with_message!(Errno::EIO, "failed to write dir block");
-        }
+        let target = self.find_entry_target(name)?;
+        self.set_link_in_cache(&target, new_ino, file_type as u8)?;
 
         if update_times {
-            self.update_dir_timestamps_and_flags()?;
+            self.commit_dir_metadata(&fs)
         } else {
             self.desc.flags.remove(FileFlags::INDEX_DIR);
+            self.persist_inode_and_sync(&fs)
         }
-        self.persist_inode_and_sync(&fs)?;
-        Ok(())
     }
 
     /// Deletes a directory entry by name.
@@ -2417,36 +2782,15 @@ impl InodeInner {
             .fs
             .upgrade()
             .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
-        let max_inumber = fs.super_block().total_inodes();
-        let chunk_size = fs.block_size();
-        let size = self.desc.size as usize;
-
-        // Linux split: ext2_find_entry() locates, ext2_delete_entry() mutates one folio/chunk.
-        let Some(mut target) =
-            self.find_entry_slot(name_bytes, &fs, max_inumber, chunk_size, size)?
-        else {
-            return_errno_with_message!(Errno::EIO, "dir entry not found for delete");
-        };
-
-        Self::delete_entry_in_block(
-            &mut target.block_buf,
-            target.limit,
-            chunk_size,
-            target.entry_offset,
-            target.entry_rec_len,
-        )?;
-
-        if fs
-            .block_device()
-            .write_bytes(target.block_bid.to_offset(), &target.block_buf)
-            .is_err()
-        {
-            return_errno_with_message!(Errno::EIO, "failed to write dir block");
-        }
-
-        self.update_dir_timestamps_and_flags()?;
-        self.persist_inode_and_sync(&fs)?;
-        Ok(())
+        let target = self.find_entry_target(name).map_err(|err| {
+            if err.error() == Errno::ENOENT {
+                Error::with_message(Errno::EIO, "dir entry not found for delete")
+            } else {
+                err
+            }
+        })?;
+        self.delete_entry_in_cache(&target)?;
+        self.commit_dir_metadata(&fs)
     }
 
     fn collect_dir_entries_with_offsets(
@@ -2465,61 +2809,6 @@ impl InodeInner {
         }
 
         Ok(entries)
-    }
-
-    fn find_entry_slot(
-        &self,
-        name_bytes: &[u8],
-        fs: &Ext2,
-        max_inumber: u32,
-        chunk_size: usize,
-        size: usize,
-    ) -> Result<Option<DeleteTarget>> {
-        let data_blocks = size.div_ceil(chunk_size);
-
-        for block_idx in 0..data_blocks {
-            let block_bid = self
-                .get_block(block_idx as u32)?
-                .ok_or_else(|| Error::with_message(Errno::EIO, "dir block not mapped"))?;
-
-            let mut block_buf = vec![0u8; chunk_size];
-            if fs
-                .block_device()
-                .read_bytes(block_bid.to_offset(), &mut block_buf)
-                .is_err()
-            {
-                return_errno_with_message!(Errno::EIO, "failed to read dir block");
-            }
-
-            let block_offset = block_idx.saturating_mul(chunk_size);
-            let limit = size.saturating_sub(block_offset).min(chunk_size);
-            if limit == 0 {
-                continue;
-            }
-
-            let entries = Self::collect_dir_entries_with_offsets(&block_buf, limit, max_inumber)?;
-            for (entry_offset, entry) in entries {
-                if entry.inode == 0 {
-                    continue;
-                }
-                if entry.name_len as usize != name_bytes.len() {
-                    continue;
-                }
-                if entry.name.as_bytes() != name_bytes {
-                    continue;
-                }
-
-                return Ok(Some(DeleteTarget {
-                    block_bid,
-                    block_buf,
-                    limit,
-                    entry_offset,
-                    entry_rec_len: entry.rec_len as usize,
-                }));
-            }
-        }
-
-        Ok(None)
     }
 
     fn delete_entry_in_block(
@@ -2800,22 +3089,8 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        // Acquire write lock on self.inner for the entire mutation.
-        let mut inner = self.inner.write();
-
-        // SPEC: check for duplicate name before allocation.
-        if inner.find_entry(name).is_ok() {
-            return_errno!(Errno::EEXIST);
-        }
-
         if type_ == InodeType::Dir {
-            // TODO: different from Linux, should we keep this?
-            // Delegate to existing mkdir which handles the full directory
-            // creation state machine (parent link reservation, make_empty,
-            // add_entry, rollback).
-            // Linux: ext2_mkdir
-            let ret = inner.mkdir(name, perm)?;
-            return Ok(ret);
+            return self.mkdir(name, perm);
         } else {
             // Linux: ext2_create → ext2_new_inode + ext2_add_nondir
             let fs = self
@@ -2826,7 +3101,7 @@ impl Inode {
             let child_ino = child.ino();
             let dir_ft = Self::inode_type_to_dir_file_type(type_);
 
-            if let Err(err) = inner.add_entry(name, child_ino, dir_ft) {
+            if let Err(err) = self.add_entry(name, child_ino, dir_ft) {
                 // SPEC: rollback — ext2_add_nondir failure path:
                 // decrement link count and discard inode.
                 let _ = fs.free_inode(child_ino);
@@ -2873,29 +3148,23 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        // Lock ordering: acquire write locks by ascending inode number
-        // to prevent deadlock when self and old are different inodes.
         let dir_ft = Self::inode_type_to_dir_file_type(old.type_);
 
-        let (mut self_inner, mut old_inner) = write_lock_two_inodes(self, old);
-
-        // SPEC: check duplicate before modifying link count.
-        if self_inner.find_entry(name).is_ok() {
-            return_errno!(Errno::EEXIST);
+        // Linux: inode_set_ctime_current + inode_inc_link_count before add_link.
+        {
+            let mut old_inner = old.inner.write();
+            old_inner.desc.ctime = now();
+            old_inner.desc.links_count = old_inner.desc.links_count.saturating_add(1);
         }
 
-        // Linux: inode_set_ctime_current + inode_inc_link_count before add_link.
-        old_inner.desc.ctime = now();
-        old_inner.desc.links_count = old_inner.desc.links_count.saturating_add(1);
-
-        if let Err(err) = self_inner.add_entry(name, old.ino, dir_ft) {
+        if let Err(err) = self.add_entry(name, old.ino, dir_ft) {
             // SPEC: rollback link count on add_entry failure.
+            let mut old_inner = old.inner.write();
             old_inner.desc.links_count = old_inner.desc.links_count.saturating_sub(1);
             return Err(err);
         }
 
-        // Persist old inode metadata.
-        old_inner.persist_inode_and_sync(&fs)?;
+        old.inner.write().persist_inode_and_sync(&fs)?;
         Ok(())
     }
 
@@ -2922,9 +3191,7 @@ impl Inode {
             .upgrade()
             .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
 
-        // Acquire self write lock to resolve and delete entry.
-        let mut self_inner = self.inner.write();
-        let child_ino = self_inner.find_entry(name)?;
+        let child_ino = self.inner.read().find_entry(name)?;
         let child = fs.read_inode(child_ino)?;
 
         // SPEC: unlink rejects directories — use rmdir instead.
@@ -2933,12 +3200,12 @@ impl Inode {
         }
 
         // Delete the directory entry first.
-        self_inner.delete_entry(name)?;
+        self.delete_entry(name)?;
 
         // Linux: inode_set_ctime_to_ts(inode, inode_get_ctime(dir))
         // then inode_dec_link_count.
         let mut child_inner = child.inner.write();
-        child_inner.desc.ctime = self_inner.desc.ctime;
+        child_inner.desc.ctime = now();
         child_inner.desc.links_count = child_inner.desc.links_count.saturating_sub(1);
 
         // SPEC: if link count reaches 0, mark deletion time and free inode.
@@ -3222,8 +3489,6 @@ impl Inode {
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:450 (ext2_set_link)
     ///
-    /// This is an `Inode`-level wrapper that acquires the write lock
-    /// and delegates to `InodeInner::set_link`.
     pub(super) fn set_link(
         &self,
         name: &str,
@@ -3234,8 +3499,30 @@ impl Inode {
         if self.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
-        let mut inner = self.inner.write();
-        inner.set_link(name, new_ino, file_type, update_times)
+
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty() || name_bytes.len() > u8::MAX as usize || name_bytes == b"." {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let fs = self.fs_arc()?;
+        let max_inumber = fs.super_block().total_inodes();
+        if new_ino < ROOT_INO || new_ino > max_inumber {
+            return_errno!(Errno::EINVAL);
+        }
+
+        // SPEC: run PageCache locate+update under upread, then metadata under write.
+        let inner = self.inner.upread();
+        let target = inner.find_entry_target(name)?;
+        inner.set_link_in_cache(&target, new_ino, file_type as u8)?;
+
+        let mut write_inner = inner.upgrade();
+        if update_times {
+            write_inner.commit_dir_metadata(&fs)
+        } else {
+            write_inner.desc.flags.remove(FileFlags::INDEX_DIR);
+            write_inner.persist_inode_and_sync(&fs)
+        }
     }
 }
 
@@ -4126,13 +4413,16 @@ mod test {
         {
             let mut inner = inode.inner.write();
             inner.add_entry("foo", 11, DirEntryFileType::File).unwrap();
+            ostd::early_println!("Added entry 'foo' with inode 11");
             let dup = inner
                 .add_entry("foo", 12, DirEntryFileType::File)
                 .unwrap_err();
+            ostd::early_println!("Duplicate entry 'foo' failed with {:?}", dup.error());
             assert_eq!(dup.error(), Errno::EEXIST);
 
             assert!(!inner.desc.flags.contains(FileFlags::INDEX_DIR));
             inner.delete_entry("foo").unwrap();
+            ostd::early_println!("Deleted entry 'foo'");
         }
 
         let mut post = vec![0u8; block_size];

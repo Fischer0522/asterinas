@@ -163,78 +163,144 @@ pub trait DirentVisitor {
 ```
 
 [GUARANTEE]
+
 ```rust
-impl Inode {
-    /// Finds a directory entry by name and returns its inode number.
-    ///
-    /// Linux: /root/linux/fs/ext2/dir.c:342 (ext2_find_entry)
-    ///
-    /// # Lock
-    /// Acquires inner read lock. PageCache read may trigger read_page_async
-    /// which re-acquires read lock — safe (RwMutex read locks are reentrant).
-    pub fn find_entry(&self, name: &str) -> Result<u32>;
+/// Scan result for directory slot search.
+enum DirScanResult {
+    /// Found a usable slot in an existing block.
+    Slot(DirSlotInfo),
+    /// No slot found; directory must grow by one block.
+    NeedGrowth,
+}
 
-    /// Reads directory entries starting at byte offset and feeds visitor.
-    ///
-    /// Linux: /root/linux/fs/ext2/dir.c:257 (ext2_readdir)
-    ///
-    /// # Lock
-    /// Acquires inner read lock. Same reentrant safety as find_entry.
-    pub fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize>;
+/// Information about a candidate directory entry slot.
+struct DirSlotInfo {
+    /// Byte offset within the directory (block_idx * block_size + offset_in_block).
+    dir_offset: usize,
+    /// Current rec_len of the candidate slot.
+    slot_rec_len: usize,
+    /// Minimal occupied length of the existing entry head (0 if slot is free).
+    used_rec_len: usize,
+}
 
-    /// Checks whether this directory contains only `.` and `..` as live entries.
-    ///
-    /// Linux: /root/linux/fs/ext2/dir.c:659 (ext2_empty_dir)
-    ///
-    /// # Lock
-    /// Acquires inner read lock.
-    pub fn empty_dir(&self) -> bool;
+/// Located directory entry for delete/set_link.
+struct DirEntryTarget {
+    /// Byte offset of the target entry within the directory.
+    dir_offset: usize,
+    /// rec_len of the target entry.
+    entry_rec_len: usize,
+}
+```
 
-    /// Adds a new directory entry to this directory inode.
+```rust
+/// InodeInner: phased directory operations.
+/// Each method's &self / &mut self matches the required lock level:
+///   &self  → caller holds upread or read (PageCache I/O safe)
+///   &mut self → caller holds write (no PageCache I/O)
+impl InodeInner {
+    /// Phase 1: Scans directory blocks for a free slot or duplicate name.
+    /// Reads via PageCache — caller must hold upread or read.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link)
-    ///
-    /// # Lock — upread + upgrade protocol (exFAT pattern)
-    /// Acquires inner upread lock. Scans blocks and writes entry via PageCache
-    /// under upread (compatible with read_page_async's read lock).
-    /// Upgrades to write lock for metadata mutation (alloc, size, timestamps, persist).
-    /// upread is exclusive with other upread/write, preventing concurrent dir mutation.
-    pub fn add_entry(&self, name: &str, ino: u32, file_type: DirEntryFileType) -> Result<()>;
+    /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link scan loop)
+    fn scan_dir_for_slot(&self, name: &str, fs: &Ext2)
+        -> Result<DirScanResult>;
 
-    /// Deletes a directory entry by name.
+    /// Phase 2: Grows directory by one block.
+    /// Calls get_or_alloc_block + page_cache.resize — caller must hold write.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:560 (ext2_delete_entry)
-    ///
-    /// # Lock — upread + upgrade protocol
-    /// Acquires inner upread lock. Locates and modifies entry via PageCache
-    /// under upread. Upgrades to write lock for timestamps and persist.
-    pub fn delete_entry(&self, name: &str) -> Result<()>;
+    /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link growth path)
+    fn grow_dir_block(&mut self, fs: &Ext2) -> Result<DirSlotInfo>;
 
-    /// Rewrites an existing entry's inode/type in-place.
+    /// Phase 3: Writes a new entry into a slot via PageCache.
+    /// Caller must hold upread (PageCache I/O triggers read_page_async → read lock).
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:450 (ext2_set_link)
-    ///
-    /// # Lock — upread + upgrade protocol
-    /// Acquires inner upread lock. Locates and modifies entry via PageCache
-    /// under upread. Upgrades to write lock for timestamps and persist.
-    pub fn set_link(
-        &self,
-        name: &str,
-        new_ino: u32,
-        file_type: DirEntryFileType,
-        update_times: bool,
+    /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link commit)
+    fn write_dir_entry_to_cache(
+        &self, slot: &DirSlotInfo, name: &str, ino: u32, ft: u8,
     ) -> Result<()>;
 
-    /// Initializes a newly allocated directory inode with `.` and `..` entries.
+    /// Phase 4: Updates directory timestamps and persists inode.
+    /// Caller must hold write (metadata mutation).
     ///
+    /// Linux: /root/linux/fs/ext2/dir.c:84 (ext2_commit_chunk)
+    fn commit_dir_metadata(&mut self, fs: &Ext2) -> Result<()>;
+
+    /// Locates a directory entry by name. Returns target info for delete/set_link.
+    /// Reads via PageCache — caller must hold upread or read.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:342 (ext2_find_entry)
+    fn find_entry_target(&self, name: &str, fs: &Ext2)
+        -> Result<DirEntryTarget>;
+
+    /// Deletes a located entry by zeroing inode and merging rec_len.
+    /// Writes via PageCache — caller must hold upread.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:560 (ext2_delete_entry)
+    fn delete_entry_in_cache(&self, target: &DirEntryTarget) -> Result<()>;
+
+    /// Rewrites a located entry's inode/type via PageCache.
+    /// Caller must hold upread.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:450 (ext2_set_link)
+    fn set_link_in_cache(
+        &self, target: &DirEntryTarget, new_ino: u32, ft: u8,
+    ) -> Result<()>;
+}
+```
+
+```rust
+/// InodeInner: read-only directory operations (caller holds read or upread).
+impl InodeInner {
+    /// Finds a directory entry by name and returns its inode number.
+    /// Linux: /root/linux/fs/ext2/dir.c:342 (ext2_find_entry)
+    pub(super) fn find_entry(&self, name: &str) -> Result<u32>;
+
+    /// Reads directory entries starting at byte offset and feeds visitor.
+    /// Linux: /root/linux/fs/ext2/dir.c:257 (ext2_readdir)
+    pub(super) fn readdir_at(
+        &self, offset: usize, visitor: &mut dyn DirentVisitor,
+    ) -> Result<usize>;
+
+    /// Checks whether directory contains only `.` and `..` as live entries.
+    /// Linux: /root/linux/fs/ext2/dir.c:659 (ext2_empty_dir)
+    pub(super) fn empty_dir(&self) -> bool;
+}
+```
+
+```rust
+/// Inode: public directory API (manages upread/upgrade internally).
+impl Inode {
+    /// Adds a new directory entry. Acquires upread, upgrades as needed.
+    /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link)
+    pub(super) fn add_entry(
+        &self, name: &str, ino: u32, file_type: DirEntryFileType,
+    ) -> Result<()>;
+
+    /// Deletes a directory entry by name. Acquires upread, upgrades for metadata.
+    /// Linux: /root/linux/fs/ext2/dir.c:560 (ext2_delete_entry)
+    pub(super) fn delete_entry(&self, name: &str) -> Result<()>;
+
+    /// Rewrites an existing entry's inode/type. Acquires upread, upgrades for metadata.
+    /// Linux: /root/linux/fs/ext2/dir.c:450 (ext2_set_link)
+    pub(super) fn set_link(
+        &self, name: &str, new_ino: u32,
+        file_type: DirEntryFileType, update_times: bool,
+    ) -> Result<()>;
+
+    /// Initializes directory with `.` and `..`. Acquires write, downgrades for I/O.
     /// Linux: /root/linux/fs/ext2/dir.c:617 (ext2_make_empty)
-    ///
-    /// # Lock — write lock then downgrade to upread
-    /// Acquires write lock for block allocation and metadata setup.
-    /// Downgrades to upread for PageCache write (`.`/`..` entries).
-    /// Upgrades back to write lock for persist.
-    /// On failure: discard_range + rollback metadata + free block.
-    pub fn make_empty(&self, parent_ino: u32) -> Result<()>;
+    pub(super) fn make_empty(&self, parent_ino: u32) -> Result<()>;
+
+    /// Reads directory entries. Acquires read lock.
+    pub(super) fn readdir_at(
+        &self, offset: usize, visitor: &mut dyn DirentVisitor,
+    ) -> Result<usize>;
+
+    /// Finds entry by name. Acquires read lock.
+    pub(super) fn lookup(&self, name: &str) -> Result<Arc<Inode>>;
+
+    /// Checks if directory is empty. Acquires read lock.
+    pub(super) fn empty_dir(&self) -> bool;
 }
 ```
 
@@ -284,100 +350,107 @@ Post (empty_dir):
 - Returns `true` if only `.` and `..` entries have non-zero inode.
 - Returns `false` if any other live entry exists, or on any I/O error.
 
-## Write operations — upread + upgrade protocol
+## Write operations — phased protocol
 
-### add_entry
+### InodeInner::scan_dir_for_slot
 
 Pre:
-- `self.type_ == InodeType::Dir`.
-- `name` is non-empty and <= 255 bytes.
-- `ino > 0` and `ino <= max_inumber`.
+- `self.desc.type_ == InodeType::Dir`.
+- Caller holds upread or read lock.
 
 Post (success):
-- Acquires inner upread lock.
-- Obtains `size`, `block_size`, `max_inumber`, `reclen = DirEntry::dir_rec_len(name.len())`.
-- Scans existing blocks `0..data_blocks` via `page_cache.pages().read_bytes()`:
-  - read_page_async callback acquires read lock — compatible with upread, no deadlock.
+- Obtains `size`, `block_size`, `max_inumber`, `reclen`.
+- Scans blocks `0..data_blocks` via `page_cache.pages().read_bytes()`:
   - Checks for duplicate name → `Err(EEXIST)`.
   - Finds free slot (inode==0 with enough rec_len, or split of occupied entry).
-  - Records candidate slot info (block_idx, offset, rec_len, used_rec_len).
-- If no slot found in existing blocks (growth needed):
-  - Upgrades upread → write lock.
-  - Calls `get_or_alloc_block(data_blocks, true)` to allocate new block.
-  - Updates `desc.size += block_size`, `desc.blocks`.
-  - Calls `page_cache.resize(new_size_aligned)` to extend PageCache.
-    - Grow path: no callbacks — safe under write lock.
-  - Downgrades write → upread lock.
-  - New block slot: offset=0, rec_len=block_size.
-- Writes new entry into slot via `page_cache.pages().write_bytes()`:
-  - If splitting occupied entry, updates predecessor's rec_len first.
-  - Writes new entry at computed offset.
-  - PageCache write may trigger read_page_async — compatible with upread.
-- Upgrades upread → write lock.
+- Returns `DirScanResult::Slot(info)` or `DirScanResult::NeedGrowth`.
+
+### InodeInner::grow_dir_block
+
+Pre:
+- Caller holds write lock.
+
+Post (success):
+- Calls `get_or_alloc_block(data_blocks, true)`.
+- Updates `desc.size += block_size`, `desc.blocks`.
+- Calls `page_cache.resize(new_size)` — grow path, no callbacks.
+- Returns `DirSlotInfo` for the new block (offset=0, rec_len=block_size).
+
+Post (failure rollback):
+- `page_cache.discard_range(old_size..new_size)`.
+- Restore `desc.size`, `desc.blocks`.
+- `truncate_blocks(old_size)` — free excess blocks.
+
+### InodeInner::write_dir_entry_to_cache
+
+Pre:
+- Caller holds upread lock.
+- `slot` is a valid `DirSlotInfo` from scan or grow.
+
+Post (success):
+- If splitting occupied entry, updates predecessor's rec_len first.
+- Writes new entry at `slot.dir_offset` via `page_cache.pages().write_bytes()`.
+- PageCache I/O may trigger read_page_async → read lock, compatible with upread.
+
+### InodeInner::commit_dir_metadata
+
+Pre:
+- Caller holds write lock.
+
+Post (success):
 - Updates `desc.mtime` and `desc.ctime`.
 - Calls `persist_inode_and_sync`.
 
-Post (add_entry: growth failure rollback):
-- If block allocation or page_cache.resize fails after upgrade:
-  - `page_cache.discard_range(old_size_aligned..new_size_aligned)` — discard any
-    pages for the partially-allocated region. No callbacks — safe under write lock.
-  - Restore `desc.size`, `desc.blocks` to pre-growth values.
-  - `truncate_blocks(old_size)` — free excess blocks.
-  - Return the original error.
+### InodeInner::find_entry_target / delete_entry_in_cache / set_link_in_cache
 
-Post (add_entry: failure):
-- `Err(ENOTDIR)` if not a directory.
-- `Err(EEXIST)` if name already exists.
-- `Err(EINVAL)` if name empty/too long or ino invalid.
-- `Err(ENOSPC)` if block allocation fails during growth.
-- `Err(EIO)` if PageCache I/O fails.
+find_entry_target:
+- Caller holds upread or read. Scans via PageCache, returns `DirEntryTarget`.
 
-### delete_entry
+delete_entry_in_cache:
+- Caller holds upread. Reads block, zeroes inode, merges rec_len, writes back.
+
+set_link_in_cache:
+- Caller holds upread. Reads block, modifies inode/type, writes back.
+
+### Inode::add_entry (orchestrator)
 
 Pre:
 - `self.type_ == InodeType::Dir`.
-- `name` is non-empty and <= 255 bytes.
+- `name` non-empty, <= 255 bytes. `ino > 0`, `ino <= max_inumber`.
 
 Post (success):
-- Acquires inner upread lock.
-- Scans blocks via `page_cache.pages().read_bytes()` to locate target entry.
-  - Records target info (block_idx, entry_offset, rec_len, predecessor info).
-  - If not found, returns `Err(EIO)`.
-- Reads target block into buffer via `page_cache.pages().read_bytes()`.
-- Modifies buffer: zeroes target entry's inode field, merges rec_len into predecessor.
-- Writes modified block back via `page_cache.pages().write_bytes()`.
-  - All PageCache I/O under upread — compatible with read_page_async.
-- Upgrades upread → write lock.
-- Updates `desc.mtime` and `desc.ctime`.
-- Calls `persist_inode_and_sync`.
+- Acquires upread. Calls `scan_dir_for_slot`.
+- If NeedGrowth: upgrades → write, calls `grow_dir_block`, downgrades → upread.
+- Calls `write_dir_entry_to_cache` (under upread).
+- Upgrades → write. Calls `commit_dir_metadata`.
 
-Post (delete_entry: failure):
-- `Err(ENOTDIR)` if not a directory.
-- `Err(EINVAL)` if name empty/too long.
-- `Err(EIO)` if entry not found or PageCache I/O fails.
+Post (failure):
+- `Err(EEXIST)` if duplicate. `Err(ENOSPC)` if growth fails. `Err(EIO)` on I/O.
 
-### set_link
+### Inode::delete_entry (orchestrator)
 
 Pre:
-- `self.type_ == InodeType::Dir`.
-- `name` is non-empty and <= 255 bytes, not `.`.
-- `new_ino >= ROOT_INO` and `new_ino <= max_inumber`.
+- `self.type_ == InodeType::Dir`. `name` non-empty, <= 255 bytes.
 
 Post (success):
-- Acquires inner upread lock.
-- Locates target entry via `page_cache.pages().read_bytes()` scan.
-- Reads target block, modifies inode number and file_type in buffer.
-- Writes modified block back via `page_cache.pages().write_bytes()`.
-- Upgrades upread → write lock.
-- If `update_times`: updates `desc.mtime` and `desc.ctime`.
-- Else: clears `INDEX_DIR` flag only.
-- Calls `persist_inode_and_sync`.
+- Acquires upread. Calls `find_entry_target`.
+- Calls `delete_entry_in_cache` (under upread).
+- Upgrades → write. Calls `commit_dir_metadata`.
 
-Post (set_link: failure):
-- `Err(ENOTDIR)` if not a directory.
-- `Err(EINVAL)` if name invalid or ino out of range.
-- `Err(ENOENT)` if entry not found.
-- `Err(EIO)` if PageCache I/O fails.
+Post (failure):
+- `Err(EIO)` if not found or I/O fails.
+
+### Inode::set_link (orchestrator)
+
+Pre:
+- `self.type_ == InodeType::Dir`. `name` non-empty, not `.`.
+- `new_ino >= ROOT_INO`, `new_ino <= max_inumber`.
+
+Post (success):
+- Acquires upread. Calls `find_entry_target`.
+- Calls `set_link_in_cache` (under upread).
+- Upgrades → write. If `update_times`: updates timestamps. Else: clears INDEX_DIR.
+- Calls `persist_inode_and_sync`.
 
 ### make_empty
 
@@ -396,7 +469,9 @@ Post (success):
 - Downgrades write → upread lock.
 - Constructs `.` and `..` entries in a buffer (zero-filled, canonical layout).
 - Writes buffer via `page_cache.pages().write_bytes(0, &buf)`.
-  - PageCache write may trigger read_page_async — compatible with upread.
+  - buf.len() == block_size == PAGE_SIZE, so Vmo treats this as a full-page mid
+    segment with WILL_OVERWRITE → commit_overwrite skips disk read. No
+    read_page_async callback triggered. Safe even under upread.
 - Upgrades upread → write lock.
 - Calls `persist_inode_and_sync`.
 
@@ -423,73 +498,96 @@ Post (make_empty: failure):
 Current: `InodeInner::mkdir(&mut self, ...)` holds write lock throughout,
 calls `make_empty` and `add_entry` on InodeInner directly.
 
-New: `Inode::mkdir(&self, ...)` orchestrates lock transitions:
-- Acquires upread lock for validation and parent link reservation.
-- Upgrades to write for `desc.links_count` increment.
-- Downgrades to upread, then drops lock before calling child `make_empty`.
-- Calls `self.add_entry(...)` which acquires its own upread lock.
+New: `Inode::mkdir(&self, ...)` uses phased InodeInner methods:
+- Acquires upread on parent. Calls `scan_dir_for_slot(child_name)` to check
+  EEXIST and find slot (PageCache I/O under upread — safe).
+- Upgrades → write. Increments `desc.links_count`.
+  If NeedGrowth: calls `grow_dir_block` (under write — no PageCache I/O).
+- Downgrades → upread (keep lock held — prevents TOCTOU on slot).
+- Creates child inode via `fs.create_inode()` (no lock conflict).
+  Calls child `make_empty(parent_ino)` (child manages its own lock;
+  parent upread + child write = safe, different lock instances).
+- Calls `write_dir_entry_to_cache` on parent (still under upread —
+  PageCache I/O safe).
+- Upgrades → write. Calls `commit_dir_metadata`.
 - On failure at any step: rollback parent links_count, free child inode/blocks.
 
 ### rmdir (on Inode, not InodeInner)
 
 Current: `InodeInner::rmdir(&mut self, ...)` holds write lock throughout.
 
-New: `Inode::rmdir(&self, ...)`:
-- Calls `self.find_entry(name)` (read lock, via page cache).
-- Loads child inode, checks empty_dir (read lock on child).
-- Calls `self.delete_entry(name)` (upread + upgrade on self).
-- Updates child metadata under child's write lock.
-- Updates parent links_count under self's write lock.
+New: `Inode::rmdir(&self, ...)` uses phased methods:
+- Acquires upread on self. Calls `find_entry(name)` (PageCache I/O safe).
+- Loads child inode. Acquires read lock on child, checks `empty_dir`.
+- Calls `find_entry_target(name)` + `delete_entry_in_cache(target)` (under
+  upread — PageCache I/O safe).
+- Upgrades self → write. Calls `commit_dir_metadata`.
+- Updates child metadata under child's write lock (links_count, dtime).
+- Updates parent `links_count`. Calls `persist_inode_and_sync`.
 
 ### rename (on Inode)
 
 Current: `rename_same_dir` holds single write lock; `rename_inner` holds
 two write locks via `write_lock_two_inodes`.
 
-New: Sub-operations (`find_entry`, `add_entry`, `delete_entry`, `set_link`)
-each manage their own upread/upgrade locks internally. The outer rename
-function does NOT hold a persistent lock across sub-operations.
+New: Uses phased InodeInner methods. PageCache I/O always under upread,
+metadata mutation under write.
 
 For same-dir rename:
-- `find_entry(old_name)` — read lock (page cache).
-- `find_entry(new_name)` — read lock (page cache).
-- If replacing: `set_link(new_name, old_ino, ...)` — upread + upgrade.
-- Else: `add_entry(new_name, old_ino, ...)` — upread + upgrade.
-- `delete_entry(old_name)` — upread + upgrade.
-- Update links_count under write lock.
+- Acquires upread on self.
+- `find_entry(old_name)` / `find_entry(new_name)` on `&InodeInner`.
+- If replacing: `find_entry_target` + `set_link_in_cache` (under upread).
+- Else: `scan_dir_for_slot` (under upread).
+- Upgrades → write.
+  - If NeedGrowth: `grow_dir_block`.
+  - Downgrades → upread. `write_dir_entry_to_cache`. Upgrades → write.
+- `find_entry_target(old_name)` under upread (downgrade first if needed).
+  `delete_entry_in_cache`. Upgrades → write.
+- Update `links_count`, `commit_dir_metadata`.
 
 For cross-dir rename:
-- Lock ordering: acquire upread on both dirs by ascending ino to avoid deadlock.
-  Helper: `upread_two_inodes(a, b) -> (UpgradeableGuard, UpgradeableGuard)`.
-- Sub-operations on each dir use the already-held upread lock (passed as guard).
-- Upgrade individual guards to write as needed for metadata updates.
-
-Note: Cross-dir rename requires sub-operations to accept an existing upread
-guard rather than acquiring their own. This requires internal variants:
-`add_entry_with_guard`, `delete_entry_with_guard`, `set_link_with_guard`
-that take `&RwMutexUpgradeableGuard<InodeInner>` instead of acquiring upread.
+- `upread_two_inodes(a, b)` — ascending ino order.
+- `find_entry` on each `&InodeInner` via held guards.
+- PageCache I/O phases (scan, write_entry, delete_entry_in_cache,
+  set_link_in_cache) under upread on the relevant directory.
+- Upgrade individual guards → write for `grow_dir_block`,
+  `commit_dir_metadata`, `links_count` updates.
+- No `_with_guard` variants — upgrade gives `&mut InodeInner` directly.
 
 ## Invariants
 
 - All directory data I/O goes through PageCache, never direct block device access.
 - Directory operations share the same Inode PageCache as file data operations.
-- read_page_async acquires inner read lock only.
+- read_page_async and write_page_async both acquire inner read lock only.
+- **No PageCache I/O under write lock.** write lock is incompatible with read lock
+  on the same RwMutex — if PageCache I/O triggers read_page_async (which acquires
+  inner.read()), it will deadlock. All PageCache read/write must happen under upread.
 - Write operations use upread + upgrade protocol (exFAT pattern):
   - upread for PageCache I/O (compatible with read_page_async's read lock).
   - upgrade to write for metadata mutation (alloc, size, timestamps, persist).
   - upread is exclusive with other upread/write — prevents concurrent dir mutation.
-- This replaces the split-lock protocol (which had TOCTOU issues between phases).
+- persist_inode_and_sync is safe under write lock: it writes to the block group's
+  inode table page cache (separate lock domain), not the inode's own data page cache.
+- page_cache.resize (grow path) is safe under write lock: no callbacks triggered.
+- page_cache.discard_range is safe under write lock: only clears LruCache, no callbacks.
 - make_empty uses write → downgrade → upread → upgrade because block allocation
-  (`get_or_alloc_block`) requires `&mut InodeInner`.
-- Rollback on failure uses `page_cache.discard_range()` to drop dirty pages
-  without writeback (no callbacks — safe under write lock), then restores metadata.
+  (`get_or_alloc_block`) requires `&mut InodeInner`. The PageCache write of `.`/`..`
+  entries writes a full block (block_size == PAGE_SIZE), so Vmo uses WILL_OVERWRITE
+  (commit_overwrite) which skips disk read — no read_page_async callback triggered.
+- Compound operations (mkdir, rmdir, unlink, link, rename) hold upread for the
+  entire operation to prevent TOCTOU. Upgrade to write only for &mut InodeInner access.
 
 [DIFF]
-Linux: Directory data is accessed via `ext2_get_folio` (dir.c:189) which calls
+Current Asterinas: All directory operations (find_entry, add_entry, delete_entry,
+  set_link, make_empty) use direct block device I/O via
+  `fs.block_device().read_bytes(bid.to_offset(), &mut buf)` — completely bypassing
+  the inode's PageCache.
+  → New: All directory data I/O goes through `page_cache.pages().read_bytes()` /
+  `write_bytes()`, matching Linux's `ext2_get_folio` (dir.c:189) which calls
   `read_mapping_folio(mapping, n, NULL)` — same page cache as file data.
-  → Asterinas: Directory data uses the same Inode PageCache. Directory operations
-  (find_entry, add_entry, readdir, delete_entry, make_empty, set_link) read/write
-  through `page_cache.pages()`.
+  Consequences: (1) Directory reads can hit cache (no disk I/O on repeated lookups).
+  (2) Directory writes mark pages dirty; data is not immediately durable until
+  sync/fsync — matching Linux's `ext2_commit_chunk` which only marks dirty.
   Reason: Unified caching for both file and directory data, matching Linux's model.
 
 Linux: `ext2_find_entry` (dir.c:342) uses `ext2_get_folio` per page, iterates
@@ -535,7 +633,9 @@ Linux: Rollback on failure (e.g., ext2_write_failed) uses truncate_pagecache
 Cross-dir rename lock ordering:
   Linux: acquires i_rwsem on both directories in inode number order.
   → Asterinas: acquires upread on both directories in ascending ino order via
-  `upread_two_inodes()`. Sub-operations use the held guards directly.
+  `upread_two_inodes()`. PageCache I/O under upread, then upgrade individual
+  guards to write for `&mut InodeInner` access (add_entry, delete_entry, etc.).
+  No `_with_guard` variants needed — upgrade gives `&mut InodeInner` directly.
 
 [TEST]
 ## Inode::find_entry
@@ -602,8 +702,24 @@ Cross-dir rename lock ordering:
 | add_entry scan         | upread        | pages().read_bytes  | read_page → read  | YES (upread compat read) |
 | add_entry write entry  | upread        | pages().write_bytes | read_page → read  | YES (upread compat read) |
 | add_entry growth       | write         | resize (grow)       | no callbacks      | YES |
+| add_entry metadata     | write         | persist_inode_sync  | BG inode table PC | YES (different lock domain) |
 | delete_entry r-m-w     | upread        | read+write_bytes    | read_page → read  | YES (upread compat read) |
+| delete_entry metadata  | write         | persist_inode_sync  | BG inode table PC | YES (different lock domain) |
 | set_link r-m-w         | upread        | read+write_bytes    | read_page → read  | YES (upread compat read) |
 | make_empty alloc       | write         | resize (grow)       | no callbacks      | YES |
-| make_empty write ./../ | upread        | pages().write_bytes | read_page → read  | YES (upread compat read) |
+| make_empty write ./../ | upread        | pages().write_bytes | WILL_OVERWRITE    | YES (full page, no read_page) |
+| make_empty persist     | write         | persist_inode_sync  | BG inode table PC | YES (different lock domain) |
+| make_empty rollback    | write         | discard_range       | no callbacks      | YES |
+| rmdir (parent)         | upread→write  | find+delete via PC  | read_page → read  | YES (upread phase for PC I/O) |
+| rmdir (child)          | write(child)  | none (metadata only)| none              | YES |
+| mkdir (parent)         | upread→write  | add_entry via PC    | read_page → read  | YES (upread phase for PC I/O) |
+| link (parent dir)      | upread→write  | add_entry via PC    | read_page → read  | YES (upread phase for PC I/O) |
+| link (target file)     | write         | none (metadata only)| none              | YES |
+| rename same-dir        | upread→write  | find+add+del via PC | read_page → read  | YES (upread phase for PC I/O) |
+| rename cross-dir       | upread(both)→ | find+add+del via PC | read_page → read  | YES (upread compat read) |
+|                        | upgrade each  | persist_inode_sync  | BG inode table PC | YES (different lock domain) |
 | evict/sync (external)  | NONE          | evict_range         | write_page → read | YES |
+
+NOTE on link: `link` uses upread+upgrade on parent dir for add_entry (PageCache I/O
+under upread, metadata under write). Target file only needs write lock for metadata
+(increment links_count, persist) — no PageCache I/O on target.
