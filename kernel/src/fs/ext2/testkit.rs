@@ -452,29 +452,6 @@ pub(super) fn write_raw_inode_to_disk(
         .unwrap();
 }
 
-pub(super) fn read_raw_inode_from_disk(
-    sb: &SuperBlock,
-    descs: &[RawGroupDesc],
-    ino: u32,
-    disk: &Ext2MemoryDisk,
-) -> RawInode {
-    let inodes_per_group = sb.inodes_per_group();
-    let group_idx = ((ino - 1) / inodes_per_group) as usize;
-    let index_in_group = (ino - 1) % inodes_per_group;
-
-    let inode_size = sb.inode_size();
-    let block_size = sb.block_size();
-    let offset_bytes = (index_in_group as usize).saturating_mul(inode_size);
-    let block_index = offset_bytes / block_size;
-    let offset_in_block = offset_bytes % block_size;
-
-    let table_block = descs[group_idx].inode_table + block_index as u32;
-    let table_bid = Bid::new(table_block as u64);
-    disk.segment()
-        .read_val::<RawInode>(table_bid.to_offset() + offset_in_block)
-        .unwrap()
-}
-
 // ---------------------------------------------------------------------------
 // Bit manipulation helpers
 // ---------------------------------------------------------------------------
