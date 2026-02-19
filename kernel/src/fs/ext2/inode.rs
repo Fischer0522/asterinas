@@ -1669,7 +1669,6 @@ impl InodeInner {
     /// Linux: /root/linux/fs/ext2/dir.c:659 (ext2_empty_dir)
     pub(super) fn empty_dir(&self) -> bool {
         if self.desc.type_ != InodeType::Dir {
-            ostd::early_println!("ext2: empty_dir check on non-directory inode");
             return false;
         }
 
@@ -1697,7 +1696,6 @@ impl InodeInner {
                 .read_bytes(block_offset, &mut buf)
                 .is_err()
             {
-                ostd::early_println!("ext2: empty_dir failed to read block {}", block_idx);
                 return false;
             }
 
@@ -1709,20 +1707,14 @@ impl InodeInner {
 
             let mut iter = match DirEntryIter::new(&buf, limit, max_inumber) {
                 Ok(iter) => iter,
-                Err(_) => {
-                    ostd::early_println!("ext2: empty_dir failed to parse dir entries");
-                    return false;
-                }
+                Err(_) => return false,
             };
 
             loop {
                 let entry = match iter.next_entry() {
                     Ok(Some(entry)) => entry,
                     Ok(None) => break,
-                    Err(_) => {
-                        ostd::early_println!("ext2: empty_dir failed to parse dir entries");
-                        return false;
-                    }
+                    Err(_) => return false,
                 };
 
                 if entry.inode == 0 {
@@ -1732,7 +1724,6 @@ impl InodeInner {
                 let name = entry.name.as_bytes();
                 if name == b"." {
                     if entry.inode != self_ino {
-                        ostd::early_println!("ext2: empty_dir found invalid . entry");
                         return false;
                     }
                     continue;
