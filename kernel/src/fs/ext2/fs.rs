@@ -332,18 +332,21 @@ impl Ext2 {
 
     /// Allocates up to `count` contiguous blocks.
     ///
-    /// Thin orchestrator: iterates groups, delegates to `BlockGroup::alloc_blocks`,
+    /// Thin orchestrator: starts from goal group (Linux ext2_new_blocks behavior),
+    /// iterates groups cyclically, delegates to `BlockGroup::alloc_blocks`, and
     /// updates superblock counter on success.
-    pub(super) fn alloc_blocks(&self, count: u32) -> Result<Range<u32>> {
+    pub(super) fn alloc_blocks(&self, count: u32, goal: Bid) -> Result<Range<u32>> {
         if count == 0 {
             return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
         }
 
-        let (groups_count, sb_free_blocks) = {
+        let (groups_count, sb_free_blocks, first_data_block, blocks_per_group) = {
             let guard = self.super_block.read();
             (
                 guard.block_groups_count() as usize,
                 guard.free_blocks_count(),
+                guard.first_data_block(),
+                guard.blocks_per_group(),
             )
         };
         if groups_count == 0 || self.block_groups.len() < groups_count {
@@ -353,8 +356,23 @@ impl Ext2 {
             return_errno_with_message!(Errno::ENOSPC, "no free blocks on device");
         }
 
+        // Linux: /root/linux/fs/ext2/balloc.c:1260 (goal-based group start).
+        let goal_raw = goal.to_raw();
+        let first_data_raw = first_data_block as u64;
+        let goal_group = if goal_raw > first_data_raw {
+            ((goal_raw - first_data_raw) / blocks_per_group as u64) as usize
+        } else {
+            0
+        }
+        .min(groups_count - 1);
+
         let mut saw_corruption = false;
-        for group in &self.block_groups {
+        for offset in 0..groups_count {
+            let group_idx = (goal_group + offset) % groups_count;
+            let group = self
+                .block_groups
+                .get(group_idx)
+                .ok_or_else(|| Error::with_message(Errno::EIO, "block group index out of range"))?;
             if group.free_blocks_count() == 0 {
                 continue;
             }
@@ -558,7 +576,7 @@ impl Ext2 {
 
         if let Err(err) = self.write_inode_desc(ino, &raw) {
             // SPEC: cleanup inode allocation if descriptor initialization failed.
-            let _ = self.free_inode(ino);
+            let _ = self.free_inode(ino, inode_type.is_directory());
             return Err(err);
         }
 
@@ -577,7 +595,7 @@ impl Ext2 {
     ///
     /// Thin orchestrator: validates, delegates bitmap op to `BlockGroup::free_inode`,
     /// updates group and superblock counters on success.
-    pub(super) fn free_inode(&self, ino: u32) -> Result<()> {
+    pub(super) fn free_inode(&self, ino: u32, is_dir: bool) -> Result<()> {
         let (inodes_per_group, total_inodes, first_ino, groups_count) = {
             let sb_guard = self.super_block.read();
             (
@@ -593,10 +611,6 @@ impl Ext2 {
         if groups_count == 0 || self.block_groups.len() < groups_count {
             return_errno_with_message!(Errno::EIO, "inconsistent block group count");
         }
-
-        let desc = self.read_inode_desc(ino)?;
-        let inode_type = desc.type_();
-        let is_dir = inode_type.is_directory();
 
         let group_idx = ((ino - 1) / inodes_per_group) as usize;
         let bit = ((ino - 1) % inodes_per_group) as u16;
@@ -748,9 +762,12 @@ mod test {
     use ostd::{mm::VmIo, prelude::*};
 
     use super::*;
-    use crate::fs::ext2::testkit::{
-        self, build_group_desc_segment, make_valid_group_desc, make_valid_super_block,
-        ErrorBioDisk, Ext2FixtureBuilder, Ext2MemoryDisk, RawInodeBuilder,
+    use crate::{
+        fs::ext2::testkit::{
+            self, build_group_desc_segment, make_valid_group_desc, make_valid_super_block,
+            ErrorBioDisk, Ext2FixtureBuilder, Ext2MemoryDisk, RawInodeBuilder,
+        },
+        time::clocks,
     };
 
     fn make_raw_inode(mode: u16, links_count: u16, dtime: u32) -> RawInode {
@@ -841,7 +858,8 @@ mod test {
         let before_sb_free = f.ext2.super_block().free_blocks_count();
         let before_group_free = f.block_groups()[0].free_blocks_count();
 
-        let range = f.ext2.alloc_blocks(8).unwrap();
+        let goal = Bid::new(f.sb.group_first_block_no(0) as u64);
+        let range = f.ext2.alloc_blocks(8, goal).unwrap();
         let alloc_len = range.end - range.start;
         assert!(alloc_len >= 1 && alloc_len <= 8);
 
@@ -876,11 +894,19 @@ mod test {
             .build()
             .unwrap();
         assert_eq!(
-            f_nospc.ext2.alloc_blocks(1).unwrap_err().error(),
+            f_nospc
+                .ext2
+                .alloc_blocks(1, Bid::new(f_nospc.sb.first_data_block() as u64))
+                .unwrap_err()
+                .error(),
             Errno::ENOSPC
         );
         assert_eq!(
-            f_nospc.ext2.alloc_blocks(0).unwrap_err().error(),
+            f_nospc
+                .ext2
+                .alloc_blocks(0, Bid::new(f_nospc.sb.first_data_block() as u64))
+                .unwrap_err()
+                .error(),
             Errno::EINVAL
         );
 
@@ -891,7 +917,11 @@ mod test {
             .build()
             .unwrap();
         assert_eq!(
-            f_corrupt.ext2.alloc_blocks(1).unwrap_err().error(),
+            f_corrupt
+                .ext2
+                .alloc_blocks(1, Bid::new(f_corrupt.sb.first_data_block() as u64))
+                .unwrap_err()
+                .error(),
             Errno::EIO
         );
 
@@ -916,6 +946,32 @@ mod test {
                 .error(),
             Errno::EIO
         );
+    }
+
+    #[ktest]
+    fn block_alloc_starts_from_goal_group() {
+        clocks::init_for_ktest();
+        // With 2 groups both having free blocks, allocation should start from
+        // the group containing goal.
+        let f = Ext2FixtureBuilder::new(2, 256)
+            .with_free_blocks(64, 32)
+            .with_metadata_block_bitmap()
+            .build()
+            .unwrap();
+
+        // Fixture builder only customizes group 0 free-block counter.
+        // Make group 1 allocatable as well so goal-based start is observable.
+        f.block_groups()[1].inc_free_blocks(16);
+        {
+            let mut sb = f.ext2.super_block.write();
+            sb.inc_free_blocks(16);
+        }
+
+        let goal = Bid::new((f.sb.group_first_block_no(1) + 16) as u64);
+        let range = f.ext2.alloc_blocks(4, goal).unwrap();
+
+        let start_group = (range.start - f.sb.first_data_block()) / f.sb.blocks_per_group();
+        assert_eq!(start_group, 1);
     }
 
     #[ktest]
@@ -945,10 +1001,10 @@ mod test {
         );
         assert_eq!(f.block_groups()[0].used_dirs_count(), before_used_dirs + 1);
 
-        // Free path uses read_inode_desc; write a valid directory inode through PageCache.
+        // Free path now takes caller-provided inode type; no inode-table read is needed.
         let raw_dir = make_raw_inode(0o040755, 1, 0);
         f.ext2.write_inode_desc(ino, &raw_dir).unwrap();
-        f.ext2.free_inode(ino).unwrap();
+        f.ext2.free_inode(ino, true).unwrap();
         assert_eq!(f.ext2.super_block().free_inodes_count(), before_sb_free);
         assert_eq!(f.block_groups()[0].free_inodes_count(), before_group_free);
         assert_eq!(f.block_groups()[0].used_dirs_count(), before_used_dirs);
@@ -1002,7 +1058,7 @@ mod test {
         assert_eq!(
             f_free
                 .ext2
-                .free_inode(f_free.sb.first_ino() - 1)
+                .free_inode(f_free.sb.first_ino() - 1, false)
                 .unwrap_err()
                 .error(),
             Errno::EIO
@@ -1015,7 +1071,7 @@ mod test {
 
         let before_sb = f_free.ext2.super_block().free_inodes_count();
         let before_group = f_free.block_groups()[0].free_inodes_count();
-        f_free.ext2.free_inode(target_ino).unwrap();
+        f_free.ext2.free_inode(target_ino, false).unwrap();
         assert_eq!(f_free.ext2.super_block().free_inodes_count(), before_sb);
         assert_eq!(f_free.block_groups()[0].free_inodes_count(), before_group);
     }

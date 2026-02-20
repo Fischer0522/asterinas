@@ -711,7 +711,10 @@ impl Inode {
         }
 
         parent_write.desc.links_count = parent_write.desc.links_count.saturating_sub(1);
-        parent_write.persist_inode_and_sync(&fs)?;
+        // SPEC: parent link-count change in rmdir is a directory mutation; refresh
+        // ctime/mtime the same way as add/delete entry paths.
+        // Linux: /root/linux/fs/ext2/namei.c:312 (inode_dec_link_count(dir)).
+        parent_write.commit_dir_metadata(&fs)?;
         Ok(())
     }
 
@@ -761,7 +764,7 @@ impl Inode {
         let child_ino = child.ino();
 
         if let Err(err) = child.make_empty(self.ino) {
-            let _ = fs.free_inode(child_ino);
+            let _ = fs.free_inode(child_ino, true);
             let mut parent_write = parent_guard.upgrade();
             parent_write.desc.links_count = parent_write.desc.links_count.saturating_sub(1);
             return Err(err);
@@ -777,7 +780,7 @@ impl Inode {
                 let mut child_inner = child.inner.write();
                 let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
             }
-            let _ = fs.free_inode(child_ino);
+            let _ = fs.free_inode(child_ino, true);
             let mut parent_write = parent_guard.upgrade();
             parent_write.desc.links_count = parent_write.desc.links_count.saturating_sub(1);
             return Err(err);
@@ -790,7 +793,7 @@ impl Inode {
                 let mut child_inner = child.inner.write();
                 let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
             }
-            let _ = fs.free_inode(child_ino);
+            let _ = fs.free_inode(child_ino, true);
             parent_write.desc.links_count = parent_write.desc.links_count.saturating_sub(1);
             return Err(err);
         }
@@ -1934,13 +1937,15 @@ impl InodeInner {
             .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
         let sb = fs.super_block();
         let block_size = fs.block_size();
-        let size = self.desc.size;
+        let size = self.desc.size as usize;
         let max_inumber = sb.total_inodes();
-        let mut block_idx = 0usize;
+        // SPEC: bound directory scan by i_size-derived pages (Linux dir_pages).
+        // Linux: /root/linux/fs/ext2/dir.c:349 (npages = dir_pages(dir)).
+        let max_blocks = size.div_ceil(block_size);
 
-        while (block_idx as u64).saturating_mul(block_size as u64) < size {
+        for block_idx in 0..max_blocks {
             let block_offset = block_idx.saturating_mul(block_size);
-            let remain = (size as usize).saturating_sub(block_offset);
+            let remain = size.saturating_sub(block_offset);
             let limit = remain.min(block_size);
             if limit == 0 {
                 break;
@@ -1969,8 +1974,6 @@ impl InodeInner {
                     return Ok(entry.inode);
                 }
             }
-
-            block_idx += 1;
         }
 
         return_errno!(Errno::ENOENT);
@@ -2326,6 +2329,13 @@ impl InodeInner {
             .ok_or_else(|| Error::with_message(Errno::EIO, "inode block count overflow"))?;
 
         let mut new_blocks = Vec::with_capacity(total as usize);
+        let mut alloc_goal = Bid::new(
+            branch
+                .chain
+                .last()
+                .map_or(self.desc.block_ptrs[0], |entry| entry.key)
+                .max(fs.super_block().first_data_block()) as u64,
+        );
         // Rollback helper: frees all blocks allocated so far.
         let free_all = |blocks: &Vec<u32>| {
             for bid in blocks {
@@ -2335,7 +2345,7 @@ impl InodeInner {
 
         while (new_blocks.len() as u32) < total {
             let remain = total - new_blocks.len() as u32;
-            let allocated = match fs.alloc_blocks(remain) {
+            let allocated = match fs.alloc_blocks(remain, alloc_goal) {
                 Ok(allocated) => allocated,
                 Err(err) => {
                     free_all(&new_blocks);
@@ -2350,6 +2360,9 @@ impl InodeInner {
             }
 
             new_blocks.extend(allocated);
+            if let Some(last) = new_blocks.last() {
+                alloc_goal = Bid::new(last.saturating_add(1) as u64);
+            }
         }
 
         // SPEC: data block is at index `indirect_blks` in allocation order.
@@ -3172,7 +3185,7 @@ impl Inode {
             if let Err(err) = self.add_entry(name, child_ino, dir_ft) {
                 // SPEC: rollback — ext2_add_nondir failure path:
                 // decrement link count and discard inode.
-                let _ = fs.free_inode(child_ino);
+                let _ = fs.free_inode(child_ino, false);
                 return Err(err);
             }
 

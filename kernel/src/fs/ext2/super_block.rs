@@ -205,7 +205,16 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
         }
         let blocks_after = blocks_count - first_data_block - 1;
         let groups_count = (blocks_after / blocks_per_group as u64) + 1;
-        if groups_count * (inodes_per_group as u64) != sb.inodes_count as u64 {
+
+        // Linux does not require exact equality between inodes_count and
+        // groups_count * inodes_per_group. The last group may have fewer inodes.
+        // Linux: /root/linux/fs/ext2/super.c:960-980.
+        let max_inodes = groups_count.saturating_mul(inodes_per_group as u64);
+        let min_inodes = groups_count
+            .saturating_sub(1)
+            .saturating_mul(inodes_per_group as u64);
+        let inodes_count = sb.inodes_count as u64;
+        if inodes_count <= min_inodes || inodes_count > max_inodes {
             return_errno_with_message!(Errno::EINVAL, "invalid inodes count");
         }
 
@@ -279,7 +288,7 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
 /// Linux: /root/linux/fs/ext2/super.c:877 (ext2_fill_super)
 pub fn load_super_block(device: &dyn BlockDevice, read_only: bool) -> Result<SuperBlock> {
     let raw = device.read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)?;
-    let sb = SuperBlock::try_from(raw)?;
+    let mut sb = SuperBlock::try_from(raw)?;
 
     let device_bytes = (device.metadata().nr_sectors as u64) * (SECTOR_SIZE as u64);
     let device_blocks = device_bytes / (BLOCK_SIZE as u64);
@@ -291,6 +300,22 @@ pub fn load_super_block(device: &dyn BlockDevice, read_only: bool) -> Result<Sup
         FeatureRoCompatSet::SPARSE_SUPER.bits() | FeatureRoCompatSet::LARGE_FILE.bits();
     if !read_only && (raw.feature_ro_compat & !allowed_ro_compat) != 0 {
         return_errno_with_message!(Errno::EINVAL, "unsupported ro compat feature");
+    }
+
+    if !read_only {
+        // Linux mount-time setup updates superblock fields immediately.
+        // Linux: /root/linux/fs/ext2/super.c:645 (ext2_setup_super).
+        sb.mnt_count = sb.mnt_count.saturating_add(1);
+        sb.state.remove(FsState::VALID);
+        sb.set_wtime(super::utils::now());
+
+        let raw_sb = RawSuperBlock::from(&sb);
+        if device
+            .write_bytes(SUPER_BLOCK_OFFSET, raw_sb.as_bytes())
+            .is_err()
+        {
+            return_errno_with_message!(Errno::EIO, "failed to write superblock on mount");
+        }
     }
 
     Ok(sb)
@@ -754,10 +779,12 @@ impl Default for Reserved {
 
 #[cfg(ktest)]
 mod test {
-    use ostd::prelude::*;
+    use core::time::Duration;
+
+    use ostd::{mm::VmIo, prelude::*};
 
     use super::*;
-    use crate::fs::ext2::testkit::{Ext2MemoryDisk, make_valid_raw_super_block};
+    use crate::{fs::ext2::testkit::{Ext2MemoryDisk, make_valid_raw_super_block}, time::clocks::{self, init_for_ktest}};
 
     #[ktest]
     fn try_from_valid_raw_ok() {
