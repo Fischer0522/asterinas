@@ -5,7 +5,8 @@ use core::{fmt, mem::size_of};
 use ostd::const_assert;
 
 use super::{
-    inode::{InodeDesc, RawInode},
+    fs::Ext2,
+    inode::{Inode, InodeDesc, RawInode},
     prelude::*,
     super_block::SuperBlock,
 };
@@ -80,6 +81,17 @@ pub struct BlockGroup {
     inode_table_backend: Arc<InodeTableBackend>,
     /// Inode table page cache.
     inode_table_cache: PageCache,
+    /// Per-group inode cache keyed by group-local inode index.
+    ///
+    /// Linux equivalent is VFS global inode hash (fs/inode.c:63).
+    /// Asterinas keeps per-group cache because VFS does not provide inode caching.
+    inode_cache: RwMutex<BTreeMap<u32, Arc<Inode>>>,
+}
+
+/// Aggregated inode-eviction counters for superblock updates.
+pub(super) struct EvictResult {
+    pub freed_inodes: u32,
+    pub freed_dirs: u32,
 }
 
 impl fmt::Debug for BlockGroup {
@@ -204,7 +216,125 @@ impl BlockGroup {
             inode_size,
             inode_table_backend: backend,
             inode_table_cache,
+            inode_cache: RwMutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Looks up an allocated inode by group-local index and returns cached/in-memory object.
+    ///
+    /// Linux: /root/linux/fs/inode.c:1371 (iget_locked hash lookup + allocate on miss)
+    /// Linux: /root/linux/fs/ext2/inode.c:1387 (ext2_iget)
+    pub(super) fn lookup_inode(
+        &self,
+        inode_idx: u32,
+        ino: u32,
+        fs: Weak<Ext2>,
+    ) -> Result<Arc<Inode>> {
+        let inode_bit = u16::try_from(inode_idx)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "inode index out of range"))?;
+
+        {
+            let inode_bitmap = self.inode_bitmap.read();
+            if !inode_bitmap.is_allocated(inode_bit) {
+                return_errno!(Errno::ENOENT);
+            }
+        }
+
+        // Fast path: cache hit under read lock.
+        if let Some(inode) = self.inode_cache.read().get(&inode_idx) {
+            return Ok(inode.clone());
+        }
+
+        // Slow path: double-check under write lock and load on miss.
+        let mut inode_cache = self.inode_cache.write();
+        if let Some(inode) = inode_cache.get(&inode_idx) {
+            return Ok(inode.clone());
+        }
+
+        {
+            let inode_bitmap = self.inode_bitmap.read();
+            if !inode_bitmap.is_allocated(inode_bit) {
+                return_errno!(Errno::ENOENT);
+            }
+        }
+
+        let desc = self.read_inode_desc(inode_idx)?;
+        let desc = Dirty::new(desc);
+        let inode = Inode::new(ino, desc.type_(), desc, self.idx, fs);
+        inode_cache.insert(inode_idx, inode.clone());
+        Ok(inode)
+    }
+
+    /// Inserts a fully initialized inode into this group's cache.
+    pub(super) fn insert_cache(&self, inode_idx: u32, inode: Arc<Inode>) {
+        self.inode_cache.write().insert(inode_idx, inode);
+    }
+
+    /// Evicts one inode and performs Linux-equivalent deleted-inode cleanup.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:72 (ext2_evict_inode)
+    fn evict_inode(&self, inode: &Arc<Inode>) -> Result<EvictResult> {
+        if !inode.prepare_for_evict()? {
+            return Ok(EvictResult {
+                freed_inodes: 0,
+                freed_dirs: 0,
+            });
+        }
+
+        let inode_idx = (inode.ino().saturating_sub(1)) % self.inodes_per_group;
+        let inode_bit = u16::try_from(inode_idx)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "inode index out of range"))?;
+        let was_allocated = self.free_inode(inode_bit)?;
+        if !was_allocated {
+            return Ok(EvictResult {
+                freed_inodes: 0,
+                freed_dirs: 0,
+            });
+        }
+
+        self.inc_free_inodes(1);
+        let freed_dirs = u32::from(inode.inode_type().is_directory());
+        if freed_dirs > 0 {
+            self.dec_used_dirs();
+        }
+
+        Ok(EvictResult {
+            freed_inodes: 1,
+            freed_dirs,
+        })
+    }
+
+    /// Syncs cached inodes and evicts unreferenced entries.
+    ///
+    /// Linux trigger analogue: /root/linux/fs/inode.c:1910 (iput_final)
+    pub(super) fn sync_all_inodes(&self) -> Result<EvictResult> {
+        let mut evicted = EvictResult {
+            freed_inodes: 0,
+            freed_dirs: 0,
+        };
+
+        // Phase 1: remove unreferenced inodes from cache.
+        let unused_inodes: Vec<Arc<Inode>> = self
+            .inode_cache
+            .write()
+            .extract_if(.., |_, inode| Arc::strong_count(inode) == 1)
+            .map(|(_, inode)| inode)
+            .collect();
+
+        // Phase 2: evict removed inodes (without holding cache lock).
+        for inode in &unused_inodes {
+            let result = self.evict_inode(inode)?;
+            evicted.freed_inodes = evicted.freed_inodes.saturating_add(result.freed_inodes);
+            evicted.freed_dirs = evicted.freed_dirs.saturating_add(result.freed_dirs);
+        }
+
+        // Phase 3: sync still-referenced cached inodes.
+        let remaining_inodes: Vec<Arc<Inode>> = self.inode_cache.read().values().cloned().collect();
+        for inode in &remaining_inodes {
+            inode.sync_all()?;
+        }
+
+        Ok(evicted)
     }
 
     pub fn block_bitmap(&self) -> RwMutexReadGuard<'_, Dirty<IdBitmap>> {

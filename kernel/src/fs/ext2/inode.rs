@@ -704,15 +704,15 @@ impl Inode {
 
         {
             let mut child_write = child.inner.write();
-            child_write.release_dir_data_blocks_for_cleanup(&fs)?;
             child_write.desc.links_count = child_write.desc.links_count.saturating_sub(2);
             child_write.desc.dtime = now();
+            child_write.is_freed = true;
             child_write.persist_inode_and_sync(&fs)?;
         }
 
         parent_write.desc.links_count = parent_write.desc.links_count.saturating_sub(1);
         parent_write.persist_inode_and_sync(&fs)?;
-        fs.free_inode(child_ino)
+        Ok(())
     }
 
     /// Creates a subdirectory under this directory using phased locking.
@@ -803,6 +803,29 @@ impl Inode {
         self.inner.read().persist_inode_and_sync(&fs)?;
         fs.block_device().sync()?;
         Ok(())
+    }
+
+    /// Prepares this inode for eviction.
+    ///
+    /// Returns `Ok(true)` if inode had `nlink == 0` and was truncated/persisted;
+    /// returns `Ok(false)` if inode is still linked and only regular sync is needed.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:72 (ext2_evict_inode)
+    pub(super) fn prepare_for_evict(&self) -> Result<bool> {
+        let fs = self.fs_arc()?;
+        let mut inner = self.inner.write();
+        if inner.desc.links_count > 0 {
+            drop(inner);
+            self.sync_all()?;
+            return Ok(false);
+        }
+
+        inner.desc.dtime = now();
+        inner.is_freed = true;
+        inner.desc.size = 0;
+        inner.truncate_blocks(0)?;
+        inner.persist_inode_and_sync(&fs)?;
+        Ok(true)
     }
 
     pub(super) fn sync_data(&self) -> Result<()> {
@@ -3101,6 +3124,8 @@ impl Inode {
                 return Err(err);
             }
 
+            fs.insert_inode_cache(child.clone());
+
             Ok(child)
         }
     }
@@ -3201,17 +3226,12 @@ impl Inode {
         child_inner.desc.ctime = now();
         child_inner.desc.links_count = child_inner.desc.links_count.saturating_sub(1);
 
-        // SPEC: if link count reaches 0, mark deletion time and free inode.
-        // DIFF from Linux: Linux defers reclamation to inode eviction/orphan.
-        // Asterinas reclaims immediately since orphan pipeline is not yet integrated.
+        // Defer ext2_evict_inode-style reclamation to cache eviction.
         if child_inner.desc.links_count == 0 {
             child_inner.desc.dtime = now();
-            child_inner.persist_inode_and_sync(&fs)?;
-            drop(child_inner);
-            let _ = fs.free_inode(child_ino);
-        } else {
-            child_inner.persist_inode_and_sync(&fs)?;
+            child_inner.is_freed = true;
         }
+        child_inner.persist_inode_and_sync(&fs)?;
 
         Ok(())
     }
@@ -3329,12 +3349,9 @@ impl Inode {
 
             if existing_inner.desc.links_count == 0 {
                 existing_inner.desc.dtime = now();
-                existing_inner.persist_inode_and_sync(fs)?;
-                drop(existing_inner);
-                let _ = fs.free_inode(existing_ino);
-            } else {
-                existing_inner.persist_inode_and_sync(fs)?;
+                existing_inner.is_freed = true;
             }
+            existing_inner.persist_inode_and_sync(fs)?;
         } else {
             // No existing entry: add new entry.
             inner.add_entry(new_name, old_ino, moved_ft)?;
@@ -3432,12 +3449,9 @@ impl Inode {
 
             if existing_inner.desc.links_count == 0 {
                 existing_inner.desc.dtime = now();
-                existing_inner.persist_inode_and_sync(fs)?;
-                drop(existing_inner);
-                let _ = fs.free_inode(existing_ino);
-            } else {
-                existing_inner.persist_inode_and_sync(fs)?;
+                existing_inner.is_freed = true;
             }
+            existing_inner.persist_inode_and_sync(fs)?;
         } else {
             // No existing entry: ext2_add_link.
             target_inner.add_entry(new_name, old_ino, moved_ft)?;
@@ -3844,8 +3858,8 @@ mod test {
             ext2::{
                 fs::ROOT_INO,
                 testkit::{
-                    self, CollectDirentVisitor, ErrorBioDisk, Ext2FixtureBuilder, RawInodeBuilder,
-                    StopAfterVisitor, encode_dir_entry, write_indirect_ptr,
+                    self, encode_dir_entry, write_indirect_ptr, CollectDirentVisitor, ErrorBioDisk,
+                    Ext2FixtureBuilder, RawInodeBuilder, StopAfterVisitor,
                 },
             },
             utils::{IdBitmap, InodeIo, StatusFlags},
@@ -3986,6 +4000,7 @@ mod test {
                 .error(),
             Errno::EINVAL
         );
+        let free_inodes_before_dup = f.ext2.super_block().free_inodes_count();
         assert_eq!(
             root.create(
                 "alpha",
@@ -3995,6 +4010,10 @@ mod test {
             .unwrap_err()
             .error(),
             Errno::EEXIST
+        );
+        assert_eq!(
+            f.ext2.super_block().free_inodes_count(),
+            free_inodes_before_dup
         );
         assert_eq!(
             root.create(
@@ -4020,6 +4039,10 @@ mod test {
             .unwrap();
         let old_ino = old.ino();
         let old_links_before = f.ext2.read_inode_desc(old_ino).unwrap().links_count;
+        let block_size = f.ext2.block_size();
+        let payload = vec![0x6au8; block_size];
+        let mut payload_reader = VmReader::from(payload.as_slice()).to_fallible();
+        old.write_direct_at(0, &mut payload_reader).unwrap();
 
         // Linux ext2_link intent: increase nlink before publishing name.
         root.link(&old, "alias").unwrap();
@@ -4051,9 +4074,21 @@ mod test {
         assert_eq!(root.unlink("dir").unwrap_err().error(), Errno::EISDIR);
         assert_eq!(root.unlink(".").unwrap_err().error(), Errno::EINVAL);
 
+        let free_blocks_before_sync = f.ext2.super_block().free_blocks_count();
         root.unlink("old").unwrap();
+        {
+            let inode_bitmap = f.block_groups()[0].inode_bitmap();
+            assert!(inode_bitmap.is_allocated((old_ino - 1) as u16));
+        }
+        drop(old);
+        f.ext2.sync_all_inodes().unwrap();
         let inode_bitmap = f.block_groups()[0].inode_bitmap();
         assert!(!inode_bitmap.is_allocated((old_ino - 1) as u16));
+        drop(inode_bitmap);
+        assert_eq!(
+            f.ext2.super_block().free_blocks_count(),
+            free_blocks_before_sync.saturating_add(1)
+        );
     }
 
     #[ktest]
@@ -4123,6 +4158,12 @@ mod test {
             assert_eq!(guard.find_entry("old").unwrap_err().error(), Errno::ENOENT);
         }
 
+        {
+            let inode_bitmap = f.block_groups()[0].inode_bitmap();
+            assert!(inode_bitmap.is_allocated((replaced_ino - 1) as u16));
+        }
+        drop(new);
+        f.ext2.sync_all_inodes().unwrap();
         let inode_bitmap = f.block_groups()[0].inode_bitmap();
         assert!(!inode_bitmap.is_allocated((replaced_ino - 1) as u16));
 

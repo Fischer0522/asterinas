@@ -16,6 +16,7 @@ impl FileSystem for Ext2 {
 
     fn sync(&self) -> Result<()> {
         // Linux: /root/linux/fs/ext2/super.c:1308 (ext2_sync_fs)
+        self.sync_all_inodes()?;
         self.sync_metadata()?;
         self.block_device().sync()?;
         Ok(())

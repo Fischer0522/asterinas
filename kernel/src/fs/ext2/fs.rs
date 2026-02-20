@@ -3,11 +3,11 @@
 use core::mem::size_of;
 
 use super::{
-    block_group::{BlockGroup, RawGroupDesc},
+    block_group::{BlockGroup, EvictResult, RawGroupDesc},
     inode::{FilePerm, Inode, InodeDesc, RawInode},
     prelude::*,
-    super_block::{RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
-    utils::{Dirty, now},
+    super_block::{RawSuperBlock, SuperBlock, SUPER_BLOCK_OFFSET},
+    utils::{now, Dirty},
 };
 use crate::fs::utils::FsEventSubscriberStats;
 
@@ -128,30 +128,42 @@ impl Ext2 {
         self.root_inode.clone()
     }
 
-    /// Reads an inode and constructs its in-memory representation.
-    /// TODO: Add inode caching.
-    /// TODO: refactor this function into BlockGroup.
+    /// Reads an inode via per-block-group inode cache.
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:1387 (ext2_iget)
     pub(super) fn read_inode(&self, ino: u32) -> Result<Arc<Inode>> {
-        let desc = self.read_inode_desc(ino)?;
-        let desc = Dirty::new(desc);
-
-        let inodes_per_group = self.super_block.read().inodes_per_group();
-        let block_group_idx = ((ino - 1) / inodes_per_group) as usize;
-
         if self.self_ref.upgrade().is_none() {
             return_errno_with_message!(Errno::EIO, "filesystem already dropped");
         }
 
-        let inode = Inode::new(
-            ino,
-            desc.type_(),
-            desc,
-            block_group_idx,
-            self.self_ref.clone(),
-        );
-        Ok(inode)
+        let sb = self.super_block.read();
+        if ino == 0 || ((ino != ROOT_INO && ino < sb.first_ino()) || ino > sb.total_inodes()) {
+            return_errno_with_message!(Errno::EINVAL, "inode number out of valid range");
+        }
+        let inodes_per_group = sb.inodes_per_group();
+        drop(sb);
+
+        let group_idx = ((ino - 1) / inodes_per_group) as usize;
+        let inode_idx = (ino - 1) % inodes_per_group;
+
+        let group = self
+            .block_groups
+            .get(group_idx)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "block group index out of range"))?;
+        group.lookup_inode(inode_idx, ino, self.self_ref.clone())
+    }
+
+    /// Inserts a newly created inode into the corresponding block-group cache.
+    pub(super) fn insert_inode_cache(&self, inode: Arc<Inode>) {
+        let ino = inode.ino();
+        if ino == 0 {
+            return;
+        }
+        let group_idx = ((ino - 1) / self.inodes_per_group) as usize;
+        let inode_idx = (ino - 1) % self.inodes_per_group;
+        if let Some(group) = self.block_groups.get(group_idx) {
+            group.insert_cache(inode_idx, inode);
+        }
     }
 
     /// Returns the inode table block ID for the given group.
@@ -485,7 +497,6 @@ impl Ext2 {
         }
 
         let ino = self.alloc_inode(parent_ino, inode_type)?;
-        // TODO: reduce this extra I/O operation after implementing inode cache.
         // SPEC: initialize a valid on-disk inode before publishing it.
         let mode = (inode_type as u16) | (perm.bits() & 0o07777);
         let links_count = if inode_type.is_directory() { 2 } else { 1 };
@@ -521,14 +532,15 @@ impl Ext2 {
             return Err(err);
         }
 
-        match self.read_inode(ino) {
-            Ok(inode) => Ok(inode),
-            Err(err) => {
-                // SPEC: rollback allocated inode on publish failure.
-                let _ = self.free_inode(ino);
-                Err(err)
-            }
-        }
+        let desc = InodeDesc::try_from(&raw)?;
+        let block_group_idx = ((ino - 1) / self.inodes_per_group) as usize;
+        Ok(Inode::new(
+            ino,
+            desc.type_(),
+            Dirty::new(desc),
+            block_group_idx,
+            self.self_ref.clone(),
+        ))
     }
 
     /// Frees an inode by number.
@@ -661,6 +673,29 @@ impl Ext2 {
         sb_guard.clear_dirty();
         Ok(())
     }
+
+    /// Syncs cached inodes in all block groups and applies freed-inode counters.
+    pub fn sync_all_inodes(&self) -> Result<()> {
+        let mut total = EvictResult {
+            freed_inodes: 0,
+            freed_dirs: 0,
+        };
+
+        for group in &self.block_groups {
+            let result = group.sync_all_inodes()?;
+            total.freed_inodes = total.freed_inodes.saturating_add(result.freed_inodes);
+            total.freed_dirs = total.freed_dirs.saturating_add(result.freed_dirs);
+        }
+
+        if total.freed_inodes > 0 {
+            let mut sb = self.super_block.write();
+            for _ in 0..total.freed_inodes {
+                sb.inc_free_inodes();
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(ktest)]
@@ -684,8 +719,8 @@ mod test {
 
     use super::*;
     use crate::fs::ext2::testkit::{
-        self, ErrorBioDisk, Ext2FixtureBuilder, Ext2MemoryDisk, RawInodeBuilder,
-        build_group_desc_segment, make_valid_group_desc, make_valid_super_block,
+        self, build_group_desc_segment, make_valid_group_desc, make_valid_super_block,
+        ErrorBioDisk, Ext2FixtureBuilder, Ext2MemoryDisk, RawInodeBuilder,
     };
 
     fn make_raw_inode(mode: u16, links_count: u16, dtime: u32) -> RawInode {
@@ -1141,10 +1176,47 @@ mod test {
         assert_eq!(parse_err.error(), Errno::ESTALE);
     }
 
-    // NOTE: `read_inode_ok` and `read_inode_error` removed — their success/error
-    // paths are already covered by `read_inode_desc_valid_ino_ok`,
-    // `read_inode_desc_deleted_ino_returns_err`, and
-    // `alloc_inode_initializes_descriptor_on_disk`.
+    #[ktest]
+    fn read_inode_cache_hit_and_unallocated_checks() {
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+
+        let first = f.ext2.read_inode(ROOT_INO).unwrap();
+        let second = f.ext2.read_inode(ROOT_INO).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let unallocated_ino = f.sb.first_ino();
+        let err = f.ext2.read_inode(unallocated_ino).unwrap_err();
+        assert_eq!(err.error(), Errno::ENOENT);
+    }
+
+    #[ktest]
+    fn create_inserts_inode_cache_and_sync_eviction_keeps_linked_inode() {
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+
+        let child = root
+            .create(
+                "cache_file",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644),
+            )
+            .unwrap();
+        let child_ino = child.ino();
+
+        let cached = f.ext2.read_inode(child_ino).unwrap();
+        assert!(Arc::ptr_eq(&child, &cached));
+
+        drop(cached);
+        drop(child);
+        f.ext2.sync_all_inodes().unwrap();
+
+        let inode_bitmap = f.block_groups()[0].inode_bitmap();
+        assert!(inode_bitmap.is_allocated((child_ino - 1) as u16));
+        drop(inode_bitmap);
+
+        let reloaded = f.ext2.read_inode(child_ino).unwrap();
+        assert_eq!(reloaded.ino(), child_ino);
+    }
 
     #[ktest]
     fn load_block_bitmap_valid_image_ok() {
