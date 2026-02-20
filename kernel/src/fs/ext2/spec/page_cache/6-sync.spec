@@ -305,30 +305,20 @@ Pre:
 - Called from `FileSystem::sync()`.
 
 Post (success):
-- Iterates all inodes reachable from the dentry cache via the root inode.
-  Since Asterinas VFS caches inodes in the dentry tree, all open/cached
-  inodes are reachable from root.
-
-  However, the current implementation takes a simpler approach matching
-  ext2_old: the root inode is the only inode directly held by Ext2.
-  Other inodes are held by the dentry cache and are not directly
-  accessible from the filesystem.
-
-  Therefore, `sync_all_inodes` syncs only the root inode. The VFS layer
-  is responsible for iterating the dentry tree and calling `sync_all`
-  on each inode during `sync(2)`.
-
-  NOTE: This is a known limitation. A proper implementation would add
-  an inode cache (like ext2_old's `BTreeMap<u32, Arc<Inode>>` per
-  BlockGroup or exFAT's `HashMap<usize, Arc<ExfatInode>>` on the fs)
-  to track all live inodes. This spec focuses on the per-file sync
-  correctness which is the critical missing piece.
-
-- Calls `self.root_inode.sync_all()`.
+- Iterates all `BlockGroup`s in `self.block_groups`.
+- For each group, calls `group.sync_all_inodes()` which:
+  1. Evicts unreferenced inodes (`Arc::strong_count == 1`) from the
+     per-group `BTreeMap<u32, Arc<Inode>>` cache.
+  2. For evicted inodes with `nlink == 0`: runs `truncate_blocks(0)` +
+     `free_inode` (bitmap clear) — equivalent to Linux `ext2_evict_inode`.
+  3. For evicted inodes with `nlink > 0`: calls `sync_all()` before drop.
+  4. Calls `sync_all()` on all remaining cached inodes.
+- Aggregates `EvictResult` (freed inode/dir counts) across groups.
+- If any inodes were freed, updates superblock `free_inodes_count`.
 - Returns `Ok(())`.
 
 Post (failure):
-- `Err(EIO)` if root inode sync fails.
+- `Err(EIO)` if any group sync or eviction fails.
 
 ## FileSystem::sync for Ext2
 
@@ -406,13 +396,16 @@ Linux: `ext2_sync_fs` (super.c:1308) only syncs the superblock. Dirty
   responsibility for flushing dirty data during sync.
 
 Linux: The writeback framework tracks dirty inodes via `sb->s_inodes`
-  and `inode->i_io_list`.
-  → Asterinas: Currently no inode tracking in new ext2. This spec adds
-  `sync_all_inodes` which syncs the root inode. Full inode cache tracking
-  (like ext2_old's per-BlockGroup BTreeMap) is deferred to a future spec.
-  Reason: The critical bug is per-file fsync not writing back dirty pages.
-  Filesystem-level sync of all inodes requires architectural changes
-  (inode cache) that are orthogonal to the page cache writeback fix.
+  and `inode->i_io_list`. Eviction happens immediately when `i_count`
+  drops to 0 via `iput_final` → `evict`.
+  → Asterinas: Per-BlockGroup `BTreeMap<u32, Arc<Inode>>` inode cache.
+  Eviction of unreferenced inodes (`Arc::strong_count == 1`) is deferred
+  to `sync_all_inodes` time rather than happening immediately on last
+  reference drop.
+  Reason: Asterinas has no shrinker/LRU infrastructure yet. Deferred
+  eviction at sync time is acceptable for current usage patterns.
+  TODO: Integrate with memory pressure callbacks when Asterinas supports
+  periodic writeback/shrinker (see phase-08-inode-cache.spec).
 
 Linux: `generic_buffers_fsync_noflush` (buffer.c:614-617) conditionally
   writes metadata during fdatasync: skips only if `I_DIRTY_DATASYNC` is

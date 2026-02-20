@@ -650,7 +650,7 @@ impl Inode {
             return Err(err.into());
         }
 
-        let write_inner = upread_inner.upgrade();
+        let mut write_inner = upread_inner.upgrade();
         if let Err(err) = write_inner.persist_inode_and_sync(&fs) {
             let mut write_inner = write_inner;
             write_inner.page_cache.discard_range(0..block_size);
@@ -795,12 +795,30 @@ impl Inode {
             return Err(err);
         }
 
+        fs.insert_inode_cache(child.clone());
         Ok(child)
     }
 
     pub(super) fn sync_all(&self) -> Result<()> {
         let fs = self.fs_arc()?;
-        self.inner.read().persist_inode_and_sync(&fs)?;
+
+        {
+            // SPEC: fsync step 1 flushes dirty data pages first.
+            // Linux: /root/linux/fs/buffer.c:646 (generic_buffers_fsync)
+            // -> /root/linux/mm/filemap.c:777 (file_write_and_wait_range).
+            let inner = self.inner.read();
+            inner.sync_data()?;
+        }
+
+        {
+            // SPEC: fsync step 2 persists inode metadata after data writeback.
+            // Linux: /root/linux/fs/buffer.c:619 (sync_inode_metadata).
+            let mut inner = self.inner.write();
+            inner.persist_inode_and_sync(&fs)?;
+        }
+
+        // SPEC: fsync step 3 flushes device write cache.
+        // Linux: /root/linux/fs/buffer.c:654 (blkdev_issue_flush).
         fs.block_device().sync()?;
         Ok(())
     }
@@ -829,7 +847,26 @@ impl Inode {
     }
 
     pub(super) fn sync_data(&self) -> Result<()> {
-        self.fs_arc()?.block_device().sync()?;
+        let fs = self.fs_arc()?;
+
+        {
+            // SPEC: fdatasync always writes back dirty data pages first.
+            // Linux: /root/linux/fs/buffer.c:609 (file_write_and_wait_range).
+            let mut inner = self.inner.write();
+            inner.sync_data()?;
+
+            // SPEC: Linux writes metadata when I_DIRTY_DATASYNC is set.
+            // Linux: /root/linux/fs/buffer.c:616-619.
+            // Asterinas uses desc.is_dirty() as a conservative approximation
+            // so fdatasync never misses i_size/block-mapping persistence.
+            if inner.desc.is_dirty() {
+                inner.persist_inode_and_sync(&fs)?;
+            }
+        }
+
+        // SPEC: fdatasync ends with device cache flush.
+        // Linux: /root/linux/fs/buffer.c:654 (blkdev_issue_flush).
+        fs.block_device().sync()?;
         Ok(())
     }
 
@@ -2974,7 +3011,21 @@ impl InodeInner {
         Ok(())
     }
 
-    fn persist_inode_and_sync(&self, fs: &Ext2) -> Result<()> {
+    fn sync_data(&self) -> Result<()> {
+        // SPEC: file_write_and_wait_range on an empty file is a no-op.
+        // Linux: /root/linux/mm/filemap.c:782-783.
+        let file_size = self.desc.size as usize;
+        if file_size == 0 {
+            return Ok(());
+        }
+
+        // SPEC: evict_range writes back dirty pages in [0, file_size), waits for
+        // completion, and keeps pages cached as UpToDate.
+        // Linux equivalent flow: /root/linux/mm/filemap.c:785-790.
+        self.page_cache.evict_range(0..file_size)
+    }
+
+    fn persist_inode_and_sync(&mut self, fs: &Ext2) -> Result<()> {
         let inode = self
             .weak_self
             .upgrade()
@@ -2982,6 +3033,7 @@ impl InodeInner {
         let raw = RawInode::from(&*self.desc);
         fs.write_inode_desc(inode.ino, &raw)?;
         fs.sync_metadata()?;
+        self.desc.clear_dirty();
         Ok(())
     }
 }
