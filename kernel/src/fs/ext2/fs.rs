@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::mem::size_of;
+use core::{
+    mem::size_of,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use super::{
     block_group::{BlockGroup, EvictResult, RawGroupDesc},
@@ -9,7 +12,9 @@ use super::{
     super_block::{RawSuperBlock, SuperBlock, SUPER_BLOCK_OFFSET},
     utils::{now, Dirty},
 };
-use crate::fs::utils::FsEventSubscriberStats;
+use crate::{
+    fs::utils::FsEventSubscriberStats, process::posix_thread::AsPosixThread, thread::Thread,
+};
 
 /// The root inode number (Linux EXT2_ROOT_INO).
 pub const ROOT_INO: u32 = 2;
@@ -37,6 +42,8 @@ pub struct Ext2 {
     root_inode: Arc<Inode>,
     /// FS event stats for VFS.
     fs_event_subscriber_stats: FsEventSubscriberStats,
+    /// Per-filesystem inode generation counter.
+    next_generation: AtomicU32,
     /// Weak self reference for inode back-pointers.
     self_ref: Weak<Ext2>,
 }
@@ -82,6 +89,7 @@ impl Ext2 {
                 weak_self.clone(),
             ),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+            next_generation: AtomicU32::new(now().as_secs() as u32),
             self_ref: weak_self.clone(),
         });
 
@@ -500,29 +508,51 @@ impl Ext2 {
         // SPEC: initialize a valid on-disk inode before publishing it.
         let mode = (inode_type as u16) | (perm.bits() & 0o07777);
         let links_count = if inode_type.is_directory() { 2 } else { 1 };
+        // Linux: /root/linux/fs/ext2/ialloc.c:540-549 (owner + timestamp init).
+        let (uid, gid) = if let Some(thread) = Thread::current() {
+            if let Some(posix_thread) = thread.as_posix_thread() {
+                let credentials = posix_thread.credentials();
+                (
+                    u32::from(credentials.fsuid()),
+                    u32::from(credentials.fsgid()),
+                )
+            } else {
+                // DIFF from Linux: tests/internal tasks may not have POSIX credentials.
+                // Fall back to root ownership in that case.
+                (0, 0)
+            }
+        } else {
+            // DIFF from Linux: tests/internal tasks may not have a thread context.
+            // Fall back to root ownership in that case.
+            (0, 0)
+        };
+        // Linux: /root/linux/fs/ext2/ialloc.c:549 (simple_inode_init_ts).
+        let now_secs = now().as_secs() as u32;
+        // Linux: /root/linux/fs/ext2/ialloc.c:564-566 (s_next_generation++)
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let raw = RawInode {
             mode,
-            uid: 0,
+            uid: uid as u16,
             size_lo: 0,
-            atime: 0,
-            ctime: 0,
-            mtime: 0,
+            atime: now_secs,
+            ctime: now_secs,
+            mtime: now_secs,
             dtime: 0,
-            gid: 0,
+            gid: gid as u16,
             links_count,
             blocks: 0,
             flags: 0,
             osd1: 0,
             block: [0; 15],
-            generation: 0,
+            generation,
             file_acl: 0,
             size_high: 0,
             faddr: 0,
             frag: 0,
             fsize: 0,
             pad1: 0,
-            uid_high: 0,
-            gid_high: 0,
+            uid_high: (uid >> 16) as u16,
+            gid_high: (gid >> 16) as u16,
             reserved2: 0,
         };
 

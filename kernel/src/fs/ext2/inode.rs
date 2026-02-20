@@ -3738,6 +3738,7 @@ pub(super) struct InodeDesc {
     blocks: u32,
     flags: FileFlags,
     file_acl: u32,
+    generation: u32,
     block_ptrs: [u32; 15],
 }
 
@@ -3799,6 +3800,7 @@ impl TryFrom<&RawInode> for InodeDesc {
             blocks,
             flags,
             file_acl,
+            generation: raw.generation,
             block_ptrs,
         })
     }
@@ -3837,7 +3839,7 @@ impl From<&InodeDesc> for RawInode {
             flags: desc.flags.bits(),
             osd1: 0,
             block: desc.block_ptrs,
-            generation: 0,
+            generation: desc.generation,
             file_acl: desc.file_acl,
             size_high,
             faddr: 0,
