@@ -17,6 +17,11 @@ use crate::{
     process::{Gid, Uid},
 };
 
+/// Maximum bytes storable in ext2 inode i_block area for fast symlink payload.
+///
+/// Linux: /root/linux/fs/ext2/namei.c:177 (`sizeof(EXT2_I(inode)->i_data)`).
+const MAX_FAST_SYMLINK_LEN: usize = size_of::<u32>() * 15;
+
 #[derive(Clone, Copy, Debug)]
 pub struct FilePerm(u16);
 
@@ -90,10 +95,10 @@ impl Inode {
                 return_errno!(Errno::EINVAL);
             }
 
-            if inner.desc.type_ == InodeType::SymLink
-                && inner.desc.blocks == 0
-                && inner.desc.size <= 60
-            {
+            // Linux: /root/linux/fs/ext2/inode.c:48-55 (ext2_inode_is_fast_symlink).
+            // Keep resize invalid for existing fast symlinks (inline payload), but
+            // allow empty newly-created symlink inodes to grow into slow symlinks.
+            if inner.desc.is_fast_symlink(block_size) && inner.desc.size != 0 {
                 return_errno!(Errno::EINVAL);
             }
 
@@ -234,6 +239,134 @@ impl Inode {
 
     pub(super) fn set_ctime(&self, time: Duration) {
         self.inner.write().desc.ctime = time;
+    }
+
+    /// Reads symbolic-link target bytes and decodes them as UTF-8.
+    ///
+    /// Linux fast path: /root/linux/fs/ext2/inode.c:1483-1487
+    /// Linux slow path: /root/linux/fs/namei.c:6227-6234 (page_get_link)
+    pub(super) fn read_link(&self) -> Result<String> {
+        if self.type_ != InodeType::SymLink {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let fs = self.fs_arc()?;
+        let block_size = fs.block_size();
+        if block_size == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+        }
+
+        let inner = self.inner.read();
+        let link_size = inner.desc.size as usize;
+
+        if inner.desc.is_fast_symlink(block_size) {
+            let read_len = link_size.min(MAX_FAST_SYMLINK_LEN.saturating_sub(1));
+            let mut raw_bytes = [0u8; MAX_FAST_SYMLINK_LEN];
+            for (idx, block_ptr) in inner.desc.block_ptrs.iter().enumerate() {
+                let offset = idx * size_of::<u32>();
+                raw_bytes[offset..offset + size_of::<u32>()]
+                    .copy_from_slice(&block_ptr.to_le_bytes());
+            }
+
+            return String::from_utf8(raw_bytes[..read_len].to_vec())
+                .map_err(|_| Error::with_message(Errno::EIO, "symlink target is not valid UTF-8"));
+        }
+
+        let mut target = vec![0u8; link_size];
+        inner
+            .page_cache
+            .pages()
+            .read_bytes(0, &mut target)
+            .map_err(|_| {
+                Error::with_message(Errno::EIO, "failed to read symlink target from page cache")
+            })?;
+
+        String::from_utf8(target)
+            .map_err(|_| Error::with_message(Errno::EIO, "symlink target is not valid UTF-8"))
+    }
+
+    /// Writes symbolic-link target bytes into either fast-inline or slow-pagecache storage.
+    ///
+    /// Linux length gate and fast/slow split: /root/linux/fs/ext2/namei.c:165-191
+    /// Linux slow write primitive: /root/linux/fs/namei.c:6273-6302 (page_symlink)
+    pub(super) fn write_link(&self, target: &str) -> Result<()> {
+        if self.type_ != InodeType::SymLink {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let fs = self.fs_arc()?;
+        let block_size = fs.block_size();
+        if block_size == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+        }
+
+        let target_len = target.len();
+        let with_nul = target_len.checked_add(1).ok_or_else(|| {
+            Error::with_message(Errno::ENAMETOOLONG, "symlink target length overflow")
+        })?;
+
+        // Linux: /root/linux/fs/ext2/namei.c:165-166 (`strlen(symname)+1 > sb->s_blocksize`).
+        if with_nul > block_size {
+            return_errno!(Errno::ENAMETOOLONG);
+        }
+
+        if with_nul <= MAX_FAST_SYMLINK_LEN {
+            let mut inner = self.inner.write();
+            let mut raw_bytes = [0u8; MAX_FAST_SYMLINK_LEN];
+            raw_bytes[..target_len].copy_from_slice(target.as_bytes());
+
+            for idx in 0..inner.desc.block_ptrs.len() {
+                let offset = idx * size_of::<u32>();
+                inner.desc.block_ptrs[idx] = u32::from_le_bytes([
+                    raw_bytes[offset],
+                    raw_bytes[offset + 1],
+                    raw_bytes[offset + 2],
+                    raw_bytes[offset + 3],
+                ]);
+            }
+
+            inner.desc.size = target_len as u64;
+            inner.desc.blocks = 0;
+            inner.persist_inode_and_sync(&fs)?;
+            return Ok(());
+        }
+
+        // Follow write_at's lock split to avoid deadlock:
+        // metadata allocation/resize under write lock, then PageCache I/O under read lock.
+        // TODO: add a rollback path on failed allocation/write similar to write_at's `write_failed_cleanup`.
+        self.resize(target_len)?;
+
+        {
+            let mut inner = self.inner.write();
+            let blocks_to_cover = target_len.div_ceil(block_size);
+            for iblock in 0..blocks_to_cover {
+                let iblock = u32::try_from(iblock).map_err(|_| {
+                    Error::with_message(Errno::EINVAL, "logical block number overflow")
+                })?;
+                if inner.get_or_alloc_block(iblock, true)?.is_none() {
+                    return_errno_with_message!(
+                        Errno::ENOSPC,
+                        "failed to allocate symlink data block"
+                    );
+                }
+            }
+        }
+
+        {
+            let inner = self.inner.read();
+            inner
+                .page_cache
+                .pages()
+                .write_bytes(0, target.as_bytes())
+                .map_err(|_| {
+                    Error::with_message(Errno::EIO, "failed to write symlink target to page cache")
+                })?;
+        }
+
+        let mut inner = self.inner.write();
+        inner.desc.size = target_len as u64;
+        inner.persist_inode_and_sync(&fs)?;
+        Ok(())
     }
 
     pub(super) fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
@@ -3165,8 +3298,9 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        // SPEC: Phase 6.3 supports File and Dir only.
-        if type_ != InodeType::File && type_ != InodeType::Dir {
+        // TODO:
+        // SPEC: Currently only support File, Dir, and SymLink.
+        if type_ != InodeType::File && type_ != InodeType::Dir && type_ != InodeType::SymLink {
             return_errno!(Errno::EINVAL);
         }
 
@@ -3758,6 +3892,19 @@ pub(super) struct InodeDesc {
 impl InodeDesc {
     pub fn type_(&self) -> InodeType {
         self.type_
+    }
+
+    /// Determines whether the symlink payload is stored inline in `i_block[15]`.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:48-55 (ext2_inode_is_fast_symlink).
+    fn is_fast_symlink(&self, block_size: usize) -> bool {
+        let ea_blocks = if self.file_acl != 0 {
+            (block_size / SECTOR_SIZE) as u32
+        } else {
+            0
+        };
+
+        self.type_ == InodeType::SymLink && self.blocks.checked_sub(ea_blocks) == Some(0)
     }
 }
 
@@ -5158,6 +5305,94 @@ mod test {
         let symlink_desc = InodeDesc::try_from(&raw_fast_symlink).unwrap();
         let mut symlink_inner = InodeInner::new(Dirty::new(symlink_desc), Weak::new(), Weak::new());
         assert_eq!(symlink_inner.resize(4).unwrap_err().error(), Errno::EINVAL);
+    }
+
+    #[ktest]
+    fn symlink_fast_round_trip_ok() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let link = root
+            .create(
+                "fast_link",
+                InodeType::SymLink,
+                FilePerm::from_bits_truncate(0o777),
+            )
+            .unwrap();
+
+        let target = "./phase08/fast-target";
+        link.write_link(target).unwrap();
+        assert_eq!(link.read_link().unwrap(), target);
+
+        let inner = link.inner.read();
+        assert_eq!(inner.desc.size as usize, target.len());
+        assert_eq!(inner.desc.blocks, 0);
+        assert!(inner.desc.is_fast_symlink(f.ext2.block_size()));
+    }
+
+    #[ktest]
+    fn symlink_slow_round_trip_ok() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let link = root
+            .create(
+                "slow_link",
+                InodeType::SymLink,
+                FilePerm::from_bits_truncate(0o777),
+            )
+            .unwrap();
+
+        let target = "x".repeat(MAX_FAST_SYMLINK_LEN);
+        link.write_link(&target).unwrap();
+        assert_eq!(link.read_link().unwrap(), target);
+
+        let inner = link.inner.read();
+        assert_eq!(inner.desc.size as usize, MAX_FAST_SYMLINK_LEN);
+        assert!(inner.desc.blocks > 0);
+        assert!(!inner.desc.is_fast_symlink(f.ext2.block_size()));
+    }
+
+    #[ktest]
+    fn symlink_write_link_enametoolong_boundary() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let link = root
+            .create(
+                "long_link",
+                InodeType::SymLink,
+                FilePerm::from_bits_truncate(0o777),
+            )
+            .unwrap();
+
+        let too_long = "y".repeat(f.ext2.block_size());
+        let err = link.write_link(&too_long).unwrap_err();
+        assert_eq!(err.error(), Errno::ENAMETOOLONG);
+    }
+
+    #[ktest]
+    fn symlink_read_write_reject_non_symlink_inode() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let file = root
+            .create(
+                "regular_file",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644),
+            )
+            .unwrap();
+
+        assert_eq!(file.read_link().unwrap_err().error(), Errno::EINVAL);
+        assert_eq!(
+            file.write_link("target").unwrap_err().error(),
+            Errno::EINVAL
+        );
     }
 
     #[ktest]

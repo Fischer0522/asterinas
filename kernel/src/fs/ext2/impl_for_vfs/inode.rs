@@ -167,11 +167,11 @@ impl VfsInode for Inode {
     }
 
     fn read_link(&self) -> Result<SymbolicLink> {
-        return_errno_with_message!(Errno::EOPNOTSUPP, "symlink read is not supported yet");
+        Inode::read_link(self).map(SymbolicLink::Plain)
     }
 
-    fn write_link(&self, _target: &str) -> Result<()> {
-        return_errno_with_message!(Errno::EOPNOTSUPP, "symlink write is not supported yet");
+    fn write_link(&self, target: &str) -> Result<()> {
+        Inode::write_link(self, target)
     }
 
     fn sync_all(&self) -> Result<()> {
