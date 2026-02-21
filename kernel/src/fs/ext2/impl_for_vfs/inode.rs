@@ -132,8 +132,22 @@ impl VfsInode for Inode {
         Ok(Inode::create(self, name, type_, mode.into())?)
     }
 
-    fn mknod(&self, _name: &str, _mode: InodeMode, _type_: MknodType) -> Result<Arc<dyn VfsInode>> {
-        return_errno_with_message!(Errno::EOPNOTSUPP, "mknod is not supported yet");
+    fn mknod(&self, name: &str, mode: InodeMode, type_: MknodType) -> Result<Arc<dyn VfsInode>> {
+        // Linux: /root/linux/fs/ext2/namei.c:136-155 (ext2_mknod)
+        // SPEC: map mknod request to ext2 inode type plus optional encoded device id.
+        let (inode_type, device_id) = match type_ {
+            MknodType::CharDevice(dev_id) => (InodeType::CharDevice, Some(dev_id)),
+            MknodType::BlockDevice(dev_id) => (InodeType::BlockDevice, Some(dev_id)),
+            MknodType::NamedPipe => (InodeType::NamedPipe, None),
+        };
+
+        let new_inode = Inode::create(self, name, inode_type, mode.into())?;
+        if let Some(device_id) = device_id {
+            // SPEC: persist Linux-compatible i_block[0..2] device encoding.
+            new_inode.set_device_id(device_id)?;
+        }
+
+        Ok(new_inode)
     }
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn VfsInode>> {

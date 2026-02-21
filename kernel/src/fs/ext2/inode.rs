@@ -2,6 +2,7 @@
 
 use core::mem::size_of;
 
+use device_id::{decode_device_numbers, encode_device_numbers};
 use ostd::{const_assert, mm::io_util::HasVmReaderWriter};
 
 use super::{
@@ -79,6 +80,39 @@ impl Inode {
         self.inner.read().desc.size as usize
     }
 
+    /// Returns the encoded device ID for special files.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:1493-1500 (ext2_iget)
+    pub(super) fn device_id(&self) -> u64 {
+        // SPEC: non-device inodes report rdev = 0.
+        if self.type_ != InodeType::CharDevice && self.type_ != InodeType::BlockDevice {
+            return 0;
+        }
+
+        // SPEC: acquire inode read lock before reading i_block-based device encoding.
+        let inner = self.inner.read();
+        inner.desc.decode_device_id()
+    }
+
+    /// Sets the encoded device ID for special files and persists it.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:1589-1599 (__ext2_write_inode)
+    pub(super) fn set_device_id(&self, device_id: u64) -> Result<()> {
+        if self.type_ != InodeType::CharDevice && self.type_ != InodeType::BlockDevice {
+            // SPEC: fail with EINVAL for non-device inodes; no lock/state mutation needed.
+            return_errno!(Errno::EINVAL);
+        }
+
+        let fs = self.fs_arc()?;
+        // SPEC: acquire inode write lock before mutating block_ptrs and timestamps.
+        let mut inner = self.inner.write();
+        // DIFF from Linux: Linux caches dev_t in i_rdev and encodes during write_inode;
+        // Asterinas stores the Linux-compatible on-disk encoding directly in block_ptrs.
+        inner.desc.encode_device_id(device_id);
+        inner.desc.ctime = now();
+        inner.persist_inode_and_sync(&fs)
+    }
+
     pub(super) fn resize(&self, new_size: usize) -> Result<()> {
         let fs = self.fs_arc()?;
         let block_size = fs.block_size();
@@ -154,10 +188,17 @@ impl Inode {
     }
 
     pub(super) fn metadata(&self) -> Metadata {
+        // SPEC: hold inode read lock while reading metadata fields and rdev encoding.
         let inner = self.inner.read();
         let (dev, blk_size) = match self.fs.upgrade() {
             Some(fs) => (fs.block_device().id().as_encoded_u64(), fs.block_size()),
             None => (0, BLOCK_SIZE),
+        };
+        let rdev = if self.type_ == InodeType::CharDevice || self.type_ == InodeType::BlockDevice {
+            // SPEC: for device inodes, decode rdev from i_block old/new format.
+            inner.desc.decode_device_id()
+        } else {
+            0
         };
         Metadata {
             dev,
@@ -173,7 +214,7 @@ impl Inode {
             nlinks: inner.desc.links_count as usize,
             uid: Uid::new(inner.desc.uid),
             gid: Gid::new(inner.desc.gid),
-            rdev: 0,
+            rdev,
         }
     }
 
@@ -3298,9 +3339,15 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        // TODO:
-        // SPEC: Currently only support File, Dir, and SymLink.
-        if type_ != InodeType::File && type_ != InodeType::Dir && type_ != InodeType::SymLink {
+        // Linux: /root/linux/fs/ext2/namei.c:136-155 (ext2_mknod)
+        // Accept ext2 special inode kinds needed by mknod in addition to regular kinds.
+        if type_ != InodeType::File
+            && type_ != InodeType::Dir
+            && type_ != InodeType::SymLink
+            && type_ != InodeType::CharDevice
+            && type_ != InodeType::BlockDevice
+            && type_ != InodeType::NamedPipe
+        {
             return_errno!(Errno::EINVAL);
         }
 
@@ -3905,6 +3952,45 @@ impl InodeDesc {
         };
 
         self.type_ == InodeType::SymLink && self.blocks.checked_sub(ea_blocks) == Some(0)
+    }
+
+    /// Decodes Linux ext2 old/new special-file device encoding from `i_block`.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:1495-1500
+    /// Linux: /root/linux/include/linux/kdev_t.h:34-37,46-51
+    fn decode_device_id(&self) -> u64 {
+        let (major, minor) = if self.block_ptrs[0] != 0 {
+            let val = self.block_ptrs[0];
+            // SPEC: old_decode_dev((major << 8) | minor) with 8-bit major/minor.
+            (((val >> 8) & 0xFF), (val & 0xFF))
+        } else {
+            let dev = self.block_ptrs[1];
+            // SPEC: new_decode_dev bit layout in Linux kdev_t.h.
+            (
+                ((dev & 0xFFF00) >> 8),
+                ((dev & 0xFF) | ((dev >> 12) & 0xFFF00)),
+            )
+        };
+
+        encode_device_numbers(major, minor)
+    }
+
+    /// Encodes an Asterinas u64 device ID into Linux ext2 `i_block` layout.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:1589-1599
+    /// Linux: /root/linux/include/linux/kdev_t.h:24-32,39-44
+    fn encode_device_id(&mut self, device_id: u64) {
+        let (major, minor) = decode_device_numbers(device_id);
+
+        // SPEC: old_valid_dev => MAJOR/MINOR must both fit in 8 bits.
+        if major < 256 && minor < 256 {
+            self.block_ptrs[0] = (major << 8) | minor;
+            self.block_ptrs[1] = 0;
+        } else {
+            self.block_ptrs[0] = 0;
+            self.block_ptrs[1] = (minor & 0xFF) | (major << 8) | ((minor & !0xFF) << 12);
+            self.block_ptrs[2] = 0;
+        }
     }
 }
 
