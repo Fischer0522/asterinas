@@ -196,8 +196,11 @@ impl VfsInode for Inode {
         Inode::sync_data(self)
     }
 
-    fn fallocate(&self, _mode: FallocMode, _offset: usize, _len: usize) -> Result<()> {
-        return_errno_with_message!(Errno::EOPNOTSUPP, "fallocate is not supported yet");
+    fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {
+        // Linux ext2 has no `.fallocate` file operation
+        // (/root/linux/fs/ext2/file.c:313-328), so delegate to the
+        // Asterinas compatibility implementation.
+        Inode::fallocate(self, mode, offset, len)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

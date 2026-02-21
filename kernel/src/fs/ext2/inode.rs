@@ -13,7 +13,7 @@ use super::{
 use crate::{
     fs::{
         ext2::dir::{DirEntry, DirEntryIter},
-        utils::{Extension, InodeMode, Metadata},
+        utils::{Extension, FallocMode, InodeMode, Metadata},
     },
     process::{Gid, Uid},
 };
@@ -974,6 +974,41 @@ impl Inode {
 
         fs.insert_inode_cache(child.clone());
         Ok(child)
+    }
+
+    /// Implements fallocate operations for ext2.
+    ///
+    /// Linux ext2 has no native fallocate; this provides compatibility
+    /// matching the old Asterinas ext2 implementation.
+    ///
+    /// Linux: /root/linux/fs/ext2/file.c:313-328 (`ext2_file_operations`, no `.fallocate`).
+    /// Compat reference: /root/asterinas/kernel/src/fs/ext2_old/inode.rs:804-836.
+    pub(super) fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {
+        match mode {
+            FallocMode::PunchHoleKeepSize => {
+                let inner = self.inner.read();
+                let file_size = inner.desc.size as usize;
+                if offset >= file_size {
+                    return Ok(());
+                }
+                let end = file_size.min(offset + len);
+                inner.page_cache.fill_zeros(offset..end)
+            }
+            FallocMode::Allocate => {
+                let new_size = offset + len;
+                if new_size > self.file_size() {
+                    self.resize(new_size)?;
+                }
+                Ok(())
+            }
+            FallocMode::AllocateKeepSize => Ok(()),
+            _ => {
+                return_errno_with_message!(
+                    Errno::EOPNOTSUPP,
+                    "fallocate with the specified flags is not supported"
+                );
+            }
+        }
     }
 
     pub(super) fn sync_all(&self) -> Result<()> {
@@ -5726,6 +5761,95 @@ mod test {
         assert_eq!(inner.desc.size as usize, target);
         assert_eq!(inner.desc.blocks, 0);
         assert!(inner.desc.block_ptrs.iter().all(|ptr| *ptr == 0));
+    }
+
+    #[ktest]
+    fn fallocate_allocate_extends_file_size() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .build()
+            .unwrap();
+        let file = make_live_file_inode(&f.ext2, 67, 0, 0, FileFlags::empty(), [0; 15]);
+        let block_size = f.ext2.block_size();
+        let new_size = block_size + 210;
+
+        file.fallocate(FallocMode::Allocate, block_size + 10, 200)
+            .unwrap();
+        assert_eq!(file.file_size(), new_size);
+    }
+
+    #[ktest]
+    fn fallocate_allocate_keep_size_is_noop() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .build()
+            .unwrap();
+        let file = make_live_file_inode(&f.ext2, 68, 123, 0, FileFlags::empty(), [0; 15]);
+
+        file.fallocate(FallocMode::AllocateKeepSize, 4096, 512)
+            .unwrap();
+        assert_eq!(file.file_size(), 123);
+    }
+
+    #[ktest]
+    fn fallocate_punch_hole_keep_size_zeroes_requested_range() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .build()
+            .unwrap();
+        let file = make_live_file_inode(&f.ext2, 69, 0, 0, FileFlags::empty(), [0; 15]);
+        let block_size = f.ext2.block_size();
+
+        let payload = vec![0xabu8; block_size];
+        let mut payload_reader = VmReader::from(payload.as_slice()).to_fallible();
+        file.write_at(0, &mut payload_reader).unwrap();
+
+        let punch_off = 128usize;
+        let punch_len = 512usize;
+        file.fallocate(FallocMode::PunchHoleKeepSize, punch_off, punch_len)
+            .unwrap();
+
+        let mut out = vec![0u8; block_size];
+        let mut out_writer = VmWriter::from(out.as_mut_slice()).to_fallible();
+        assert_eq!(file.read_at(0, &mut out_writer).unwrap(), block_size);
+
+        assert_eq!(&out[..punch_off], &payload[..punch_off]);
+        assert!(out[punch_off..punch_off + punch_len]
+            .iter()
+            .all(|byte| *byte == 0));
+        assert_eq!(
+            &out[punch_off + punch_len..],
+            &payload[punch_off + punch_len..]
+        );
+        assert_eq!(file.file_size(), block_size);
+    }
+
+    #[ktest]
+    fn fallocate_unsupported_modes_return_eopnotsupp() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .build()
+            .unwrap();
+        let file = make_live_file_inode(&f.ext2, 70, 0, 0, FileFlags::empty(), [0; 15]);
+
+        for mode in [
+            FallocMode::ZeroRange,
+            FallocMode::ZeroRangeKeepSize,
+            FallocMode::CollapseRange,
+            FallocMode::InsertRange,
+            FallocMode::AllocateUnshareRange,
+        ] {
+            let err = file.fallocate(mode, 0, 1).unwrap_err();
+            assert_eq!(err.error(), Errno::EOPNOTSUPP);
+        }
     }
 
     #[ktest]
