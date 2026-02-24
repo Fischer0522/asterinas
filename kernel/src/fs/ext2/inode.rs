@@ -151,12 +151,42 @@ impl Inode {
             old_size
         };
 
-        if new_size < old_size && new_size % block_size != 0 {
-            // Linux-compatible shrink semantics: zero the truncated tail in the
-            // last partial block before dropping cache pages / blocks.
-            let zero_to = new_size.align_up(block_size);
-            let inner = self.inner.read();
-            inner.page_cache.fill_zeros(new_size..zero_to)?;
+        if new_size < old_size {
+            // Linux: /root/linux/fs/buffer.c:2654 (block_truncate_page)
+            // Keep shrink tail-zeroing in a read-compatible phase before metadata
+            // mutation/truncate, then atomically upgrade for commit.
+            let upread_inner = self.inner.upread();
+            let current_size = upread_inner.desc.size as usize;
+            if new_size < current_size && new_size % block_size != 0 {
+                let zero_to = new_size.align_up(block_size);
+                upread_inner.page_cache.fill_zeros(new_size..zero_to)?;
+            }
+
+            let mut inner = upread_inner.upgrade();
+            let old_size = inner.desc.size as usize;
+            if new_size == old_size {
+                return Ok(());
+            }
+            if new_size < old_size {
+                let old_size_aligned = old_size.align_up(block_size);
+                let new_size_aligned = new_size.align_up(block_size);
+                if new_size_aligned < old_size_aligned {
+                    inner
+                        .page_cache
+                        .discard_range(new_size_aligned..old_size_aligned);
+                }
+                inner.page_cache.resize(new_size_aligned)?;
+                inner.desc.size = new_size as u64;
+                inner.truncate_blocks(new_size)?;
+            } else {
+                inner.page_cache.resize(new_size.align_up(block_size))?;
+                inner.desc.size = new_size as u64;
+            }
+
+            let current = now();
+            inner.desc.mtime = current;
+            inner.desc.ctime = current;
+            return inner.persist_inode_and_sync(&fs);
         }
 
         let mut inner = self.inner.write();
@@ -455,9 +485,10 @@ impl Inode {
             .checked_add(write_len)
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
 
+        let old_size;
         {
             let mut inner = self.inner.write();
-            let old_size = inner.desc.size as usize;
+            old_size = inner.desc.size as usize;
             let start_block = offset / block_size;
             let end_block = end.div_ceil(block_size);
 
@@ -490,13 +521,16 @@ impl Inode {
             }
         }
 
-        {
-            let inner = self.inner.read();
-            // Phase 2: copy user data through VMO-backed page cache.
-            inner.page_cache.pages().write(offset, reader)?;
+        let upread_inner = self.inner.upread();
+        // Phase 2: copy user data through VMO-backed page cache under upread.
+        if let Err(err) = upread_inner.page_cache.pages().write(offset, reader) {
+            drop(upread_inner);
+            let mut inner = self.inner.write();
+            Self::write_failed_cleanup(&mut inner, old_size, end, block_size);
+            return Err(err.into());
         }
 
-        let mut inner = self.inner.write();
+        let mut inner = upread_inner.upgrade();
         let current = now();
         inner.desc.mtime = current;
         inner.desc.ctime = current;
@@ -607,17 +641,15 @@ impl Inode {
             }
         }
 
-        {
-            let inner = self.inner.read();
-            if let Err(err) = inner.write_at(offset, reader) {
-                drop(inner);
-                let mut inner = self.inner.write();
-                Self::write_failed_cleanup(&mut inner, old_size, end, block_size);
-                return Err(err);
-            }
+        let upread_inner = self.inner.upread();
+        if let Err(err) = upread_inner.write_at(offset, reader) {
+            drop(upread_inner);
+            let mut inner = self.inner.write();
+            Self::write_failed_cleanup(&mut inner, old_size, end, block_size);
+            return Err(err);
         }
 
-        let mut inner = self.inner.write();
+        let mut inner = upread_inner.upgrade();
         let current = now();
         inner.desc.mtime = current;
         inner.desc.ctime = current;
@@ -1015,20 +1047,16 @@ impl Inode {
     pub(super) fn sync_all(&self) -> Result<()> {
         let fs = self.fs_arc()?;
 
-        {
-            // SPEC: fsync step 1 flushes dirty data pages first.
-            // Linux: /root/linux/fs/buffer.c:646 (generic_buffers_fsync)
-            // -> /root/linux/mm/filemap.c:777 (file_write_and_wait_range).
-            let inner = self.inner.read();
-            inner.sync_data()?;
-        }
+        // SPEC: fsync step 1 flushes dirty data pages first.
+        // Linux: /root/linux/fs/buffer.c:646 (generic_buffers_fsync)
+        // -> /root/linux/mm/filemap.c:777 (file_write_and_wait_range).
+        let inner = self.inner.upread();
+        inner.sync_data()?;
 
-        {
-            // SPEC: fsync step 2 persists inode metadata after data writeback.
-            // Linux: /root/linux/fs/buffer.c:619 (sync_inode_metadata).
-            let mut inner = self.inner.write();
-            inner.persist_inode_and_sync(&fs)?;
-        }
+        // SPEC: fsync step 2 persists inode metadata after data writeback.
+        // Linux: /root/linux/fs/buffer.c:619 (sync_inode_metadata).
+        let mut inner = inner.upgrade();
+        inner.persist_inode_and_sync(&fs)?;
 
         // SPEC: fsync step 3 flushes device write cache.
         // Linux: /root/linux/fs/buffer.c:654 (blkdev_issue_flush).

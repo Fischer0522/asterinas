@@ -44,4 +44,5 @@ distro/etc_nixos/_config_for_test.nix
 .claude
 .opencode
 .trellis
+.codex
 AGENTS.md
