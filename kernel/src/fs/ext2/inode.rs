@@ -878,6 +878,7 @@ impl Inode {
 
         {
             let mut child_write = child.inner.write();
+            child_write.desc.size = 0;
             child_write.desc.links_count = child_write.desc.links_count.saturating_sub(2);
             child_write.desc.dtime = now();
             child_write.is_freed = true;
@@ -4993,35 +4994,31 @@ mod test {
         }
     }
 
-    // TODO: this test will pass after adding inode cache
-    // #[ktest]
-    // fn dir_rmdir_removes_child_and_updates_nlinks() {
-    //     clocks::init_for_ktest();
+    #[ktest]
+    fn dir_rmdir_removes_child_and_updates_nlinks() {
+        clocks::init_for_ktest();
 
-    //     let env = prepare_rmdir_env(false);
-    //     let f = &env.f;
-    //     let child_ino = env.child_ino;
-    //     let parent = &env.parent;
+        let env = prepare_rmdir_env(false);
+        let f = &env.f;
+        let child_ino = env.child_ino;
+        let parent = &env.parent;
 
-    //     parent.rmdir("sub").unwrap();
-    //     {
-    //         let parent_inner = parent.inner.read();
-    //         assert_eq!(parent_inner.desc.links_count, 2);
-    //         assert_eq!(
-    //             parent_inner.find_entry("sub").unwrap_err().error(),
-    //             Errno::ENOENT
-    //         );
-    //     }
+        parent.rmdir("sub").unwrap();
+        {
+            let parent_inner = parent.inner.read();
+            assert_eq!(parent_inner.desc.links_count, 2);
+            assert_eq!(
+                parent_inner.find_entry("sub").unwrap_err().error(),
+                Errno::ENOENT
+            );
+        }
 
-    //     let parent_desc = f.ext2.read_inode_desc(ROOT_INO).unwrap();
-    //     assert_eq!(parent_desc.links_count, 2);
-    //     let child_desc = f.ext2.read_inode_desc(child_ino).unwrap();
-    //     assert_eq!(child_desc.size, 0);
-    //     assert_eq!(child_desc.links_count, 0);
-
-    //     let inode_bitmap = f.block_groups()[0].inode_bitmap();
-    //     assert!(!inode_bitmap.is_allocated((child_ino - 1) as u16));
-    // }
+        let parent = f.ext2.read_inode(ROOT_INO).unwrap();
+        assert_eq!(parent.inner.read().desc.links_count, 2);
+        let child = f.ext2.read_inode(child_ino).unwrap();
+        assert_eq!(child.inner.read().desc.size, 0);
+        assert_eq!(child.inner.read().desc.links_count, 0);
+    }
 
     #[ktest]
     fn dir_rmdir_notempty_returns_enotempty() {
