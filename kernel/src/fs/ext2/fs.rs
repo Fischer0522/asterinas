@@ -728,6 +728,18 @@ impl Ext2 {
             return_errno_with_message!(Errno::EIO, "failed to read group descriptor segment");
         }
         let mut sb_guard = self.super_block.write();
+
+        // Linux: /root/linux/fs/ext2/super.c:1288-1289 (ext2_sync_super)
+        // Recompute free counters from group descriptors — they are the source of truth.
+        let mut total_free_blocks: u32 = 0;
+        let mut total_free_inodes: u32 = 0;
+        for group in &self.block_groups {
+            total_free_blocks += group.free_blocks_count() as u32;
+            total_free_inodes += group.free_inodes_count() as u32;
+        }
+        sb_guard.set_free_blocks_count(total_free_blocks);
+        sb_guard.set_free_inodes_count(total_free_inodes);
+
         sb_guard.set_wtime(now());
         if self
             .block_device

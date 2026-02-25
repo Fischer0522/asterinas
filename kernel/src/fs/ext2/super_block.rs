@@ -484,6 +484,11 @@ impl SuperBlock {
         self.free_blocks_count += count;
     }
 
+    /// Overwrites the free blocks counter with a recomputed value.
+    pub(super) fn set_free_blocks_count(&mut self, count: u32) {
+        self.free_blocks_count = count;
+    }
+
     /// Decrease the number of free blocks.
     pub(super) fn dec_free_blocks(&mut self, count: u32) {
         if self.free_blocks_count < count {
@@ -498,6 +503,11 @@ impl SuperBlock {
     /// Returns the number of free inodes.
     pub fn free_inodes_count(&self) -> u32 {
         self.free_inodes_count
+    }
+
+    /// Overwrites the free inodes counter with a recomputed value.
+    pub(super) fn set_free_inodes_count(&mut self, count: u32) {
+        self.free_inodes_count = count;
     }
 
     /// Increase the number of free inodes.
