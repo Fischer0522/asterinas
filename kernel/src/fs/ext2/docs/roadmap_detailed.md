@@ -51,6 +51,7 @@ The following Linux Ext2 features are explicitly out of scope:
 - `inode.rs:3898` — refactor with enum approach
 - `inode.rs:4070` — behavior differs from Linux
 - `inode.rs:5920` — test blocked by PageCache::discard_range bug
+- `inode.rs` — indirect blocks read via uncached `block_device().read_bytes()` (needs IndirectBlockCache)
 
 ---
 
@@ -474,7 +475,33 @@ Goal: finalize boundary checks, feature gating, and consistency rules.
 - Spec: `phase-09-boundary-checks.spec`.
 - Status: ❌ not implemented (no dedicated `check_block_range`/`check_ino_range` methods).
 
-### Module 9.3: Consistency & Sync
+### Module 9.3: IndirectBlockCache
+- New/extend structs:
+  - `IndirectBlockCache` (per-superblock or per-inode cached indirect block layer).
+- Methods:
+  - `IndirectBlockCache::read(block_nr)` (return cached buffer or read from disk).
+  - `IndirectBlockCache::mark_dirty(block_nr)` (schedule deferred writeback).
+  - `IndirectBlockCache::sync()` (flush all dirty indirect blocks).
+- Linux refs:
+  - `/root/linux/fs/ext2/inode.c:234` (`ext2_get_branch` — `sb_bread` for indirect blocks).
+  - `/root/linux/fs/ext2/inode.c:479` (`ext2_alloc_branch` — `sb_getblk` + `mark_buffer_dirty`).
+  - `/root/linux/fs/ext2/inode.c:561` (`ext2_splice_branch` — `mark_buffer_dirty` on parent bh).
+  - `/root/linux/fs/ext2/inode.c:1136` (`ext2_free_branches` — `sb_bread` per level).
+  - `/root/linux/include/linux/buffer_head.h` (`sb_bread` → `__bread_gfp` → bdev address_space cache).
+- Asterinas adjustments:
+  - Linux caches indirect blocks globally in the block device's `address_space` via `buffer_head`.
+    Asterinas has no `buffer_head`; use `PageCache` or a dedicated `BTreeMap<Bid, Frame>` cache.
+  - The old `ext2_old` implementation had a per-inode LRU cache (`IndirectBlockCache`, 16 entries,
+    backed by `Frame<()>`). Evaluate whether per-inode or per-superblock scope is appropriate.
+  - Current code in `get_branch`, `alloc_and_splice_branch`, `truncate_blocks`, and `free_branches`
+    allocates a fresh `Vec<u8>` per indirect block read and writes back the entire block synchronously.
+    With a cache, modifications can be batched and written back lazily via `mark_dirty`.
+  - Whole-block write-back in splice/truncate risks lost updates if lock granularity is relaxed;
+    a cache with dirty tracking eliminates this class of bugs.
+- Spec: `phase-09-indirect-block-cache.spec`.
+- Status: ❌ not implemented (all indirect block I/O is uncached direct `block_device().read_bytes()`).
+
+### Module 9.4: Consistency & Sync
 - Methods:
   - `Ext2::sync_metadata`, `Inode::sync_metadata`.
 - Linux refs:

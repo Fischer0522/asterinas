@@ -22,6 +22,7 @@ use crate::{
 ///
 /// Linux: /root/linux/fs/ext2/namei.c:177 (`sizeof(EXT2_I(inode)->i_data)`).
 const MAX_FAST_SYMLINK_LEN: usize = size_of::<u32>() * 15;
+const MAX_LINK_COUNT: u16 = 32000;
 
 #[derive(Clone, Copy, Debug)]
 pub struct FilePerm(u16);
@@ -736,7 +737,7 @@ impl Inode {
             }
         };
 
-        inner.write_dir_entry_to_cache(&slot, name, ino, file_type as u8)?;
+        inner.write_dir_entry(&slot, name, ino, file_type as u8)?;
 
         // SPEC: upgrade after cache write to commit inode metadata.
         let mut write_inner = inner.upgrade();
@@ -977,7 +978,7 @@ impl Inode {
             return Err(err);
         }
 
-        if let Err(err) = parent_guard.write_dir_entry_to_cache(
+        if let Err(err) = parent_guard.write_dir_entry(
             &slot,
             name,
             child_ino,
@@ -1124,9 +1125,7 @@ impl PageCacheBackend for Inode {
     fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
         let inner = self.inner.read();
         let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+            .fs_arc()?;
         let iblock = u32::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
 
@@ -1148,10 +1147,7 @@ impl PageCacheBackend for Inode {
 
     fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
         let inner = self.inner.read();
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
         let iblock = u32::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
 
@@ -1212,6 +1208,12 @@ struct DirEntryTarget {
 }
 
 impl InodeInner {
+    fn fs_arc(&self) -> Result<Arc<Ext2>> {
+        self.fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))
+    }
+
     pub fn new(desc: Dirty<InodeDesc>, weak_self: Weak<Inode>, fs: Weak<Ext2>) -> Self {
         let num_page_bytes = (desc.size as usize).align_up(BLOCK_SIZE);
         let backend: Weak<dyn PageCacheBackend> = weak_self.clone();
@@ -1246,10 +1248,7 @@ impl InodeInner {
             return Ok(0);
         }
 
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
         let block_size = fs.block_size();
         if block_size == 0 {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
@@ -1330,10 +1329,7 @@ impl InodeInner {
             return Ok(0);
         }
 
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
         let block_size = fs.block_size();
         if block_size == 0 {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
@@ -1440,10 +1436,7 @@ impl InodeInner {
             return_errno!(Errno::EPERM);
         }
 
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
         let block_size = fs.block_size();
         if block_size == 0 {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
@@ -1507,10 +1500,7 @@ impl InodeInner {
     /// Linux: /root/linux/fs/ext2/inode.c:1172 (__ext2_truncate_blocks)
     fn truncate_blocks(&mut self, new_size: usize) -> Result<()> {
         // === Initialization ===
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
         let block_size = fs.block_size();
         if block_size == 0 {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
@@ -2169,10 +2159,7 @@ impl InodeInner {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
         let sb = fs.super_block();
         let block_size = fs.block_size();
         let size = self.desc.size as usize;
@@ -2235,10 +2222,7 @@ impl InodeInner {
             return Ok(0);
         }
 
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
         let sb = fs.super_block();
         let block_size = fs.block_size();
         let max_inumber = sb.total_inodes();
@@ -2316,10 +2300,7 @@ impl InodeInner {
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:163 (ext2_block_to_path)
     pub(super) fn block_to_path(&self, iblock: u32) -> Result<BlockPath> {
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
         let sb = fs.super_block();
         let ptrs = (sb.block_size() / size_of::<u32>()) as u32;
         if ptrs == 0 {
@@ -2389,10 +2370,7 @@ impl InodeInner {
             return Ok(None);
         }
 
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
         let branch = self.get_branch(&path, &fs)?;
         if branch.partial_level < path.depth {
             return Ok(None);
@@ -2572,7 +2550,7 @@ impl InodeInner {
                 .max(fs.super_block().first_data_block()) as u64,
         );
         // Rollback helper: frees all blocks allocated so far.
-        let free_all = |blocks: &Vec<u32>| {
+        let free_all_fn = |blocks: &Vec<u32>| {
             for bid in blocks {
                 let _ = fs.free_blocks(*bid, 1);
             }
@@ -2583,14 +2561,14 @@ impl InodeInner {
             let allocated = match fs.alloc_blocks(remain, alloc_goal) {
                 Ok(allocated) => allocated,
                 Err(err) => {
-                    free_all(&new_blocks);
+                    free_all_fn(&new_blocks);
                     return Err(err);
                 }
             };
 
             let alloc_len = allocated.end - allocated.start;
             if alloc_len == 0 || alloc_len > remain {
-                free_all(&new_blocks);
+                free_all_fn(&new_blocks);
                 return_errno_with_message!(Errno::EIO, "invalid block allocation result");
             }
 
@@ -2604,7 +2582,7 @@ impl InodeInner {
         let data_block = match new_blocks.get(indirect_blks as usize) {
             Some(bid) => *bid,
             None => {
-                free_all(&new_blocks);
+                free_all_fn(&new_blocks);
                 return_errno_with_message!(Errno::EIO, "allocated chain missing data block");
             }
         };
@@ -2615,21 +2593,21 @@ impl InodeInner {
         for i in 0..(indirect_blks as usize) {
             let level = branch.partial_level + 1 + i;
             if level >= path.depth {
-                free_all(&new_blocks);
+                free_all_fn(&new_blocks);
                 return_errno_with_message!(Errno::EIO, "invalid branch depth during allocation");
             }
 
             let ptr_offset = (path.offsets[level] as usize) * size_of::<u32>();
             let ptr_end = ptr_offset + size_of::<u32>();
             if ptr_end > block_size {
-                free_all(&new_blocks);
+                free_all_fn(&new_blocks);
                 return_errno_with_message!(Errno::EIO, "indirect pointer offset out of bounds");
             }
 
             let next_block = match new_blocks.get(i + 1) {
                 Some(bid) => *bid,
                 None => {
-                    free_all(&new_blocks);
+                    free_all_fn(&new_blocks);
                     return_errno_with_message!(Errno::EIO, "allocated chain metadata mismatch");
                 }
             };
@@ -2641,7 +2619,7 @@ impl InodeInner {
                 .write_bytes(Bid::new(new_blocks[i] as u64).to_offset(), &buf)
                 .is_err()
             {
-                free_all(&new_blocks);
+                free_all_fn(&new_blocks);
                 return_errno_with_message!(Errno::EIO, "failed to write new indirect block");
             }
         }
@@ -2652,11 +2630,11 @@ impl InodeInner {
         if branch.partial_level == 0 {
             let slot = path.offsets[0] as usize;
             if slot >= self.desc.block_ptrs.len() {
-                free_all(&new_blocks);
+                free_all_fn(&new_blocks);
                 return_errno_with_message!(Errno::EIO, "invalid inode block pointer slot");
             }
             if self.desc.block_ptrs[slot] != 0 {
-                free_all(&new_blocks);
+                free_all_fn(&new_blocks);
                 return_errno_with_message!(Errno::EIO, "block pointer changed during allocation");
             }
 
@@ -2671,7 +2649,7 @@ impl InodeInner {
             {
                 Some(buf) => buf,
                 None => {
-                    free_all(&new_blocks);
+                    free_all_fn(&new_blocks);
                     return_errno_with_message!(
                         Errno::EIO,
                         "missing parent indirect block for splice"
@@ -2685,14 +2663,14 @@ impl InodeInner {
                 .map(|entry| entry.key)
                 .unwrap_or(0);
             if parent_bid == 0 {
-                free_all(&new_blocks);
+                free_all_fn(&new_blocks);
                 return_errno_with_message!(Errno::EIO, "invalid parent indirect block number");
             }
 
             let ptr_offset = (path.offsets[parent_entry_level] as usize) * size_of::<u32>();
             let ptr_end = ptr_offset + size_of::<u32>();
             if ptr_end > parent_buf.len() {
-                free_all(&new_blocks);
+                free_all_fn(&new_blocks);
                 return_errno_with_message!(Errno::EIO, "splice offset out of bounds");
             }
             parent_buf[ptr_offset..ptr_end].copy_from_slice(&splice_ptr.to_le_bytes());
@@ -2702,7 +2680,7 @@ impl InodeInner {
                 .write_bytes(Bid::new(parent_bid as u64).to_offset(), &parent_buf)
                 .is_err()
             {
-                free_all(&new_blocks);
+                free_all_fn(&new_blocks);
                 return_errno_with_message!(Errno::EIO, "failed to splice branch into parent");
             }
         }
@@ -2718,10 +2696,7 @@ impl InodeInner {
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:624 (ext2_get_blocks, create path)
     pub(super) fn get_or_alloc_block(&mut self, iblock: u32, create: bool) -> Result<Option<Bid>> {
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
         let path = self.block_to_path(iblock)?;
         if path.depth == 0 {
             return_errno_with_message!(Errno::EIO, "invalid block path depth");
@@ -2848,17 +2823,14 @@ impl InodeInner {
     /// Phase 3: write a new entry into a selected slot via PageCache.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link commit)
-    fn write_dir_entry_to_cache(
+    fn write_dir_entry(
         &self,
         slot: &DirSlotInfo,
         name: &str,
         ino: u32,
         ft: u8,
     ) -> Result<()> {
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
         let max_inumber = fs.super_block().total_inodes();
         if ino == 0 || ino > max_inumber {
             return_errno!(Errno::EINVAL);
@@ -2907,10 +2879,7 @@ impl InodeInner {
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:342 (ext2_find_entry)
     fn find_entry_target(&self, name: &str) -> Result<DirEntryTarget> {
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
         let max_inumber = fs.super_block().total_inodes();
         let block_size = fs.block_size();
         let size = self.desc.size as usize;
@@ -2950,10 +2919,7 @@ impl InodeInner {
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:560 (ext2_delete_entry)
     fn delete_entry_in_cache(&self, target: &DirEntryTarget) -> Result<()> {
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
         let block_size = fs.block_size();
         let block_base = (target.dir_offset / block_size).saturating_mul(block_size);
         let entry_offset = target.dir_offset.saturating_sub(block_base);
@@ -2982,10 +2948,7 @@ impl InodeInner {
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:450 (ext2_set_link)
     fn set_link_in_cache(&self, target: &DirEntryTarget, new_ino: u32, ft: u8) -> Result<()> {
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
         let block_size = fs.block_size();
         let block_base = (target.dir_offset / block_size).saturating_mul(block_size);
         let entry_offset = target.dir_offset.saturating_sub(block_base);
@@ -3014,17 +2977,14 @@ impl InodeInner {
         ino: u32,
         file_type: DirEntryFileType,
     ) -> Result<()> {
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
 
         // SPEC: ext2_add_link-style scan then growth if needed.
         let slot = match self.scan_dir_for_slot(name, &fs)? {
             DirScanResult::Slot(slot) => slot,
             DirScanResult::NeedGrowth => self.grow_dir_block(&fs)?,
         };
-        self.write_dir_entry_to_cache(&slot, name, ino, file_type as u8)?;
+        self.write_dir_entry(&slot, name, ino, file_type as u8)?;
         self.commit_dir_metadata(&fs)
     }
 
@@ -3047,10 +3007,7 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
         let max_inumber = fs.super_block().total_inodes();
         if new_ino < ROOT_INO || new_ino > max_inumber {
             return_errno!(Errno::EINVAL);
@@ -3080,10 +3037,7 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
         let target = self.find_entry_target(name).map_err(|err| {
             if err.error() == Errno::ENOENT {
                 Error::with_message(Errno::EIO, "dir entry not found for delete")
@@ -3415,10 +3369,7 @@ impl Inode {
             return self.mkdir(name, perm);
         } else {
             // Linux: ext2_create → ext2_new_inode + ext2_add_nondir
-            let fs = self
-                .fs
-                .upgrade()
-                .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+            let fs = self.fs_arc()?;
             let child = fs.create_inode(self.ino, type_, perm)?;
             let child_ino = child.ino();
             let dir_ft = Self::inode_type_to_dir_file_type(type_);
@@ -3450,6 +3401,11 @@ impl Inode {
             return_errno!(Errno::EPERM);
         }
 
+        if old.inner.read().desc.links_count >= MAX_LINK_COUNT {
+            return_errno!(Errno::EOVERFLOW);
+        }
+
+
         let name_bytes = name.as_bytes();
         if name_bytes.is_empty()
             || name_bytes.len() > u8::MAX as usize
@@ -3459,15 +3415,9 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        // SPEC: cross-filesystem link check.
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
-        let old_fs = old
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        // SPEC: cross-filesystem rename check.
+        let fs = self.fs_arc()?;
+        let old_fs = old.fs_arc()?;
         if !Arc::ptr_eq(&fs, &old_fs) {
             return_errno!(Errno::EINVAL);
         }
@@ -3510,10 +3460,7 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
 
         let child_ino = self.inner.read().find_entry(name)?;
         let child = fs.read_inode(child_ino)?;
@@ -3572,14 +3519,8 @@ impl Inode {
         }
 
         // SPEC: cross-filesystem rename check.
-        let fs = self
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
-        let target_fs = target
-            .fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))?;
+        let fs = self.fs_arc()?;
+        let target_fs = target.fs_arc()?;
         if !Arc::ptr_eq(&fs, &target_fs) {
             return_errno!(Errno::EINVAL);
         }
