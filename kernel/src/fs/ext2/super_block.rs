@@ -209,10 +209,8 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
         // Linux does not require exact equality between inodes_count and
         // groups_count * inodes_per_group. The last group may have fewer inodes.
         // Linux: /root/linux/fs/ext2/super.c:960-980.
-        let max_inodes = groups_count.saturating_mul(inodes_per_group as u64);
-        let min_inodes = groups_count
-            .saturating_sub(1)
-            .saturating_mul(inodes_per_group as u64);
+        let max_inodes = groups_count * (inodes_per_group as u64);
+        let min_inodes = (groups_count - 1) * (inodes_per_group as u64);
         let inodes_count = sb.inodes_count as u64;
         if inodes_count <= min_inodes || inodes_count > max_inodes {
             return_errno_with_message!(Errno::EINVAL, "invalid inodes count");
@@ -356,9 +354,7 @@ impl SuperBlock {
     ///
     /// Linux: /root/linux/fs/ext2/ext2.h:798 (ext2_group_first_block_no)
     pub(super) fn group_first_block_no(&self, group_idx: usize) -> u32 {
-        (group_idx as u32)
-            .saturating_mul(self.blocks_per_group)
-            .saturating_add(self.first_data_block())
+        (group_idx as u32) * self.blocks_per_group + self.first_data_block()
     }
 
     /// Returns the last block number of a block group.
@@ -366,12 +362,10 @@ impl SuperBlock {
     /// Linux: /root/linux/fs/ext2/ext2.h:804 (ext2_group_last_block_no)
     pub(super) fn group_last_block_no(&self, group_idx: usize) -> u32 {
         let groups_count = self.block_groups_count();
-        if group_idx as u32 == groups_count.saturating_sub(1) {
-            self.total_blocks().saturating_sub(1)
+        if group_idx as u32 == groups_count - 1 {
+            self.total_blocks() - 1
         } else {
-            self.group_first_block_no(group_idx)
-                .saturating_add(self.blocks_per_group)
-                .saturating_sub(1)
+            self.group_first_block_no(group_idx) + self.blocks_per_group - 1
         }
     }
 
@@ -386,7 +380,7 @@ impl SuperBlock {
         let first_data_block = self.first_data_block();
         let blocks_count = self.total_blocks();
 
-        let Some(end_blk) = start_blk.checked_add(count.saturating_sub(1)) else {
+        let Some(end_blk) = start_blk.checked_add(count - 1) else {
             return false;
         };
 
@@ -468,12 +462,18 @@ impl SuperBlock {
 
     /// Increase the number of free blocks.
     pub(super) fn inc_free_blocks(&mut self, count: u32) {
-        self.free_blocks_count = self.free_blocks_count.checked_add(count).unwrap();
+        self.free_blocks_count += count;
     }
 
     /// Decrease the number of free blocks.
     pub(super) fn dec_free_blocks(&mut self, count: u32) {
-        self.free_blocks_count = self.free_blocks_count.checked_sub(count).unwrap();
+        if self.free_blocks_count < count {
+            warn!(
+                "free block counter underflow detected: free_blocks_count={}, count={}",
+                self.free_blocks_count, count
+            );
+        }
+        self.free_blocks_count = self.free_blocks_count.saturating_sub(count);
     }
 
     /// Returns the number of free inodes.
@@ -493,7 +493,7 @@ impl SuperBlock {
     /// Decrease the number of free inodes.
     pub(super) fn dec_free_inodes(&mut self) {
         debug_assert!(self.free_inodes_count > 0);
-        self.free_inodes_count -= 1;
+        self.free_inodes_count = self.free_inodes_count.saturating_sub(1);
     }
 
     /// Checks if the block group will backup the super block.
@@ -784,7 +784,10 @@ mod test {
     use ostd::{mm::VmIo, prelude::*};
 
     use super::*;
-    use crate::{fs::ext2::testkit::{Ext2MemoryDisk, make_valid_raw_super_block}, time::clocks::{self, init_for_ktest}};
+    use crate::{
+        fs::ext2::testkit::{Ext2MemoryDisk, make_valid_raw_super_block},
+        time::clocks::{self, init_for_ktest},
+    };
 
     #[ktest]
     fn try_from_valid_raw_ok() {

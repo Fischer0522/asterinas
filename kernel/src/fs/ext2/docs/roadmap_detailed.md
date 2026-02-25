@@ -26,6 +26,34 @@ The following Linux Ext2 features are explicitly out of scope:
 
 ---
 
+## Progress Summary (updated 2026-02-25)
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| 0 | Scaffolding & Interfaces | ✅ Complete |
+| 1 | On-Disk Structures & Superblock | ✅ Complete |
+| 2 | Block Groups & Bitmaps | ✅ Complete |
+| 3 | Inode Read Path & Block Mapping | ✅ Complete |
+| 4 | Directory Read Path | ✅ Complete |
+| 5 | Allocation + Write Enable | ✅ Complete (minor gaps: no Orlov, no reserved-block gate) |
+| 6 | Directory Mutation & File Creation | ✅ Complete |
+| 7 | File Write, Resize, Truncate | ✅ Complete (known issue: PageCache::discard_range bug) |
+| 8 | Metadata & Special Files | ✅ Complete (incl. fallocate) |
+| 9 | Robustness & Compliance | ⚠️ Partial (sync done; feature gating, reserved blocks, boundary checks missing) |
+| 10 | Extended Attributes & ioctl | ❌ Not started |
+| 11 | Orphan Inode & Crash Recovery | ⚠️ Partial (evict_inode done; orphan list/cleanup missing) |
+
+### Open TODOs in code
+- `inode.rs:407` — rollback path on failed allocation/write
+- `inode.rs:1422` — refactor fast symlink detection logic
+- `inode.rs:3133` — simplify mask logic
+- `inode.rs:3248` — shared truncate/evict pipeline
+- `inode.rs:3898` — refactor with enum approach
+- `inode.rs:4070` — behavior differs from Linux
+- `inode.rs:5920` — test blocked by PageCache::discard_range bug
+
+---
+
 ## Phase 0: Scaffolding & Interfaces
 Goal: establish module layout, VFS glue, and basic types with no on-disk logic.
 
@@ -39,7 +67,7 @@ Goal: establish module layout, VFS glue, and basic types with no on-disk logic.
 - Linux refs: none (scaffolding only).
 - Asterinas adjustments: use `Arc`/`Weak` and `RwMutex` for future state.
 - Spec: `phase-00-core-skeleton.spec`.
-- Status: implemented (open/root_inode are stubs).
+- Status: ✅ implemented (`Ext2::open` fully mounts the filesystem; `root_inode()` returns cached root inode).
 
 ### Module 0.2: VFS Glue Interfaces
 - New/extend structs:
@@ -50,7 +78,7 @@ Goal: establish module layout, VFS glue, and basic types with no on-disk logic.
 - Linux refs: none (glue only).
 - Asterinas adjustments: follow VFS trait expectations and error model.
 - Spec: `phase-00-vfs-glue.spec`.
-- Status: not implemented (FileSystem/Inode glue missing).
+- Status: ✅ implemented (`impl FileSystem for Ext2` in `impl_for_vfs/fs.rs`; `impl VfsInode for Inode` in `impl_for_vfs/inode.rs` with full trait coverage).
 
 ---
 
@@ -69,7 +97,7 @@ Goal: parse/validate on-disk structures and mount read-only.
 - Asterinas adjustments:
   - use `Pod` layouts with `VmReader`/`VmIo`; no manual endian swaps.
 - Spec: `phase-01-raw-structures.spec`.
-- Status: implemented (RawSuperBlock/RawGroupDesc/RawInode/RawDirEntry).
+- Status: ✅ implemented (RawSuperBlock/RawGroupDesc/RawInode/RawDirEntry).
 
 ### Module 1.2: Superblock Read/Validate
 - New/extend structs:
@@ -85,7 +113,7 @@ Goal: parse/validate on-disk structures and mount read-only.
   - block size fixed to 4096 (per project constraint), restrict features accordingly.
   - error handling via `Errno` mapping.
 - Spec: `phase-01-superblock.spec`.
-- Status: implemented (load_super_block + TryFrom).
+- Status: ✅ implemented (load_super_block + TryFrom).
 
 ### Module 1.3: Group Descriptor Table Load
 - New/extend structs: none (use `USegment` + `RawGroupDesc`).
@@ -97,7 +125,7 @@ Goal: parse/validate on-disk structures and mount read-only.
 - Asterinas adjustments:
   - read into `USegment` via `BlockDevice` I/O (no PageCache yet).
 - Spec: `phase-01-group-desc-table.spec`.
-- Status: implemented (load/check group descriptor table).
+- Status: ✅ implemented (load/check group descriptor table).
 
 ---
 
@@ -115,7 +143,7 @@ Goal: load/validate block group metadata and bitmap read paths.
 - Asterinas adjustments:
   - store descriptor in `RwMutex<Dirty<_>>`.
 - Spec: `phase-02-block-group-cache.spec`.
-- Status: implemented (BlockGroup load + counters).
+- Status: ✅ implemented (BlockGroup load + counters + per-group inode cache via BTreeMap).
 
 ### Module 2.2: Block Bitmap Read Path
 - New/extend structs: none (use `IdBitmap`).
@@ -127,7 +155,7 @@ Goal: load/validate block group metadata and bitmap read paths.
 - Asterinas adjustments:
   - direct block reads into a buffer; PageCache integration later.
 - Spec: `phase-02-block-bitmap-read.spec`.
-- Status: implemented (load_block_bitmap).
+- Status: ✅ implemented (load_block_bitmap; bitmap kept in memory).
 
 ### Module 2.3: Inode Bitmap Read Path
 - New/extend structs: none (use `IdBitmap`).
@@ -139,7 +167,7 @@ Goal: load/validate block group metadata and bitmap read paths.
 - Asterinas adjustments:
   - same direct-read approach as block bitmap.
 - Spec: `phase-02-inode-bitmap-read.spec`.
-- Status: implemented (load_inode_bitmap).
+- Status: ✅ implemented (load_inode_bitmap; bitmap kept in memory).
 
 ---
 
@@ -157,7 +185,7 @@ Goal: read inode from disk, map logical to physical blocks, enable read-only fil
 - Asterinas adjustments:
   - compute offsets using `block_size` and `inode_size`.
 - Spec: `phase-03-inode-table-io.spec`.
-- Status: implemented (read_inode_desc + inode_table_block).
+- Status: ✅ implemented (read_inode_desc + inode_table_block; PageCache-backed inode table via InodeTableBackend).
 
 ### Module 3.2: Inode Cache & Instantiation
 - New/extend structs:
@@ -170,7 +198,7 @@ Goal: read inode from disk, map logical to physical blocks, enable read-only fil
 - Asterinas adjustments:
   - inode cache deferred; will use `BTreeMap<u32, Weak<Inode>>` when added.
 - Spec: `phase-03-inode-cache.spec`.
-- Status: partial (read_inode implemented; cache not wired).
+- Status: ✅ implemented (read_inode with per-group BTreeMap<u32, Weak<Inode>> cache; eviction integrated into sync_all_inodes).
 
 ### Module 3.3: Logical-to-Physical Block Mapping
 - New/extend structs:
@@ -184,7 +212,7 @@ Goal: read inode from disk, map logical to physical blocks, enable read-only fil
 - Asterinas adjustments:
   - indirect blocks read via `BlockDevice` into buffers; PageCache integration later.
 - Spec: `phase-03-block-mapping.spec`.
-- Status: implemented (block_to_path + get_block).
+- Status: ✅ implemented (block_to_path + get_block + get_or_alloc_block; direct/single/double/triple indirect).
 
 ### Module 3.4: File Read Path (read-only)
 - Methods:
@@ -196,7 +224,7 @@ Goal: read inode from disk, map logical to physical blocks, enable read-only fil
 - Asterinas adjustments:
   - use PageCache for data pages; fall back to direct block reads until PageCache is wired.
 - Spec: `phase-03-file-read.spec`.
-- Status: not implemented.
+- Status: ✅ implemented (read_at via PageCache; read_direct_at for O_DIRECT; read_page_async implements PageCacheBackend).
 
 ---
 
@@ -213,7 +241,7 @@ Goal: lookup and readdir in read-only mode.
 - Asterinas adjustments:
   - parse entries from raw block buffers; enforce 4-byte alignment.
 - Spec: `phase-04-dir-entry-parse.spec`.
-- Status: implemented (DirEntry/DirEntryIter; no dir_iter helper yet).
+- Status: ✅ implemented (DirEntry/DirEntryIter with validation and 4-byte alignment).
 
 ### Module 4.2: Lookup / Readdir
 - Methods:
@@ -225,7 +253,7 @@ Goal: lookup and readdir in read-only mode.
 - Asterinas adjustments:
   - return `Errno::ENOENT` on miss, integrate `DirentVisitor`.
 - Spec: `phase-04-dir-lookup-readdir.spec`.
-- Status: implemented; linux-logic-verify pass (2026-02-05).
+- Status: ✅ implemented; linux-logic-verify pass (2026-02-05).
 
 ---
 
@@ -244,7 +272,7 @@ Goal: enable writable mount and allocation semantics.
 - Asterinas adjustments:
   - direct bitmap read/write via `BlockDevice`; `IdBitmap::alloc_consecutive` with halving fallback.
 - Spec: `phase-05-block-alloc.spec`.
-- Status: implemented in code (`Ext2::alloc_blocks` / `Ext2::free_blocks`), verification pending.
+- Status: ✅ implemented (`BlockGroup::alloc_blocks` / `BlockGroup::free_blocks` with bitmap operations).
 - Known gaps vs Linux:
   - No goal-based placement heuristic (`find_next_usable_block` path).
   - Reserved-block policy (`ext2_has_free_blocks`) not implemented yet.
@@ -261,7 +289,8 @@ Goal: enable writable mount and allocation semantics.
 - Asterinas adjustments:
   - Current implementation uses cyclic scan from parent group; Orlov policy is not implemented yet.
 - Spec: `phase-05-inode-alloc.spec`.
-- Status: implemented in code (`Ext2::alloc_inode` / `Ext2::free_inode`), verification pending.
+- Status: ✅ implemented (`BlockGroup::alloc_inode` / `BlockGroup::free_inode`; cyclic scan from parent group).
+- Known gap: Orlov directory allocation policy not implemented.
 
 ### Module 5.3: Writable Superblock / Group Counters
 - Methods:
@@ -272,11 +301,11 @@ Goal: enable writable mount and allocation semantics.
 - Asterinas adjustments:
   - atomicity via `RwMutex` and `Dirty`.
 - Spec: `phase-05-counter-accounting.spec`.
-- Status: implemented in code (`sync_metadata` + group/super counter updates), verification pending.
+- Status: ✅ implemented (`sync_metadata` + group/super counter updates via `Dirty` tracking).
 
 ### Phase 5 Gate Snapshot (2026-02-06)
 - Spec: pass (phase-05 specs complete).
-- Implementation: pass (core methods present).
+- Implementation: ✅ pass (core methods present and functional).
 - linux-logic-verify: pending (no recorded pass yet).
 
 ---
@@ -294,6 +323,7 @@ Goal: create/remove/rename entries and update link counts.
 - Asterinas adjustments:
   - update PageCache-backed dir blocks; maintain alignment.
 - Spec: `phase-06-dir-mutation.spec`.
+- Status: ✅ implemented (add_entry/delete_entry as methods on Inode with PageCache-backed dir blocks).
 
 ### Module 6.2: make_empty / mkdir / rmdir
 - Methods:
@@ -305,6 +335,7 @@ Goal: create/remove/rename entries and update link counts.
 - Asterinas adjustments:
   - update link counts and timestamps via inode methods.
 - Spec: `phase-06-dir-create-remove.spec`.
+- Status: ✅ implemented (`mkdir` at inode.rs:931, `rmdir` at inode.rs:877; link counts and timestamps updated).
 
 ### Module 6.3: Namei Ops (create/link/unlink/rename)
 - Methods:
@@ -316,6 +347,7 @@ Goal: create/remove/rename entries and update link counts.
 - Asterinas adjustments:
   - use Asterinas inode/type enums; no raw pointers.
 - Spec: `phase-06-namei-ops.spec`.
+- Status: ✅ implemented (`create` at inode.rs:3386, `link` at inode.rs:3446, `unlink` at inode.rs:3502, `rename` at inode.rs:3552 with same-dir and cross-dir paths).
 
 ---
 
@@ -332,6 +364,7 @@ Goal: full data write path and size changes with correct block tree updates.
 - Asterinas adjustments:
   - use PageCache and async `BioWaiter` for flush.
 - Spec: `phase-07-file-write.spec`.
+- Status: ✅ implemented (`write_at` via PageCache; `write_direct_at` for O_DIRECT; `write_page_async` implements PageCacheBackend).
 
 ### Module 7.2: Resize (grow)
 - Methods:
@@ -342,6 +375,8 @@ Goal: full data write path and size changes with correct block tree updates.
 - Asterinas adjustments:
   - update `Dirty<InodeDesc>` and PageCache size.
 - Spec: `phase-07-file-resize-grow.spec`.
+- Status: ✅ implemented (`resize` with grow path; `get_or_alloc_block` allocates blocks on demand).
+- Known TODO: rollback path on failed allocation/write (inode.rs:407).
 
 ### Module 7.3: Truncate (shrink + free)
 - Methods:
@@ -353,6 +388,9 @@ Goal: full data write path and size changes with correct block tree updates.
 - Asterinas adjustments:
   - use BlockAllocator + PageCache eviction.
 - Spec: `phase-07-file-truncate.spec`.
+- Status: ✅ implemented (`resize` with shrink path; indirect tree freeing via `free_branches`-equivalent logic).
+- Known TODO: shared truncate/evict pipeline (inode.rs:3248).
+- Known issue: PageCache::discard_range bug affects truncate tests (inode.rs:5920).
 
 ---
 
@@ -367,6 +405,8 @@ Goal: symlink and special inode types with correct metadata behavior.
 - Asterinas adjustments:
   - fast symlink stored in inode block pointers; slow via data blocks.
 - Spec: `phase-08-symlink.spec`.
+- Status: ✅ implemented (`read_link`/`write_link` with fast symlink in inode block pointers and slow symlink via data blocks; commit d8afce08).
+- Known TODO: refactor fast symlink detection logic (inode.rs:1422-1423).
 
 ### Module 8.2: Special Files
 - Methods:
@@ -376,6 +416,7 @@ Goal: symlink and special inode types with correct metadata behavior.
 - Asterinas adjustments:
   - map device IDs to `InodeType::CharDevice/BlockDevice`.
 - Spec: `phase-08-special-files.spec`.
+- Status: ✅ implemented (`mknod` with device ID encoding/decoding for char/block devices and named pipes; commit be13a2c0).
 
 ### Module 8.3: Metadata Updates
 - Methods:
@@ -385,6 +426,18 @@ Goal: symlink and special inode types with correct metadata behavior.
 - Asterinas adjustments:
   - use `UnixTime` and Asterinas credential APIs.
 - Spec: `phase-08-metadata.spec`.
+- Status: ✅ implemented (`set_mode`, `set_owner`, `set_group`, atime/mtime/ctime setters via VfsInode trait; `UnixTime` used for timestamps).
+
+### Module 8.4: Fallocate
+- Methods:
+  - `Inode::fallocate(mode, offset, len)`.
+- Linux refs:
+  - `/root/linux/fs/ext2/file.c` (`ext2_fallocate`).
+- Asterinas adjustments:
+  - supports ALLOCATE, PUNCH_HOLE, KEEP_SIZE modes.
+  - block preallocation via `get_or_alloc_block`; hole punching via block freeing + PageCache eviction.
+- Spec: `phase-08-fallocate.spec`.
+- Status: ✅ implemented (commit 5aaab809; VfsInode::fallocate wired in impl_for_vfs/inode.rs).
 
 ---
 
@@ -399,6 +452,7 @@ Goal: finalize boundary checks, feature gating, and consistency rules.
 - Asterinas adjustments:
   - enforce limited supported feature bits per project constraints.
 - Spec: `phase-09-feature-gating.spec`.
+- Status: ❌ not implemented (feature compat/incompat validation not enforced at mount time).
 
 ### Module 9.2: Reserved Block Policy
 - Methods:
@@ -408,6 +462,7 @@ Goal: finalize boundary checks, feature gating, and consistency rules.
 - Asterinas adjustments:
   - integrate with Asterinas credential APIs (resuid/resgid + CAP_SYS_RESOURCE).
 - Spec: `phase-09-reserved-blocks.spec`.
+- Status: ❌ not implemented (reserved_blocks_count is parsed but no `has_free_blocks` gate exists).
 
 ### Module 9.2: Boundary Checks & Error Mapping
 - Methods:
@@ -417,6 +472,7 @@ Goal: finalize boundary checks, feature gating, and consistency rules.
 - Asterinas adjustments:
   - return `Errno::EIO`/`EINVAL` instead of asserts.
 - Spec: `phase-09-boundary-checks.spec`.
+- Status: ❌ not implemented (no dedicated `check_block_range`/`check_ino_range` methods).
 
 ### Module 9.3: Consistency & Sync
 - Methods:
@@ -426,6 +482,7 @@ Goal: finalize boundary checks, feature gating, and consistency rules.
 - Asterinas adjustments:
   - use PageCache and `BlockDevice::sync`.
 - Spec: `phase-09-sync.spec`.
+- Status: ✅ implemented (`Ext2::sync_metadata` in fs.rs:637, `Inode::sync_all` in inode.rs:1047, `BlockGroup::sync_bitmaps` in block_group.rs:459; commit efcf1018).
 
 ---
 
@@ -448,6 +505,7 @@ Goal: support extended attributes and file attribute ioctls.
   - use PageCache for xattr block I/O.
   - namespace handlers as trait objects or enum dispatch.
 - Spec: `phase-10-xattr-core.spec`.
+- Status: ❌ not implemented (VfsInode methods return EOPNOTSUPP).
 
 ### Module 10.2: Xattr Namespace Handlers
 - Methods:
@@ -461,6 +519,7 @@ Goal: support extended attributes and file attribute ioctls.
 - Asterinas adjustments:
   - permission checks via Asterinas credential APIs.
 - Spec: `phase-10-xattr-handlers.spec`.
+- Status: ❌ not implemented.
 
 ### Module 10.3: ioctl Operations
 - Methods:
@@ -473,6 +532,7 @@ Goal: support extended attributes and file attribute ioctls.
 - Asterinas adjustments:
   - integrate with VFS ioctl dispatch.
 - Spec: `phase-10-ioctl.spec`.
+- Status: ❌ not implemented.
 
 ---
 
@@ -492,6 +552,7 @@ Goal: handle unlinked-but-open files and ensure crash consistency.
   - use linked list or BTreeSet for orphan tracking.
   - update `s_last_orphan` in superblock.
 - Spec: `phase-11-orphan-list.spec`.
+- Status: ❌ not implemented (no orphan list tracking; `last_orphan` field is parsed from superblock but not used).
 
 ### Module 11.2: Orphan Cleanup on Mount
 - Methods:
@@ -502,6 +563,7 @@ Goal: handle unlinked-but-open files and ensure crash consistency.
   - iterate orphan chain via `i_dtime` linkage.
   - truncate and free each orphan inode.
 - Spec: `phase-11-orphan-cleanup.spec`.
+- Status: ❌ not implemented.
 
 ### Module 11.3: Evict Inode Integration
 - Methods:
@@ -512,6 +574,7 @@ Goal: handle unlinked-but-open files and ensure crash consistency.
   - if nlink=0: truncate data, free inode, remove from orphan list.
   - if nlink>0: just sync metadata.
 - Spec: `phase-11-evict-inode.spec`.
+- Status: ✅ partially implemented (`prepare_for_evict` at inode.rs:1073; `evict_inode` at block_group.rs:276 handles nlink=0 truncation and inode freeing during `sync_all_inodes`; but not wired into orphan list).
 
 ---
 

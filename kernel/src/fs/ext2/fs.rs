@@ -9,8 +9,8 @@ use super::{
     block_group::{BlockGroup, EvictResult, RawGroupDesc},
     inode::{FilePerm, Inode, InodeDesc, RawInode},
     prelude::*,
-    super_block::{RawSuperBlock, SuperBlock, SUPER_BLOCK_OFFSET},
-    utils::{now, Dirty},
+    super_block::{RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
+    utils::{Dirty, now},
 };
 use crate::{
     fs::utils::FsEventSubscriberStats, process::posix_thread::AsPosixThread, thread::Thread,
@@ -307,7 +307,7 @@ impl Ext2 {
                 error!("Ext2: Inode bitmap out of range");
                 return_errno_with_message!(Errno::EINVAL, "inode bitmap out of group range");
             }
-            let table_last = inode_table.saturating_add(itb_per_group.saturating_sub(1));
+            let table_last = inode_table + itb_per_group - 1;
             if inode_table < first_block || table_last > last_block {
                 error!("Ext2: Inode table out of range");
                 return_errno_with_message!(Errno::EINVAL, "inode table out of group range");
@@ -428,11 +428,11 @@ impl Ext2 {
                 return_errno_with_message!(Errno::EIO, "block group has invalid block range");
             }
             let group_size = group_last - group_first + 1;
-            let bit = current.saturating_sub(group_first);
+            let bit = current - group_first;
             if bit >= group_size {
                 return_errno_with_message!(Errno::EIO, "block offset outside group boundary");
             }
-            let group_count = remaining.min(group_size.saturating_sub(bit));
+            let group_count = remaining.min(group_size - bit);
 
             let freed = group.free_blocks(bit, group_count)?;
 
@@ -441,8 +441,8 @@ impl Ext2 {
                 sb_write.inc_free_blocks(freed);
             }
 
-            current = current.saturating_add(group_count);
-            remaining = remaining.saturating_sub(group_count);
+            current += group_count;
+            remaining -= group_count;
         }
 
         Ok(())
@@ -488,10 +488,7 @@ impl Ext2 {
                 continue;
             };
 
-            let ino = (group_idx as u32)
-                .saturating_mul(inodes_per_group)
-                .saturating_add(inode_idx as u32)
-                .saturating_add(1);
+            let ino = (group_idx as u32) * inodes_per_group + inode_idx as u32 + 1;
             if ino < first_ino || ino > total_inodes {
                 return_errno_with_message!(Errno::EIO, "allocated inode number out of valid range");
             }
@@ -727,8 +724,8 @@ impl Ext2 {
 
         for group in &self.block_groups {
             let result = group.sync_all_inodes()?;
-            total.freed_inodes = total.freed_inodes.saturating_add(result.freed_inodes);
-            total.freed_dirs = total.freed_dirs.saturating_add(result.freed_dirs);
+            total.freed_inodes += result.freed_inodes;
+            total.freed_dirs += result.freed_dirs;
         }
 
         if total.freed_inodes > 0 {
@@ -764,8 +761,8 @@ mod test {
     use super::*;
     use crate::{
         fs::ext2::testkit::{
-            self, build_group_desc_segment, make_valid_group_desc, make_valid_super_block,
-            ErrorBioDisk, Ext2FixtureBuilder, Ext2MemoryDisk, RawInodeBuilder,
+            self, ErrorBioDisk, Ext2FixtureBuilder, Ext2MemoryDisk, RawInodeBuilder,
+            build_group_desc_segment, make_valid_group_desc, make_valid_super_block,
         },
         time::clocks,
     };

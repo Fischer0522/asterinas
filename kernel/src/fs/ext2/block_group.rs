@@ -194,7 +194,7 @@ impl BlockGroup {
         let inode_bitmap = Self::load_inode_bitmap(block_device.as_ref(), inodes_per_group, &desc)?;
 
         // Create PageCache for inode table backed by InodeTableBackend.
-        let raw_inodes_size = (inodes_per_group as usize).saturating_mul(inode_size);
+        let raw_inodes_size = (inodes_per_group as usize) * inode_size;
         let backend = Arc::new(InodeTableBackend {
             inode_table_bid: desc.inode_table,
             raw_inodes_size,
@@ -281,7 +281,7 @@ impl BlockGroup {
             });
         }
 
-        let inode_idx = (inode.ino().saturating_sub(1)) % self.inodes_per_group;
+        let inode_idx = (inode.ino() - 1) % self.inodes_per_group;
         let inode_bit = u16::try_from(inode_idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "inode index out of range"))?;
         let was_allocated = self.free_inode(inode_bit)?;
@@ -520,7 +520,7 @@ impl BlockGroup {
             return_errno_with_message!(Errno::EINVAL, "block group has invalid block range");
         }
         let max_bit = last_block - first_block;
-        let capacity = max_bit.saturating_add(1) as usize;
+        let capacity = (max_bit + 1) as usize;
         if capacity > IdBitmap::capacity() as usize {
             return_errno_with_message!(Errno::EINVAL, "block bitmap capacity overflow");
         }
@@ -561,12 +561,12 @@ impl BlockGroup {
             if inode_table < first_block || offset > max_bit {
                 return_errno_with_message!(Errno::EINVAL, "inode table start out of group range");
             }
-            let table_last = offset.saturating_add(itb_per_group.saturating_sub(1));
+            let table_last = offset + itb_per_group - 1;
             if table_last > max_bit {
                 return_errno_with_message!(Errno::EINVAL, "inode table extends beyond group");
             }
 
-            let end = offset.saturating_add(itb_per_group);
+            let end = offset + itb_per_group;
             let mut bit = offset;
             while bit < end {
                 if !bitmap.is_allocated(bit as u16) {
@@ -649,7 +649,7 @@ impl BlockGroup {
             };
             let alloc_len = range.len() as u32;
             let run_start = range.start as u32;
-            let ret_block = self.first_block.saturating_add(run_start);
+            let ret_block = self.first_block + run_start;
 
             if self.overlaps_system_zone(ret_block, alloc_len) {
                 saw_corruption = true;
@@ -673,7 +673,7 @@ impl BlockGroup {
 
             self.dec_free_blocks(alloc_len as u16);
 
-            let range = ret_block..ret_block.saturating_add(alloc_len);
+            let range = ret_block..ret_block + alloc_len;
             return Ok((Some(range), saw_corruption));
         }
 
@@ -693,7 +693,7 @@ impl BlockGroup {
     /// Linux: /root/linux/fs/ext2/balloc.c:482 (ext2_free_blocks, per-group portion)
     pub(super) fn free_blocks(&self, bit: u32, group_count: u32) -> Result<u32> {
         // Validate system zone overlap using filesystem-wide coordinates.
-        let abs_start = self.first_block.saturating_add(bit);
+        let abs_start = self.first_block + bit;
         if self.overlaps_system_zone(abs_start, group_count) {
             return_errno_with_message!(Errno::EIO, "freeing blocks in system zone");
         }
@@ -709,7 +709,7 @@ impl BlockGroup {
             if !bitmap.is_allocated(idx) {
                 warn!(
                     "ext2_free_blocks: bit already cleared for block {}",
-                    abs_start.saturating_add((idx - range_start) as u32)
+                    abs_start + (idx - range_start) as u32
                 );
             } else {
                 bitmap.free(idx);
@@ -770,7 +770,7 @@ impl BlockGroup {
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:1314 (ext2_get_inode)
     pub(super) fn read_inode_desc(&self, index_in_group: u32) -> Result<InodeDesc> {
-        let offset_bytes = (index_in_group as usize).saturating_mul(self.inode_size);
+        let offset_bytes = (index_in_group as usize) * self.inode_size;
         let raw: RawInode = self.inode_table_cache.pages().read_val(offset_bytes)?;
         InodeDesc::try_from(&raw)
     }
@@ -781,7 +781,7 @@ impl BlockGroup {
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:1512 (__ext2_write_inode / mark_buffer_dirty)
     pub(super) fn write_inode_desc(&self, index_in_group: u32, raw: &RawInode) -> Result<()> {
-        let offset_bytes = (index_in_group as usize).saturating_mul(self.inode_size);
+        let offset_bytes = (index_in_group as usize) * self.inode_size;
         self.inode_table_cache
             .pages()
             .write_val(offset_bytes, raw)?;
@@ -793,7 +793,7 @@ impl BlockGroup {
     ///
     /// Linux: /root/linux/fs/ext2/balloc.c:115 (ext2_bg_has_super + system zone check)
     fn overlaps_system_zone(&self, start: u32, count: u32) -> bool {
-        let Some(end) = start.checked_add(count.saturating_sub(1)) else {
+        let Some(end) = start.checked_add(count - 1) else {
             return true;
         };
 
@@ -820,7 +820,7 @@ impl BlockGroup {
         if zone_len == 0 {
             return false;
         }
-        let Some(zone_end) = zone_start.checked_add(zone_len.saturating_sub(1)) else {
+        let Some(zone_end) = zone_start.checked_add(zone_len - 1) else {
             return true;
         };
         !(end < zone_start || start > zone_end)

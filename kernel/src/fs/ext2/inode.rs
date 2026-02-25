@@ -331,7 +331,7 @@ impl Inode {
         let link_size = inner.desc.size as usize;
 
         if inner.desc.is_fast_symlink(block_size) {
-            let read_len = link_size.min(MAX_FAST_SYMLINK_LEN.saturating_sub(1));
+            let read_len = link_size.min(MAX_FAST_SYMLINK_LEN - 1);
             let mut raw_bytes = [0u8; MAX_FAST_SYMLINK_LEN];
             for (idx, block_ptr) in inner.desc.block_ptrs.iter().enumerate() {
                 let offset = idx * size_of::<u32>();
@@ -455,7 +455,7 @@ impl Inode {
             if offset >= file_size {
                 return Ok(0);
             }
-            let read_len = writer.avail().min(file_size.saturating_sub(offset));
+            let read_len = writer.avail().min(file_size - offset);
             writer.limit(read_len);
             inner.page_cache.pages().read(offset, writer)?;
             read_len
@@ -561,7 +561,7 @@ impl Inode {
             if offset >= file_size {
                 0
             } else {
-                let read_len = writer.avail().min(file_size.saturating_sub(offset));
+                let read_len = writer.avail().min(file_size - offset);
                 let end = offset
                     .checked_add(read_len)
                     .ok_or_else(|| Error::with_message(Errno::EINVAL, "read range overflow"))?;
@@ -841,7 +841,7 @@ impl Inode {
             &mut buf,
             dot_len,
             parent_ino,
-            (block_size.saturating_sub(dot_len)) as u16,
+            (block_size - dot_len) as u16,
             b"..",
             DirEntryFileType::Dir as u8,
         )?;
@@ -1255,7 +1255,7 @@ impl InodeInner {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
         }
 
-        let read_len = writer.avail().min(file_size.saturating_sub(offset));
+        let read_len = writer.avail().min(file_size - offset);
         let mut current_offset = offset;
         let end = offset
             .checked_add(read_len)
@@ -1313,7 +1313,7 @@ impl InodeInner {
                 }
             }
 
-            current_offset = current_offset.saturating_add(bytes_this_block);
+            current_offset += bytes_this_block;
         }
 
         Ok(read_len)
@@ -1401,7 +1401,7 @@ impl InodeInner {
                 return_errno_with_message!(Errno::EIO, "failed to write data block");
             }
 
-            current_offset = current_offset.saturating_add(bytes_this_block);
+            current_offset += bytes_this_block;
         }
 
         Ok(write_len)
@@ -1577,7 +1577,7 @@ impl InodeInner {
             // traversal stopped on a zero pointer.
             // The all_zeroes loop below may shrink `partial` upward.
             let mut partial = if branch.partial_level == k {
-                k.saturating_sub(1)
+                k - 1
             } else {
                 branch.partial_level
             };
@@ -1601,7 +1601,7 @@ impl InodeInner {
 
                 // Check if entries [0..offsets[partial]) are all zero.
                 let keep_entries = path.offsets[partial] as usize;
-                let keep_bytes = keep_entries.saturating_mul(size_of::<u32>());
+                let keep_bytes = keep_entries * size_of::<u32>();
                 if keep_bytes > buf.len() {
                     return_errno_with_message!(Errno::EIO, "all-zeroes check offset out of bounds");
                 }
@@ -1619,7 +1619,7 @@ impl InodeInner {
                         all_zero = false;
                         break;
                     }
-                    byte = byte.saturating_add(size_of::<u32>());
+                    byte += size_of::<u32>();
                 }
                 if !all_zero {
                     break;
@@ -1660,8 +1660,8 @@ impl InodeInner {
                 }
 
                 // Read the pointer at offsets[partial].
-                let ptr_offset = (path.offsets[partial] as usize).saturating_mul(size_of::<u32>());
-                let ptr_end = ptr_offset.saturating_add(size_of::<u32>());
+                let ptr_offset = (path.offsets[partial] as usize) * size_of::<u32>();
+                let ptr_end = ptr_offset + size_of::<u32>();
                 if ptr_end > parent_buf.len() {
                     return_errno_with_message!(Errno::EIO, "shared branch pointer out of bounds");
                 }
@@ -1687,7 +1687,7 @@ impl InodeInner {
             // Recursively free the detached subtree.
             if detached_nr != 0 {
                 // SPEC: free detached subtree root.
-                let subtree_depth = (path.depth - 1).saturating_sub(partial) as u32;
+                let subtree_depth = (path.depth - 1 - partial) as u32;
                 self.free_branches(&fs, detached_nr, subtree_depth);
             }
 
@@ -1720,11 +1720,11 @@ impl InodeInner {
                 }
 
                 // Free all pointers from offsets[level]+1 to the end.
-                let start_idx = (path.offsets[level] as usize).saturating_add(1);
-                let child_depth = (path.depth - 1).saturating_sub(level) as u32;
+                let start_idx = (path.offsets[level] as usize) + 1;
+                let child_depth = (path.depth - 1 - level) as u32;
                 for idx in start_idx..ptrs_per_block {
-                    let ptr_offset = idx.saturating_mul(size_of::<u32>());
-                    let ptr_end = ptr_offset.saturating_add(size_of::<u32>());
+                    let ptr_offset = idx * size_of::<u32>();
+                    let ptr_end = ptr_offset + size_of::<u32>();
                     if ptr_end > buf.len() {
                         break;
                     }
@@ -1843,8 +1843,8 @@ impl InodeInner {
         }
 
         for idx in 0..ptrs_per_block {
-            let ptr_offset = idx.saturating_mul(size_of::<u32>());
-            let ptr_end = ptr_offset.saturating_add(size_of::<u32>());
+            let ptr_offset = idx * size_of::<u32>();
+            let ptr_end = ptr_offset + size_of::<u32>();
             if ptr_end > buf.len() {
                 break;
             }
@@ -1858,7 +1858,7 @@ impl InodeInner {
             if nr == 0 {
                 continue;
             }
-            self.free_branches(fs, nr, depth.saturating_sub(1));
+            self.free_branches(fs, nr, depth - 1);
         }
 
         if let Err(err) = fs.free_blocks(block_nr, 1) {
@@ -1990,7 +1990,7 @@ impl InodeInner {
 
         for block_idx in 0..data_blocks {
             let mut buf = vec![0u8; block_size];
-            let block_offset = block_idx.saturating_mul(block_size);
+            let block_offset = block_idx * block_size;
             if self
                 .page_cache
                 .pages()
@@ -2000,8 +2000,8 @@ impl InodeInner {
                 return false;
             }
 
-            let block_offset = block_idx.saturating_mul(block_size);
-            let limit = size.saturating_sub(block_offset).min(block_size);
+            let block_offset = block_idx * block_size;
+            let limit = (size - block_offset).min(block_size);
             if limit == 0 {
                 continue;
             }
@@ -2182,8 +2182,8 @@ impl InodeInner {
         let max_blocks = size.div_ceil(block_size);
 
         for block_idx in 0..max_blocks {
-            let block_offset = block_idx.saturating_mul(block_size);
-            let remain = size.saturating_sub(block_offset);
+            let block_offset = block_idx * block_size;
+            let remain = size - block_offset;
             let limit = remain.min(block_size);
             if limit == 0 {
                 break;
@@ -2249,11 +2249,11 @@ impl InodeInner {
 
         let total_blocks = (size + block_size - 1) / block_size;
         for block_idx in start_block..total_blocks {
-            let block_offset = block_idx.saturating_mul(block_size);
+            let block_offset = block_idx * block_size;
             if block_offset >= size {
                 break;
             }
-            let remain = size.saturating_sub(block_offset);
+            let remain = size - block_offset;
             let limit = remain.min(block_size);
             if limit == 0 {
                 break;
@@ -2272,16 +2272,16 @@ impl InodeInner {
             let mut iter = DirEntryIter::new(&buf, limit, max_inumber)?;
             let mut inner_off = 0usize;
             while let Some(entry) = iter.next_entry()? {
-                let entry_offset = block_offset.saturating_add(inner_off);
-                let next_offset = entry_offset.saturating_add(entry.rec_len as usize);
+                let entry_offset = block_offset + inner_off;
+                let next_offset = entry_offset + entry.rec_len as usize;
 
                 if next_offset <= current_offset {
-                    inner_off = next_offset.saturating_sub(block_offset);
+                    inner_off = next_offset - block_offset;
                     continue;
                 }
                 if entry_offset < current_offset {
                     current_offset = next_offset;
-                    inner_off = next_offset.saturating_sub(block_offset);
+                    inner_off = next_offset - block_offset;
                     continue;
                 }
 
@@ -2297,16 +2297,16 @@ impl InodeInner {
                         )
                         .is_err()
                     {
-                        advanced = current_offset.saturating_sub(offset);
+                        advanced = current_offset - offset;
                         return Ok(advanced);
                     }
                 }
 
                 current_offset = next_offset;
-                inner_off = next_offset.saturating_sub(block_offset);
+                inner_off = next_offset - block_offset;
             }
 
-            advanced = current_offset.saturating_sub(offset);
+            advanced = current_offset - offset;
         }
 
         Ok(advanced)
@@ -2330,7 +2330,7 @@ impl InodeInner {
         let direct_blocks = 12u32;
         let indirect_blocks = ptrs;
         let double_blocks = 1u32
-            .checked_shl(ptrs_bits.saturating_mul(2))
+            .checked_shl(ptrs_bits * 2)
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "block path shift overflow"))?;
 
         let mut offsets = [0u32; 4];
@@ -2343,7 +2343,7 @@ impl InodeInner {
             depth = 1usize;
             boundary = direct_blocks - 1 - block;
         } else if {
-            block = block.saturating_sub(direct_blocks);
+            block -= direct_blocks;
             block < indirect_blocks
         } {
             offsets[0] = 12;
@@ -2351,7 +2351,7 @@ impl InodeInner {
             depth = 2usize;
             boundary = ptrs - 1 - (block & (ptrs - 1));
         } else if {
-            block = block.saturating_sub(indirect_blocks);
+            block -= indirect_blocks;
             block < double_blocks
         } {
             offsets[0] = 13;
@@ -2360,8 +2360,8 @@ impl InodeInner {
             depth = 3usize;
             boundary = ptrs - 1 - (block & (ptrs - 1));
         } else if {
-            block = block.saturating_sub(double_blocks);
-            (block >> (ptrs_bits.saturating_mul(2))) < ptrs
+            block -= double_blocks;
+            (block >> (ptrs_bits * 2)) < ptrs
         } {
             offsets[0] = 14;
             offsets[1] = block >> (ptrs_bits * 2);
@@ -2400,7 +2400,7 @@ impl InodeInner {
 
         let bid = branch
             .chain
-            .get(path.depth.saturating_sub(1))
+            .get(path.depth - 1)
             .ok_or_else(|| Error::with_message(Errno::EIO, "incomplete branch result"))?
             .key;
         if bid == 0 {
@@ -2455,8 +2455,8 @@ impl InodeInner {
                 return_errno_with_message!(Errno::EIO, "failed to read indirect block");
             }
 
-            let ptr_offset = (path.offsets[level] as usize).saturating_mul(size_of::<u32>());
-            let ptr_end = ptr_offset.saturating_add(size_of::<u32>());
+            let ptr_offset = (path.offsets[level] as usize) * size_of::<u32>();
+            let ptr_end = ptr_offset + size_of::<u32>();
             if ptr_end > buf.len() {
                 return_errno_with_message!(Errno::EIO, "indirect pointer offset out of bounds");
             }
@@ -2496,10 +2496,7 @@ impl InodeInner {
     /// implementation allocates one data block at a time; multi-block
     /// contiguous allocation can be added later using `BlockPath::boundary`.
     fn blks_to_allocate(&self, branch: &BranchResult, path: &BlockPath) -> (u32, u32) {
-        let indirect_blks = path
-            .depth
-            .saturating_sub(1)
-            .saturating_sub(branch.partial_level) as u32;
+        let indirect_blks = (path.depth - 1 - branch.partial_level) as u32;
         (indirect_blks, 1)
     }
 
@@ -2591,7 +2588,7 @@ impl InodeInner {
                 }
             };
 
-            let alloc_len = allocated.end.saturating_sub(allocated.start);
+            let alloc_len = allocated.end - allocated.start;
             if alloc_len == 0 || alloc_len > remain {
                 free_all(&new_blocks);
                 return_errno_with_message!(Errno::EIO, "invalid block allocation result");
@@ -2599,7 +2596,7 @@ impl InodeInner {
 
             new_blocks.extend(allocated);
             if let Some(last) = new_blocks.last() {
-                alloc_goal = Bid::new(last.saturating_add(1) as u64);
+                alloc_goal = Bid::new((last + 1) as u64);
             }
         }
 
@@ -2622,8 +2619,8 @@ impl InodeInner {
                 return_errno_with_message!(Errno::EIO, "invalid branch depth during allocation");
             }
 
-            let ptr_offset = (path.offsets[level] as usize).saturating_mul(size_of::<u32>());
-            let ptr_end = ptr_offset.saturating_add(size_of::<u32>());
+            let ptr_offset = (path.offsets[level] as usize) * size_of::<u32>();
+            let ptr_end = ptr_offset + size_of::<u32>();
             if ptr_end > block_size {
                 free_all(&new_blocks);
                 return_errno_with_message!(Errno::EIO, "indirect pointer offset out of bounds");
@@ -2684,7 +2681,7 @@ impl InodeInner {
 
             let parent_bid = branch
                 .chain
-                .get(parent_entry_level.saturating_sub(1))
+                .get(parent_entry_level - 1)
                 .map(|entry| entry.key)
                 .unwrap_or(0);
             if parent_bid == 0 {
@@ -2692,9 +2689,8 @@ impl InodeInner {
                 return_errno_with_message!(Errno::EIO, "invalid parent indirect block number");
             }
 
-            let ptr_offset =
-                (path.offsets[parent_entry_level] as usize).saturating_mul(size_of::<u32>());
-            let ptr_end = ptr_offset.saturating_add(size_of::<u32>());
+            let ptr_offset = (path.offsets[parent_entry_level] as usize) * size_of::<u32>();
+            let ptr_end = ptr_offset + size_of::<u32>();
             if ptr_end > parent_buf.len() {
                 free_all(&new_blocks);
                 return_errno_with_message!(Errno::EIO, "splice offset out of bounds");
@@ -2735,7 +2731,7 @@ impl InodeInner {
         if branch.partial_level == path.depth {
             let mapped = branch
                 .chain
-                .get(path.depth.saturating_sub(1))
+                .get(path.depth - 1)
                 .ok_or_else(|| Error::with_message(Errno::EIO, "incomplete branch result"))?
                 .key;
             return Ok(Some(Bid::new(mapped as u64)));
@@ -2773,8 +2769,8 @@ impl InodeInner {
         let data_blocks = size.div_ceil(block_size);
 
         for block_idx in 0..data_blocks {
-            let block_offset = block_idx.saturating_mul(block_size);
-            let limit = size.saturating_sub(block_offset).min(block_size);
+            let block_offset = block_idx * block_size;
+            let limit = (size - block_offset).min(block_size);
             if limit == 0 {
                 continue;
             }
@@ -2921,8 +2917,8 @@ impl InodeInner {
         let name_bytes = name.as_bytes();
 
         for block_idx in 0..size.div_ceil(block_size) {
-            let block_offset = block_idx.saturating_mul(block_size);
-            let limit = size.saturating_sub(block_offset).min(block_size);
+            let block_offset = block_idx * block_size;
+            let limit = (size - block_offset).min(block_size);
             if limit == 0 {
                 continue;
             }
@@ -4222,8 +4218,8 @@ mod test {
             ext2::{
                 fs::ROOT_INO,
                 testkit::{
-                    self, encode_dir_entry, write_indirect_ptr, CollectDirentVisitor, ErrorBioDisk,
-                    Ext2FixtureBuilder, RawInodeBuilder, StopAfterVisitor,
+                    self, CollectDirentVisitor, ErrorBioDisk, Ext2FixtureBuilder, RawInodeBuilder,
+                    StopAfterVisitor, encode_dir_entry, write_indirect_ptr,
                 },
             },
             utils::{IdBitmap, InodeIo, StatusFlags},
@@ -5845,9 +5841,11 @@ mod test {
         assert_eq!(file.read_at(0, &mut out_writer).unwrap(), block_size);
 
         assert_eq!(&out[..punch_off], &payload[..punch_off]);
-        assert!(out[punch_off..punch_off + punch_len]
-            .iter()
-            .all(|byte| *byte == 0));
+        assert!(
+            out[punch_off..punch_off + punch_len]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
         assert_eq!(
             &out[punch_off + punch_len..],
             &payload[punch_off + punch_len..]
