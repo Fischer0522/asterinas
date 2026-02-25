@@ -460,6 +460,25 @@ impl SuperBlock {
         self.free_blocks_count
     }
 
+    /// Returns the number of reserved blocks.
+    pub fn reserved_blocks_count(&self) -> u32 {
+        self.reserved_blocks_count
+    }
+
+    /// Returns the default uid for reserved blocks.
+    ///
+    /// Linux: /root/linux/fs/ext2/super.c:917 (sbi->s_resuid)
+    pub fn def_resuid(&self) -> u32 {
+        self.def_resuid
+    }
+
+    /// Returns the default gid for reserved blocks.
+    ///
+    /// Linux: /root/linux/fs/ext2/super.c:918 (sbi->s_resgid)
+    pub fn def_resgid(&self) -> u32 {
+        self.def_resgid
+    }
+
     /// Increase the number of free blocks.
     pub(super) fn inc_free_blocks(&mut self, count: u32) {
         self.free_blocks_count += count;

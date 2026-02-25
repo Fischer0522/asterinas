@@ -13,7 +13,9 @@ use super::{
     utils::{Dirty, now},
 };
 use crate::{
-    fs::utils::FsEventSubscriberStats, process::posix_thread::AsPosixThread, thread::Thread,
+    fs::utils::FsEventSubscriberStats,
+    process::{credentials::capabilities::CapSet, posix_thread::AsPosixThread, Gid},
+    thread::Thread,
 };
 
 /// The root inode number (Linux EXT2_ROOT_INO).
@@ -330,6 +332,51 @@ impl Ext2 {
         Ok(groups)
     }
 
+    /// Checks whether the current caller may allocate blocks.
+    ///
+    /// Non-privileged users are denied when free blocks fall below the reserved
+    /// threshold, unless they have `CAP_SYS_RESOURCE` or match `s_resuid`/`s_resgid`.
+    ///
+    /// Linux: /root/linux/fs/ext2/balloc.c:1158 (ext2_has_free_blocks)
+    fn has_free_blocks(&self, free_blocks: u32, reserved_blocks: u32, resuid: u32, resgid: u32) -> bool {
+        if free_blocks >= reserved_blocks + 1 {
+            return true;
+        }
+
+        // In ktest or kernel-internal contexts there is no thread — treat as root.
+        let Some(thread) = Thread::current() else {
+            return true;
+        };
+        let Some(posix_thread) = thread.as_posix_thread() else {
+            return true;
+        };
+
+        let credentials = posix_thread.credentials();
+
+        // Linux: capable(CAP_SYS_RESOURCE)
+        if credentials.effective_capset().contains(CapSet::SYS_RESOURCE) {
+            return true;
+        }
+
+        // Linux: uid_eq(sbi->s_resuid, current_fsuid())
+        if u32::from(credentials.fsuid()) == resuid {
+            return true;
+        }
+
+        // Linux: !gid_eq(sbi->s_resgid, GLOBAL_ROOT_GID) && in_group_p(sbi->s_resgid)
+        let resgid_val = Gid::from(resgid);
+        if !resgid_val.is_root() {
+            if credentials.fsgid() == resgid_val {
+                return true;
+            }
+            if credentials.groups().contains(&resgid_val) {
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Allocates up to `count` contiguous blocks.
     ///
     /// Thin orchestrator: starts from goal group (Linux ext2_new_blocks behavior),
@@ -340,13 +387,17 @@ impl Ext2 {
             return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
         }
 
-        let (groups_count, sb_free_blocks, first_data_block, blocks_per_group) = {
+        let (groups_count, sb_free_blocks, first_data_block, blocks_per_group,
+             reserved_blocks, resuid, resgid) = {
             let guard = self.super_block.read();
             (
                 guard.block_groups_count() as usize,
                 guard.free_blocks_count(),
                 guard.first_data_block(),
                 guard.blocks_per_group(),
+                guard.reserved_blocks_count(),
+                guard.def_resuid(),
+                guard.def_resgid(),
             )
         };
         if groups_count == 0 || self.block_groups.len() < groups_count {
@@ -354,6 +405,11 @@ impl Ext2 {
         }
         if sb_free_blocks == 0 {
             return_errno_with_message!(Errno::ENOSPC, "no free blocks on device");
+        }
+
+        // Linux: /root/linux/fs/ext2/balloc.c:1262 (ext2_has_free_blocks check)
+        if !self.has_free_blocks(sb_free_blocks, reserved_blocks, resuid, resgid) {
+            return_errno_with_message!(Errno::ENOSPC, "no free blocks available for unprivileged user");
         }
 
         // Linux: /root/linux/fs/ext2/balloc.c:1260 (goal-based group start).

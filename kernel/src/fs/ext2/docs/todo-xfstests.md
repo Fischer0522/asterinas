@@ -46,10 +46,12 @@ Linux 用 `le16_add_cpu()` under spinlock，bitmap 是 source of truth。
 | T09 | `get_block` 无 `verify_chain`，并发下读 stale indirect | inode.rs block mapping | F11 | 并发读写测试 |
 
 **T04**：`links_count` 用 `saturating_add(1)` 到 u16 上限后静默不增。
+DONE
 Linux 在 `ext2_link` 中检查 `EXT2_LINK_MAX` (65000) 并返回 EMLINK。
 → 在 `link()` 入口检查 `links_count >= EXT2_LINK_MAX`，返回 `Errno::EMLINK`。
 
 **T05**：`FileSystem::sb()` 返回的 `f_bavail` 应为 `f_bfree - reserved_blocks_count`（非 root 视角）。
+DONE
 Linux `ext2_statfs` 计算 overhead（superblock + group desc + bitmap + inode table blocks）。
 → 实现 overhead 计算；`f_bavail = max(0, f_bfree - s_r_blocks_count)`。
 
