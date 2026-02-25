@@ -403,40 +403,60 @@ impl Inode {
             return Ok(());
         }
 
-        // Follow write_at's lock split to avoid deadlock:
-        // metadata allocation/resize under write lock, then PageCache I/O under read lock.
-        // TODO: add a rollback path on failed allocation/write similar to write_at's `write_failed_cleanup`.
-        self.resize(target_len)?;
-
+        // Slow symlink: two-phase write with rollback, mirroring write_at's pattern.
+        // Phase 1 (write lock): allocate blocks + grow page cache + update size.
+        // Phase 2 (read lock): write target bytes into page cache.
+        // Persist only after both phases succeed.
+        //
+        // Linux: ext2_write_begin calls ext2_write_failed on allocation failure (inode.c:934-935).
+        // Linux: ext2_write_end calls ext2_write_failed on short write (inode.c:947-948).
+        let old_size;
         {
             let mut inner = self.inner.write();
-            let blocks_to_cover = target_len.div_ceil(block_size);
-            for iblock in 0..blocks_to_cover {
-                let iblock = u32::try_from(iblock).map_err(|_| {
-                    Error::with_message(Errno::EINVAL, "logical block number overflow")
-                })?;
-                if inner.get_or_alloc_block(iblock, true)?.is_none() {
-                    return_errno_with_message!(
-                        Errno::ENOSPC,
-                        "failed to allocate symlink data block"
-                    );
+            old_size = inner.desc.size as usize;
+            let end_block = target_len.div_ceil(block_size);
+
+            let phase1_result = (|| -> Result<()> {
+                for iblock in 0..end_block {
+                    let iblock = u32::try_from(iblock).map_err(|_| {
+                        Error::with_message(Errno::EINVAL, "logical block number overflow")
+                    })?;
+                    if inner.get_or_alloc_block(iblock, true)?.is_none() {
+                        return_errno_with_message!(
+                            Errno::ENOSPC,
+                            "failed to allocate symlink data block"
+                        );
+                    }
                 }
+
+                inner.page_cache.resize(target_len.align_up(block_size))?;
+                inner.desc.size = target_len as u64;
+                Ok(())
+            })();
+
+            if let Err(err) = phase1_result {
+                Self::write_failed_cleanup(&mut inner, old_size, target_len, block_size);
+                return Err(err);
             }
         }
 
+        // Phase 2 (read lock): write symlink target into page cache.
+        let upread_inner = self.inner.upread();
+        if let Err(_) = upread_inner
+            .page_cache
+            .pages()
+            .write_bytes(0, target.as_bytes())
         {
-            let inner = self.inner.read();
-            inner
-                .page_cache
-                .pages()
-                .write_bytes(0, target.as_bytes())
-                .map_err(|_| {
-                    Error::with_message(Errno::EIO, "failed to write symlink target to page cache")
-                })?;
+
+            let mut inner = upread_inner.upgrade();
+            Self::write_failed_cleanup(&mut inner, old_size, target_len, block_size);
+            return Err(Error::with_message(
+                Errno::EIO,
+                "failed to write symlink target to page cache",
+            ));
         }
 
-        let mut inner = self.inner.write();
-        inner.desc.size = target_len as u64;
+        let mut inner = upread_inner.upgrade();
         inner.persist_inode_and_sync(&fs)?;
         Ok(())
     }
@@ -525,8 +545,7 @@ impl Inode {
         let upread_inner = self.inner.upread();
         // Phase 2: copy user data through VMO-backed page cache under upread.
         if let Err(err) = upread_inner.page_cache.pages().write(offset, reader) {
-            drop(upread_inner);
-            let mut inner = self.inner.write();
+            let mut inner = upread_inner.upgrade();
             Self::write_failed_cleanup(&mut inner, old_size, end, block_size);
             return Err(err.into());
         }
@@ -644,8 +663,7 @@ impl Inode {
 
         let upread_inner = self.inner.upread();
         if let Err(err) = upread_inner.write_at(offset, reader) {
-            drop(upread_inner);
-            let mut inner = self.inner.write();
+            let mut inner = upread_inner.upgrade();
             Self::write_failed_cleanup(&mut inner, old_size, end, block_size);
             return Err(err);
         }
