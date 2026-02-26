@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
     fs::utils::FsEventSubscriberStats,
-    process::{credentials::capabilities::CapSet, posix_thread::AsPosixThread, Gid},
+    process::{Gid, credentials::capabilities::CapSet, posix_thread::AsPosixThread},
     thread::Thread,
 };
 
@@ -338,7 +338,13 @@ impl Ext2 {
     /// threshold, unless they have `CAP_SYS_RESOURCE` or match `s_resuid`/`s_resgid`.
     ///
     /// Linux: /root/linux/fs/ext2/balloc.c:1158 (ext2_has_free_blocks)
-    fn has_free_blocks(&self, free_blocks: u32, reserved_blocks: u32, resuid: u32, resgid: u32) -> bool {
+    fn has_free_blocks(
+        &self,
+        free_blocks: u32,
+        reserved_blocks: u32,
+        resuid: u32,
+        resgid: u32,
+    ) -> bool {
         if free_blocks >= reserved_blocks + 1 {
             return true;
         }
@@ -354,7 +360,10 @@ impl Ext2 {
         let credentials = posix_thread.credentials();
 
         // Linux: capable(CAP_SYS_RESOURCE)
-        if credentials.effective_capset().contains(CapSet::SYS_RESOURCE) {
+        if credentials
+            .effective_capset()
+            .contains(CapSet::SYS_RESOURCE)
+        {
             return true;
         }
 
@@ -387,8 +396,15 @@ impl Ext2 {
             return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
         }
 
-        let (groups_count, sb_free_blocks, first_data_block, blocks_per_group,
-             reserved_blocks, resuid, resgid) = {
+        let (
+            groups_count,
+            sb_free_blocks,
+            first_data_block,
+            blocks_per_group,
+            reserved_blocks,
+            resuid,
+            resgid,
+        ) = {
             let guard = self.super_block.read();
             (
                 guard.block_groups_count() as usize,
@@ -409,7 +425,10 @@ impl Ext2 {
 
         // Linux: /root/linux/fs/ext2/balloc.c:1262 (ext2_has_free_blocks check)
         if !self.has_free_blocks(sb_free_blocks, reserved_blocks, resuid, resgid) {
-            return_errno_with_message!(Errno::ENOSPC, "no free blocks available for unprivileged user");
+            return_errno_with_message!(
+                Errno::ENOSPC,
+                "no free blocks available for unprivileged user"
+            );
         }
 
         // Linux: /root/linux/fs/ext2/balloc.c:1260 (goal-based group start).
@@ -844,6 +863,7 @@ mod test {
 
     #[ktest]
     fn sync_metadata_writes_primary_and_backup() {
+        clocks::init_for_ktest();
         let fixture = Ext2FixtureBuilder::new(3, 512)
             .with_free_blocks(0, 10)
             .build()
@@ -859,6 +879,7 @@ mod test {
         };
 
         ext2.block_groups()[0].inc_free_blocks(3);
+        ext2.block_groups()[0].inc_free_inodes(1);
         assert!(ext2.block_groups()[0].is_desc_dirty());
 
         ext2.sync_metadata().unwrap();

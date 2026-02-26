@@ -8,8 +8,8 @@ use crate::{
         inode_handle::FileIo,
         utils::{
             AccessMode, DirentVisitor, Extension, FallocMode, FileSystem, Inode as VfsInode,
-            InodeIo, InodeMode, InodeType, Metadata, MknodType, StatusFlags, SymbolicLink,
-            XattrName, XattrNamespace, XattrSetFlags,
+            InodeIo, InodeMode, InodeType, Metadata, MknodType, Permission, StatusFlags,
+            SymbolicLink, XattrName, XattrNamespace, XattrSetFlags,
         },
     },
     prelude::*,
@@ -214,23 +214,27 @@ impl VfsInode for Inode {
 
     fn set_xattr(
         &self,
-        _name: XattrName,
-        _value_reader: &mut VmReader,
-        _flags: XattrSetFlags,
+        name: XattrName,
+        value_reader: &mut VmReader,
+        flags: XattrSetFlags,
     ) -> Result<()> {
-        return_errno_with_message!(Errno::EOPNOTSUPP, "xattr is not supported yet");
+        self.check_permission(Permission::MAY_WRITE)?;
+        Inode::set_xattr(self, name, value_reader, flags)
     }
 
-    fn get_xattr(&self, _name: XattrName, _value_writer: &mut VmWriter) -> Result<usize> {
-        return_errno_with_message!(Errno::EOPNOTSUPP, "xattr is not supported yet");
+    fn get_xattr(&self, name: XattrName, value_writer: &mut VmWriter) -> Result<usize> {
+        self.check_permission(Permission::MAY_READ)?;
+        Inode::get_xattr(self, name, value_writer)
     }
 
-    fn list_xattr(&self, _namespace: XattrNamespace, _list_writer: &mut VmWriter) -> Result<usize> {
-        return_errno_with_message!(Errno::EOPNOTSUPP, "xattr is not supported yet");
+    fn list_xattr(&self, namespace: XattrNamespace, list_writer: &mut VmWriter) -> Result<usize> {
+        self.check_permission(Permission::MAY_ACCESS)?;
+        Inode::list_xattr(self, namespace, list_writer)
     }
 
-    fn remove_xattr(&self, _name: XattrName) -> Result<()> {
-        return_errno_with_message!(Errno::EOPNOTSUPP, "xattr is not supported yet");
+    fn remove_xattr(&self, name: XattrName) -> Result<()> {
+        self.check_permission(Permission::MAY_WRITE)?;
+        Inode::remove_xattr(self, name)
     }
 }
 

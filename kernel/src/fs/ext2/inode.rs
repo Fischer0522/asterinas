@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::mem::size_of;
+use core::{cmp::Ordering, mem::size_of};
 
 use device_id::{decode_device_numbers, encode_device_numbers};
 use ostd::{const_assert, mm::io_util::HasVmReaderWriter};
@@ -9,11 +9,19 @@ use super::{
     fs::{Ext2, ROOT_INO},
     prelude::*,
     utils::now,
+    xattr::{
+        ParsedXattrEntry, XattrEntryRaw, XattrNameIndex, build_xattr_block, cmp_entry,
+        cmp_name_key, parse_xattr_block, read_header, read_xattr_block, validate_header,
+        write_xattr_block,
+    },
 };
 use crate::{
     fs::{
         ext2::dir::{DirEntry, DirEntryIter},
-        utils::{Extension, FallocMode, InodeMode, Metadata},
+        utils::{
+            Extension, FallocMode, InodeMode, Metadata, XATTR_NAME_MAX_LEN, XattrName,
+            XattrNamespace, XattrSetFlags,
+        },
     },
     process::{Gid, Uid},
 };
@@ -313,6 +321,112 @@ impl Inode {
         self.inner.write().desc.ctime = time;
     }
 
+    /// Reads one extended-attribute value and writes it to `value_writer`.
+    ///
+    /// Linux: /root/linux/fs/ext2/xattr.c:195-275 (ext2_xattr_get)
+    pub(super) fn get_xattr(&self, name: XattrName, value_writer: &mut VmWriter) -> Result<usize> {
+        let name_index = XattrNameIndex::from_vfs_namespace(name.namespace())?;
+        let name_suffix = name_index.strip_prefix(name.full_name())?;
+        if name_suffix.len() > XATTR_NAME_MAX_LEN {
+            return_errno_with_message!(Errno::ERANGE, "xattr name suffix is too long");
+        }
+
+        let value = self
+            .inner
+            .read()
+            .xattr_get(name_index as u8, name_suffix.as_bytes())?;
+        let value_len = value.len();
+
+        let value_avail = value_writer.avail();
+        if value_avail == 0 {
+            return Ok(value_len);
+        }
+        if value_len > value_avail {
+            return_errno_with_message!(Errno::ERANGE, "xattr value buffer is too small");
+        }
+
+        let mut value_reader = VmReader::from(value.as_slice()).to_fallible();
+        value_writer.write_fallible(&mut value_reader)?;
+        Ok(value_len)
+    }
+
+    /// Lists extended-attribute names in one namespace and writes them to `list_writer`.
+    ///
+    /// Linux: /root/linux/fs/ext2/xattr.c:287-364 (ext2_xattr_list)
+    pub(super) fn list_xattr(
+        &self,
+        namespace: XattrNamespace,
+        list_writer: &mut VmWriter,
+    ) -> Result<usize> {
+        let list = self.inner.read().xattr_list(Some(namespace))?;
+        let list_len = list.len();
+
+        let list_avail = list_writer.avail();
+        if list_avail == 0 {
+            return Ok(list_len);
+        }
+        if list_len > list_avail {
+            return_errno_with_message!(Errno::ERANGE, "xattr list buffer is too small");
+        }
+
+        let mut list_reader = VmReader::from(list.as_slice()).to_fallible();
+        list_writer.write_fallible(&mut list_reader)?;
+        Ok(list_len)
+    }
+
+    /// Creates or replaces one extended attribute.
+    ///
+    /// Linux: /root/linux/fs/ext2/xattr.c:405-651 (ext2_xattr_set)
+    pub(super) fn set_xattr(
+        &self,
+        name: XattrName,
+        value_reader: &mut VmReader,
+        flags: XattrSetFlags,
+    ) -> Result<()> {
+        let name_index = XattrNameIndex::from_vfs_namespace(name.namespace())?;
+        let name_suffix = name_index.strip_prefix(name.full_name())?;
+        if name_suffix.len() > XATTR_NAME_MAX_LEN {
+            return_errno_with_message!(Errno::ERANGE, "xattr name suffix is too long");
+        }
+
+        let mut value = vec![0u8; value_reader.remain()];
+        if !value.is_empty() {
+            let mut value_writer = VmWriter::from(value.as_mut_slice()).to_fallible();
+            value_writer.write_fallible(value_reader)?;
+        }
+
+        let fs = self.fs_arc()?;
+        let mut inner = self.inner.write();
+        inner.xattr_set(
+            name_index as u8,
+            name_suffix.as_bytes(),
+            Some(value.as_slice()),
+            flags,
+        )?;
+        inner.persist_inode_and_sync(&fs)
+    }
+
+    /// Removes one extended attribute.
+    ///
+    /// Linux: /root/linux/fs/ext2/xattr.c:405-651 (ext2_xattr_set with value == NULL)
+    pub(super) fn remove_xattr(&self, name: XattrName) -> Result<()> {
+        let name_index = XattrNameIndex::from_vfs_namespace(name.namespace())?;
+        let name_suffix = name_index.strip_prefix(name.full_name())?;
+        if name_suffix.len() > XATTR_NAME_MAX_LEN {
+            return_errno_with_message!(Errno::ERANGE, "xattr name suffix is too long");
+        }
+
+        let fs = self.fs_arc()?;
+        let mut inner = self.inner.write();
+        inner.xattr_set(
+            name_index as u8,
+            name_suffix.as_bytes(),
+            None,
+            XattrSetFlags::CREATE_OR_REPLACE,
+        )?;
+        inner.persist_inode_and_sync(&fs)
+    }
+
     /// Reads symbolic-link target bytes and decodes them as UTF-8.
     ///
     /// Linux fast path: /root/linux/fs/ext2/inode.c:1483-1487
@@ -447,7 +561,6 @@ impl Inode {
             .pages()
             .write_bytes(0, target.as_bytes())
         {
-
             let mut inner = upread_inner.upgrade();
             Self::write_failed_cleanup(&mut inner, old_size, target_len, block_size);
             return Err(Error::with_message(
@@ -996,12 +1109,9 @@ impl Inode {
             return Err(err);
         }
 
-        if let Err(err) = parent_guard.write_dir_entry(
-            &slot,
-            name,
-            child_ino,
-            DirEntryFileType::Dir as u8,
-        ) {
+        if let Err(err) =
+            parent_guard.write_dir_entry(&slot, name, child_ino, DirEntryFileType::Dir as u8)
+        {
             {
                 let mut child_inner = child.inner.write();
                 let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
@@ -1102,6 +1212,13 @@ impl Inode {
         inner.is_freed = true;
         inner.desc.size = 0;
         inner.truncate_blocks(0)?;
+        if let Err(err) = inner.xattr_delete_block() {
+            // Linux `ext2_xattr_delete_inode` logs and keeps eviction going.
+            warn!(
+                "ext2: failed to delete xattr block for inode {}: {:?}",
+                self.ino, err
+            );
+        }
         inner.persist_inode_and_sync(&fs)?;
         Ok(true)
     }
@@ -1142,8 +1259,7 @@ impl Inode {
 impl PageCacheBackend for Inode {
     fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
         let inner = self.inner.read();
-        let fs = self
-            .fs_arc()?;
+        let fs = self.fs_arc()?;
         let iblock = u32::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
 
@@ -1251,6 +1367,217 @@ impl InodeInner {
             fs,
             page_cache,
         }
+    }
+
+    /// Reads one xattr value by `(name_index, name_suffix)`.
+    ///
+    /// Linux: /root/linux/fs/ext2/xattr.c:195-275 (ext2_xattr_get)
+    pub(super) fn xattr_get(&self, name_index: u8, name_suffix: &[u8]) -> Result<Vec<u8>> {
+        if name_suffix.len() > XATTR_NAME_MAX_LEN {
+            return_errno_with_message!(Errno::ERANGE, "xattr name suffix is too long");
+        }
+        if XattrNameIndex::from_raw(name_index).is_none() {
+            return_errno_with_message!(Errno::EINVAL, "invalid xattr namespace index");
+        }
+        if self.desc.file_acl == 0 {
+            return_errno_with_message!(Errno::ENODATA, "xattr block is not present");
+        }
+
+        let fs = self.fs_arc()?;
+        let block_data = read_xattr_block(&fs, self.desc.file_acl)?;
+        let entries = parse_xattr_block(&block_data)?;
+        for entry in entries {
+            let entry_raw = XattrEntryRaw {
+                e_name_len: entry.name.len() as u8,
+                e_name_index: entry.name_index,
+                e_value_offs: 0,
+                e_value_block: 0,
+                e_value_size: 0,
+                e_hash: 0,
+            };
+            match cmp_entry(name_index, name_suffix, &entry_raw, &entry.name) {
+                Ordering::Equal => return Ok(entry.value),
+                Ordering::Less => break,
+                Ordering::Greater => {}
+            }
+        }
+
+        return_errno_with_message!(Errno::ENODATA, "xattr entry not found");
+    }
+
+    /// Lists xattr names, optionally filtered by namespace.
+    ///
+    /// Linux: /root/linux/fs/ext2/xattr.c:287-364 (ext2_xattr_list)
+    pub(super) fn xattr_list(&self, namespace: Option<XattrNamespace>) -> Result<Vec<u8>> {
+        if self.desc.file_acl == 0 {
+            return Ok(Vec::new());
+        }
+
+        let fs = self.fs_arc()?;
+        let block_data = read_xattr_block(&fs, self.desc.file_acl)?;
+        let entries = parse_xattr_block(&block_data)?;
+
+        let mut list = Vec::new();
+        for entry in entries {
+            let Some(name_index) = XattrNameIndex::from_raw(entry.name_index) else {
+                continue;
+            };
+            let Some(vfs_namespace) = name_index.to_vfs_namespace() else {
+                continue;
+            };
+            if namespace.is_some_and(|ns| ns != vfs_namespace) {
+                continue;
+            }
+
+            list.extend_from_slice(name_index.prefix().as_bytes());
+            list.extend_from_slice(&entry.name);
+            list.push(0);
+        }
+
+        Ok(list)
+    }
+
+    /// Creates, replaces or removes one xattr entry.
+    ///
+    /// Linux: /root/linux/fs/ext2/xattr.c:405-651 (ext2_xattr_set)
+    pub(super) fn xattr_set(
+        &mut self,
+        name_index: u8,
+        name_suffix: &[u8],
+        value: Option<&[u8]>,
+        flags: XattrSetFlags,
+    ) -> Result<()> {
+        if name_suffix.len() > XATTR_NAME_MAX_LEN {
+            return_errno_with_message!(Errno::ERANGE, "xattr name suffix is too long");
+        }
+        if XattrNameIndex::from_raw(name_index).is_none() {
+            return_errno_with_message!(Errno::EINVAL, "invalid xattr namespace index");
+        }
+
+        let fs = self.fs_arc()?;
+        let block_size = fs.block_size();
+        if block_size == 0 || block_size > BLOCK_SIZE {
+            return_errno_with_message!(Errno::EIO, "invalid filesystem block size for xattr");
+        }
+
+        if let Some(value_bytes) = value {
+            if value_bytes.len() > block_size {
+                return_errno_with_message!(Errno::ERANGE, "xattr value exceeds one block");
+            }
+        }
+
+        let old_block = self.desc.file_acl;
+        let mut entries = if old_block != 0 {
+            let block_data = read_xattr_block(&fs, old_block)?;
+            parse_xattr_block(&block_data)?
+        } else {
+            Vec::new()
+        };
+
+        let mut found_index = None;
+        let mut insert_index = entries.len();
+        for (idx, entry) in entries.iter().enumerate() {
+            match cmp_name_key(name_index, name_suffix, entry.name_index, &entry.name) {
+                Ordering::Less => {
+                    insert_index = idx;
+                    break;
+                }
+                Ordering::Equal => {
+                    found_index = Some(idx);
+                    insert_index = idx;
+                    break;
+                }
+                Ordering::Greater => {}
+            }
+        }
+
+        match found_index {
+            Some(idx) => {
+                if flags.contains(XattrSetFlags::CREATE_ONLY) {
+                    return_errno_with_message!(Errno::EEXIST, "the target xattr already exists");
+                }
+
+                if let Some(value_bytes) = value {
+                    entries[idx].value = value_bytes.to_vec();
+                } else {
+                    entries.remove(idx);
+                }
+            }
+            None => {
+                if flags.contains(XattrSetFlags::REPLACE_ONLY) || value.is_none() {
+                    return_errno_with_message!(Errno::ENODATA, "the target xattr does not exist");
+                }
+
+                entries.insert(
+                    insert_index,
+                    ParsedXattrEntry {
+                        name_index,
+                        name: name_suffix.to_vec(),
+                        value: value.unwrap().to_vec(),
+                    },
+                );
+            }
+        }
+
+        if entries.is_empty() {
+            if old_block != 0 {
+                fs.free_blocks(old_block, 1)?;
+                self.desc.file_acl = 0;
+            }
+            self.desc.ctime = now();
+            return Ok(());
+        }
+
+        // Entries are already in sorted order: parse_xattr_block reads them sorted,
+        // and insert() places new entries at the correct position.
+        let block_data = build_xattr_block(block_size, &entries)?;
+
+        let (target_block, allocated_new) = if old_block != 0 {
+            (old_block, false)
+        } else {
+            let inode = self
+                .weak_self
+                .upgrade()
+                .ok_or_else(|| Error::with_message(Errno::EIO, "inode already dropped"))?;
+            let goal = {
+                let sb = fs.super_block();
+                Bid::new(sb.group_first_block_no(inode.block_group_idx) as u64)
+            };
+            let allocated = fs.alloc_blocks(1, goal)?;
+            let block = allocated.start;
+            self.desc.file_acl = block;
+            (block, true)
+        };
+
+        if let Err(err) = write_xattr_block(&fs, target_block, &block_data) {
+            if allocated_new {
+                let _ = fs.free_blocks(target_block, 1);
+                self.desc.file_acl = 0;
+            }
+            return Err(err);
+        }
+
+        self.desc.ctime = now();
+        Ok(())
+    }
+
+    /// Releases the inode's dedicated xattr block.
+    ///
+    /// Linux: /root/linux/fs/ext2/xattr.c:816-861 (ext2_xattr_delete_inode)
+    pub(super) fn xattr_delete_block(&mut self) -> Result<()> {
+        if self.desc.file_acl == 0 {
+            return Ok(());
+        }
+
+        let fs = self.fs_arc()?;
+        let block = self.desc.file_acl;
+        let block_data = read_xattr_block(&fs, block)?;
+        let header = read_header(&block_data)?;
+        validate_header(&header)?;
+
+        fs.free_blocks(block, 1)?;
+        self.desc.file_acl = 0;
+        Ok(())
     }
 
     /// Reads file data directly from data blocks into `writer`.
@@ -2841,13 +3168,7 @@ impl InodeInner {
     /// Phase 3: write a new entry into a selected slot via PageCache.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link commit)
-    fn write_dir_entry(
-        &self,
-        slot: &DirSlotInfo,
-        name: &str,
-        ino: u32,
-        ft: u8,
-    ) -> Result<()> {
+    fn write_dir_entry(&self, slot: &DirSlotInfo, name: &str, ino: u32, ft: u8) -> Result<()> {
         let fs = self.fs_arc()?;
         let max_inumber = fs.super_block().total_inodes();
         if ino == 0 || ino > max_inumber {
@@ -3422,7 +3743,6 @@ impl Inode {
         if old.inner.read().desc.links_count >= MAX_LINK_COUNT {
             return_errno!(Errno::EOVERFLOW);
         }
-
 
         let name_bytes = name.as_bytes();
         if name_bytes.is_empty()
@@ -4181,7 +4501,10 @@ mod test {
                     StopAfterVisitor, encode_dir_entry, write_indirect_ptr,
                 },
             },
-            utils::{IdBitmap, InodeIo, StatusFlags},
+            utils::{
+                IdBitmap, Inode as VfsInodeTrait, InodeIo, StatusFlags, XattrName, XattrNamespace,
+                XattrSetFlags,
+            },
         },
         prelude::*,
         time::clocks,
@@ -6115,5 +6438,124 @@ mod test {
             let err = inner.page_cache.evict_range(0..block_size).unwrap_err();
             assert_eq!(err.error(), Errno::EIO);
         }
+    }
+
+    #[ktest]
+    fn xattr_set_get_and_size_query_roundtrip() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let file = root
+            .create(
+                "xattr-file",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644),
+            )
+            .unwrap();
+
+        let make_name = || XattrName::try_from_full_name("user.test").unwrap();
+        let value = b"hello-xattr";
+        let mut set_reader = VmReader::from(value.as_slice()).to_fallible();
+        VfsInodeTrait::set_xattr(
+            file.as_ref(),
+            make_name(),
+            &mut set_reader,
+            XattrSetFlags::CREATE_OR_REPLACE,
+        )
+        .unwrap();
+
+        let mut empty_writer = VmWriter::from(&mut [][..]).to_fallible();
+        let queried =
+            VfsInodeTrait::get_xattr(file.as_ref(), make_name(), &mut empty_writer).unwrap();
+        assert_eq!(queried, value.len());
+
+        let mut got = vec![0u8; value.len()];
+        let mut get_writer = VmWriter::from(got.as_mut_slice()).to_fallible();
+        let read = VfsInodeTrait::get_xattr(file.as_ref(), make_name(), &mut get_writer).unwrap();
+        assert_eq!(read, value.len());
+        assert_eq!(got.as_slice(), value);
+
+        assert_ne!(file.inner.read().desc.file_acl, 0);
+    }
+
+    #[ktest]
+    fn xattr_remove_last_entry_frees_block() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let file = root
+            .create(
+                "xattr-remove",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644),
+            )
+            .unwrap();
+
+        let make_name = || XattrName::try_from_full_name("user.key").unwrap();
+        let mut set_reader = VmReader::from(b"value".as_slice()).to_fallible();
+        VfsInodeTrait::set_xattr(
+            file.as_ref(),
+            make_name(),
+            &mut set_reader,
+            XattrSetFlags::CREATE_OR_REPLACE,
+        )
+        .unwrap();
+        assert_ne!(file.inner.read().desc.file_acl, 0);
+
+        VfsInodeTrait::remove_xattr(file.as_ref(), make_name()).unwrap();
+        assert_eq!(file.inner.read().desc.file_acl, 0);
+
+        let err = VfsInodeTrait::remove_xattr(file.as_ref(), make_name()).unwrap_err();
+        assert_eq!(err.error(), Errno::ENODATA);
+    }
+
+    #[ktest]
+    fn xattr_list_filters_namespace() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let file = root
+            .create(
+                "xattr-list",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644),
+            )
+            .unwrap();
+
+        let user_name = XattrName::try_from_full_name("user.alpha").unwrap();
+        let trusted_name = XattrName::try_from_full_name("trusted.beta").unwrap();
+
+        let mut user_reader = VmReader::from(b"u".as_slice()).to_fallible();
+        VfsInodeTrait::set_xattr(
+            file.as_ref(),
+            user_name,
+            &mut user_reader,
+            XattrSetFlags::CREATE_OR_REPLACE,
+        )
+        .unwrap();
+
+        let mut trusted_reader = VmReader::from(b"t".as_slice()).to_fallible();
+        VfsInodeTrait::set_xattr(
+            file.as_ref(),
+            trusted_name,
+            &mut trusted_reader,
+            XattrSetFlags::CREATE_OR_REPLACE,
+        )
+        .unwrap();
+
+        let mut buf = vec![0u8; 128];
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        let len =
+            VfsInodeTrait::list_xattr(file.as_ref(), XattrNamespace::User, &mut writer).unwrap();
+        let listed = &buf[..len];
+        let names: Vec<&[u8]> = listed
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+            .collect();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0], b"user.alpha");
     }
 }

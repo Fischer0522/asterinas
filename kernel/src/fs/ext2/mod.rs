@@ -56,3 +56,4 @@ mod super_block;
 #[cfg(ktest)]
 mod testkit;
 mod utils;
+mod xattr;

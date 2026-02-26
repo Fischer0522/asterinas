@@ -473,7 +473,7 @@ Goal: finalize boundary checks, feature gating, and consistency rules.
 - Asterinas adjustments:
   - return `Errno::EIO`/`EINVAL` instead of asserts.
 - Spec: `phase-09-boundary-checks.spec`.
-- Status: ❌ not implemented (no dedicated `check_block_range`/`check_ino_range` methods).
+- Status: not planned (no dedicated `check_block_range`/`check_ino_range` methods).
 
 ### Module 9.3: IndirectBlockCache
 - New/extend structs:

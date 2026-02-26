@@ -56,16 +56,20 @@ Linux `ext2_statfs` 计算 overhead（superblock + group desc + bitmap + inode t
 → 实现 overhead 计算；`f_bavail = max(0, f_bfree - s_r_blocks_count)`。
 
 **T06**：当前只检查 `sb_free_blocks == 0`。Linux 非 root 用户在 `free < s_r_blocks_count` 时返回 ENOSPC。
+DONE
 → 添加 `has_free_blocks()`：非 root 且无 `CAP_SYS_RESOURCE` 时，free 需 > reserved。
 
 **T07**：`sync_metadata` 写 superblock 前应从各 group descriptor 汇总 free_blocks/free_inodes。
+DONE
 Linux `ext2_sync_super` 调 `ext2_count_free_blocks/inodes`。
 → 在 `sync_metadata` 开头遍历 groups 重算 counter。
 
 **T08**：`set_symlink_target()` 分配 block 后写入失败，已分配的 block 不回收。
+DONE
 → 添加 rollback：写失败时释放已分配的 block，恢复 inode 状态。
 
 **T09**：读 indirect chain 时不验证首指针是否被并发 truncate 修改。
+won't fix / by design
 Linux 用 `ext2_get_branch` + `verify_chain` + `i_meta_lock`。
 → 读完 chain 后 verify 首指针未变；变了则 retry。
 

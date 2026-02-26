@@ -35,7 +35,9 @@ impl FileSystem for Ext2 {
             bsize: ext2_sb.block_size(),
             blocks: ext2_sb.total_blocks() as usize,
             bfree: ext2_sb.free_blocks_count() as usize,
-            bavail: ext2_sb.free_blocks_count().saturating_sub(ext2_sb.reserved_blocks_count()) as usize,
+            bavail: ext2_sb
+                .free_blocks_count()
+                .saturating_sub(ext2_sb.reserved_blocks_count()) as usize,
             files: ext2_sb.total_inodes() as usize,
             ffree: ext2_sb.free_inodes_count() as usize,
             fsid: 0,
