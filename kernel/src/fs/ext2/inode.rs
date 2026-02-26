@@ -341,7 +341,7 @@ impl Inode {
             .xattr
             .as_ref()
             .ok_or(Error::with_message(
-                Errno::EPERM,
+                Errno::EOPNOTSUPP,
                 "inode does not support extended attributes",
             ))?
             .write();
@@ -360,7 +360,7 @@ impl Inode {
             .xattr
             .as_ref()
             .ok_or(Error::with_message(
-                Errno::EPERM,
+                Errno::EOPNOTSUPP,
                 "inode does not support extended attributes",
             ))?
             .write();
@@ -380,7 +380,7 @@ impl Inode {
             .xattr
             .as_ref()
             .ok_or(Error::with_message(
-                Errno::EPERM,
+                Errno::EOPNOTSUPP,
                 "inode does not support extended attributes",
             ))?
             .write();
@@ -391,6 +391,7 @@ impl Inode {
         let fs = self.fs_arc()?;
         let mut inner = self.inner.write();
         inner.desc.file_acl = new_bid;
+        inner.desc.ctime = now();
         inner.persist_inode_and_sync(&fs)
     }
 
@@ -402,7 +403,7 @@ impl Inode {
             .xattr
             .as_ref()
             .ok_or(Error::with_message(
-                Errno::EPERM,
+                Errno::EOPNOTSUPP,
                 "inode does not support extended attributes",
             ))?
             .write();

@@ -122,6 +122,7 @@ struct XattrEntryData {
     value: Vec<u8>,
 }
 
+// TODO: add a entry cache to avoid frequent parsing
 #[derive(Debug)]
 pub(super) struct Xattr {
     block_buf: Option<USegment>,
@@ -132,6 +133,7 @@ pub(super) struct Xattr {
 }
 
 impl Xattr {
+    /// Creates a new xattr handle. `bid` comes from `InodeDesc.file_acl`.
     pub(super) fn new(bid: u32, inode: Weak<Inode>, fs: Weak<Ext2>) -> Self {
         Self {
             block_buf: None,
@@ -142,6 +144,7 @@ impl Xattr {
         }
     }
 
+    /// Returns the current xattr block number. Caller uses this to update `InodeDesc.file_acl`.
     pub(super) fn bid(&self) -> u32 {
         self.bid
     }
@@ -335,46 +338,25 @@ impl Xattr {
     }
 
     fn read_entry_from_slice(block: &[u8], offset: usize) -> Result<XattrEntryRaw> {
-        if offset + XATTR_ENTRY_HEADER_SIZE > block.len() {
+        let end = offset
+            .checked_add(XATTR_ENTRY_HEADER_SIZE)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "xattr entry header out of range"))?;
+        if end > block.len() {
             return_errno_with_message!(Errno::EIO, "xattr entry header out of range");
         }
-
-        Ok(XattrEntryRaw {
-            e_name_len: block[offset],
-            e_name_index: block[offset + 1],
-            e_value_offs: u16::from_le_bytes([block[offset + 2], block[offset + 3]]),
-            e_value_block: u32::from_le_bytes([
-                block[offset + 4],
-                block[offset + 5],
-                block[offset + 6],
-                block[offset + 7],
-            ]),
-            e_value_size: u32::from_le_bytes([
-                block[offset + 8],
-                block[offset + 9],
-                block[offset + 10],
-                block[offset + 11],
-            ]),
-            e_hash: u32::from_le_bytes([
-                block[offset + 12],
-                block[offset + 13],
-                block[offset + 14],
-                block[offset + 15],
-            ]),
-        })
+        let mut entry = XattrEntryRaw::new_zeroed();
+        entry.as_bytes_mut().copy_from_slice(&block[offset..end]);
+        Ok(entry)
     }
 
     fn write_entry_to_slice(block: &mut [u8], offset: usize, entry: &XattrEntryRaw) -> Result<()> {
-        if offset + XATTR_ENTRY_HEADER_SIZE > block.len() {
+        let end = offset
+            .checked_add(XATTR_ENTRY_HEADER_SIZE)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "xattr entry header out of range"))?;
+        if end > block.len() {
             return_errno_with_message!(Errno::EIO, "xattr entry header out of range");
         }
-
-        block[offset] = entry.e_name_len;
-        block[offset + 1] = entry.e_name_index;
-        block[offset + 2..offset + 4].copy_from_slice(&entry.e_value_offs.to_le_bytes());
-        block[offset + 4..offset + 8].copy_from_slice(&entry.e_value_block.to_le_bytes());
-        block[offset + 8..offset + 12].copy_from_slice(&entry.e_value_size.to_le_bytes());
-        block[offset + 12..offset + 16].copy_from_slice(&entry.e_hash.to_le_bytes());
+        block[offset..end].copy_from_slice(entry.as_bytes());
         Ok(())
     }
 
@@ -511,9 +493,13 @@ impl Xattr {
             let entry_raw = XattrEntryRaw {
                 e_name_len: entry.name.len() as u8,
                 e_name_index: entry.name_index as u8,
-                e_value_offs: u16::try_from(value_cursor).map_err(|_| {
-                    Error::with_message(Errno::EIO, "xattr value offset does not fit in u16")
-                })?,
+                e_value_offs: if entry.value.is_empty() {
+                    0
+                } else {
+                    u16::try_from(value_cursor).map_err(|_| {
+                        Error::with_message(Errno::EIO, "xattr value offset does not fit in u16")
+                    })?
+                },
                 e_value_block: 0,
                 e_value_size: u32::try_from(entry.value.len()).map_err(|_| {
                     Error::with_message(Errno::ERANGE, "xattr value length does not fit in u32")
@@ -593,6 +579,9 @@ impl Xattr {
         Ok(())
     }
 
+    /// Creates or replaces one extended attribute. Allocates block if needed.
+    ///
+    /// Linux: /root/linux/fs/ext2/xattr.c:405-651 (ext2_xattr_set)
     pub(super) fn set_xattr(
         &mut self,
         name: XattrName,
@@ -641,12 +630,16 @@ impl Xattr {
         }
 
         let working_block = Self::build_block(&entries, block_size)?;
+        // TODO: maybe add a rollback?
         self.alloc_bid_if_needed()?;
         self.write_working_block(&working_block, block_size)?;
         self.dirty = true;
         self.flush()
     }
 
+    /// Reads one extended-attribute value. Size query if `vm_writer.avail() == 0`.
+    ///
+    /// Linux: /root/linux/fs/ext2/xattr.c:195-275 (ext2_xattr_get)
     pub(super) fn get_xattr(&mut self, name: XattrName, vm_writer: &mut VmWriter) -> Result<usize> {
         let (target_index, target_name) = Self::parse_target_name(name)?;
 
@@ -679,6 +672,9 @@ impl Xattr {
         Ok(value.len())
     }
 
+    /// Lists extended-attribute names in one namespace. Size query if `list_writer.avail() == 0`.
+    ///
+    /// Linux: /root/linux/fs/ext2/xattr.c:287-364 (ext2_xattr_list)
     pub(super) fn list_xattr(
         &mut self,
         namespace: XattrNamespace,
@@ -729,6 +725,9 @@ impl Xattr {
         Ok(total_size)
     }
 
+    /// Removes one extended attribute. Frees block if last entry removed.
+    ///
+    /// Linux: /root/linux/fs/ext2/xattr.c:405-651 (ext2_xattr_set with value == NULL)
     pub(super) fn remove_xattr(&mut self, name: XattrName) -> Result<()> {
         let (target_index, target_name) = Self::parse_target_name(name)?;
 
@@ -760,6 +759,9 @@ impl Xattr {
         self.flush()
     }
 
+    /// Frees the xattr block entirely (called during inode eviction).
+    ///
+    /// Linux: /root/linux/fs/ext2/xattr.c:816-861 (ext2_xattr_delete_inode)
     pub(super) fn delete_xattr_block(&mut self) -> Result<()> {
         if self.bid == 0 {
             self.block_buf = None;
@@ -775,6 +777,7 @@ impl Xattr {
         Ok(())
     }
 
+    /// Writes the dirty xattr block back to disk.
     pub(super) fn flush(&mut self) -> Result<()> {
         if !self.dirty {
             return Ok(());
@@ -804,6 +807,7 @@ impl Xattr {
         }
     }
 
+    /// Lazily loads the xattr block from disk into `block_buf`.
     pub(super) fn load_block(&mut self) -> Result<()> {
         self.ensure_loaded()
     }
