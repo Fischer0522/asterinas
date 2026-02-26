@@ -519,17 +519,13 @@ Goal: support extended attributes and file attribute ioctls.
 ### Module 10.1: Extended Attributes Core
 - New/extend structs:
   - `XattrEntry` (on-disk xattr entry format).
-  - `XattrBlock` (xattr block reader/writer).
-- Methods:
-  - `Inode::getxattr(name)`.
-  - `Inode::setxattr(name, value, flags)`.
-  - `Inode::listxattr()`.
-  - `Inode::removexattr(name)`.
+  - `Xattr` (xattr).
+  - ...
 - Linux refs:
   - `/root/linux/fs/ext2/xattr.c:200` (`ext2_xattr_get`).
   - `/root/linux/fs/ext2/xattr.c:400` (`ext2_xattr_set`).
 - Asterinas adjustments:
-  - use PageCache for xattr block I/O.
+  - use USegment for xattr block I/O.
   - namespace handlers as trait objects or enum dispatch.
 - Spec: `phase-10-xattr-core.spec`.
 - Status: ❌ not implemented (VfsInode methods return EOPNOTSUPP).
