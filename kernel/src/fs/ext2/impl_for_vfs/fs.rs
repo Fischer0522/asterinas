@@ -24,7 +24,7 @@ impl FileSystem for Ext2 {
 
     fn root_inode(&self) -> Arc<dyn VfsInode> {
         // Linux: /root/linux/fs/ext2/super.c:877 (ext2_fill_super root inode setup)
-        self.root_inode()
+        self.root_inode().unwrap()
     }
 
     fn sb(&self) -> SuperBlock {

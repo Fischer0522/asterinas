@@ -40,8 +40,6 @@ pub struct Ext2 {
     block_size: usize,
     /// Group descriptor table segment.
     group_descriptors_segment: USegment,
-    /// Cached root inode for VFS `root_inode()` calls.
-    root_inode: Arc<Inode>,
     /// FS event stats for VFS.
     fs_event_subscriber_stats: FsEventSubscriberStats,
     /// Per-filesystem inode generation counter.
@@ -71,8 +69,6 @@ impl Ext2 {
 
         let block_groups =
             Self::load_block_groups(&super_block, &group_descriptors_segment, device.clone())?;
-        let root_desc = Self::read_inode_desc_from_parts(&super_block, &block_groups, ROOT_INO)?;
-        let root_block_group_idx = ((ROOT_INO - 1) / inodes_per_group) as usize;
 
         let ext2 = Arc::new_cyclic(|weak_self| Ext2 {
             block_groups,
@@ -83,13 +79,6 @@ impl Ext2 {
             inode_size,
             block_size,
             group_descriptors_segment,
-            root_inode: Inode::new(
-                ROOT_INO,
-                root_desc.type_(),
-                Dirty::new(root_desc),
-                root_block_group_idx,
-                weak_self.clone(),
-            ),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             next_generation: AtomicU32::new(now().as_secs() as u32),
             self_ref: weak_self.clone(),
@@ -134,8 +123,8 @@ impl Ext2 {
     }
 
     /// Returns the root inode.
-    pub fn root_inode(&self) -> Arc<Inode> {
-        self.root_inode.clone()
+    pub fn root_inode(&self) -> Result<Arc<Inode>> {
+        self.read_inode(ROOT_INO)
     }
 
     /// Reads an inode via per-block-group inode cache.

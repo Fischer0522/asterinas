@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::{cmp::Ordering, mem::size_of};
+use core::mem::size_of;
 
 use device_id::{decode_device_numbers, encode_device_numbers};
 use ostd::{const_assert, mm::io_util::HasVmReaderWriter};
@@ -97,6 +97,14 @@ impl Inode {
             .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))
     }
 
+    fn has_invalid_child_name(name: &str) -> bool {
+        let name_bytes = name.as_bytes();
+        name_bytes.is_empty()
+            || name_bytes.len() > u8::MAX as usize
+            || name_bytes == b"."
+            || name_bytes == b".."
+    }
+
     pub(super) fn file_size(&self) -> usize {
         self.inner.read().desc.size as usize
     }
@@ -124,14 +132,13 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs_arc()?;
         // SPEC: acquire inode write lock before mutating block_ptrs and timestamps.
         let mut inner = self.inner.write();
         // DIFF from Linux: Linux caches dev_t in i_rdev and encodes during write_inode;
         // Asterinas stores the Linux-compatible on-disk encoding directly in block_ptrs.
         inner.desc.encode_device_id(device_id);
         inner.desc.ctime = now();
-        inner.persist_inode_and_sync(&fs)
+        inner.persist_inode()
     }
 
     pub(super) fn resize(&self, new_size: usize) -> Result<()> {
@@ -141,101 +148,60 @@ impl Inode {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
         }
 
-        let old_size = {
-            let inner = self.inner.read();
-            if inner.desc.type_ != InodeType::File
-                && inner.desc.type_ != InodeType::Dir
-                && inner.desc.type_ != InodeType::SymLink
-            {
-                return_errno!(Errno::EINVAL);
-            }
-
-            // Linux: /root/linux/fs/ext2/inode.c:48-55 (ext2_inode_is_fast_symlink).
-            // Keep resize invalid for existing fast symlinks (inline payload), but
-            // allow empty newly-created symlink inodes to grow into slow symlinks.
-            if inner.desc.is_fast_symlink(block_size) && inner.desc.size != 0 {
-                return_errno!(Errno::EINVAL);
-            }
-
-            if inner
-                .desc
-                .flags
-                .intersects(FileFlags::APPEND_ONLY | FileFlags::IMMUTABLE)
-            {
-                return_errno!(Errno::EPERM);
-            }
-
-            let old_size = inner.desc.size as usize;
-            if new_size == old_size {
-                return Ok(());
-            }
-            old_size
-        };
-
-        if new_size < old_size {
-            // Linux: /root/linux/fs/buffer.c:2654 (block_truncate_page)
-            // Keep shrink tail-zeroing in a read-compatible phase before metadata
-            // mutation/truncate, then atomically upgrade for commit.
-            let upread_inner = self.inner.upread();
-            let current_size = upread_inner.desc.size as usize;
-            if new_size < current_size && new_size % block_size != 0 {
-                let zero_to = new_size.align_up(block_size);
-                upread_inner.page_cache.fill_zeros(new_size..zero_to)?;
-            }
-
-            let mut inner = upread_inner.upgrade();
-            let old_size = inner.desc.size as usize;
-            if new_size == old_size {
-                return Ok(());
-            }
-            if new_size < old_size {
-                let old_size_aligned = old_size.align_up(block_size);
-                let new_size_aligned = new_size.align_up(block_size);
-                if new_size_aligned < old_size_aligned {
-                    inner
-                        .page_cache
-                        .discard_range(new_size_aligned..old_size_aligned);
-                }
-                inner.page_cache.resize(new_size_aligned)?;
-                inner.desc.size = new_size as u64;
-                inner.truncate_blocks(new_size)?;
-            } else {
-                inner.page_cache.resize(new_size.align_up(block_size))?;
-                inner.desc.size = new_size as u64;
-            }
-
-            let current = now();
-            inner.desc.mtime = current;
-            inner.desc.ctime = current;
-            return inner.persist_inode_and_sync(&fs);
+        let inner = self.inner.upread();
+        if inner.desc.type_ != InodeType::File
+            && inner.desc.type_ != InodeType::Dir
+            && inner.desc.type_ != InodeType::SymLink
+        {
+            return_errno!(Errno::EINVAL);
         }
 
-        let mut inner = self.inner.write();
+        // Linux: /root/linux/fs/ext2/inode.c:48-55 (ext2_inode_is_fast_symlink).
+        // Keep resize invalid for existing fast symlinks (inline payload), but
+        // allow empty newly-created symlink inodes to grow into slow symlinks.
+        if inner.desc.is_fast_symlink(block_size) && inner.desc.size != 0 {
+            return_errno!(Errno::EINVAL);
+        }
+
+        if inner
+            .desc
+            .flags
+            .intersects(FileFlags::APPEND_ONLY | FileFlags::IMMUTABLE)
+        {
+            return_errno!(Errno::EPERM);
+        }
+
         let old_size = inner.desc.size as usize;
+
         if new_size == old_size {
             return Ok(());
         }
 
         if new_size < old_size {
-            let old_size_aligned = old_size.align_up(block_size);
-            let new_size_aligned = new_size.align_up(block_size);
-            if new_size_aligned < old_size_aligned {
-                inner
-                    .page_cache
-                    .discard_range(new_size_aligned..old_size_aligned);
+            // Linux: /root/linux/fs/buffer.c:2654 (block_truncate_page)
+            // Keep shrink tail-zeroing in a read-compatible phase before metadata
+            // mutation/truncate, then atomically upgrade for commit.
+            if new_size % block_size != 0 {
+                let zero_to = new_size.align_up(block_size);
+                inner.page_cache.fill_zeros(new_size..zero_to)?;
             }
-            inner.page_cache.resize(new_size_aligned)?;
-            inner.desc.size = new_size as u64;
-            inner.truncate_blocks(new_size)?;
+            inner.page_cache.resize(new_size)?;
+            let mut inner = inner.upgrade();
+            if let Err(_) = inner.shrink(new_size) {
+                // TODO: add a more elegant way to rollback this error.
+                inner.page_cache.resize(old_size)?;
+                return Err(Error::with_message(Errno::EIO, "failed to shrink inode"));
+            }
         } else {
-            inner.page_cache.resize(new_size.align_up(block_size))?;
-            inner.desc.size = new_size as u64;
+            inner.page_cache.resize(new_size)?;
+            let mut inner = inner.upgrade();
+            if let Err(_) = inner.expand(new_size) {
+                // TODO: add a more elegant way to rollback this error.
+                inner.page_cache.resize(old_size)?;
+                return Err(Error::with_message(Errno::EIO, "failed to expand inode"));
+            }
         }
-
-        let current = now();
-        inner.desc.mtime = current;
-        inner.desc.ctime = current;
-        inner.persist_inode_and_sync(&fs)
+        Ok(())
     }
 
     pub(super) fn metadata(&self) -> Metadata {
@@ -274,63 +240,59 @@ impl Inode {
     }
 
     pub(super) fn mode(&self) -> InodeMode {
-        InodeMode::from_bits_truncate(self.inner.read().desc.perm.bits() as _)
+        self.inner.read().mode()
     }
 
     pub(super) fn set_mode(&self, mode: InodeMode) -> Result<()> {
-        let fs = self.fs_arc()?;
         let mut inner = self.inner.write();
-        inner.desc.perm = FilePerm::from_bits_truncate(mode.bits() as u16);
-        inner.desc.ctime = now();
-        inner.persist_inode_and_sync(&fs)
+        inner.set_mode(mode);
+        Ok(())
     }
 
     pub(super) fn uid(&self) -> u32 {
-        self.inner.read().desc.uid
+        self.inner.read().uid()
     }
 
     pub(super) fn set_uid(&self, uid: u32) -> Result<()> {
-        let fs = self.fs_arc()?;
         let mut inner = self.inner.write();
-        inner.desc.uid = uid;
-        inner.desc.ctime = now();
-        inner.persist_inode_and_sync(&fs)
+        inner.set_uid(uid);
+        inner.set_ctime(now());
+        Ok(())
     }
 
     pub(super) fn gid(&self) -> u32 {
-        self.inner.read().desc.gid
+        self.inner.read().gid()
     }
 
     pub(super) fn set_gid(&self, gid: u32) -> Result<()> {
-        let fs = self.fs_arc()?;
         let mut inner = self.inner.write();
-        inner.desc.gid = gid;
-        inner.desc.ctime = now();
-        inner.persist_inode_and_sync(&fs)
+        inner.set_gid(gid);
+        inner.set_ctime(now());
+        Ok(())
     }
 
     pub(super) fn atime(&self) -> Duration {
-        self.inner.read().desc.atime
+        self.inner.read().atime()
     }
 
     pub(super) fn set_atime(&self, time: Duration) {
-        self.inner.write().desc.atime = time;
+        self.inner.write().set_atime(time);
     }
 
     pub(super) fn mtime(&self) -> Duration {
-        self.inner.read().desc.mtime
+        self.inner.read().mtime()
     }
 
     pub(super) fn set_mtime(&self, time: Duration) {
-        self.inner.write().desc.mtime = time;
+        self.inner.write().set_mtime(time);
     }
 
     pub(super) fn ctime(&self) -> Duration {
-        self.inner.read().desc.ctime
+        self.inner.read().ctime()
     }
 
     pub(super) fn set_ctime(&self, time: Duration) {
-        self.inner.write().desc.ctime = time;
+        self.inner.write().set_ctime(time);
     }
 
     /// Reads one extended-attribute value and writes it to `value_writer`.
@@ -388,11 +350,10 @@ impl Inode {
         let new_bid = xattr.bid();
         drop(xattr);
 
-        let fs = self.fs_arc()?;
         let mut inner = self.inner.write();
         inner.desc.file_acl = new_bid;
         inner.desc.ctime = now();
-        inner.persist_inode_and_sync(&fs)
+        inner.persist_inode()
     }
 
     /// Removes one extended attribute.
@@ -411,10 +372,9 @@ impl Inode {
         let new_bid = xattr.bid();
         drop(xattr);
 
-        let fs = self.fs_arc()?;
         let mut inner = self.inner.write();
         inner.desc.file_acl = new_bid;
-        inner.persist_inode_and_sync(&fs)
+        inner.persist_inode()
     }
 
     /// Reads symbolic-link target bytes and decodes them as UTF-8.
@@ -503,7 +463,7 @@ impl Inode {
 
             inner.desc.size = target_len as u64;
             inner.desc.blocks = 0;
-            inner.persist_inode_and_sync(&fs)?;
+            inner.persist_inode()?;
             return Ok(());
         }
 
@@ -560,7 +520,7 @@ impl Inode {
         }
 
         let mut inner = upread_inner.upgrade();
-        inner.persist_inode_and_sync(&fs)?;
+        inner.persist_inode()?;
         Ok(())
     }
 
@@ -613,31 +573,8 @@ impl Inode {
         {
             let mut inner = self.inner.write();
             old_size = inner.desc.size as usize;
-            let start_block = offset / block_size;
-            let end_block = end.div_ceil(block_size);
 
-            // Phase 1: ensure all target blocks exist and grow page-cache/file size
-            // first, so data write (phase 2) only touches mapped pages.
-            let phase1_result = (|| -> Result<()> {
-                for iblock in start_block..end_block {
-                    let iblock = u32::try_from(iblock).map_err(|_| {
-                        Error::with_message(Errno::EINVAL, "logical block number overflow")
-                    })?;
-                    if inner.get_or_alloc_block(iblock, true)?.is_none() {
-                        return_errno_with_message!(
-                            Errno::EIO,
-                            "missing block mapping after allocation"
-                        );
-                    }
-                }
-
-                if end > old_size {
-                    inner.page_cache.resize(end.align_up(block_size))?;
-                    inner.desc.size = end as u64;
-                }
-
-                Ok(())
-            })();
+            let phase1_result = inner.prepare_continuous_blocks(offset, end, block_size, false);
 
             if let Err(err) = phase1_result {
                 Self::write_failed_cleanup(&mut inner, old_size, end, block_size);
@@ -657,7 +594,7 @@ impl Inode {
         let current = now();
         inner.desc.mtime = current;
         inner.desc.ctime = current;
-        inner.persist_inode_and_sync(&fs)?;
+        inner.persist_inode()?;
         Ok(write_len)
     }
 
@@ -681,15 +618,16 @@ impl Inode {
         let read_len = {
             let inner = self.inner.read();
             let file_size = inner.desc.size as usize;
-            if offset >= file_size {
+            if offset >= file_size || writer.avail() == 0 {
                 0
             } else {
                 let read_len = writer.avail().min(file_size - offset);
                 let end = offset
                     .checked_add(read_len)
                     .ok_or_else(|| Error::with_message(Errno::EINVAL, "read range overflow"))?;
-                inner.page_cache.discard_range(offset..end);
-                inner.read_at(offset, writer)?
+                inner.page_cache.evict_range(offset..end)?;
+                inner.read_direct_at(offset, end, writer)?;
+                read_len
             }
         };
 
@@ -728,44 +666,16 @@ impl Inode {
         {
             let mut inner = self.inner.write();
             old_size = inner.desc.size as usize;
-            let start_block = offset / block_size;
-            let end_block = end.div_ceil(block_size);
 
-            let phase1_result = (|| -> Result<()> {
-                for iblock in start_block..end_block {
-                    let iblock = u32::try_from(iblock).map_err(|_| {
-                        Error::with_message(Errno::EINVAL, "logical block number overflow")
-                    })?;
-                    if inner.get_or_alloc_block(iblock, true)?.is_none() {
-                        return_errno_with_message!(
-                            Errno::EIO,
-                            "missing block mapping after allocation"
-                        );
-                    }
-                }
-
-                if end > old_size {
-                    inner.page_cache.resize(end.align_up(block_size))?;
-                    inner.desc.size = end as u64;
-                }
-
-                let discard_start = offset.min(old_size);
-                let discard_end = end.min(old_size);
-                if discard_start < discard_end {
-                    inner.page_cache.discard_range(discard_start..discard_end);
-                }
-
-                Ok(())
-            })();
-
-            if let Err(err) = phase1_result {
+            let prepare_ret = inner.prepare_continuous_blocks(offset, end, block_size, true);
+            if let Err(err) = prepare_ret {
                 Self::write_failed_cleanup(&mut inner, old_size, end, block_size);
                 return Err(err);
             }
         }
 
         let upread_inner = self.inner.upread();
-        if let Err(err) = upread_inner.write_at(offset, reader) {
+        if let Err(err) = upread_inner.write_direct_at(offset, reader) {
             let mut inner = upread_inner.upgrade();
             Self::write_failed_cleanup(&mut inner, old_size, end, block_size);
             return Err(err);
@@ -773,9 +683,9 @@ impl Inode {
 
         let mut inner = upread_inner.upgrade();
         let current = now();
-        inner.desc.mtime = current;
-        inner.desc.ctime = current;
-        inner.persist_inode_and_sync(&fs)?;
+        inner.set_mtime(current);
+        inner.set_ctime(current);
+        inner.persist_inode()?;
         Ok(write_len)
     }
 
@@ -862,7 +772,7 @@ impl Inode {
 
         // SPEC: upgrade after cache write to commit inode metadata.
         let mut write_inner = inner.upgrade();
-        write_inner.commit_dir_metadata(&fs)
+        write_inner.commit_dir_metadata()
     }
 
     pub(super) fn readdir_at(
@@ -890,7 +800,6 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs_arc()?;
         let inner = self.inner.upread();
         let target = inner.find_entry_target(name).map_err(|err| {
             if err.error() == Errno::ENOENT {
@@ -902,7 +811,7 @@ impl Inode {
         inner.delete_entry_in_cache(&target)?;
 
         let mut write_inner = inner.upgrade();
-        write_inner.commit_dir_metadata(&fs)
+        write_inner.commit_dir_metadata()
     }
 
     /// Initializes a directory with `.` and `..` using write->upread->write phases.
@@ -979,7 +888,7 @@ impl Inode {
         }
 
         let mut write_inner = upread_inner.upgrade();
-        if let Err(err) = write_inner.persist_inode_and_sync(&fs) {
+        if let Err(err) = write_inner.persist_inode() {
             let mut write_inner = write_inner;
             write_inner.page_cache.discard_range(0..block_size);
             write_inner.desc.block_ptrs[0] = old_ptr0;
@@ -1001,12 +910,7 @@ impl Inode {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let name_bytes = name.as_bytes();
-        if name_bytes.is_empty()
-            || name_bytes.len() > u8::MAX as usize
-            || name_bytes == b"."
-            || name_bytes == b".."
-        {
+        if Self::has_invalid_child_name(name) {
             return_errno!(Errno::EINVAL);
         }
 
@@ -1028,7 +932,7 @@ impl Inode {
         let target = parent_upread.find_entry_target(name)?;
         parent_upread.delete_entry_in_cache(&target)?;
         let mut parent_write = parent_upread.upgrade();
-        parent_write.commit_dir_metadata(&fs)?;
+        parent_write.commit_dir_metadata()?;
 
         {
             let mut child_write = child.inner.write();
@@ -1036,14 +940,14 @@ impl Inode {
             child_write.desc.links_count = child_write.desc.links_count.saturating_sub(2);
             child_write.desc.dtime = now();
             child_write.is_freed = true;
-            child_write.persist_inode_and_sync(&fs)?;
+            child_write.persist_inode()?;
         }
 
         parent_write.desc.links_count = parent_write.desc.links_count.saturating_sub(1);
         // SPEC: parent link-count change in rmdir is a directory mutation; refresh
         // ctime/mtime the same way as add/delete entry paths.
         // Linux: /root/linux/fs/ext2/namei.c:312 (inode_dec_link_count(dir)).
-        parent_write.commit_dir_metadata(&fs)?;
+        parent_write.commit_dir_metadata()?;
         Ok(())
     }
 
@@ -1055,12 +959,7 @@ impl Inode {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let name_bytes = name.as_bytes();
-        if name_bytes.is_empty()
-            || name_bytes.len() > u8::MAX as usize
-            || name_bytes == b"."
-            || name_bytes == b".."
-        {
+        if Self::has_invalid_child_name(name) {
             return_errno!(Errno::EINVAL);
         }
 
@@ -1113,7 +1012,7 @@ impl Inode {
         }
 
         let mut parent_write = parent_guard.upgrade();
-        if let Err(err) = parent_write.commit_dir_metadata(&fs) {
+        if let Err(err) = parent_write.commit_dir_metadata() {
             let _ = self.delete_entry(name);
             {
                 let mut child_inner = child.inner.write();
@@ -1175,7 +1074,7 @@ impl Inode {
         // SPEC: fsync step 2 persists inode metadata after data writeback.
         // Linux: /root/linux/fs/buffer.c:619 (sync_inode_metadata).
         let mut inner = inner.upgrade();
-        inner.persist_inode_and_sync(&fs)?;
+        inner.persist_inode()?;
 
         // SPEC: fsync step 3 flushes device write cache.
         // Linux: /root/linux/fs/buffer.c:654 (blkdev_issue_flush).
@@ -1195,7 +1094,6 @@ impl Inode {
             return Ok(false);
         }
 
-        let fs = self.fs_arc()?;
         if let Some(xattr) = self.xattr.as_ref() {
             xattr.write().delete_xattr_block()?;
         }
@@ -1206,7 +1104,7 @@ impl Inode {
         inner.desc.size = 0;
         inner.desc.file_acl = 0;
         inner.truncate_blocks(0)?;
-        inner.persist_inode_and_sync(&fs)?;
+        inner.persist_inode()?;
 
         Ok(true)
     }
@@ -1217,15 +1115,16 @@ impl Inode {
         {
             // SPEC: fdatasync always writes back dirty data pages first.
             // Linux: /root/linux/fs/buffer.c:609 (file_write_and_wait_range).
-            let mut inner = self.inner.write();
+            let inner = self.inner.upread();
             inner.sync_data()?;
 
             // SPEC: Linux writes metadata when I_DIRTY_DATASYNC is set.
             // Linux: /root/linux/fs/buffer.c:616-619.
             // Asterinas uses desc.is_dirty() as a conservative approximation
             // so fdatasync never misses i_size/block-mapping persistence.
+            let mut inner = inner.upgrade();
             if inner.desc.is_dirty() {
-                inner.persist_inode_and_sync(&fs)?;
+                inner.persist_inode()?;
             }
         }
 
@@ -1357,30 +1256,62 @@ impl InodeInner {
             .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))
     }
 
+    fn mode(&self) -> InodeMode {
+        InodeMode::from_bits_truncate(self.desc.perm.bits())
+    }
+
+    fn set_mode(&mut self, mode: InodeMode) {
+        self.desc.perm = FilePerm::from_bits_truncate(mode.bits() as u16);
+        self.set_ctime(now());
+    }
+
+    fn uid(&self) -> u32 {
+        self.desc.uid
+    }
+
+    fn set_uid(&mut self, uid: u32) {
+        self.desc.uid = uid;
+    }
+
+    fn gid(&self) -> u32 {
+        self.desc.gid
+    }
+
+    fn set_gid(&mut self, gid: u32) {
+        self.desc.gid = gid;
+    }
+
+    fn atime(&self) -> Duration {
+        self.desc.atime
+    }
+
+    fn set_atime(&mut self, time: Duration) {
+        self.desc.atime = time;
+    }
+
+    fn mtime(&self) -> Duration {
+        self.desc.mtime
+    }
+
+    fn set_mtime(&mut self, time: Duration) {
+        self.desc.mtime = time;
+    }
+
+    fn ctime(&self) -> Duration {
+        self.desc.ctime
+    }
+
+    fn set_ctime(&mut self, time: Duration) {
+        self.desc.ctime = time;
+    }
+
     /// Reads file data directly from data blocks into `writer`.
     ///
     /// Linux: /root/linux/fs/ext2/file.c:168 (ext2_dio_read_iter)
-    pub fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
-        if self.desc.type_ == InodeType::Dir {
-            return_errno!(Errno::EISDIR);
-        }
-
-        let file_size = self.desc.size as usize;
-        if offset >= file_size || writer.avail() == 0 {
-            return Ok(0);
-        }
-
+    pub fn read_direct_at(&self, offset: usize, end: usize, writer: &mut VmWriter) -> Result<()> {
         let fs = self.fs_arc()?;
         let block_size = fs.block_size();
-        if block_size == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
-        }
-
-        let read_len = writer.avail().min(file_size - offset);
         let mut current_offset = offset;
-        let end = offset
-            .checked_add(read_len)
-            .ok_or_else(|| Error::with_message(Errno::EINVAL, "read range overflow"))?;
 
         while current_offset < end {
             let iblock = u32::try_from(current_offset / block_size)
@@ -1437,30 +1368,18 @@ impl InodeInner {
             current_offset += bytes_this_block;
         }
 
-        Ok(read_len)
+        Ok(())
     }
 
     /// Writes file data directly to already-allocated data blocks.
     ///
     /// Linux: /root/linux/fs/ext2/file.c:214 (ext2_dio_write_iter)
-    pub fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
-        if self.desc.type_ == InodeType::Dir {
-            return_errno!(Errno::EISDIR);
-        }
-        if reader.remain() == 0 {
-            return Ok(0);
-        }
-
+    pub fn write_direct_at(&self, offset: usize, reader: &mut VmReader) -> Result<()> {
         let fs = self.fs_arc()?;
         let block_size = fs.block_size();
-        if block_size == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
-        }
-
         let write_len = reader.remain();
-        let end = offset
-            .checked_add(write_len)
-            .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
+        // end is already checked in `Inode::write_direct_at`.
+        let end = offset + write_len;
         let mut current_offset = offset;
 
         while current_offset < end {
@@ -1522,95 +1441,118 @@ impl InodeInner {
             current_offset += bytes_this_block;
         }
 
-        Ok(write_len)
+        Ok(())
     }
 
-    /// Resizes this inode to `new_size` bytes.
-    ///
-    /// Linux: /root/linux/fs/ext2/inode.c:1275 (ext2_setsize)
-    pub fn resize(&mut self, new_size: usize) -> Result<()> {
-        // SPEC: ext2_setsize only supports regular file, directory, and symlink.
-        if self.desc.type_ != InodeType::File
-            && self.desc.type_ != InodeType::Dir
-            && self.desc.type_ != InodeType::SymLink
-        {
-            return_errno!(Errno::EINVAL);
-        }
+    fn expand(&mut self, new_size: usize) -> Result<()> {
+        self.desc.size = new_size as u64;
+        let current = now();
+        self.desc.mtime = current;
+        self.desc.ctime = current;
+        self.persist_inode()
+    }
 
-        // TODO: refactor this into a new func
-        // FIXME: Linux ext2_inode_is_fast_symlink (fs/ext2/inode.c:48-55) uses:
-        //   S_ISLNK && (i_blocks - ea_blocks == 0),
-        // where ea_blocks depends on i_file_acl:
-        //   ea_blocks = i_file_acl != 0 ? (block_size >> 9) : 0.
-        // ACL/EA accounting is not implemented in this path yet, so this remains
-        // an approximation until ACL support is added.
-        // SPEC: reject fast symlink (inline data in i_block[]).
-        if self.desc.type_ == InodeType::SymLink && self.desc.blocks == 0 && self.desc.size <= 60 {
-            return_errno!(Errno::EINVAL);
-        }
-
-        // SPEC: Linux IS_APPEND/IS_IMMUTABLE gate.
-        if self
-            .desc
-            .flags
-            .intersects(FileFlags::APPEND_ONLY | FileFlags::IMMUTABLE)
-        {
-            return_errno!(Errno::EPERM);
-        }
-
-        let fs = self.fs_arc()?;
-        let block_size = fs.block_size();
-        if block_size == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
-        }
-
+    fn shrink(&mut self, new_size: usize) -> Result<()> {
         let old_size = self.desc.size as usize;
         if new_size == old_size {
             return Ok(());
         }
 
-        // SPEC: ext2_setsize calls block_truncate_page before size update.
-        if new_size % block_size != 0 {
-            let tail_iblock = u32::try_from(new_size / block_size)
-                .map_err(|_| Error::with_message(Errno::EINVAL, "resize block index overflow"))?;
-            let zero_from = new_size % block_size;
-            if let Some(tail_bid) = self.get_block(tail_iblock)? {
-                let mut block_buf = vec![0u8; block_size];
-                if fs
-                    .block_device()
-                    .read_bytes(tail_bid.to_offset(), &mut block_buf)
-                    .is_err()
-                {
-                    return_errno_with_message!(
-                        Errno::EIO,
-                        "failed to read tail block during resize"
-                    );
-                }
-                block_buf[zero_from..].fill(0);
-                if fs
-                    .block_device()
-                    .write_bytes(tail_bid.to_offset(), &block_buf)
-                    .is_err()
-                {
-                    return_errno_with_message!(
-                        Errno::EIO,
-                        "failed to write tail block during resize"
-                    );
-                }
-            }
-        }
-
-        // SPEC: Linux truncate_setsize updates i_size before block release.
-        // Linux ext2_setsize then always calls __ext2_truncate_blocks, even on
-        // extension, so keep the same control-flow here.
-        self.desc.size = new_size as u64;
         self.truncate_blocks(new_size)?;
+        self.desc.size = new_size as u64;
+
         let current = now();
         self.desc.mtime = current;
         self.desc.ctime = current;
-        self.persist_inode_and_sync(&fs)?;
-        Ok(())
+        self.persist_inode()
     }
+
+    /// Resizes this inode to `new_size` bytes.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:1275 (ext2_setsize)
+    // pub fn resize(&mut self, new_size: usize) -> Result<()> {
+    //     // SPEC: ext2_setsize only supports regular file, directory, and symlink.
+    //     if self.desc.type_ != InodeType::File
+    //         && self.desc.type_ != InodeType::Dir
+    //         && self.desc.type_ != InodeType::SymLink
+    //     {
+    //         return_errno!(Errno::EINVAL);
+    //     }
+
+    //     // TODO: refactor this into a new func
+    //     // FIXME: Linux ext2_inode_is_fast_symlink (fs/ext2/inode.c:48-55) uses:
+    //     //   S_ISLNK && (i_blocks - ea_blocks == 0),
+    //     // where ea_blocks depends on i_file_acl:
+    //     //   ea_blocks = i_file_acl != 0 ? (block_size >> 9) : 0.
+    //     // ACL/EA accounting is not implemented in this path yet, so this remains
+    //     // an approximation until ACL support is added.
+    //     // SPEC: reject fast symlink (inline data in i_block[]).
+    //     if self.desc.type_ == InodeType::SymLink && self.desc.blocks == 0 && self.desc.size <= 60 {
+    //         return_errno!(Errno::EINVAL);
+    //     }
+
+    //     // SPEC: Linux IS_APPEND/IS_IMMUTABLE gate.
+    //     if self
+    //         .desc
+    //         .flags
+    //         .intersects(FileFlags::APPEND_ONLY | FileFlags::IMMUTABLE)
+    //     {
+    //         return_errno!(Errno::EPERM);
+    //     }
+
+    //     let fs = self.fs_arc()?;
+    //     let block_size = fs.block_size();
+    //     if block_size == 0 {
+    //         return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+    //     }
+
+    //     let old_size = self.desc.size as usize;
+    //     if new_size == old_size {
+    //         return Ok(());
+    //     }
+
+    //     // SPEC: ext2_setsize calls block_truncate_page before size update.
+    //     if new_size % block_size != 0 {
+    //         let tail_iblock = u32::try_from(new_size / block_size)
+    //             .map_err(|_| Error::with_message(Errno::EINVAL, "resize block index overflow"))?;
+    //         let zero_from = new_size % block_size;
+    //         if let Some(tail_bid) = self.get_block(tail_iblock)? {
+    //             let mut block_buf = vec![0u8; block_size];
+    //             if fs
+    //                 .block_device()
+    //                 .read_bytes(tail_bid.to_offset(), &mut block_buf)
+    //                 .is_err()
+    //             {
+    //                 return_errno_with_message!(
+    //                     Errno::EIO,
+    //                     "failed to read tail block during resize"
+    //                 );
+    //             }
+    //             block_buf[zero_from..].fill(0);
+    //             if fs
+    //                 .block_device()
+    //                 .write_bytes(tail_bid.to_offset(), &block_buf)
+    //                 .is_err()
+    //             {
+    //                 return_errno_with_message!(
+    //                     Errno::EIO,
+    //                     "failed to write tail block during resize"
+    //                 );
+    //             }
+    //         }
+    //     }
+
+    //     // SPEC: Linux truncate_setsize updates i_size before block release.
+    //     // Linux ext2_setsize then always calls __ext2_truncate_blocks, even on
+    //     // extension, so keep the same control-flow here.
+    //     self.desc.size = new_size as u64;
+    //     self.truncate_blocks(new_size)?;
+    //     let current = now();
+    //     self.desc.mtime = current;
+    //     self.desc.ctime = current;
+    //     self.persist_inode()?;
+    //     Ok(())
+    // }
 
     /// Frees blocks beyond `new_size`.
     ///
@@ -2065,7 +2007,7 @@ impl InodeInner {
     //         .checked_add(sectors_per_block)
     //         .ok_or_else(|| Error::with_message(Errno::EIO, "inode block count overflow"))?;
 
-    //     if let Err(err) = self.persist_inode_and_sync(&fs) {
+    //     if let Err(err) = self.persist_inode() {
     //         // SPEC: cleanup allocation and restore pre-state if persistence failed.
     //         self.desc.block_ptrs[0] = old_ptr0;
     //         self.desc.size = old_size;
@@ -2212,7 +2154,7 @@ impl InodeInner {
     //     }
 
     //     // SPEC: persist parent link count update.
-    //     if let Err(err) = self.persist_inode_and_sync(&fs) {
+    //     if let Err(err) = self.persist_inode() {
     //         let _ = self.delete_entry(name);
     //         {
     //             let mut child_inner = child.inner.write();
@@ -2264,11 +2206,11 @@ impl InodeInner {
     //         child_inner.release_dir_data_blocks_for_cleanup(&fs)?;
     //         child_inner.desc.size = 0;
     //         child_inner.desc.links_count = child_inner.desc.links_count.saturating_sub(2);
-    //         child_inner.persist_inode_and_sync(&fs)?;
+    //         child_inner.persist_inode()?;
     //     }
 
     //     self.desc.links_count = self.desc.links_count.saturating_sub(1);
-    //     self.persist_inode_and_sync(&fs)?;
+    //     self.persist_inode()?;
 
     //     fs.free_inode(child_ino)
     // }
@@ -2814,6 +2756,41 @@ impl InodeInner {
         Ok(Bid::new(data_block as u64))
     }
 
+    fn prepare_continuous_blocks(
+        &mut self,
+        offset: usize,
+        end: usize,
+        block_size: usize,
+        discard_page_cache: bool,
+    ) -> Result<()> {
+        let start_block = offset / block_size;
+        let end_block = end.div_ceil(block_size);
+        let old_size = self.desc.size as usize;
+
+        for iblock in start_block..end_block {
+            let iblock = u32::try_from(iblock)
+                .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
+            if self.get_or_alloc_block(iblock, true)?.is_none() {
+                return_errno_with_message!(Errno::EIO, "missing block mapping after allocation");
+            }
+        }
+
+        if end > old_size {
+            self.page_cache.resize(end.align_up(block_size))?;
+            self.desc.size = end as u64;
+        }
+
+        if discard_page_cache {
+            let discard_start = offset.min(old_size);
+            let discard_end = end.min(old_size);
+            if discard_start < discard_end {
+                self.page_cache.discard_range(discard_start..discard_end);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Resolves a logical block to physical, allocating a missing branch if requested.
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:624 (ext2_get_blocks, create path)
@@ -2986,9 +2963,9 @@ impl InodeInner {
     /// Phase 4: update directory ctime/mtime and persist inode.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:84 (ext2_commit_chunk)
-    fn commit_dir_metadata(&mut self, fs: &Ext2) -> Result<()> {
+    fn commit_dir_metadata(&mut self) -> Result<()> {
         self.update_dir_timestamps_and_flags()?;
-        self.persist_inode_and_sync(fs)
+        self.persist_inode()
     }
 
     /// Locate a target entry by name for delete/set_link operations.
@@ -3101,7 +3078,7 @@ impl InodeInner {
             DirScanResult::NeedGrowth => self.grow_dir_block(&fs)?,
         };
         self.write_dir_entry(&slot, name, ino, file_type as u8)?;
-        self.commit_dir_metadata(&fs)
+        self.commit_dir_metadata()
     }
 
     /// Rewrites an existing entry's inode/type in-place.
@@ -3133,10 +3110,10 @@ impl InodeInner {
         self.set_link_in_cache(&target, new_ino, file_type as u8)?;
 
         if update_times {
-            self.commit_dir_metadata(&fs)
+            self.commit_dir_metadata()
         } else {
             self.desc.flags.remove(FileFlags::INDEX_DIR);
-            self.persist_inode_and_sync(&fs)
+            self.persist_inode()
         }
     }
 
@@ -3153,7 +3130,6 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs_arc()?;
         let target = self.find_entry_target(name).map_err(|err| {
             if err.error() == Errno::ENOENT {
                 Error::with_message(Errno::EIO, "dir entry not found for delete")
@@ -3162,7 +3138,7 @@ impl InodeInner {
             }
         })?;
         self.delete_entry_in_cache(&target)?;
-        self.commit_dir_metadata(&fs)
+        self.commit_dir_metadata()
     }
 
     fn collect_dir_entries_with_offsets(
@@ -3338,18 +3314,17 @@ impl InodeInner {
 
         // SPEC: evict_range writes back dirty pages in [0, file_size), waits for
         // completion, and keeps pages cached as UpToDate.
-        // Linux equivalent flow: /root/linux/mm/filemap.c:785-790.
         self.page_cache.evict_range(0..file_size)
     }
 
-    fn persist_inode_and_sync(&mut self, fs: &Ext2) -> Result<()> {
+    fn persist_inode(&mut self) -> Result<()> {
         let inode = self
             .weak_self
             .upgrade()
             .ok_or_else(|| Error::with_message(Errno::EIO, "inode already dropped"))?;
         let raw = RawInode::from(&*self.desc);
+        let fs = self.fs_arc()?;
         fs.write_inode_desc(inode.ino, &raw)?;
-        fs.sync_metadata()?;
         self.desc.clear_dirty();
         Ok(())
     }
@@ -3460,12 +3435,7 @@ impl Inode {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let name_bytes = name.as_bytes();
-        if name_bytes.is_empty()
-            || name_bytes.len() > u8::MAX as usize
-            || name_bytes == b"."
-            || name_bytes == b".."
-        {
+        if Self::has_invalid_child_name(name) {
             return_errno!(Errno::EINVAL);
         }
 
@@ -3521,12 +3491,7 @@ impl Inode {
             return_errno!(Errno::EOVERFLOW);
         }
 
-        let name_bytes = name.as_bytes();
-        if name_bytes.is_empty()
-            || name_bytes.len() > u8::MAX as usize
-            || name_bytes == b"."
-            || name_bytes == b".."
-        {
+        if Self::has_invalid_child_name(name) {
             return_errno!(Errno::EINVAL);
         }
 
@@ -3545,7 +3510,6 @@ impl Inode {
             old_inner.desc.ctime = now();
             old_inner.desc.links_count = old_inner.desc.links_count.saturating_add(1);
         }
-
         if let Err(err) = self.add_entry(name, old.ino, dir_ft) {
             // SPEC: rollback link count on add_entry failure.
             let mut old_inner = old.inner.write();
@@ -3553,7 +3517,7 @@ impl Inode {
             return Err(err);
         }
 
-        old.inner.write().persist_inode_and_sync(&fs)?;
+        old.inner.write().persist_inode()?;
         Ok(())
     }
 
@@ -3566,12 +3530,7 @@ impl Inode {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let name_bytes = name.as_bytes();
-        if name_bytes.is_empty()
-            || name_bytes.len() > u8::MAX as usize
-            || name_bytes == b"."
-            || name_bytes == b".."
-        {
+        if Self::has_invalid_child_name(name) {
             return_errno!(Errno::EINVAL);
         }
 
@@ -3599,7 +3558,7 @@ impl Inode {
             child_inner.desc.dtime = now();
             child_inner.is_freed = true;
         }
-        child_inner.persist_inode_and_sync(&fs)?;
+        child_inner.persist_inode()?;
 
         Ok(())
     }
@@ -3616,20 +3575,10 @@ impl Inode {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let old_bytes = old_name.as_bytes();
-        let new_bytes = new_name.as_bytes();
-        if old_bytes.is_empty()
-            || old_bytes.len() > u8::MAX as usize
-            || old_bytes == b"."
-            || old_bytes == b".."
-        {
+        if Self::has_invalid_child_name(old_name) {
             return_errno!(Errno::EISDIR);
         }
-        if new_bytes.is_empty()
-            || new_bytes.len() > u8::MAX as usize
-            || new_bytes == b"."
-            || new_bytes == b".."
-        {
+        if Self::has_invalid_child_name(new_name) {
             return_errno!(Errno::EISDIR);
         }
 
@@ -3713,7 +3662,7 @@ impl Inode {
                 existing_inner.desc.dtime = now();
                 existing_inner.is_freed = true;
             }
-            existing_inner.persist_inode_and_sync(fs)?;
+            existing_inner.persist_inode()?;
         } else {
             // No existing entry: add new entry.
             inner.add_entry(new_name, old_ino, moved_ft)?;
@@ -3723,7 +3672,7 @@ impl Inode {
         {
             let mut old_inner = old_inode.inner.write();
             old_inner.desc.ctime = now();
-            old_inner.persist_inode_and_sync(fs)?;
+            old_inner.persist_inode()?;
         }
 
         // Delete old entry.
@@ -3741,7 +3690,7 @@ impl Inode {
             }
             // Linux line 397: inode_dec_link_count(old_dir) — always when old_is_dir.
             inner.desc.links_count = inner.desc.links_count.saturating_sub(1);
-            inner.persist_inode_and_sync(fs)?;
+            inner.persist_inode()?;
         }
 
         Ok(())
@@ -3813,7 +3762,7 @@ impl Inode {
                 existing_inner.desc.dtime = now();
                 existing_inner.is_freed = true;
             }
-            existing_inner.persist_inode_and_sync(fs)?;
+            existing_inner.persist_inode()?;
         } else {
             // No existing entry: ext2_add_link.
             target_inner.add_entry(new_name, old_ino, moved_ft)?;
@@ -3827,7 +3776,7 @@ impl Inode {
         {
             let mut old_inner = old_inode.inner.write();
             old_inner.desc.ctime = now();
-            old_inner.persist_inode_and_sync(fs)?;
+            old_inner.persist_inode()?;
         }
 
         // Delete old entry from source directory.
@@ -3842,13 +3791,13 @@ impl Inode {
 
             // Linux: inode_dec_link_count(old_dir) — old parent loses a subdir.
             self_inner.desc.links_count = self_inner.desc.links_count.saturating_sub(1);
-            self_inner.persist_inode_and_sync(fs)?;
+            self_inner.persist_inode()?;
 
             // If destination didn't already have the entry (no replacement),
             // target link count was already incremented above.
             // If replacement happened, the replaced dir's link decrement
             // already accounts for it.
-            target_inner.persist_inode_and_sync(fs)?;
+            target_inner.persist_inode()?;
         }
 
         Ok(())
@@ -3887,10 +3836,10 @@ impl Inode {
 
         let mut write_inner = inner.upgrade();
         if update_times {
-            write_inner.commit_dir_metadata(&fs)
+            write_inner.commit_dir_metadata()
         } else {
             write_inner.desc.flags.remove(FileFlags::INDEX_DIR);
-            write_inner.persist_inode_and_sync(&fs)
+            write_inner.persist_inode()
         }
     }
 }
@@ -5493,22 +5442,6 @@ mod test {
     }
 
     #[ktest]
-    fn resize_guard_rejects_invalid_ops() {
-        let mut raw_append = make_raw_inode(0o100644);
-        raw_append.flags = FileFlags::APPEND_ONLY.bits();
-        let append_desc = InodeDesc::try_from(&raw_append).unwrap();
-        let mut append_inner = InodeInner::new(Dirty::new(append_desc), Weak::new(), Weak::new());
-        assert_eq!(append_inner.resize(1).unwrap_err().error(), Errno::EPERM);
-
-        let mut raw_fast_symlink = make_raw_inode(0o120777);
-        raw_fast_symlink.size_lo = 10;
-        raw_fast_symlink.blocks = 0;
-        let symlink_desc = InodeDesc::try_from(&raw_fast_symlink).unwrap();
-        let mut symlink_inner = InodeInner::new(Dirty::new(symlink_desc), Weak::new(), Weak::new());
-        assert_eq!(symlink_inner.resize(4).unwrap_err().error(), Errno::EINVAL);
-    }
-
-    #[ktest]
     fn symlink_fast_round_trip_ok() {
         clocks::init_for_ktest();
 
@@ -5834,10 +5767,9 @@ mod test {
             .unwrap();
         let file = make_live_file_inode(&f.ext2, 24, 0, 0, FileFlags::empty(), [0; 15]);
         let block_size = f.ext2.block_size();
-
-        let mut inner = file.inner.write();
         let target = block_size * 3 + 123;
-        inner.resize(target).unwrap();
+        file.resize(target).unwrap();
+        let inner = file.inner.read();
         assert_eq!(inner.desc.size as usize, target);
         assert_eq!(inner.desc.blocks, 0);
         assert!(inner.desc.block_ptrs.iter().all(|ptr| *ptr == 0));
@@ -6029,19 +5961,21 @@ mod test {
         let ptrs = (block_size / size_of::<u32>()) as u32;
         let first_double_iblock = 12 + ptrs;
 
-        let mut inner = file.inner.write();
-        inner.get_or_alloc_block(first_double_iblock, true).unwrap();
-        inner
-            .get_or_alloc_block(first_double_iblock + 1, true)
-            .unwrap();
-        inner
-            .get_or_alloc_block(first_double_iblock + 2, true)
-            .unwrap();
-        inner.desc.size = ((first_double_iblock as usize + 3) * block_size) as u64;
+        {
+            let mut inner = file.inner.write();
+            inner.get_or_alloc_block(first_double_iblock, true).unwrap();
+            inner
+                .get_or_alloc_block(first_double_iblock + 1, true)
+                .unwrap();
+            inner
+                .get_or_alloc_block(first_double_iblock + 2, true)
+                .unwrap();
+            inner.desc.size = ((first_double_iblock as usize + 3) * block_size) as u64;
+        }
 
-        inner
-            .resize((first_double_iblock as usize + 1) * block_size)
+        file.resize((first_double_iblock as usize + 1) * block_size)
             .unwrap();
+        let inner = file.inner.read();
         assert!(inner.get_block(first_double_iblock).unwrap().is_some());
         assert_eq!(inner.get_block(first_double_iblock + 1).unwrap(), None);
         assert_eq!(inner.get_block(first_double_iblock + 2).unwrap(), None);
@@ -6061,15 +5995,18 @@ mod test {
         let first_double_iblock = 12 + ptrs;
         let first_triple_iblock = 12 + ptrs + (1u32 << (ptrs.trailing_zeros() * 2));
 
-        let mut inner = file.inner.write();
-        inner.get_or_alloc_block(12, true).unwrap();
-        inner.get_or_alloc_block(first_double_iblock, true).unwrap();
-        inner.get_or_alloc_block(first_triple_iblock, true).unwrap();
-        assert_ne!(inner.desc.block_ptrs[12], 0);
-        assert_ne!(inner.desc.block_ptrs[13], 0);
-        assert_ne!(inner.desc.block_ptrs[14], 0);
+        {
+            let mut inner = file.inner.write();
+            inner.get_or_alloc_block(12, true).unwrap();
+            inner.get_or_alloc_block(first_double_iblock, true).unwrap();
+            inner.get_or_alloc_block(first_triple_iblock, true).unwrap();
+            assert_ne!(inner.desc.block_ptrs[12], 0);
+            assert_ne!(inner.desc.block_ptrs[13], 0);
+            assert_ne!(inner.desc.block_ptrs[14], 0);
+        }
 
-        inner.resize(0).unwrap();
+        file.resize(0).unwrap();
+        let inner = file.inner.read();
         assert_eq!(inner.desc.block_ptrs[12], 0);
         assert_eq!(inner.desc.block_ptrs[13], 0);
         assert_eq!(inner.desc.block_ptrs[14], 0);
