@@ -106,7 +106,7 @@ impl Inode {
     }
 
     pub(super) fn file_size(&self) -> usize {
-        self.inner.read().desc.size as usize
+        self.inner.read().meta.desc.size as usize
     }
 
     /// Returns the encoded device ID for special files.
@@ -120,7 +120,7 @@ impl Inode {
 
         // SPEC: acquire inode read lock before reading i_block-based device encoding.
         let inner = self.inner.read();
-        inner.desc.decode_device_id()
+        inner.decode_device_id()
     }
 
     /// Sets the encoded device ID for special files and persists it.
@@ -136,8 +136,8 @@ impl Inode {
         let mut inner = self.inner.write();
         // DIFF from Linux: Linux caches dev_t in i_rdev and encodes during write_inode;
         // Asterinas stores the Linux-compatible on-disk encoding directly in block_ptrs.
-        inner.desc.encode_device_id(device_id);
-        inner.desc.ctime = now();
+        inner.encode_device_id(device_id);
+        inner.meta.desc.ctime = now();
         inner.persist_inode()
     }
 
@@ -149,9 +149,9 @@ impl Inode {
         }
 
         let inner = self.inner.upread();
-        if inner.desc.type_ != InodeType::File
-            && inner.desc.type_ != InodeType::Dir
-            && inner.desc.type_ != InodeType::SymLink
+        if inner.meta.desc.type_ != InodeType::File
+            && inner.meta.desc.type_ != InodeType::Dir
+            && inner.meta.desc.type_ != InodeType::SymLink
         {
             return_errno!(Errno::EINVAL);
         }
@@ -159,11 +159,12 @@ impl Inode {
         // Linux: /root/linux/fs/ext2/inode.c:48-55 (ext2_inode_is_fast_symlink).
         // Keep resize invalid for existing fast symlinks (inline payload), but
         // allow empty newly-created symlink inodes to grow into slow symlinks.
-        if inner.desc.is_fast_symlink(block_size) && inner.desc.size != 0 {
+        if inner.is_fast_symlink(block_size) && inner.meta.desc.size != 0 {
             return_errno!(Errno::EINVAL);
         }
 
         if inner
+            .meta
             .desc
             .flags
             .intersects(FileFlags::APPEND_ONLY | FileFlags::IMMUTABLE)
@@ -171,7 +172,7 @@ impl Inode {
             return_errno!(Errno::EPERM);
         }
 
-        let old_size = inner.desc.size as usize;
+        let old_size = inner.meta.desc.size as usize;
 
         if new_size == old_size {
             return Ok(());
@@ -213,24 +214,24 @@ impl Inode {
         };
         let rdev = if self.type_ == InodeType::CharDevice || self.type_ == InodeType::BlockDevice {
             // SPEC: for device inodes, decode rdev from i_block old/new format.
-            inner.desc.decode_device_id()
+            inner.decode_device_id()
         } else {
             0
         };
         Metadata {
             dev,
             ino: self.ino as u64,
-            size: inner.desc.size as usize,
+            size: inner.meta.desc.size as usize,
             blk_size,
-            blocks: inner.desc.blocks as usize,
-            atime: inner.desc.atime,
-            mtime: inner.desc.mtime,
-            ctime: inner.desc.ctime,
+            blocks: inner.mapping.desc.blocks as usize,
+            atime: inner.meta.desc.atime,
+            mtime: inner.meta.desc.mtime,
+            ctime: inner.meta.desc.ctime,
             type_: self.type_,
-            mode: InodeMode::from_bits_truncate(inner.desc.perm.bits() as _),
-            nlinks: inner.desc.links_count as usize,
-            uid: Uid::new(inner.desc.uid),
-            gid: Gid::new(inner.desc.gid),
+            mode: InodeMode::from_bits_truncate(inner.meta.desc.perm.bits() as _),
+            nlinks: inner.meta.desc.links_count as usize,
+            uid: Uid::new(inner.meta.desc.uid),
+            gid: Gid::new(inner.meta.desc.gid),
             rdev,
         }
     }
@@ -351,8 +352,8 @@ impl Inode {
         drop(xattr);
 
         let mut inner = self.inner.write();
-        inner.desc.file_acl = new_bid;
-        inner.desc.ctime = now();
+        inner.meta.desc.file_acl = new_bid;
+        inner.meta.desc.ctime = now();
         inner.persist_inode()
     }
 
@@ -373,7 +374,7 @@ impl Inode {
         drop(xattr);
 
         let mut inner = self.inner.write();
-        inner.desc.file_acl = new_bid;
+        inner.meta.desc.file_acl = new_bid;
         inner.persist_inode()
     }
 
@@ -393,12 +394,12 @@ impl Inode {
         }
 
         let inner = self.inner.read();
-        let link_size = inner.desc.size as usize;
+        let link_size = inner.meta.desc.size as usize;
 
-        if inner.desc.is_fast_symlink(block_size) {
+        if inner.is_fast_symlink(block_size) {
             let read_len = link_size.min(MAX_FAST_SYMLINK_LEN - 1);
             let mut raw_bytes = [0u8; MAX_FAST_SYMLINK_LEN];
-            for (idx, block_ptr) in inner.desc.block_ptrs.iter().enumerate() {
+            for (idx, block_ptr) in inner.mapping.desc.block_ptrs.iter().enumerate() {
                 let offset = idx * size_of::<u32>();
                 raw_bytes[offset..offset + size_of::<u32>()]
                     .copy_from_slice(&block_ptr.to_le_bytes());
@@ -451,9 +452,9 @@ impl Inode {
             let mut raw_bytes = [0u8; MAX_FAST_SYMLINK_LEN];
             raw_bytes[..target_len].copy_from_slice(target.as_bytes());
 
-            for idx in 0..inner.desc.block_ptrs.len() {
+            for idx in 0..inner.mapping.desc.block_ptrs.len() {
                 let offset = idx * size_of::<u32>();
-                inner.desc.block_ptrs[idx] = u32::from_le_bytes([
+                inner.mapping.desc.block_ptrs[idx] = u32::from_le_bytes([
                     raw_bytes[offset],
                     raw_bytes[offset + 1],
                     raw_bytes[offset + 2],
@@ -461,8 +462,8 @@ impl Inode {
                 ]);
             }
 
-            inner.desc.size = target_len as u64;
-            inner.desc.blocks = 0;
+            inner.meta.desc.size = target_len as u64;
+            inner.mapping.desc.blocks = 0;
             inner.persist_inode()?;
             return Ok(());
         }
@@ -477,7 +478,7 @@ impl Inode {
         let old_size;
         {
             let mut inner = self.inner.write();
-            old_size = inner.desc.size as usize;
+            old_size = inner.meta.desc.size as usize;
             let end_block = target_len.div_ceil(block_size);
 
             let phase1_result = (|| -> Result<()> {
@@ -494,7 +495,7 @@ impl Inode {
                 }
 
                 inner.page_cache.resize(target_len.align_up(block_size))?;
-                inner.desc.size = target_len as u64;
+                inner.meta.desc.size = target_len as u64;
                 Ok(())
             })();
 
@@ -535,7 +536,7 @@ impl Inode {
 
         let read_len = {
             let inner = self.inner.read();
-            let file_size = inner.desc.size as usize;
+            let file_size = inner.meta.desc.size as usize;
             if offset >= file_size {
                 return Ok(0);
             }
@@ -572,7 +573,7 @@ impl Inode {
         let old_size;
         {
             let mut inner = self.inner.write();
-            old_size = inner.desc.size as usize;
+            old_size = inner.meta.desc.size as usize;
 
             let phase1_result = inner.prepare_continuous_blocks(offset, end, block_size, false);
 
@@ -592,8 +593,8 @@ impl Inode {
 
         let mut inner = upread_inner.upgrade();
         let current = now();
-        inner.desc.mtime = current;
-        inner.desc.ctime = current;
+        inner.meta.desc.mtime = current;
+        inner.meta.desc.ctime = current;
         inner.persist_inode()?;
         Ok(write_len)
     }
@@ -617,7 +618,7 @@ impl Inode {
 
         let read_len = {
             let inner = self.inner.read();
-            let file_size = inner.desc.size as usize;
+            let file_size = inner.meta.desc.size as usize;
             if offset >= file_size || writer.avail() == 0 {
                 0
             } else {
@@ -665,7 +666,7 @@ impl Inode {
 
         {
             let mut inner = self.inner.write();
-            old_size = inner.desc.size as usize;
+            old_size = inner.meta.desc.size as usize;
 
             let prepare_ret = inner.prepare_continuous_blocks(offset, end, block_size, true);
             if let Err(err) = prepare_ret {
@@ -719,7 +720,7 @@ impl Inode {
                 old_size, err
             );
         }
-        inner.desc.size = old_size as u64;
+        inner.meta.desc.size = old_size as u64;
     }
 
     pub(super) fn lookup(&self, name: &str) -> Result<Arc<Inode>> {
@@ -892,13 +893,13 @@ impl Inode {
 
         let block_size = fs.block_size();
         let mut write_inner = self.inner.write();
-        if write_inner.desc.block_ptrs[0] != 0 {
+        if write_inner.mapping.desc.block_ptrs[0] != 0 {
             return_errno_with_message!(Errno::EIO, "dir block pointer already occupied");
         }
 
-        let old_ptr0 = write_inner.desc.block_ptrs[0];
-        let old_size = write_inner.desc.size;
-        let old_blocks = write_inner.desc.blocks;
+        let old_ptr0 = write_inner.mapping.desc.block_ptrs[0];
+        let old_size = write_inner.meta.desc.size;
+        let old_blocks = write_inner.mapping.desc.blocks;
 
         // SPEC: allocate first data block under write lock (&mut self required).
         let new_bid = write_inner
@@ -907,13 +908,13 @@ impl Inode {
                 Error::with_message(Errno::ENOSPC, "failed to allocate first dir block")
             })?
             .to_raw() as u32;
-        write_inner.desc.size = block_size as u64;
+        write_inner.meta.desc.size = block_size as u64;
 
         if let Err(err) = write_inner.page_cache.resize(block_size) {
             write_inner.page_cache.discard_range(0..block_size);
-            write_inner.desc.block_ptrs[0] = old_ptr0;
-            write_inner.desc.size = old_size;
-            write_inner.desc.blocks = old_blocks;
+            write_inner.mapping.desc.block_ptrs[0] = old_ptr0;
+            write_inner.meta.desc.size = old_size;
+            write_inner.mapping.desc.blocks = old_blocks;
             let _ = fs.free_blocks(new_bid, 1);
             return Err(err);
         }
@@ -942,9 +943,9 @@ impl Inode {
         if let Err(err) = upread_inner.page_cache.pages().write_bytes(0, &buf) {
             let mut write_inner = upread_inner.upgrade();
             write_inner.page_cache.discard_range(0..block_size);
-            write_inner.desc.block_ptrs[0] = old_ptr0;
-            write_inner.desc.size = old_size;
-            write_inner.desc.blocks = old_blocks;
+            write_inner.mapping.desc.block_ptrs[0] = old_ptr0;
+            write_inner.meta.desc.size = old_size;
+            write_inner.mapping.desc.blocks = old_blocks;
             let _ = fs.free_blocks(new_bid, 1);
             return Err(err.into());
         }
@@ -953,9 +954,9 @@ impl Inode {
         if let Err(err) = write_inner.persist_inode() {
             let mut write_inner = write_inner;
             write_inner.page_cache.discard_range(0..block_size);
-            write_inner.desc.block_ptrs[0] = old_ptr0;
-            write_inner.desc.size = old_size;
-            write_inner.desc.blocks = old_blocks;
+            write_inner.mapping.desc.block_ptrs[0] = old_ptr0;
+            write_inner.meta.desc.size = old_size;
+            write_inner.mapping.desc.blocks = old_blocks;
             let _ = fs.free_blocks(new_bid, 1);
             return Err(err);
         }
@@ -983,7 +984,7 @@ impl Inode {
 
         {
             let child_read = child.inner.read();
-            if child_read.desc.type_ != InodeType::Dir {
+            if child_read.meta.desc.type_ != InodeType::Dir {
                 return_errno!(Errno::ENOTDIR);
             }
             if !child_read.empty_dir() {
@@ -998,14 +999,14 @@ impl Inode {
 
         {
             let mut child_write = child.inner.write();
-            child_write.desc.size = 0;
-            child_write.desc.links_count = child_write.desc.links_count.saturating_sub(2);
-            child_write.desc.dtime = now();
-            child_write.is_freed = true;
+            child_write.meta.desc.size = 0;
+            child_write.meta.desc.links_count = child_write.meta.desc.links_count.saturating_sub(2);
+            child_write.meta.desc.dtime = now();
+            child_write.meta.is_freed = true;
             child_write.persist_inode()?;
         }
 
-        parent_write.desc.links_count = parent_write.desc.links_count.saturating_sub(1);
+        parent_write.meta.desc.links_count = parent_write.meta.desc.links_count.saturating_sub(1);
         // SPEC: parent link-count change in rmdir is a directory mutation; refresh
         // ctime/mtime the same way as add/delete entry paths.
         // Linux: /root/linux/fs/ext2/namei.c:312 (inode_dec_link_count(dir)).
@@ -1040,14 +1041,15 @@ impl Inode {
         };
 
         let mut parent_write = parent_guard.upgrade();
-        parent_write.desc.links_count = parent_write.desc.links_count.saturating_add(1);
+        parent_write.meta.desc.links_count = parent_write.meta.desc.links_count.saturating_add(1);
         parent_guard = parent_write.downgrade();
 
         let child = match fs.create_inode(self.ino, InodeType::Dir, perm) {
             Ok(child) => child,
             Err(err) => {
                 let mut parent_write = parent_guard.upgrade();
-                parent_write.desc.links_count = parent_write.desc.links_count.saturating_sub(1);
+                parent_write.meta.desc.links_count =
+                    parent_write.meta.desc.links_count.saturating_sub(1);
                 return Err(err);
             }
         };
@@ -1056,7 +1058,8 @@ impl Inode {
         if let Err(err) = child.make_empty(self.ino) {
             let _ = fs.free_inode(child_ino, true);
             let mut parent_write = parent_guard.upgrade();
-            parent_write.desc.links_count = parent_write.desc.links_count.saturating_sub(1);
+            parent_write.meta.desc.links_count =
+                parent_write.meta.desc.links_count.saturating_sub(1);
             return Err(err);
         }
 
@@ -1069,7 +1072,8 @@ impl Inode {
             }
             let _ = fs.free_inode(child_ino, true);
             let mut parent_write = parent_guard.upgrade();
-            parent_write.desc.links_count = parent_write.desc.links_count.saturating_sub(1);
+            parent_write.meta.desc.links_count =
+                parent_write.meta.desc.links_count.saturating_sub(1);
             return Err(err);
         }
 
@@ -1081,7 +1085,8 @@ impl Inode {
                 let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
             }
             let _ = fs.free_inode(child_ino, true);
-            parent_write.desc.links_count = parent_write.desc.links_count.saturating_sub(1);
+            parent_write.meta.desc.links_count =
+                parent_write.meta.desc.links_count.saturating_sub(1);
             return Err(err);
         }
 
@@ -1100,7 +1105,7 @@ impl Inode {
         match mode {
             FallocMode::PunchHoleKeepSize => {
                 let inner = self.inner.read();
-                let file_size = inner.desc.size as usize;
+                let file_size = inner.meta.desc.size as usize;
                 if offset >= file_size {
                     return Ok(());
                 }
@@ -1151,7 +1156,7 @@ impl Inode {
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:72 (ext2_evict_inode)
     pub(super) fn prepare_for_evict(&self) -> Result<bool> {
-        if self.inner.read().desc.links_count > 0 {
+        if self.inner.read().meta.desc.links_count > 0 {
             self.sync_all()?;
             return Ok(false);
         }
@@ -1161,10 +1166,10 @@ impl Inode {
         }
 
         let mut inner = self.inner.write();
-        inner.desc.dtime = now();
-        inner.is_freed = true;
-        inner.desc.size = 0;
-        inner.desc.file_acl = 0;
+        inner.meta.desc.dtime = now();
+        inner.meta.is_freed = true;
+        inner.meta.desc.size = 0;
+        inner.meta.desc.file_acl = 0;
         inner.truncate_blocks(0)?;
         inner.persist_inode()?;
 
@@ -1185,7 +1190,7 @@ impl Inode {
             // Asterinas uses desc.is_dirty() as a conservative approximation
             // so fdatasync never misses i_size/block-mapping persistence.
             let mut inner = inner.upgrade();
-            if inner.desc.is_dirty() {
+            if inner.meta.desc.is_dirty() || inner.mapping.desc.is_dirty() {
                 inner.persist_inode()?;
             }
         }
@@ -1277,7 +1282,7 @@ impl Inode {
             return_errno!(Errno::EPERM);
         }
 
-        if old.inner.read().desc.links_count >= MAX_LINK_COUNT {
+        if old.inner.read().meta.desc.links_count >= MAX_LINK_COUNT {
             return_errno!(Errno::EOVERFLOW);
         }
 
@@ -1297,13 +1302,13 @@ impl Inode {
         // Linux: inode_set_ctime_current + inode_inc_link_count before add_link.
         {
             let mut old_inner = old.inner.write();
-            old_inner.desc.ctime = now();
-            old_inner.desc.links_count = old_inner.desc.links_count.saturating_add(1);
+            old_inner.meta.desc.ctime = now();
+            old_inner.meta.desc.links_count = old_inner.meta.desc.links_count.saturating_add(1);
         }
         if let Err(err) = self.add_entry(name, old.ino, dir_ft) {
             // SPEC: rollback link count on add_entry failure.
             let mut old_inner = old.inner.write();
-            old_inner.desc.links_count = old_inner.desc.links_count.saturating_sub(1);
+            old_inner.meta.desc.links_count = old_inner.meta.desc.links_count.saturating_sub(1);
             return Err(err);
         }
 
@@ -1340,13 +1345,13 @@ impl Inode {
         // Linux: inode_set_ctime_to_ts(inode, inode_get_ctime(dir))
         // then inode_dec_link_count.
         let mut child_inner = child.inner.write();
-        child_inner.desc.ctime = now();
-        child_inner.desc.links_count = child_inner.desc.links_count.saturating_sub(1);
+        child_inner.meta.desc.ctime = now();
+        child_inner.meta.desc.links_count = child_inner.meta.desc.links_count.saturating_sub(1);
 
         // Defer ext2_evict_inode-style reclamation to cache eviction.
-        if child_inner.desc.links_count == 0 {
-            child_inner.desc.dtime = now();
-            child_inner.is_freed = true;
+        if child_inner.meta.desc.links_count == 0 {
+            child_inner.meta.desc.dtime = now();
+            child_inner.meta.is_freed = true;
         }
         child_inner.persist_inode()?;
 
@@ -1443,16 +1448,18 @@ impl Inode {
 
             // Update replaced inode: set ctime, decrement links.
             let mut existing_inner = existing.inner.write();
-            existing_inner.desc.ctime = now();
+            existing_inner.meta.desc.ctime = now();
             if old_is_dir {
                 // Directory replacement: drop extra link for `..`.
-                existing_inner.desc.links_count = existing_inner.desc.links_count.saturating_sub(1);
+                existing_inner.meta.desc.links_count =
+                    existing_inner.meta.desc.links_count.saturating_sub(1);
             }
-            existing_inner.desc.links_count = existing_inner.desc.links_count.saturating_sub(1);
+            existing_inner.meta.desc.links_count =
+                existing_inner.meta.desc.links_count.saturating_sub(1);
 
-            if existing_inner.desc.links_count == 0 {
-                existing_inner.desc.dtime = now();
-                existing_inner.is_freed = true;
+            if existing_inner.meta.desc.links_count == 0 {
+                existing_inner.meta.desc.dtime = now();
+                existing_inner.meta.is_freed = true;
             }
             existing_inner.persist_inode()?;
         } else {
@@ -1463,7 +1470,7 @@ impl Inode {
         // Linux: inode_set_ctime_current(old_inode) + mark_inode_dirty.
         {
             let mut old_inner = old_inode.inner.write();
-            old_inner.desc.ctime = now();
+            old_inner.meta.desc.ctime = now();
             old_inner.persist_inode()?;
         }
 
@@ -1478,10 +1485,10 @@ impl Inode {
             if existing_ino.is_none() {
                 // Linux: inode_inc_link_count(new_dir) was done in the else branch
                 // of the replacement check. For same dir, this is self.
-                inner.desc.links_count = inner.desc.links_count.saturating_add(1);
+                inner.meta.desc.links_count = inner.meta.desc.links_count.saturating_add(1);
             }
             // Linux line 397: inode_dec_link_count(old_dir) — always when old_is_dir.
-            inner.desc.links_count = inner.desc.links_count.saturating_sub(1);
+            inner.meta.desc.links_count = inner.meta.desc.links_count.saturating_sub(1);
             inner.persist_inode()?;
         }
 
@@ -1552,15 +1559,17 @@ impl Inode {
 
             // Update replaced inode.
             let mut existing_inner = existing.inner.write();
-            existing_inner.desc.ctime = now();
+            existing_inner.meta.desc.ctime = now();
             if old_is_dir {
-                existing_inner.desc.links_count = existing_inner.desc.links_count.saturating_sub(1);
+                existing_inner.meta.desc.links_count =
+                    existing_inner.meta.desc.links_count.saturating_sub(1);
             }
-            existing_inner.desc.links_count = existing_inner.desc.links_count.saturating_sub(1);
+            existing_inner.meta.desc.links_count =
+                existing_inner.meta.desc.links_count.saturating_sub(1);
 
-            if existing_inner.desc.links_count == 0 {
-                existing_inner.desc.dtime = now();
-                existing_inner.is_freed = true;
+            if existing_inner.meta.desc.links_count == 0 {
+                existing_inner.meta.desc.dtime = now();
+                existing_inner.meta.is_freed = true;
             }
             existing_inner.persist_inode()?;
         } else {
@@ -1569,14 +1578,15 @@ impl Inode {
                 target.add_entry_from_write_guard(target_inner, new_name, old_ino, moved_ft)?;
             if old_is_dir {
                 // Linux: inode_inc_link_count(new_dir) for new subdir.
-                target_inner.desc.links_count = target_inner.desc.links_count.saturating_add(1);
+                target_inner.meta.desc.links_count =
+                    target_inner.meta.desc.links_count.saturating_add(1);
             }
         }
 
         // Linux: inode_set_ctime_current(old_inode) + mark_inode_dirty.
         {
             let mut old_inner = old_inode.inner.write();
-            old_inner.desc.ctime = now();
+            old_inner.meta.desc.ctime = now();
             old_inner.persist_inode()?;
         }
 
@@ -1596,7 +1606,7 @@ impl Inode {
             )?;
 
             // Linux: inode_dec_link_count(old_dir) — old parent loses a subdir.
-            self_inner.desc.links_count = self_inner.desc.links_count.saturating_sub(1);
+            self_inner.meta.desc.links_count = self_inner.meta.desc.links_count.saturating_sub(1);
             self_inner.persist_inode()?;
 
             // If destination didn't already have the entry (no replacement),
@@ -1642,7 +1652,7 @@ impl Inode {
         if update_times {
             write_inner.commit_dir_metadata()?;
         } else {
-            write_inner.desc.flags.remove(FileFlags::INDEX_DIR);
+            write_inner.meta.desc.flags.remove(FileFlags::INDEX_DIR);
             write_inner.persist_inode()?;
         }
         Ok(write_inner)
@@ -1734,14 +1744,14 @@ impl PageCacheBackend for Inode {
 
     fn npages(&self) -> usize {
         let inner = self.inner.read();
-        (inner.desc.size as usize).align_up(BLOCK_SIZE) / BLOCK_SIZE
+        (inner.meta.desc.size as usize).align_up(BLOCK_SIZE) / BLOCK_SIZE
     }
 }
 
 #[derive(Debug)]
 pub struct InodeInner {
-    desc: Dirty<InodeDesc>,
-    is_freed: bool,
+    meta: InodeMeta,
+    mapping: InodeMapping,
     weak_self: Weak<Inode>,
     fs: Weak<Ext2>,
     page_cache: PageCache,
@@ -1779,6 +1789,8 @@ struct DirEntryTarget {
 impl InodeInner {
     pub fn new(desc: Dirty<InodeDesc>, weak_self: Weak<Inode>, fs: Weak<Ext2>) -> Self {
         let num_page_bytes = (desc.size as usize).align_up(BLOCK_SIZE);
+        let meta = InodeMeta::new(desc.meta_desc());
+        let mapping = InodeMapping::new(desc.mapping_desc());
         let backend: Weak<dyn PageCacheBackend> = weak_self.clone();
         // Keep page-cache capacity aligned with inode size so `npages`/VMO window
         // and on-disk data extent stay consistent from mount time.
@@ -1790,8 +1802,8 @@ impl InodeInner {
         .expect("ext2 inode page cache allocation failed");
 
         Self {
-            desc,
-            is_freed: false,
+            meta,
+            mapping,
             weak_self,
             fs,
             page_cache,
@@ -1804,53 +1816,90 @@ impl InodeInner {
             .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))
     }
 
+    fn is_fast_symlink(&self, block_size: usize) -> bool {
+        let ea_blocks = if self.meta.desc.file_acl != 0 {
+            (block_size / SECTOR_SIZE) as u32
+        } else {
+            0
+        };
+        self.meta.desc.type_ == InodeType::SymLink
+            && self.mapping.desc.blocks.checked_sub(ea_blocks) == Some(0)
+    }
+
+    fn decode_device_id(&self) -> u64 {
+        let (major, minor) = if self.mapping.desc.block_ptrs[0] != 0 {
+            let val = self.mapping.desc.block_ptrs[0];
+            (((val >> 8) & 0xFF), (val & 0xFF))
+        } else {
+            let dev = self.mapping.desc.block_ptrs[1];
+            (
+                ((dev & 0xFFF00) >> 8),
+                ((dev & 0xFF) | ((dev >> 12) & 0xFFF00)),
+            )
+        };
+        encode_device_numbers(major, minor)
+    }
+
+    fn encode_device_id(&mut self, device_id: u64) {
+        let (major, minor) = decode_device_numbers(device_id);
+        if major < 256 && minor < 256 {
+            self.mapping.desc.block_ptrs[0] = (major << 8) | minor;
+            self.mapping.desc.block_ptrs[1] = 0;
+        } else {
+            self.mapping.desc.block_ptrs[0] = 0;
+            self.mapping.desc.block_ptrs[1] =
+                (minor & 0xFF) | (major << 8) | ((minor & !0xFF) << 12);
+            self.mapping.desc.block_ptrs[2] = 0;
+        }
+    }
+
     fn mode(&self) -> InodeMode {
-        InodeMode::from_bits_truncate(self.desc.perm.bits())
+        InodeMode::from_bits_truncate(self.meta.desc.perm.bits())
     }
 
     fn set_mode(&mut self, mode: InodeMode) {
-        self.desc.perm = FilePerm::from_bits_truncate(mode.bits() as u16);
+        self.meta.desc.perm = FilePerm::from_bits_truncate(mode.bits() as u16);
         self.set_ctime(now());
     }
 
     fn uid(&self) -> u32 {
-        self.desc.uid
+        self.meta.desc.uid
     }
 
     fn set_uid(&mut self, uid: u32) {
-        self.desc.uid = uid;
+        self.meta.desc.uid = uid;
     }
 
     fn gid(&self) -> u32 {
-        self.desc.gid
+        self.meta.desc.gid
     }
 
     fn set_gid(&mut self, gid: u32) {
-        self.desc.gid = gid;
+        self.meta.desc.gid = gid;
     }
 
     fn atime(&self) -> Duration {
-        self.desc.atime
+        self.meta.desc.atime
     }
 
     fn set_atime(&mut self, time: Duration) {
-        self.desc.atime = time;
+        self.meta.desc.atime = time;
     }
 
     fn mtime(&self) -> Duration {
-        self.desc.mtime
+        self.meta.desc.mtime
     }
 
     fn set_mtime(&mut self, time: Duration) {
-        self.desc.mtime = time;
+        self.meta.desc.mtime = time;
     }
 
     fn ctime(&self) -> Duration {
-        self.desc.ctime
+        self.meta.desc.ctime
     }
 
     fn set_ctime(&mut self, time: Duration) {
-        self.desc.ctime = time;
+        self.meta.desc.ctime = time;
     }
 
     /// Reads file data directly from data blocks into `writer`.
@@ -1993,25 +2042,25 @@ impl InodeInner {
     }
 
     fn expand(&mut self, new_size: usize) -> Result<()> {
-        self.desc.size = new_size as u64;
+        self.meta.desc.size = new_size as u64;
         let current = now();
-        self.desc.mtime = current;
-        self.desc.ctime = current;
+        self.meta.desc.mtime = current;
+        self.meta.desc.ctime = current;
         self.persist_inode()
     }
 
     fn shrink(&mut self, new_size: usize) -> Result<()> {
-        let old_size = self.desc.size as usize;
+        let old_size = self.meta.desc.size as usize;
         if new_size == old_size {
             return Ok(());
         }
 
         self.truncate_blocks(new_size)?;
-        self.desc.size = new_size as u64;
+        self.meta.desc.size = new_size as u64;
 
         let current = now();
-        self.desc.mtime = current;
-        self.desc.ctime = current;
+        self.meta.desc.mtime = current;
+        self.meta.desc.ctime = current;
         self.persist_inode()
     }
 
@@ -2024,282 +2073,8 @@ impl InodeInner {
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:1172 (__ext2_truncate_blocks)
     fn truncate_blocks(&mut self, new_size: usize) -> Result<()> {
-        // === Initialization ===
         let fs = self.fs_arc()?;
-        let block_size = fs.block_size();
-        if block_size == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
-        }
-        let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
-        if sectors_per_block == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid sector accounting for block size");
-        }
-
-        // SPEC: first logical block to free = ceil(new_size / block_size).
-        let iblock = u32::try_from(new_size.div_ceil(block_size))
-            .map_err(|_| Error::with_message(Errno::EINVAL, "truncate size exceeds ext2 limits"))?;
-
-        // Convert logical block number to access path (depth + offsets).
-        let path = self.block_to_path(iblock)?;
-        if path.depth == 0 {
-            return Ok(());
-        }
-
-        let ptrs_per_block = block_size / size_of::<u32>();
-        if ptrs_per_block == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid indirect pointer fanout");
-        }
-
-        // === Case 1: Direct blocks only ===
-        if path.depth == 1 {
-            // Linux: ext2_free_data(i_data + offsets[0], i_data + EXT2_NDIR_BLOCKS).
-            // Free direct blocks from offsets[0] to block_ptrs[11].
-            let start = (path.offsets[0] as usize).min(12);
-            for idx in start..12 {
-                let ptr = self.desc.block_ptrs[idx];
-                if ptr == 0 {
-                    continue;
-                }
-                fs.free_blocks(ptr, 1)?;
-                self.desc.block_ptrs[idx] = 0;
-                self.desc.blocks = self.desc.blocks.saturating_sub(sectors_per_block);
-            }
-        } else {
-            // === Case 2: Indirect blocks ===
-
-            // --- Step 1: Adjust depth for boundary case ---
-            // SPEC: ext2_find_shared-style partial branch handling.
-            // If truncation point is at the start of an indirect block (offset = 0),
-            // we can handle it at a higher level without reading that indirect block.
-            let mut k = path.depth;
-            while k > 1 && path.offsets[k - 1] == 0 {
-                k -= 1;
-            }
-            let shared_path = BlockPath {
-                depth: k,
-                offsets: path.offsets,
-                boundary: path.boundary,
-            };
-
-            // --- Step 2: Read indirect block chain ---
-            // branch.chain[i] contains the i-th level indirect block.
-            // branch.partial_level indicates how deep we successfully read.
-            let branch = self.get_branch(&shared_path, &fs)?;
-            // `partial` is an index into `branch.chain[]`, pointing to the
-            // deepest level from which we start detaching and freeing blocks.
-            // If the full chain was read (partial_level == k), the last valid
-            // index is k-1; otherwise partial_level already is the index where
-            // traversal stopped on a zero pointer.
-            // The all_zeroes loop below may shrink `partial` upward.
-            let mut partial = if branch.partial_level == k {
-                k - 1
-            } else {
-                branch.partial_level
-            };
-
-            // --- Step 3: all_zeroes optimization ---
-            // SPEC: preserve Linux all_zeroes optimization by walking up to the
-            // highest indirect block that can be fully detached.
-            // If the left side (to be kept) of an indirect block is all zeros,
-            // we can free the entire indirect block and handle it at a higher level.
-            while partial > 0 {
-                let buf = branch
-                    .chain
-                    .get(partial)
-                    .and_then(|entry| entry.bh.as_ref())
-                    .ok_or_else(|| {
-                        Error::with_message(
-                            Errno::EIO,
-                            "missing indirect block buffer for all-zeroes check",
-                        )
-                    })?;
-
-                // Check if entries [0..offsets[partial]) are all zero.
-                let keep_entries = path.offsets[partial] as usize;
-                let keep_bytes = keep_entries * size_of::<u32>();
-                if keep_bytes > buf.len() {
-                    return_errno_with_message!(Errno::EIO, "all-zeroes check offset out of bounds");
-                }
-
-                let mut all_zero = true;
-                let mut byte = 0usize;
-                while byte < keep_bytes {
-                    let val = u32::from_le_bytes([
-                        buf[byte],
-                        buf[byte + 1],
-                        buf[byte + 2],
-                        buf[byte + 3],
-                    ]);
-                    if val != 0 {
-                        all_zero = false;
-                        break;
-                    }
-                    byte += size_of::<u32>();
-                }
-                if !all_zero {
-                    break;
-                }
-                // Left side is all zeros, move up one level.
-                partial -= 1;
-            }
-
-            // --- Step 4: Detach subtree root ---
-            // Disconnect the pointer at offsets[partial] and get the subtree root block number.
-            let detached_nr;
-            if partial == 0 {
-                // Detach from inode.block_ptrs directly.
-                let slot = path.offsets[0] as usize;
-                if slot >= self.desc.block_ptrs.len() {
-                    return_errno_with_message!(Errno::EIO, "inode block pointer slot out of range");
-                }
-                detached_nr = self.desc.block_ptrs[slot];
-                self.desc.block_ptrs[slot] = 0;
-            } else {
-                // Detach from parent indirect block.
-                // chain[partial] contains the current level's buffer.
-                // chain[partial-1].key is the block number to write back.
-                let mut parent_buf = branch
-                    .chain
-                    .get(partial)
-                    .and_then(|entry| entry.bh.clone())
-                    .ok_or_else(|| {
-                        Error::with_message(Errno::EIO, "missing parent indirect block buffer")
-                    })?;
-                let parent_bid = branch
-                    .chain
-                    .get(partial - 1)
-                    .map(|entry| entry.key)
-                    .unwrap_or(0);
-                if parent_bid == 0 {
-                    return_errno_with_message!(Errno::EIO, "invalid parent indirect block number");
-                }
-
-                // Read the pointer at offsets[partial].
-                let ptr_offset = (path.offsets[partial] as usize) * size_of::<u32>();
-                let ptr_end = ptr_offset + size_of::<u32>();
-                if ptr_end > parent_buf.len() {
-                    return_errno_with_message!(Errno::EIO, "shared branch pointer out of bounds");
-                }
-
-                detached_nr = u32::from_le_bytes([
-                    parent_buf[ptr_offset],
-                    parent_buf[ptr_offset + 1],
-                    parent_buf[ptr_offset + 2],
-                    parent_buf[ptr_offset + 3],
-                ]);
-
-                // Zero out the pointer and write back.
-                parent_buf[ptr_offset..ptr_end].copy_from_slice(&0u32.to_le_bytes());
-                if fs
-                    .block_device()
-                    .write_bytes(Bid::new(parent_bid as u64).to_offset(), &parent_buf)
-                    .is_err()
-                {
-                    return_errno_with_message!(Errno::EIO, "failed to detach shared branch");
-                }
-            }
-
-            // Recursively free the detached subtree.
-            if detached_nr != 0 {
-                // SPEC: free detached subtree root.
-                let subtree_depth = (path.depth - 1 - partial) as u32;
-                self.free_branches(&fs, detached_nr, subtree_depth);
-            }
-
-            // --- Step 5: Clear right side of partially shared indirect blocks ---
-            // SPEC: clear right side of each partially shared indirect block.
-            // For each level from partial down to 1, free all pointers to the right
-            // of offsets[level].
-            for level in (1..=partial).rev() {
-                let parent_bid = branch
-                    .chain
-                    .get(level - 1)
-                    .map(|entry| entry.key)
-                    .unwrap_or(0);
-                if parent_bid == 0 {
-                    return_errno_with_message!(Errno::EIO, "invalid indirect block number on tail");
-                }
-
-                // Re-read the current indirect block state to avoid stale-buffer
-                // overwrite after the detach step above.
-                let mut buf = vec![0u8; block_size];
-                if fs
-                    .block_device()
-                    .read_bytes(Bid::new(parent_bid as u64).to_offset(), &mut buf)
-                    .is_err()
-                {
-                    return_errno_with_message!(
-                        Errno::EIO,
-                        "failed to read indirect block for truncation tail"
-                    );
-                }
-
-                // Free all pointers from offsets[level]+1 to the end.
-                let start_idx = (path.offsets[level] as usize) + 1;
-                let child_depth = (path.depth - 1 - level) as u32;
-                for idx in start_idx..ptrs_per_block {
-                    let ptr_offset = idx * size_of::<u32>();
-                    let ptr_end = ptr_offset + size_of::<u32>();
-                    if ptr_end > buf.len() {
-                        break;
-                    }
-                    let nr = u32::from_le_bytes([
-                        buf[ptr_offset],
-                        buf[ptr_offset + 1],
-                        buf[ptr_offset + 2],
-                        buf[ptr_offset + 3],
-                    ]);
-                    if nr == 0 {
-                        continue;
-                    }
-                    buf[ptr_offset..ptr_end].copy_from_slice(&0u32.to_le_bytes());
-                    self.free_branches(&fs, nr, child_depth);
-                }
-
-                // Write back the modified indirect block.
-                if fs
-                    .block_device()
-                    .write_bytes(Bid::new(parent_bid as u64).to_offset(), &buf)
-                    .is_err()
-                {
-                    return_errno_with_message!(
-                        Errno::EIO,
-                        "failed to persist partial indirect truncation"
-                    );
-                }
-            }
-        }
-
-        // === Step 6: Free complete indirect block trees ===
-        // Linux: do_indirects switch/fallthrough by offsets[0].
-        // If truncation point is in direct blocks, free all indirect trees.
-        // If in single indirect, free double and triple indirect trees, etc.
-        if path.offsets[0] < 12 {
-            // Truncation in direct blocks: free single, double, triple indirect.
-            let nr = self.desc.block_ptrs[12];
-            if nr != 0 {
-                self.desc.block_ptrs[12] = 0;
-                self.free_branches(&fs, nr, 1);
-            }
-        }
-        if path.offsets[0] <= 12 {
-            // Truncation in direct or single indirect: free double, triple indirect.
-            let nr = self.desc.block_ptrs[13];
-            if nr != 0 {
-                self.desc.block_ptrs[13] = 0;
-                self.free_branches(&fs, nr, 2);
-            }
-        }
-        if path.offsets[0] <= 13 {
-            // Truncation in direct, single, or double indirect: free triple indirect.
-            let nr = self.desc.block_ptrs[14];
-            if nr != 0 {
-                self.desc.block_ptrs[14] = 0;
-                self.free_branches(&fs, nr, 3);
-            }
-        }
-
-        Ok(())
+        self.mapping.truncate_blocks(&fs, new_size)
     }
 
     /// Recursively frees an indirect branch.
@@ -2307,90 +2082,14 @@ impl InodeInner {
     /// Linux: /root/linux/fs/ext2/inode.c:1136 (ext2_free_branches)
     /// Linux: /root/linux/fs/ext2/inode.c:1096 (ext2_free_data)
     fn free_branches(&mut self, fs: &Ext2, block_nr: u32, depth: u32) {
-        if block_nr == 0 {
-            return;
-        }
-
-        let block_size = fs.block_size();
-        let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
-        if sectors_per_block == 0 {
-            error!(
-                "ext2: free_branches: invalid sector accounting for block size {}",
-                block_size
-            );
-            return;
-        }
-
-        if depth == 0 {
-            if let Err(err) = fs.free_blocks(block_nr, 1) {
-                // SPEC: best-effort free path logs errors and proceeds.
-                error!(
-                    "ext2: free_branches: failed to free data block {}: {:?}",
-                    block_nr, err
-                );
-                return;
-            }
-            self.desc.blocks = self.desc.blocks.saturating_sub(sectors_per_block);
-            return;
-        }
-
-        let ptrs_per_block = block_size / size_of::<u32>();
-        if ptrs_per_block == 0 {
-            error!(
-                "ext2: free_branches: invalid indirect fanout for block size {}",
-                block_size
-            );
-            return;
-        }
-
-        let mut buf = vec![0u8; block_size];
-        if fs
-            .block_device()
-            .read_bytes(Bid::new(block_nr as u64).to_offset(), &mut buf)
-            .is_err()
-        {
-            // Linux ext2_free_branches logs read failure and skips that branch.
-            error!(
-                "ext2: free_branches: failed to read indirect block {} (depth {})",
-                block_nr, depth
-            );
-            return;
-        }
-
-        for idx in 0..ptrs_per_block {
-            let ptr_offset = idx * size_of::<u32>();
-            let ptr_end = ptr_offset + size_of::<u32>();
-            if ptr_end > buf.len() {
-                break;
-            }
-
-            let nr = u32::from_le_bytes([
-                buf[ptr_offset],
-                buf[ptr_offset + 1],
-                buf[ptr_offset + 2],
-                buf[ptr_offset + 3],
-            ]);
-            if nr == 0 {
-                continue;
-            }
-            self.free_branches(fs, nr, depth - 1);
-        }
-
-        if let Err(err) = fs.free_blocks(block_nr, 1) {
-            error!(
-                "ext2: free_branches: failed to free indirect block {}: {:?}",
-                block_nr, err
-            );
-            return;
-        }
-        self.desc.blocks = self.desc.blocks.saturating_sub(sectors_per_block);
+        self.mapping.free_branches(fs, block_nr, depth)
     }
 
     /// Checks whether this directory contains only `.` and `..` as live entries.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:659 (ext2_empty_dir)
     pub(super) fn empty_dir(&self) -> bool {
-        if self.desc.type_ != InodeType::Dir {
+        if self.meta.desc.type_ != InodeType::Dir {
             return false;
         }
 
@@ -2405,7 +2104,7 @@ impl InodeInner {
         };
 
         let block_size = fs.block_size();
-        let size = self.desc.size as usize;
+        let size = self.meta.desc.size as usize;
         let max_inumber = fs.super_block().total_inodes();
         let data_blocks = size.div_ceil(block_size);
 
@@ -2464,14 +2163,14 @@ impl InodeInner {
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:342 (ext2_find_entry)
     pub(super) fn find_entry(&self, name: &str) -> Result<u32> {
-        if self.desc.type_ != InodeType::Dir {
+        if self.meta.desc.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
 
         let fs = self.fs_arc()?;
         let sb = fs.super_block();
         let block_size = fs.block_size();
-        let size = self.desc.size as usize;
+        let size = self.meta.desc.size as usize;
         let max_inumber = sb.total_inodes();
         // SPEC: bound directory scan by i_size-derived pages (Linux dir_pages).
         // Linux: /root/linux/fs/ext2/dir.c:349 (npages = dir_pages(dir)).
@@ -2521,11 +2220,11 @@ impl InodeInner {
         offset: usize,
         visitor: &mut dyn DirentVisitor,
     ) -> Result<usize> {
-        if self.desc.type_ != InodeType::Dir {
+        if self.meta.desc.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let size = self.desc.size as usize;
+        let size = self.meta.desc.size as usize;
         let min_rec_len = DirEntry::dir_rec_len(1) as usize;
         if size < min_rec_len || offset > size - min_rec_len {
             return Ok(0);
@@ -2610,395 +2309,15 @@ impl InodeInner {
     /// Linux: /root/linux/fs/ext2/inode.c:163 (ext2_block_to_path)
     pub(super) fn block_to_path(&self, iblock: u32) -> Result<BlockPath> {
         let fs = self.fs_arc()?;
-        let sb = fs.super_block();
-        let ptrs = (sb.block_size() / size_of::<u32>()) as u32;
-        if ptrs == 0 {
-            return_errno_with_message!(Errno::EINVAL, "block number out of range");
-        }
-
-        let ptrs_bits = ptrs.trailing_zeros();
-        let direct_blocks = 12u32;
-        let indirect_blocks = ptrs;
-        let double_blocks = 1u32
-            .checked_shl(ptrs_bits * 2)
-            .ok_or_else(|| Error::with_message(Errno::EINVAL, "block path shift overflow"))?;
-
-        let mut offsets = [0u32; 4];
-        let depth;
-        let boundary;
-        let mut block = iblock;
-
-        if block < direct_blocks {
-            offsets[0] = block;
-            depth = 1usize;
-            boundary = direct_blocks - 1 - block;
-        } else if {
-            block -= direct_blocks;
-            block < indirect_blocks
-        } {
-            offsets[0] = 12;
-            offsets[1] = block;
-            depth = 2usize;
-            boundary = ptrs - 1 - (block & (ptrs - 1));
-        } else if {
-            block -= indirect_blocks;
-            block < double_blocks
-        } {
-            offsets[0] = 13;
-            offsets[1] = block >> ptrs_bits;
-            offsets[2] = block & (ptrs - 1);
-            depth = 3usize;
-            boundary = ptrs - 1 - (block & (ptrs - 1));
-        } else if {
-            block -= double_blocks;
-            (block >> (ptrs_bits * 2)) < ptrs
-        } {
-            offsets[0] = 14;
-            offsets[1] = block >> (ptrs_bits * 2);
-            offsets[2] = (block >> ptrs_bits) & (ptrs - 1);
-            offsets[3] = block & (ptrs - 1);
-            depth = 4usize;
-            boundary = ptrs - 1 - (block & (ptrs - 1));
-        } else {
-            return_errno_with_message!(Errno::EINVAL, "block number exceeds maximum");
-        }
-
-        Ok(BlockPath {
-            depth,
-            offsets,
-            boundary,
-        })
+        self.mapping.block_to_path(&fs, iblock)
     }
 
     /// Maps a logical block to a physical block (read-only path).
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:783 (ext2_get_block)
     pub(super) fn get_block(&self, iblock: u32) -> Result<Option<Bid>> {
-        let path = self.block_to_path(iblock)?;
-        if path.depth == 0 {
-            return Ok(None);
-        }
-
         let fs = self.fs_arc()?;
-        let branch = self.get_branch(&path, &fs)?;
-        if branch.partial_level < path.depth {
-            return Ok(None);
-        }
-
-        let bid = branch
-            .chain
-            .get(path.depth - 1)
-            .ok_or_else(|| Error::with_message(Errno::EIO, "incomplete branch result"))?
-            .key;
-        if bid == 0 {
-            return Ok(None);
-        }
-        Ok(Some(Bid::new(bid as u64)))
-    }
-
-    /// Traverses the existing block pointer chain for a block path.
-    ///
-    /// Linux: /root/linux/fs/ext2/inode.c:234 (ext2_get_branch)
-    fn get_branch(&self, path: &BlockPath, fs: &Ext2) -> Result<BranchResult> {
-        if path.depth == 0 || path.depth > path.offsets.len() {
-            return_errno_with_message!(Errno::EIO, "invalid block path depth");
-        }
-
-        let top_offset = path.offsets[0] as usize;
-        let top_key =
-            *self.desc.block_ptrs.get(top_offset).ok_or_else(|| {
-                Error::with_message(Errno::EIO, "invalid top-level block pointer")
-            })?;
-
-        let mut chain = Vec::with_capacity(path.depth);
-        chain.push(IndirectEntry {
-            key: top_key,
-            bh: None,
-        });
-        if top_key == 0 {
-            // SPEC: zero pointer means the chain is broken at level 0.
-            return Ok(BranchResult {
-                partial_level: 0,
-                chain,
-            });
-        }
-
-        let block_size = fs.block_size();
-        if block_size < size_of::<u32>() {
-            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
-        }
-
-        // DIFF from Linux ext2_get_branch: no verify_chain/-EAGAIN retry loop.
-        // Asterinas callers hold InodeInner locks, so chain pointers are stable.
-        for level in 1..path.depth {
-            let parent_key = chain[level - 1].key;
-            let mut buf = vec![0u8; block_size];
-            if fs
-                .block_device()
-                .read_bytes(Bid::new(parent_key as u64).to_offset(), &mut buf)
-                .is_err()
-            {
-                // SPEC: indirect block read failure must return EIO.
-                return_errno_with_message!(Errno::EIO, "failed to read indirect block");
-            }
-
-            let ptr_offset = (path.offsets[level] as usize) * size_of::<u32>();
-            let ptr_end = ptr_offset + size_of::<u32>();
-            if ptr_end > buf.len() {
-                return_errno_with_message!(Errno::EIO, "indirect pointer offset out of bounds");
-            }
-
-            let next_key = u32::from_le_bytes([
-                buf[ptr_offset],
-                buf[ptr_offset + 1],
-                buf[ptr_offset + 2],
-                buf[ptr_offset + 3],
-            ]);
-            chain.push(IndirectEntry {
-                key: next_key,
-                bh: Some(buf),
-            });
-            if next_key == 0 {
-                // SPEC: include the zero-key entry and report break level.
-                return Ok(BranchResult {
-                    partial_level: level,
-                    chain,
-                });
-            }
-        }
-
-        Ok(BranchResult {
-            partial_level: path.depth,
-            chain,
-        })
-    }
-
-    /// Counts metadata/data blocks needed to complete a broken chain.
-    ///
-    /// Linux: /root/linux/fs/ext2/inode.c:361 (ext2_blks_to_allocate)
-    ///
-    /// DIFF from Linux: `data_blks` is always 1. Linux uses `boundary` and
-    /// `maxblocks` to batch-allocate multiple contiguous data blocks in a
-    /// single call, avoiding repeated `get_block` round-trips. This
-    /// implementation allocates one data block at a time; multi-block
-    /// contiguous allocation can be added later using `BlockPath::boundary`.
-    fn blks_to_allocate(&self, branch: &BranchResult, path: &BlockPath) -> (u32, u32) {
-        let indirect_blks = (path.depth - 1 - branch.partial_level) as u32;
-        (indirect_blks, 1)
-    }
-
-    /// Allocates a missing branch and splices it into the inode block tree.
-    ///
-    /// The function proceeds in two phases for crash safety:
-    ///
-    /// Phase 1 — Build the new chain (alloc_branch):
-    ///   Allocate `indirect_blks` metadata blocks + `data_blks` data blocks,
-    ///   zero-fill each new indirect block, write the next-level pointer into it,
-    ///   and flush to disk. After this phase the new chain is fully formed on disk
-    ///   but unreachable — nothing in the existing tree points to it yet.
-    ///
-    /// Phase 2 — Splice into the tree (splice_branch):
-    ///   Write `new_blocks[0]` (the chain head) into the break point:
-    ///   - If the break is at level 0, write directly into `inode.i_block[]`.
-    ///   - Otherwise, patch the cached indirect block at the break point and
-    ///     flush it back to disk.
-    ///   This single pointer write atomically makes the entire new chain visible.
-    ///
-    /// Crash safety: if a crash occurs during phase 1, the new blocks are orphaned
-    /// (reclaimable by fsck) but the tree remains consistent. Only after phase 2
-    /// completes does the new chain become reachable.
-    ///
-    /// Linux: /root/linux/fs/ext2/inode.c:479 (ext2_alloc_branch)
-    /// Linux: /root/linux/fs/ext2/inode.c:561 (ext2_splice_branch)
-    fn alloc_and_splice_branch(
-        &mut self,
-        fs: &Ext2,
-        indirect_blks: u32,
-        data_blks: u32,
-        path: &BlockPath,
-        branch: &BranchResult,
-    ) -> Result<Bid> {
-        if data_blks == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid zero data allocation");
-        }
-        if branch.partial_level >= path.depth {
-            return_errno_with_message!(Errno::EIO, "branch is already complete");
-        }
-
-        let total = indirect_blks
-            .checked_add(data_blks)
-            .ok_or_else(|| Error::with_message(Errno::EIO, "block allocation count overflow"))?;
-        if total == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid zero total allocation");
-        }
-
-        let block_size = fs.block_size();
-        if block_size < size_of::<u32>() {
-            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
-        }
-
-        let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
-        if sectors_per_block == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid sector accounting for block size");
-        }
-        let added_sectors = total
-            .checked_mul(sectors_per_block)
-            .ok_or_else(|| Error::with_message(Errno::EIO, "inode block accounting overflow"))?;
-        let new_block_count = self
-            .desc
-            .blocks
-            .checked_add(added_sectors)
-            .ok_or_else(|| Error::with_message(Errno::EIO, "inode block count overflow"))?;
-
-        let mut new_blocks = Vec::with_capacity(total as usize);
-        let mut alloc_goal = Bid::new(
-            branch
-                .chain
-                .last()
-                .map_or(self.desc.block_ptrs[0], |entry| entry.key)
-                .max(fs.super_block().first_data_block()) as u64,
-        );
-        // Rollback helper: frees all blocks allocated so far.
-        let free_all_fn = |blocks: &Vec<u32>| {
-            for bid in blocks {
-                let _ = fs.free_blocks(*bid, 1);
-            }
-        };
-
-        while (new_blocks.len() as u32) < total {
-            let remain = total - new_blocks.len() as u32;
-            let allocated = match fs.alloc_blocks(remain, alloc_goal) {
-                Ok(allocated) => allocated,
-                Err(err) => {
-                    free_all_fn(&new_blocks);
-                    return Err(err);
-                }
-            };
-
-            let alloc_len = allocated.end - allocated.start;
-            if alloc_len == 0 || alloc_len > remain {
-                free_all_fn(&new_blocks);
-                return_errno_with_message!(Errno::EIO, "invalid block allocation result");
-            }
-
-            new_blocks.extend(allocated);
-            if let Some(last) = new_blocks.last() {
-                alloc_goal = Bid::new((last + 1) as u64);
-            }
-        }
-
-        // SPEC: data block is at index `indirect_blks` in allocation order.
-        let data_block = match new_blocks.get(indirect_blks as usize) {
-            Some(bid) => *bid,
-            None => {
-                free_all_fn(&new_blocks);
-                return_errno_with_message!(Errno::EIO, "allocated chain missing data block");
-            }
-        };
-
-        // Phase 1: Build the new chain — zero-fill each indirect block, write
-        // the next-level pointer, and flush to disk. The chain is fully formed
-        // but still unreachable from the existing tree.
-        for i in 0..(indirect_blks as usize) {
-            let level = branch.partial_level + 1 + i;
-            if level >= path.depth {
-                free_all_fn(&new_blocks);
-                return_errno_with_message!(Errno::EIO, "invalid branch depth during allocation");
-            }
-
-            let ptr_offset = (path.offsets[level] as usize) * size_of::<u32>();
-            let ptr_end = ptr_offset + size_of::<u32>();
-            if ptr_end > block_size {
-                free_all_fn(&new_blocks);
-                return_errno_with_message!(Errno::EIO, "indirect pointer offset out of bounds");
-            }
-
-            let next_block = match new_blocks.get(i + 1) {
-                Some(bid) => *bid,
-                None => {
-                    free_all_fn(&new_blocks);
-                    return_errno_with_message!(Errno::EIO, "allocated chain metadata mismatch");
-                }
-            };
-
-            let mut buf = vec![0u8; block_size];
-            buf[ptr_offset..ptr_end].copy_from_slice(&next_block.to_le_bytes());
-            if fs
-                .block_device()
-                .write_bytes(Bid::new(new_blocks[i] as u64).to_offset(), &buf)
-                .is_err()
-            {
-                free_all_fn(&new_blocks);
-                return_errno_with_message!(Errno::EIO, "failed to write new indirect block");
-            }
-        }
-
-        // Phase 2: Splice — write the chain head into the break point, making
-        // the entire new chain reachable in one pointer write.
-        let splice_ptr = new_blocks[0];
-        if branch.partial_level == 0 {
-            let slot = path.offsets[0] as usize;
-            if slot >= self.desc.block_ptrs.len() {
-                free_all_fn(&new_blocks);
-                return_errno_with_message!(Errno::EIO, "invalid inode block pointer slot");
-            }
-            if self.desc.block_ptrs[slot] != 0 {
-                free_all_fn(&new_blocks);
-                return_errno_with_message!(Errno::EIO, "block pointer changed during allocation");
-            }
-
-            // SPEC: splice directly into inode i_block[].
-            self.desc.block_ptrs[slot] = splice_ptr;
-        } else {
-            let parent_entry_level = branch.partial_level;
-            let mut parent_buf = match branch
-                .chain
-                .get(parent_entry_level)
-                .and_then(|entry| entry.bh.clone())
-            {
-                Some(buf) => buf,
-                None => {
-                    free_all_fn(&new_blocks);
-                    return_errno_with_message!(
-                        Errno::EIO,
-                        "missing parent indirect block for splice"
-                    );
-                }
-            };
-
-            let parent_bid = branch
-                .chain
-                .get(parent_entry_level - 1)
-                .map(|entry| entry.key)
-                .unwrap_or(0);
-            if parent_bid == 0 {
-                free_all_fn(&new_blocks);
-                return_errno_with_message!(Errno::EIO, "invalid parent indirect block number");
-            }
-
-            let ptr_offset = (path.offsets[parent_entry_level] as usize) * size_of::<u32>();
-            let ptr_end = ptr_offset + size_of::<u32>();
-            if ptr_end > parent_buf.len() {
-                free_all_fn(&new_blocks);
-                return_errno_with_message!(Errno::EIO, "splice offset out of bounds");
-            }
-            parent_buf[ptr_offset..ptr_end].copy_from_slice(&splice_ptr.to_le_bytes());
-
-            if fs
-                .block_device()
-                .write_bytes(Bid::new(parent_bid as u64).to_offset(), &parent_buf)
-                .is_err()
-            {
-                free_all_fn(&new_blocks);
-                return_errno_with_message!(Errno::EIO, "failed to splice branch into parent");
-            }
-        }
-
-        // SPEC: ext2_splice_branch-style inode accounting and ctime update.
-        self.desc.blocks = new_block_count;
-        self.desc.ctime = now();
-
-        Ok(Bid::new(data_block as u64))
+        self.mapping.get_block(&fs, iblock)
     }
 
     fn prepare_continuous_blocks(
@@ -3010,7 +2329,7 @@ impl InodeInner {
     ) -> Result<()> {
         let start_block = offset / block_size;
         let end_block = end.div_ceil(block_size);
-        let old_size = self.desc.size as usize;
+        let old_size = self.meta.desc.size as usize;
 
         for iblock in start_block..end_block {
             let iblock = u32::try_from(iblock)
@@ -3022,7 +2341,7 @@ impl InodeInner {
 
         if end > old_size {
             self.page_cache.resize(end.align_up(block_size))?;
-            self.desc.size = end as u64;
+            self.meta.desc.size = end as u64;
         }
 
         if discard_page_cache {
@@ -3041,34 +2360,19 @@ impl InodeInner {
     /// Linux: /root/linux/fs/ext2/inode.c:624 (ext2_get_blocks, create path)
     pub(super) fn get_or_alloc_block(&mut self, iblock: u32, create: bool) -> Result<Option<Bid>> {
         let fs = self.fs_arc()?;
-        let path = self.block_to_path(iblock)?;
-        if path.depth == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid block path depth");
+        let old_blocks = self.mapping.blocks_512();
+        let mapped = self.mapping.get_or_alloc_block(&fs, iblock, create)?;
+        if self.mapping.blocks_512() != old_blocks {
+            self.meta.set_ctime(now());
         }
-
-        let branch = self.get_branch(&path, &fs)?;
-        if branch.partial_level == path.depth {
-            let mapped = branch
-                .chain
-                .get(path.depth - 1)
-                .ok_or_else(|| Error::with_message(Errno::EIO, "incomplete branch result"))?
-                .key;
-            return Ok(Some(Bid::new(mapped as u64)));
-        }
-        if !create {
-            return Ok(None);
-        }
-
-        let (indirect_blks, data_blks) = self.blks_to_allocate(&branch, &path);
-        let bid = self.alloc_and_splice_branch(&fs, indirect_blks, data_blks, &path, &branch)?;
-        Ok(Some(bid))
+        Ok(mapped)
     }
 
     /// Phase 1: scan directory blocks for reusable slot or duplicate.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link scan loop)
     fn scan_dir_for_slot(&self, name: &str, fs: &Ext2) -> Result<DirScanResult> {
-        if self.desc.type_ != InodeType::Dir {
+        if self.meta.desc.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
 
@@ -3083,7 +2387,7 @@ impl InodeInner {
             return_errno_with_message!(Errno::ENOSPC, "dir entry too large for block");
         }
 
-        let size = self.desc.size as usize;
+        let size = self.meta.desc.size as usize;
         let max_inumber = fs.super_block().total_inodes();
         let data_blocks = size.div_ceil(block_size);
 
@@ -3136,8 +2440,8 @@ impl InodeInner {
     /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link growth path)
     fn grow_dir_block(&mut self, fs: &Ext2) -> Result<DirSlotInfo> {
         let block_size = fs.block_size();
-        let old_size = self.desc.size as usize;
-        let old_blocks = self.desc.blocks;
+        let old_size = self.meta.desc.size as usize;
+        let old_blocks = self.mapping.desc.blocks;
         let data_blocks = old_size.div_ceil(block_size);
         let growth_iblock = u32::try_from(data_blocks)
             .map_err(|_| Error::with_message(Errno::EINVAL, "directory block index overflow"))?;
@@ -3147,12 +2451,12 @@ impl InodeInner {
             .ok_or_else(|| Error::with_message(Errno::ENOSPC, "failed to grow directory block"))?;
 
         let new_size = old_size.saturating_add(block_size);
-        self.desc.size = new_size as u64;
+        self.meta.desc.size = new_size as u64;
         if let Err(err) = self.page_cache.resize(new_size) {
             // SPEC: rollback allocated growth on resize failure.
             self.page_cache.discard_range(old_size..new_size);
-            self.desc.size = old_size as u64;
-            self.desc.blocks = old_blocks;
+            self.meta.desc.size = old_size as u64;
+            self.mapping.desc.blocks = old_blocks;
             self.truncate_blocks(old_size)?;
             return Err(err);
         }
@@ -3220,7 +2524,7 @@ impl InodeInner {
         let fs = self.fs_arc()?;
         let max_inumber = fs.super_block().total_inodes();
         let block_size = fs.block_size();
-        let size = self.desc.size as usize;
+        let size = self.meta.desc.size as usize;
         let name_bytes = name.as_bytes();
 
         for block_idx in 0..size.div_ceil(block_size) {
@@ -3261,7 +2565,7 @@ impl InodeInner {
         let block_size = fs.block_size();
         let block_base = (target.dir_offset / block_size).saturating_mul(block_size);
         let entry_offset = target.dir_offset.saturating_sub(block_base);
-        let limit = (self.desc.size as usize)
+        let limit = (self.meta.desc.size as usize)
             .saturating_sub(block_base)
             .min(block_size);
 
@@ -3457,22 +2761,22 @@ impl InodeInner {
         // SPEC: delegate to full indirect-tree truncation path.
         self.truncate_blocks(0)?;
         // SPEC: cleanup path must leave directory size at zero.
-        self.desc.size = 0;
+        self.meta.desc.size = 0;
         Ok(())
     }
 
     fn update_dir_timestamps_and_flags(&mut self) -> Result<()> {
         let current = now();
-        self.desc.ctime = current;
-        self.desc.mtime = current;
-        self.desc.flags.remove(FileFlags::INDEX_DIR);
+        self.meta.desc.ctime = current;
+        self.meta.desc.mtime = current;
+        self.meta.desc.flags.remove(FileFlags::INDEX_DIR);
         Ok(())
     }
 
     fn sync_data(&self) -> Result<()> {
         // SPEC: file_write_and_wait_range on an empty file is a no-op.
         // Linux: /root/linux/mm/filemap.c:782-783.
-        let file_size = self.desc.size as usize;
+        let file_size = self.meta.desc.size as usize;
         if file_size == 0 {
             return Ok(());
         }
@@ -3487,12 +2791,13 @@ impl InodeInner {
             .weak_self
             .upgrade()
             .ok_or_else(|| Error::with_message(Errno::EIO, "inode already dropped"))?;
-        let meta = self.desc.meta_desc();
-        let mapping = self.desc.mapping_desc();
+        let meta = *self.meta.desc;
+        let mapping = *self.mapping.desc;
         let raw = RawInode::from_parts(&meta, &mapping);
         let fs = self.fs_arc()?;
         fs.write_inode_desc(inode.ino, &raw)?;
-        self.desc.clear_dirty();
+        self.meta.desc.clear_dirty();
+        self.mapping.desc.clear_dirty();
         Ok(())
     }
 }
@@ -3939,6 +3244,848 @@ impl InodeMappingDesc {
     }
 }
 
+#[derive(Debug)]
+pub(super) struct InodeMeta {
+    pub(super) desc: Dirty<InodeMetaDesc>,
+    pub(super) is_freed: bool,
+}
+
+impl InodeMeta {
+    fn new(desc: InodeMetaDesc) -> Self {
+        Self {
+            desc: Dirty::new(desc),
+            is_freed: false,
+        }
+    }
+
+    pub(super) fn file_size(&self) -> usize {
+        self.desc.size as usize
+    }
+
+    pub(super) fn set_file_size(&mut self, new_size: usize) {
+        self.desc.size = new_size as u64;
+    }
+
+    pub(super) fn atime(&self) -> Duration {
+        self.desc.atime
+    }
+
+    pub(super) fn set_atime(&mut self, t: Duration) {
+        self.desc.atime = t;
+    }
+
+    pub(super) fn mtime(&self) -> Duration {
+        self.desc.mtime
+    }
+
+    pub(super) fn set_mtime(&mut self, t: Duration) {
+        self.desc.mtime = t;
+    }
+
+    pub(super) fn ctime(&self) -> Duration {
+        self.desc.ctime
+    }
+
+    pub(super) fn set_ctime(&mut self, t: Duration) {
+        self.desc.ctime = t;
+    }
+
+    pub(super) fn links_count(&self) -> u16 {
+        self.desc.links_count
+    }
+
+    pub(super) fn set_links_count(&mut self, nlinks: u16) {
+        self.desc.links_count = nlinks;
+    }
+
+    pub(super) fn flags(&self) -> FileFlags {
+        self.desc.flags
+    }
+
+    pub(super) fn set_flags(&mut self, flags: FileFlags) {
+        self.desc.flags = flags;
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct InodeMapping {
+    pub(super) desc: Dirty<InodeMappingDesc>,
+}
+
+impl InodeMapping {
+    fn new(desc: InodeMappingDesc) -> Self {
+        Self {
+            desc: Dirty::new(desc),
+        }
+    }
+
+    pub(super) fn blocks_512(&self) -> u32 {
+        self.desc.blocks
+    }
+
+    pub(super) fn set_blocks_512(&mut self, blocks: u32) {
+        self.desc.blocks = blocks;
+    }
+
+    /// Translates a logical block number into a path of block pointer offsets.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:163 (ext2_block_to_path)
+    fn block_to_path(&self, fs: &Ext2, iblock: u32) -> Result<BlockPath> {
+        let sb = fs.super_block();
+        let ptrs = (sb.block_size() / size_of::<u32>()) as u32;
+        if ptrs == 0 {
+            return_errno_with_message!(Errno::EINVAL, "block number out of range");
+        }
+
+        let ptrs_bits = ptrs.trailing_zeros();
+        let direct_blocks = 12u32;
+        let indirect_blocks = ptrs;
+        let double_blocks = 1u32
+            .checked_shl(ptrs_bits * 2)
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "block path shift overflow"))?;
+
+        let mut offsets = [0u32; 4];
+        let depth;
+        let boundary;
+        let mut block = iblock;
+
+        if block < direct_blocks {
+            offsets[0] = block;
+            depth = 1usize;
+            boundary = direct_blocks - 1 - block;
+        } else if {
+            block -= direct_blocks;
+            block < indirect_blocks
+        } {
+            offsets[0] = 12;
+            offsets[1] = block;
+            depth = 2usize;
+            boundary = ptrs - 1 - (block & (ptrs - 1));
+        } else if {
+            block -= indirect_blocks;
+            block < double_blocks
+        } {
+            offsets[0] = 13;
+            offsets[1] = block >> ptrs_bits;
+            offsets[2] = block & (ptrs - 1);
+            depth = 3usize;
+            boundary = ptrs - 1 - (block & (ptrs - 1));
+        } else if {
+            block -= double_blocks;
+            (block >> (ptrs_bits * 2)) < ptrs
+        } {
+            offsets[0] = 14;
+            offsets[1] = block >> (ptrs_bits * 2);
+            offsets[2] = (block >> ptrs_bits) & (ptrs - 1);
+            offsets[3] = block & (ptrs - 1);
+            depth = 4usize;
+            boundary = ptrs - 1 - (block & (ptrs - 1));
+        } else {
+            return_errno_with_message!(Errno::EINVAL, "block number exceeds maximum");
+        }
+
+        Ok(BlockPath {
+            depth,
+            offsets,
+            boundary,
+        })
+    }
+
+    /// Traverses the existing block pointer chain for a block path.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:234 (ext2_get_branch)
+    fn get_branch(&self, path: &BlockPath, fs: &Ext2) -> Result<BranchResult> {
+        if path.depth == 0 || path.depth > path.offsets.len() {
+            return_errno_with_message!(Errno::EIO, "invalid block path depth");
+        }
+
+        let top_offset = path.offsets[0] as usize;
+        let top_key =
+            *self.desc.block_ptrs.get(top_offset).ok_or_else(|| {
+                Error::with_message(Errno::EIO, "invalid top-level block pointer")
+            })?;
+
+        let mut chain = Vec::with_capacity(path.depth);
+        chain.push(IndirectEntry {
+            key: top_key,
+            bh: None,
+        });
+        if top_key == 0 {
+            // SPEC: zero pointer means the chain is broken at level 0.
+            return Ok(BranchResult {
+                partial_level: 0,
+                chain,
+            });
+        }
+
+        let block_size = fs.block_size();
+        if block_size < size_of::<u32>() {
+            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+        }
+
+        // DIFF from Linux ext2_get_branch: no verify_chain/-EAGAIN retry loop.
+        // Asterinas callers hold InodeInner locks, so chain pointers are stable.
+        for level in 1..path.depth {
+            let parent_key = chain[level - 1].key;
+            let mut buf = vec![0u8; block_size];
+            if fs
+                .block_device()
+                .read_bytes(Bid::new(parent_key as u64).to_offset(), &mut buf)
+                .is_err()
+            {
+                // SPEC: indirect block read failure must return EIO.
+                return_errno_with_message!(Errno::EIO, "failed to read indirect block");
+            }
+
+            let ptr_offset = (path.offsets[level] as usize) * size_of::<u32>();
+            let ptr_end = ptr_offset + size_of::<u32>();
+            if ptr_end > buf.len() {
+                return_errno_with_message!(Errno::EIO, "indirect pointer offset out of bounds");
+            }
+
+            let next_key = u32::from_le_bytes([
+                buf[ptr_offset],
+                buf[ptr_offset + 1],
+                buf[ptr_offset + 2],
+                buf[ptr_offset + 3],
+            ]);
+            chain.push(IndirectEntry {
+                key: next_key,
+                bh: Some(buf),
+            });
+            if next_key == 0 {
+                // SPEC: include the zero-key entry and report break level.
+                return Ok(BranchResult {
+                    partial_level: level,
+                    chain,
+                });
+            }
+        }
+
+        Ok(BranchResult {
+            partial_level: path.depth,
+            chain,
+        })
+    }
+
+    /// Linux: /root/linux/fs/ext2/inode.c:361 (ext2_blks_to_allocate)
+    fn blks_to_allocate(&self, branch: &BranchResult, path: &BlockPath) -> (u32, u32) {
+        let indirect_blks = (path.depth - 1 - branch.partial_level) as u32;
+        (indirect_blks, 1)
+    }
+
+    /// Linux: /root/linux/fs/ext2/inode.c:1096 (ext2_free_data)
+    /// Linux: /root/linux/fs/ext2/inode.c:1136 (ext2_free_branches)
+    fn free_branches(&mut self, fs: &Ext2, block_nr: u32, depth: u32) {
+        if block_nr == 0 {
+            return;
+        }
+
+        let block_size = fs.block_size();
+        let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
+        if sectors_per_block == 0 {
+            error!(
+                "ext2: free_branches: invalid sector accounting for block size {}",
+                block_size
+            );
+            return;
+        }
+
+        if depth == 0 {
+            if let Err(err) = fs.free_blocks(block_nr, 1) {
+                // SPEC: best-effort free path logs errors and proceeds.
+                error!(
+                    "ext2: free_branches: failed to free data block {}: {:?}",
+                    block_nr, err
+                );
+                return;
+            }
+            self.desc.blocks = self.desc.blocks.saturating_sub(sectors_per_block);
+            return;
+        }
+
+        let ptrs_per_block = block_size / size_of::<u32>();
+        if ptrs_per_block == 0 {
+            error!(
+                "ext2: free_branches: invalid indirect fanout for block size {}",
+                block_size
+            );
+            return;
+        }
+
+        let mut buf = vec![0u8; block_size];
+        if fs
+            .block_device()
+            .read_bytes(Bid::new(block_nr as u64).to_offset(), &mut buf)
+            .is_err()
+        {
+            // Linux ext2_free_branches logs read failure and skips that branch.
+            error!(
+                "ext2: free_branches: failed to read indirect block {} (depth {})",
+                block_nr, depth
+            );
+            return;
+        }
+
+        for idx in 0..ptrs_per_block {
+            let ptr_offset = idx * size_of::<u32>();
+            let ptr_end = ptr_offset + size_of::<u32>();
+            if ptr_end > buf.len() {
+                break;
+            }
+
+            let nr = u32::from_le_bytes([
+                buf[ptr_offset],
+                buf[ptr_offset + 1],
+                buf[ptr_offset + 2],
+                buf[ptr_offset + 3],
+            ]);
+            if nr == 0 {
+                continue;
+            }
+            self.free_branches(fs, nr, depth - 1);
+        }
+
+        if let Err(err) = fs.free_blocks(block_nr, 1) {
+            error!(
+                "ext2: free_branches: failed to free indirect block {}: {:?}",
+                block_nr, err
+            );
+            return;
+        }
+        self.desc.blocks = self.desc.blocks.saturating_sub(sectors_per_block);
+    }
+
+    /// Linux: /root/linux/fs/ext2/inode.c:479 (ext2_alloc_branch)
+    /// Linux: /root/linux/fs/ext2/inode.c:561 (ext2_splice_branch)
+    fn alloc_and_splice_branch(
+        &mut self,
+        fs: &Ext2,
+        indirect_blks: u32,
+        data_blks: u32,
+        path: &BlockPath,
+        branch: &BranchResult,
+    ) -> Result<Bid> {
+        if data_blks == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid zero data allocation");
+        }
+        if branch.partial_level >= path.depth {
+            return_errno_with_message!(Errno::EIO, "branch is already complete");
+        }
+
+        let total = indirect_blks
+            .checked_add(data_blks)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "block allocation count overflow"))?;
+        if total == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid zero total allocation");
+        }
+
+        let block_size = fs.block_size();
+        if block_size < size_of::<u32>() {
+            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+        }
+
+        let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
+        if sectors_per_block == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid sector accounting for block size");
+        }
+        let added_sectors = total
+            .checked_mul(sectors_per_block)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "inode block accounting overflow"))?;
+        let new_block_count = self
+            .desc
+            .blocks
+            .checked_add(added_sectors)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "inode block count overflow"))?;
+
+        let mut new_blocks = Vec::with_capacity(total as usize);
+        let mut alloc_goal = Bid::new(
+            branch
+                .chain
+                .last()
+                .map_or(self.desc.block_ptrs[0], |entry| entry.key)
+                .max(fs.super_block().first_data_block()) as u64,
+        );
+        // Rollback helper: frees all blocks allocated so far.
+        let free_all_fn = |blocks: &Vec<u32>| {
+            for bid in blocks {
+                let _ = fs.free_blocks(*bid, 1);
+            }
+        };
+
+        while (new_blocks.len() as u32) < total {
+            let remain = total - new_blocks.len() as u32;
+            let allocated = match fs.alloc_blocks(remain, alloc_goal) {
+                Ok(allocated) => allocated,
+                Err(err) => {
+                    free_all_fn(&new_blocks);
+                    return Err(err);
+                }
+            };
+
+            let alloc_len = allocated.end - allocated.start;
+            if alloc_len == 0 || alloc_len > remain {
+                free_all_fn(&new_blocks);
+                return_errno_with_message!(Errno::EIO, "invalid block allocation result");
+            }
+
+            new_blocks.extend(allocated);
+            if let Some(last) = new_blocks.last() {
+                alloc_goal = Bid::new((last + 1) as u64);
+            }
+        }
+
+        // SPEC: data block is at index `indirect_blks` in allocation order.
+        let data_block = match new_blocks.get(indirect_blks as usize) {
+            Some(bid) => *bid,
+            None => {
+                free_all_fn(&new_blocks);
+                return_errno_with_message!(Errno::EIO, "allocated chain missing data block");
+            }
+        };
+
+        // Phase 1: Build the new chain — zero-fill each indirect block, write
+        // the next-level pointer, and flush to disk. The chain is fully formed
+        // but still unreachable from the existing tree.
+        for i in 0..(indirect_blks as usize) {
+            let level = branch.partial_level + 1 + i;
+            if level >= path.depth {
+                free_all_fn(&new_blocks);
+                return_errno_with_message!(Errno::EIO, "invalid branch depth during allocation");
+            }
+
+            let ptr_offset = (path.offsets[level] as usize) * size_of::<u32>();
+            let ptr_end = ptr_offset + size_of::<u32>();
+            if ptr_end > block_size {
+                free_all_fn(&new_blocks);
+                return_errno_with_message!(Errno::EIO, "indirect pointer offset out of bounds");
+            }
+
+            let next_block = match new_blocks.get(i + 1) {
+                Some(bid) => *bid,
+                None => {
+                    free_all_fn(&new_blocks);
+                    return_errno_with_message!(Errno::EIO, "allocated chain metadata mismatch");
+                }
+            };
+
+            let mut buf = vec![0u8; block_size];
+            buf[ptr_offset..ptr_end].copy_from_slice(&next_block.to_le_bytes());
+            if fs
+                .block_device()
+                .write_bytes(Bid::new(new_blocks[i] as u64).to_offset(), &buf)
+                .is_err()
+            {
+                free_all_fn(&new_blocks);
+                return_errno_with_message!(Errno::EIO, "failed to write new indirect block");
+            }
+        }
+
+        // Phase 2: Splice — write the chain head into the break point, making
+        // the entire new chain reachable in one pointer write.
+        let splice_ptr = new_blocks[0];
+        if branch.partial_level == 0 {
+            let slot = path.offsets[0] as usize;
+            if slot >= self.desc.block_ptrs.len() {
+                free_all_fn(&new_blocks);
+                return_errno_with_message!(Errno::EIO, "invalid inode block pointer slot");
+            }
+            if self.desc.block_ptrs[slot] != 0 {
+                free_all_fn(&new_blocks);
+                return_errno_with_message!(Errno::EIO, "block pointer changed during allocation");
+            }
+
+            // SPEC: splice directly into inode i_block[].
+            self.desc.block_ptrs[slot] = splice_ptr;
+        } else {
+            let parent_entry_level = branch.partial_level;
+            let mut parent_buf = match branch
+                .chain
+                .get(parent_entry_level)
+                .and_then(|entry| entry.bh.clone())
+            {
+                Some(buf) => buf,
+                None => {
+                    free_all_fn(&new_blocks);
+                    return_errno_with_message!(
+                        Errno::EIO,
+                        "missing parent indirect block for splice"
+                    );
+                }
+            };
+
+            let parent_bid = branch
+                .chain
+                .get(parent_entry_level - 1)
+                .map(|entry| entry.key)
+                .unwrap_or(0);
+            if parent_bid == 0 {
+                free_all_fn(&new_blocks);
+                return_errno_with_message!(Errno::EIO, "invalid parent indirect block number");
+            }
+
+            let ptr_offset = (path.offsets[parent_entry_level] as usize) * size_of::<u32>();
+            let ptr_end = ptr_offset + size_of::<u32>();
+            if ptr_end > parent_buf.len() {
+                free_all_fn(&new_blocks);
+                return_errno_with_message!(Errno::EIO, "splice offset out of bounds");
+            }
+            parent_buf[ptr_offset..ptr_end].copy_from_slice(&splice_ptr.to_le_bytes());
+
+            if fs
+                .block_device()
+                .write_bytes(Bid::new(parent_bid as u64).to_offset(), &parent_buf)
+                .is_err()
+            {
+                free_all_fn(&new_blocks);
+                return_errno_with_message!(Errno::EIO, "failed to splice branch into parent");
+            }
+        }
+
+        // SPEC: ext2_splice_branch-style inode accounting and ctime update.
+        self.desc.blocks = new_block_count;
+
+        Ok(Bid::new(data_block as u64))
+    }
+
+    /// Resolves a logical block to physical block (read-only).
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:783 (ext2_get_block)
+    pub(super) fn get_block(&self, fs: &Ext2, iblock: u32) -> Result<Option<Bid>> {
+        let path = self.block_to_path(fs, iblock)?;
+        if path.depth == 0 {
+            return Ok(None);
+        }
+
+        let branch = self.get_branch(&path, &fs)?;
+        if branch.partial_level < path.depth {
+            return Ok(None);
+        }
+
+        let bid = branch
+            .chain
+            .get(path.depth - 1)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "incomplete branch result"))?
+            .key;
+        if bid == 0 {
+            return Ok(None);
+        }
+        Ok(Some(Bid::new(bid as u64)))
+    }
+
+    /// Resolves a logical block to physical, optionally allocating missing branch.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:624 (ext2_get_blocks)
+    pub(super) fn get_or_alloc_block(
+        &mut self,
+        fs: &Ext2,
+        iblock: u32,
+        create: bool,
+    ) -> Result<Option<Bid>> {
+        let path = self.block_to_path(fs, iblock)?;
+        if path.depth == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid block path depth");
+        }
+
+        let branch = self.get_branch(&path, &fs)?;
+        if branch.partial_level == path.depth {
+            let mapped = branch
+                .chain
+                .get(path.depth - 1)
+                .ok_or_else(|| Error::with_message(Errno::EIO, "incomplete branch result"))?
+                .key;
+            return Ok(Some(Bid::new(mapped as u64)));
+        }
+        if !create {
+            return Ok(None);
+        }
+
+        let (indirect_blks, data_blks) = self.blks_to_allocate(&branch, &path);
+        let bid = self.alloc_and_splice_branch(&fs, indirect_blks, data_blks, &path, &branch)?;
+        Ok(Some(bid))
+    }
+
+    /// Truncates all blocks beyond `new_size`.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:1172 (__ext2_truncate_blocks)
+    pub(super) fn truncate_blocks(&mut self, fs: &Ext2, new_size: usize) -> Result<()> {
+        let block_size = fs.block_size();
+        if block_size == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+        }
+        let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
+        if sectors_per_block == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid sector accounting for block size");
+        }
+
+        // SPEC: first logical block to free = ceil(new_size / block_size).
+        let iblock = u32::try_from(new_size.div_ceil(block_size))
+            .map_err(|_| Error::with_message(Errno::EINVAL, "truncate size exceeds ext2 limits"))?;
+
+        // Convert logical block number to access path (depth + offsets).
+        let path = self.block_to_path(fs, iblock)?;
+        if path.depth == 0 {
+            return Ok(());
+        }
+
+        let ptrs_per_block = block_size / size_of::<u32>();
+        if ptrs_per_block == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid indirect pointer fanout");
+        }
+
+        // === Case 1: Direct blocks only ===
+        if path.depth == 1 {
+            // Linux: ext2_free_data(i_data + offsets[0], i_data + EXT2_NDIR_BLOCKS).
+            // Free direct blocks from offsets[0] to block_ptrs[11].
+            let start = (path.offsets[0] as usize).min(12);
+            for idx in start..12 {
+                let ptr = self.desc.block_ptrs[idx];
+                if ptr == 0 {
+                    continue;
+                }
+                fs.free_blocks(ptr, 1)?;
+                self.desc.block_ptrs[idx] = 0;
+                self.desc.blocks = self.desc.blocks.saturating_sub(sectors_per_block);
+            }
+        } else {
+            // === Case 2: Indirect blocks ===
+
+            // --- Step 1: Adjust depth for boundary case ---
+            // SPEC: ext2_find_shared-style partial branch handling.
+            // If truncation point is at the start of an indirect block (offset = 0),
+            // we can handle it at a higher level without reading that indirect block.
+            let mut k = path.depth;
+            while k > 1 && path.offsets[k - 1] == 0 {
+                k -= 1;
+            }
+            let shared_path = BlockPath {
+                depth: k,
+                offsets: path.offsets,
+                boundary: path.boundary,
+            };
+
+            // --- Step 2: Read indirect block chain ---
+            // branch.chain[i] contains the i-th level indirect block.
+            // branch.partial_level indicates how deep we successfully read.
+            let branch = self.get_branch(&shared_path, &fs)?;
+            // `partial` is an index into `branch.chain[]`, pointing to the
+            // deepest level from which we start detaching and freeing blocks.
+            // If the full chain was read (partial_level == k), the last valid
+            // index is k-1; otherwise partial_level already is the index where
+            // traversal stopped on a zero pointer.
+            // The all_zeroes loop below may shrink `partial` upward.
+            let mut partial = if branch.partial_level == k {
+                k - 1
+            } else {
+                branch.partial_level
+            };
+
+            // --- Step 3: all_zeroes optimization ---
+            // SPEC: preserve Linux all_zeroes optimization by walking up to the
+            // highest indirect block that can be fully detached.
+            // If the left side (to be kept) of an indirect block is all zeros,
+            // we can free the entire indirect block and handle it at a higher level.
+            while partial > 0 {
+                let buf = branch
+                    .chain
+                    .get(partial)
+                    .and_then(|entry| entry.bh.as_ref())
+                    .ok_or_else(|| {
+                        Error::with_message(
+                            Errno::EIO,
+                            "missing indirect block buffer for all-zeroes check",
+                        )
+                    })?;
+
+                // Check if entries [0..offsets[partial]) are all zero.
+                let keep_entries = path.offsets[partial] as usize;
+                let keep_bytes = keep_entries * size_of::<u32>();
+                if keep_bytes > buf.len() {
+                    return_errno_with_message!(Errno::EIO, "all-zeroes check offset out of bounds");
+                }
+
+                let mut all_zero = true;
+                let mut byte = 0usize;
+                while byte < keep_bytes {
+                    let val = u32::from_le_bytes([
+                        buf[byte],
+                        buf[byte + 1],
+                        buf[byte + 2],
+                        buf[byte + 3],
+                    ]);
+                    if val != 0 {
+                        all_zero = false;
+                        break;
+                    }
+                    byte += size_of::<u32>();
+                }
+                if !all_zero {
+                    break;
+                }
+                // Left side is all zeros, move up one level.
+                partial -= 1;
+            }
+
+            // --- Step 4: Detach subtree root ---
+            // Disconnect the pointer at offsets[partial] and get the subtree root block number.
+            let detached_nr;
+            if partial == 0 {
+                // Detach from inode.block_ptrs directly.
+                let slot = path.offsets[0] as usize;
+                if slot >= self.desc.block_ptrs.len() {
+                    return_errno_with_message!(Errno::EIO, "inode block pointer slot out of range");
+                }
+                detached_nr = self.desc.block_ptrs[slot];
+                self.desc.block_ptrs[slot] = 0;
+            } else {
+                // Detach from parent indirect block.
+                // chain[partial] contains the current level's buffer.
+                // chain[partial-1].key is the block number to write back.
+                let mut parent_buf = branch
+                    .chain
+                    .get(partial)
+                    .and_then(|entry| entry.bh.clone())
+                    .ok_or_else(|| {
+                        Error::with_message(Errno::EIO, "missing parent indirect block buffer")
+                    })?;
+                let parent_bid = branch
+                    .chain
+                    .get(partial - 1)
+                    .map(|entry| entry.key)
+                    .unwrap_or(0);
+                if parent_bid == 0 {
+                    return_errno_with_message!(Errno::EIO, "invalid parent indirect block number");
+                }
+
+                // Read the pointer at offsets[partial].
+                let ptr_offset = (path.offsets[partial] as usize) * size_of::<u32>();
+                let ptr_end = ptr_offset + size_of::<u32>();
+                if ptr_end > parent_buf.len() {
+                    return_errno_with_message!(Errno::EIO, "shared branch pointer out of bounds");
+                }
+
+                detached_nr = u32::from_le_bytes([
+                    parent_buf[ptr_offset],
+                    parent_buf[ptr_offset + 1],
+                    parent_buf[ptr_offset + 2],
+                    parent_buf[ptr_offset + 3],
+                ]);
+
+                // Zero out the pointer and write back.
+                parent_buf[ptr_offset..ptr_end].copy_from_slice(&0u32.to_le_bytes());
+                if fs
+                    .block_device()
+                    .write_bytes(Bid::new(parent_bid as u64).to_offset(), &parent_buf)
+                    .is_err()
+                {
+                    return_errno_with_message!(Errno::EIO, "failed to detach shared branch");
+                }
+            }
+
+            // Recursively free the detached subtree.
+            if detached_nr != 0 {
+                // SPEC: free detached subtree root.
+                let subtree_depth = (path.depth - 1 - partial) as u32;
+                self.free_branches(&fs, detached_nr, subtree_depth);
+            }
+
+            // --- Step 5: Clear right side of partially shared indirect blocks ---
+            // SPEC: clear right side of each partially shared indirect block.
+            // For each level from partial down to 1, free all pointers to the right
+            // of offsets[level].
+            for level in (1..=partial).rev() {
+                let parent_bid = branch
+                    .chain
+                    .get(level - 1)
+                    .map(|entry| entry.key)
+                    .unwrap_or(0);
+                if parent_bid == 0 {
+                    return_errno_with_message!(Errno::EIO, "invalid indirect block number on tail");
+                }
+
+                // Re-read the current indirect block state to avoid stale-buffer
+                // overwrite after the detach step above.
+                let mut buf = vec![0u8; block_size];
+                if fs
+                    .block_device()
+                    .read_bytes(Bid::new(parent_bid as u64).to_offset(), &mut buf)
+                    .is_err()
+                {
+                    return_errno_with_message!(
+                        Errno::EIO,
+                        "failed to read indirect block for truncation tail"
+                    );
+                }
+
+                // Free all pointers from offsets[level]+1 to the end.
+                let start_idx = (path.offsets[level] as usize) + 1;
+                let child_depth = (path.depth - 1 - level) as u32;
+                for idx in start_idx..ptrs_per_block {
+                    let ptr_offset = idx * size_of::<u32>();
+                    let ptr_end = ptr_offset + size_of::<u32>();
+                    if ptr_end > buf.len() {
+                        break;
+                    }
+                    let nr = u32::from_le_bytes([
+                        buf[ptr_offset],
+                        buf[ptr_offset + 1],
+                        buf[ptr_offset + 2],
+                        buf[ptr_offset + 3],
+                    ]);
+                    if nr == 0 {
+                        continue;
+                    }
+                    buf[ptr_offset..ptr_end].copy_from_slice(&0u32.to_le_bytes());
+                    self.free_branches(&fs, nr, child_depth);
+                }
+
+                // Write back the modified indirect block.
+                if fs
+                    .block_device()
+                    .write_bytes(Bid::new(parent_bid as u64).to_offset(), &buf)
+                    .is_err()
+                {
+                    return_errno_with_message!(
+                        Errno::EIO,
+                        "failed to persist partial indirect truncation"
+                    );
+                }
+            }
+        }
+
+        // === Step 6: Free complete indirect block trees ===
+        // Linux: do_indirects switch/fallthrough by offsets[0].
+        // If truncation point is in direct blocks, free all indirect trees.
+        // If in single indirect, free double and triple indirect trees, etc.
+        if path.offsets[0] < 12 {
+            // Truncation in direct blocks: free single, double, triple indirect.
+            let nr = self.desc.block_ptrs[12];
+            if nr != 0 {
+                self.desc.block_ptrs[12] = 0;
+                self.free_branches(&fs, nr, 1);
+            }
+        }
+        if path.offsets[0] <= 12 {
+            // Truncation in direct or single indirect: free double, triple indirect.
+            let nr = self.desc.block_ptrs[13];
+            if nr != 0 {
+                self.desc.block_ptrs[13] = 0;
+                self.free_branches(&fs, nr, 2);
+            }
+        }
+        if path.offsets[0] <= 13 {
+            // Truncation in direct, single, or double indirect: free triple indirect.
+            let nr = self.desc.block_ptrs[14];
+            if nr != 0 {
+                self.desc.block_ptrs[14] = 0;
+                self.free_branches(&fs, nr, 3);
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl RawInode {
     pub(super) fn from_parts(meta: &InodeMetaDesc, mapping: &InodeMappingDesc) -> Self {
         let mode = meta.perm.0;
@@ -4296,7 +4443,7 @@ mod test {
 
         let (ctime_before, mtime_before) = {
             let guard = root.inner.read();
-            (guard.desc.ctime, guard.desc.mtime)
+            (guard.meta.desc.ctime, guard.meta.desc.mtime)
         };
 
         // Linux ext2_set_link with update_times=false keeps ctime/mtime unchanged.
@@ -4305,7 +4452,7 @@ mod test {
         assert_eq!(root.inner.read().find_entry("src").unwrap(), target.ino());
         let (ctime_after, mtime_after) = {
             let guard = root.inner.read();
-            (guard.desc.ctime, guard.desc.mtime)
+            (guard.meta.desc.ctime, guard.meta.desc.mtime)
         };
         assert_eq!(ctime_before, ctime_after);
         assert_eq!(mtime_before, mtime_after);
@@ -4677,7 +4824,7 @@ mod test {
 
         let mut stop_visitor = StopAfterVisitor::new(2);
         let stop_advanced = inner.readdir_at(0, &mut stop_visitor).unwrap();
-        assert!(stop_advanced > 0 && stop_advanced < inner.desc.size as usize);
+        assert!(stop_advanced > 0 && stop_advanced < inner.meta.desc.size as usize);
 
         let first_entry_end = visitor.entries[0].3 + 1;
         let mut offset_visitor = CollectDirentVisitor::default();
@@ -4827,16 +4974,19 @@ mod test {
         let mut idx = 0u32;
         loop {
             let name = alloc::format!("e{idx:03}");
-            let size_before = root.inner.read().desc.size;
+            let size_before = root.inner.read().meta.desc.size;
             let result = root.create(&name, InodeType::File, FilePerm::from_bits_truncate(0o644));
             match result {
                 Ok(_) => {
-                    let size_after = root.inner.read().desc.size;
+                    let size_after = root.inner.read().meta.desc.size;
                     if size_after > size_before {
                         // Block growth happened — this is what we wanted to test.
                         let inner = root.inner.read();
-                        assert_eq!(inner.desc.size, (size_before as usize + block_size) as u64);
-                        assert_ne!(inner.desc.block_ptrs[1], 0);
+                        assert_eq!(
+                            inner.meta.desc.size,
+                            (size_before as usize + block_size) as u64
+                        );
+                        assert_ne!(inner.mapping.desc.block_ptrs[1], 0);
                         assert!(inner.find_entry(&name).is_ok());
                         return;
                     }
@@ -4872,8 +5022,8 @@ mod test {
             root.add_entry(&name, ROOT_INO, DirEntryFileType::File)
                 .unwrap();
             let inner = root.inner.read();
-            if inner.desc.block_ptrs[12] != 0 {
-                assert!(inner.desc.size > (block_size * 12) as u64);
+            if inner.mapping.desc.block_ptrs[12] != 0 {
+                assert!(inner.meta.desc.size > (block_size * 12) as u64);
                 assert!(inner.find_entry(&name).is_ok());
                 return;
             }
@@ -4901,17 +5051,17 @@ mod test {
             for iblock in 0..13u32 {
                 inner.get_or_alloc_block(iblock, true).unwrap().unwrap();
             }
-            inner.desc.size = (13 * block_size) as u64;
+            inner.meta.desc.size = (13 * block_size) as u64;
 
-            let old_block_sectors = inner.desc.blocks;
-            assert!(inner.desc.block_ptrs[12] != 0);
+            let old_block_sectors = inner.mapping.desc.blocks;
+            assert!(inner.mapping.desc.block_ptrs[12] != 0);
             assert!(inner.get_block(12).unwrap().is_some());
             let free_before = f.ext2.super_block().free_blocks_count();
 
             inner.release_dir_data_blocks_for_cleanup(&f.ext2).unwrap();
-            assert_eq!(inner.desc.size, 0);
-            assert_eq!(inner.desc.blocks, 0);
-            assert!(inner.desc.block_ptrs.iter().all(|ptr| *ptr == 0));
+            assert_eq!(inner.meta.desc.size, 0);
+            assert_eq!(inner.mapping.desc.blocks, 0);
+            assert!(inner.mapping.desc.block_ptrs.iter().all(|ptr| *ptr == 0));
             assert_eq!(inner.get_block(0).unwrap(), None);
             assert_eq!(inner.get_block(12).unwrap(), None);
 
@@ -4993,9 +5143,9 @@ mod test {
         let allocated_bid = {
             let inner = inode.inner.read();
             assert!(inner.empty_dir());
-            assert_eq!(inner.desc.size as usize, block_size);
-            assert_eq!(inner.desc.blocks, (block_size / SECTOR_SIZE) as u32);
-            inner.desc.block_ptrs[0]
+            assert_eq!(inner.meta.desc.size as usize, block_size);
+            assert_eq!(inner.mapping.desc.blocks, (block_size / SECTOR_SIZE) as u32);
+            inner.mapping.desc.block_ptrs[0]
         };
         assert_ne!(allocated_bid, 0);
 
@@ -5061,7 +5211,7 @@ mod test {
         parent.rmdir("sub").unwrap();
         {
             let parent_inner = parent.inner.read();
-            assert_eq!(parent_inner.desc.links_count, 2);
+            assert_eq!(parent_inner.meta.desc.links_count, 2);
             assert_eq!(
                 parent_inner.find_entry("sub").unwrap_err().error(),
                 Errno::ENOENT
@@ -5069,10 +5219,10 @@ mod test {
         }
 
         let parent = f.ext2.read_inode(ROOT_INO).unwrap();
-        assert_eq!(parent.inner.read().desc.links_count, 2);
+        assert_eq!(parent.inner.read().meta.desc.links_count, 2);
         let child = f.ext2.read_inode(child_ino).unwrap();
-        assert_eq!(child.inner.read().desc.size, 0);
-        assert_eq!(child.inner.read().desc.links_count, 0);
+        assert_eq!(child.inner.read().meta.desc.size, 0);
+        assert_eq!(child.inner.read().meta.desc.links_count, 0);
     }
 
     #[ktest]
@@ -5089,7 +5239,7 @@ mod test {
 
         let parent_inner = parent.inner.read();
         assert_eq!(parent_inner.find_entry("sub").unwrap(), child_ino);
-        assert_eq!(parent_inner.desc.links_count, 3);
+        assert_eq!(parent_inner.meta.desc.links_count, 3);
 
         let inode_bitmap = f.block_groups()[0].inode_bitmap();
         assert!(inode_bitmap.is_allocated((child_ino - 1) as u16));
@@ -5302,15 +5452,18 @@ mod test {
 
         let mut inode_inner = make_inode_inner(Arc::downgrade(ext2), [0u32; 15]);
         assert_eq!(inode_inner.get_or_alloc_block(0, false).unwrap(), None);
-        assert_eq!(inode_inner.desc.block_ptrs[0], 0);
+        assert_eq!(inode_inner.mapping.desc.block_ptrs[0], 0);
 
         let free_before = ext2.super_block().free_blocks_count();
         let allocated = inode_inner.get_or_alloc_block(0, true).unwrap().unwrap();
         let free_after = ext2.super_block().free_blocks_count();
 
-        assert_eq!(inode_inner.desc.block_ptrs[0], allocated.to_raw() as u32);
+        assert_eq!(
+            inode_inner.mapping.desc.block_ptrs[0],
+            allocated.to_raw() as u32
+        );
         assert_eq!(inode_inner.get_block(0).unwrap(), Some(allocated));
-        assert_eq!(inode_inner.desc.blocks, sectors_per_block);
+        assert_eq!(inode_inner.mapping.desc.blocks, sectors_per_block);
         assert_eq!(free_before.saturating_sub(free_after), 1);
     }
 
@@ -5328,9 +5481,12 @@ mod test {
         let allocated = inode_inner.get_or_alloc_block(12, true).unwrap().unwrap();
         let free_after = ext2.super_block().free_blocks_count();
 
-        assert_ne!(inode_inner.desc.block_ptrs[12], 0);
+        assert_ne!(inode_inner.mapping.desc.block_ptrs[12], 0);
         assert_eq!(inode_inner.get_block(12).unwrap(), Some(allocated));
-        assert_eq!(inode_inner.desc.blocks, sectors_per_block.saturating_mul(2));
+        assert_eq!(
+            inode_inner.mapping.desc.blocks,
+            sectors_per_block.saturating_mul(2)
+        );
         assert_eq!(free_before.saturating_sub(free_after), 2);
     }
 
@@ -5346,8 +5502,8 @@ mod test {
         let mut inode_inner = make_inode_inner(Arc::downgrade(ext2), [0u32; 15]);
         let err = inode_inner.get_or_alloc_block(0, true).unwrap_err();
         assert_eq!(err.error(), Errno::ENOSPC);
-        assert_eq!(inode_inner.desc.block_ptrs, [0u32; 15]);
-        assert_eq!(inode_inner.desc.blocks, 0);
+        assert_eq!(inode_inner.mapping.desc.block_ptrs, [0u32; 15]);
+        assert_eq!(inode_inner.mapping.desc.blocks, 0);
     }
 
     #[ktest]
@@ -5393,7 +5549,7 @@ mod test {
             .get_or_alloc_block(first_double_iblock, true)
             .unwrap()
             .unwrap();
-        assert_ne!(inode_inner.desc.block_ptrs[13], 0);
+        assert_ne!(inode_inner.mapping.desc.block_ptrs[13], 0);
         assert_eq!(
             inode_inner.get_block(first_double_iblock).unwrap(),
             Some(allocated_data)
@@ -5404,7 +5560,7 @@ mod test {
         assert_eq!(ext2.super_block().free_blocks_count(), 0);
         assert_eq!(f.block_groups()[0].free_blocks_count(), 0);
         assert_eq!(
-            inode_inner.desc.blocks,
+            inode_inner.mapping.desc.blocks,
             ((block_size / SECTOR_SIZE) as u32) * 3
         );
     }
@@ -5437,7 +5593,7 @@ mod test {
 
         {
             let inner = file.inner.read();
-            assert_eq!(inner.desc.size as usize, payload.len());
+            assert_eq!(inner.meta.desc.size as usize, payload.len());
         }
         let mut readback = vec![0u8; block_size];
         let mut readback_writer = VmWriter::from(readback.as_mut_slice()).to_fallible();
@@ -5454,9 +5610,9 @@ mod test {
 
         {
             let inner = file.inner.read();
-            assert_eq!(inner.desc.size, 0);
-            assert_eq!(inner.desc.blocks, 0);
-            assert_eq!(inner.desc.block_ptrs[0], 0);
+            assert_eq!(inner.meta.desc.size, 0);
+            assert_eq!(inner.mapping.desc.blocks, 0);
+            assert_eq!(inner.mapping.desc.block_ptrs[0], 0);
         }
 
         let on_disk = f.ext2.read_inode_desc(file.ino()).unwrap();
@@ -5483,9 +5639,9 @@ mod test {
         assert_eq!(link.read_link().unwrap(), target);
 
         let inner = link.inner.read();
-        assert_eq!(inner.desc.size as usize, target.len());
-        assert_eq!(inner.desc.blocks, 0);
-        assert!(inner.desc.is_fast_symlink(f.ext2.block_size()));
+        assert_eq!(inner.meta.desc.size as usize, target.len());
+        assert_eq!(inner.mapping.desc.blocks, 0);
+        assert!(inner.is_fast_symlink(f.ext2.block_size()));
     }
 
     #[ktest]
@@ -5507,9 +5663,9 @@ mod test {
         assert_eq!(link.read_link().unwrap(), target);
 
         let inner = link.inner.read();
-        assert_eq!(inner.desc.size as usize, MAX_FAST_SYMLINK_LEN);
-        assert!(inner.desc.blocks > 0);
-        assert!(!inner.desc.is_fast_symlink(f.ext2.block_size()));
+        assert_eq!(inner.meta.desc.size as usize, MAX_FAST_SYMLINK_LEN);
+        assert!(inner.mapping.desc.blocks > 0);
+        assert!(!inner.is_fast_symlink(f.ext2.block_size()));
     }
 
     #[ktest]
@@ -5610,7 +5766,7 @@ mod test {
             &out[crossing_off..crossing_off + 128],
             crossing_data.as_slice()
         );
-        assert_eq!(file.inner.read().desc.size as usize, block_size * 2);
+        assert_eq!(file.inner.read().meta.desc.size as usize, block_size * 2);
     }
 
     #[ktest]
@@ -5630,7 +5786,7 @@ mod test {
         file.write_at(write_off, &mut payload_reader).unwrap();
 
         let inner = file.inner.read();
-        assert_eq!(inner.desc.size as usize, write_off + payload.len());
+        assert_eq!(inner.meta.desc.size as usize, write_off + payload.len());
         assert_eq!(inner.get_block(0).unwrap(), None);
         assert_eq!(inner.get_block(1).unwrap(), None);
         drop(inner);
@@ -5669,7 +5825,7 @@ mod test {
         assert_eq!(err.error(), Errno::ENOSPC);
 
         let inner = file.inner.read();
-        assert_eq!(inner.desc.size as usize, block_size);
+        assert_eq!(inner.meta.desc.size as usize, block_size);
         assert!(inner.get_block(0).unwrap().is_some());
         assert_eq!(inner.get_block(1).unwrap(), None);
         assert_eq!(f.ext2.super_block().free_blocks_count(), free_before_fail);
@@ -5793,9 +5949,9 @@ mod test {
         let target = block_size * 3 + 123;
         file.resize(target).unwrap();
         let inner = file.inner.read();
-        assert_eq!(inner.desc.size as usize, target);
-        assert_eq!(inner.desc.blocks, 0);
-        assert!(inner.desc.block_ptrs.iter().all(|ptr| *ptr == 0));
+        assert_eq!(inner.meta.desc.size as usize, target);
+        assert_eq!(inner.mapping.desc.blocks, 0);
+        assert!(inner.mapping.desc.block_ptrs.iter().all(|ptr| *ptr == 0));
     }
 
     #[ktest]
@@ -5925,8 +6081,11 @@ mod test {
         assert_eq!(eof, [0x5au8; 32]);
 
         let inner = file.inner.read();
-        assert_eq!(inner.desc.size as usize, block_size + keep_in_tail);
-        assert_eq!(inner.desc.blocks, sectors_per_block.saturating_mul(2));
+        assert_eq!(inner.meta.desc.size as usize, block_size + keep_in_tail);
+        assert_eq!(
+            inner.mapping.desc.blocks,
+            sectors_per_block.saturating_mul(2)
+        );
     }
 
     // TODO: this test will failed due to the bug of PageCache::discard_range.
@@ -5993,7 +6152,7 @@ mod test {
             inner
                 .get_or_alloc_block(first_double_iblock + 2, true)
                 .unwrap();
-            inner.desc.size = ((first_double_iblock as usize + 3) * block_size) as u64;
+            inner.meta.desc.size = ((first_double_iblock as usize + 3) * block_size) as u64;
         }
 
         file.resize((first_double_iblock as usize + 1) * block_size)
@@ -6023,20 +6182,20 @@ mod test {
             inner.get_or_alloc_block(12, true).unwrap();
             inner.get_or_alloc_block(first_double_iblock, true).unwrap();
             inner.get_or_alloc_block(first_triple_iblock, true).unwrap();
-            assert_ne!(inner.desc.block_ptrs[12], 0);
-            assert_ne!(inner.desc.block_ptrs[13], 0);
-            assert_ne!(inner.desc.block_ptrs[14], 0);
+            assert_ne!(inner.mapping.desc.block_ptrs[12], 0);
+            assert_ne!(inner.mapping.desc.block_ptrs[13], 0);
+            assert_ne!(inner.mapping.desc.block_ptrs[14], 0);
         }
 
         file.resize(0).unwrap();
         let inner = file.inner.read();
-        assert_eq!(inner.desc.block_ptrs[12], 0);
-        assert_eq!(inner.desc.block_ptrs[13], 0);
-        assert_eq!(inner.desc.block_ptrs[14], 0);
+        assert_eq!(inner.mapping.desc.block_ptrs[12], 0);
+        assert_eq!(inner.mapping.desc.block_ptrs[13], 0);
+        assert_eq!(inner.mapping.desc.block_ptrs[14], 0);
         assert_eq!(inner.get_block(12).unwrap(), None);
         assert_eq!(inner.get_block(first_double_iblock).unwrap(), None);
         assert_eq!(inner.get_block(first_triple_iblock).unwrap(), None);
-        assert_eq!(inner.desc.blocks, 0);
+        assert_eq!(inner.mapping.desc.blocks, 0);
     }
 
     #[ktest]
@@ -6055,17 +6214,20 @@ mod test {
 
         let mut inner = file.inner.write();
         inner.get_or_alloc_block(first_triple_iblock, true).unwrap();
-        let root = inner.desc.block_ptrs[14];
+        let root = inner.mapping.desc.block_ptrs[14];
         assert_ne!(root, 0);
-        assert_eq!(inner.desc.blocks, sectors_per_block.saturating_mul(4));
+        assert_eq!(
+            inner.mapping.desc.blocks,
+            sectors_per_block.saturating_mul(4)
+        );
 
         let free_before = f.ext2.super_block().free_blocks_count();
         inner.free_branches(&f.ext2, root, 3);
-        inner.desc.block_ptrs[14] = 0;
+        inner.mapping.desc.block_ptrs[14] = 0;
         let free_after = f.ext2.super_block().free_blocks_count();
 
         assert_eq!(free_after.saturating_sub(free_before), 4);
-        assert_eq!(inner.desc.blocks, 0);
+        assert_eq!(inner.mapping.desc.blocks, 0);
     }
 
     #[ktest]
@@ -6148,9 +6310,9 @@ mod test {
         file.resize(block_size * 2 + 7).unwrap();
 
         let inner = file.inner.read();
-        assert_eq!(inner.desc.size as usize, block_size * 2 + 7);
-        assert_eq!(inner.desc.blocks, 0);
-        assert!(inner.desc.block_ptrs.iter().all(|ptr| *ptr == 0));
+        assert_eq!(inner.meta.desc.size as usize, block_size * 2 + 7);
+        assert_eq!(inner.mapping.desc.blocks, 0);
+        assert!(inner.mapping.desc.block_ptrs.iter().all(|ptr| *ptr == 0));
     }
 
     #[ktest]
@@ -6213,7 +6375,7 @@ mod test {
         assert_eq!(read, value.len());
         assert_eq!(got.as_slice(), value);
 
-        assert_ne!(file.inner.read().desc.file_acl, 0);
+        assert_ne!(file.inner.read().meta.desc.file_acl, 0);
     }
 
     #[ktest]
@@ -6239,10 +6401,10 @@ mod test {
             XattrSetFlags::CREATE_OR_REPLACE,
         )
         .unwrap();
-        assert_ne!(file.inner.read().desc.file_acl, 0);
+        assert_ne!(file.inner.read().meta.desc.file_acl, 0);
 
         VfsInodeTrait::remove_xattr(file.as_ref(), make_name()).unwrap();
-        assert_eq!(file.inner.read().desc.file_acl, 0);
+        assert_eq!(file.inner.read().meta.desc.file_acl, 0);
 
         let err = VfsInodeTrait::remove_xattr(file.as_ref(), make_name()).unwrap_err();
         assert_eq!(err.error(), Errno::ENODATA);
