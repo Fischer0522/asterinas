@@ -551,18 +551,17 @@ impl Inode {
             return Ok(0);
         }
 
-        let read_len = {
-            let meta = self.inner.meta_read();
-            let file_size = meta.file_size();
-            if offset >= file_size {
-                return Ok(0);
-            }
-            writer.avail().min(file_size - offset)
-        };
+        let meta = self.inner.meta_upread();
+        let file_size = meta.file_size();
+        if offset >= file_size {
+            return Ok(0);
+        }
+        let read_len = writer.avail().min(file_size - offset);
         writer.limit(read_len);
         self.inner.page_cache().pages().read(offset, writer)?;
 
-        self.set_atime(now());
+        let mut meta = meta.upgrade();
+        meta.set_atime(now());
         Ok(read_len)
     }
 
@@ -627,12 +626,12 @@ impl Inode {
             return_errno_with_message!(Errno::EINVAL, "not block-aligned");
         }
 
-        let meta = self.inner.meta_read();
+        let meta = self.inner.meta_upread();
+
         let file_size = meta.file_size();
         if offset >= file_size || writer.avail() == 0 {
             return Ok(0);
         }
-        drop(meta);
 
         let read_len = writer.avail().min(file_size - offset);
         writer.limit(read_len);
@@ -645,7 +644,8 @@ impl Inode {
         self.inner
             .read_direct_at(&mapping, &fs, offset, end, writer)?;
 
-        self.set_atime(now());
+        let mut meta = meta.upgrade();
+        meta.set_atime(now());
         Ok(read_len)
     }
 
@@ -714,7 +714,7 @@ impl Inode {
         fs.read_inode(ino)
     }
 
-    /// Adds a new directory entry using upread/upgrade phases.
+    /// Adds a new directory entry.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link)
     pub(super) fn add_entry(
@@ -724,22 +724,6 @@ impl Inode {
         file_type: DirEntryFileType,
     ) -> Result<()> {
         let fs = self.fs_arc()?;
-        self.validate_add_entry_input(name, ino, &fs)?;
-        let mut meta = self.inner.meta_write();
-        let slot = match self.inner.scan_dir_for_slot(&meta, &fs, name)? {
-            DirScanResult::Slot(slot) => slot,
-            DirScanResult::NeedGrowth => self.inner.grow_dir_block(&mut meta, &fs)?,
-        };
-
-        self.inner
-            .write_dir_entry(&meta, &fs, &slot, name, ino, file_type as u8)?;
-        self.inner.update_dir_timestamps_and_flags(&mut meta)?;
-        let mut mapping = self.inner.mapping_write();
-        InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, &fs)?;
-        Ok(())
-    }
-
-    fn validate_add_entry_input(&self, name: &str, ino: u32, fs: &Ext2) -> Result<()> {
         if self.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
@@ -754,6 +738,17 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
+        let mut meta = self.inner.meta_write();
+        let slot = match self.inner.scan_dir_for_slot(&meta, &fs, name)? {
+            DirScanResult::Slot(slot) => slot,
+            DirScanResult::NeedGrowth => self.inner.grow_dir_block(&mut meta, &fs)?,
+        };
+
+        self.inner
+            .write_dir_entry(&meta, &fs, &slot, name, ino, file_type as u8)?;
+        self.inner.update_dir_timestamps_and_flags(&mut meta)?;
+        let mut mapping = self.inner.mapping_write();
+        InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, &fs)?;
         Ok(())
     }
 
@@ -771,11 +766,19 @@ impl Inode {
         self.inner.readdir_at(&meta, &fs, offset, visitor)
     }
 
-    /// Deletes a directory entry by name using upread/upgrade phases.
+    /// Deletes a directory entry by name.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:560 (ext2_delete_entry)
     pub(super) fn delete_entry(&self, name: &str) -> Result<()> {
-        self.validate_delete_entry_input(name)?;
+        if self.type_ != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty() || name_bytes.len() > u8::MAX as usize {
+            return_errno!(Errno::EINVAL);
+        }
+
         let fs = self.fs_arc()?;
         let mut meta = self.inner.meta_write();
         let target = self
@@ -792,19 +795,6 @@ impl Inode {
         self.inner.update_dir_timestamps_and_flags(&mut meta)?;
         let mut mapping = self.inner.mapping_write();
         InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, &fs)?;
-        Ok(())
-    }
-
-    fn validate_delete_entry_input(&self, name: &str) -> Result<()> {
-        if self.type_ != InodeType::Dir {
-            return_errno!(Errno::ENOTDIR);
-        }
-
-        let name_bytes = name.as_bytes();
-        if name_bytes.is_empty() || name_bytes.len() > u8::MAX as usize {
-            return_errno!(Errno::EINVAL);
-        }
-
         Ok(())
     }
 
@@ -1265,24 +1255,40 @@ impl Inode {
         }
 
         let dir_ft = Self::inode_type_to_dir_file_type(old.type_);
+        let (mut dir_meta, mut old_meta) = meta_write_lock_two_inodes(self, old);
 
         // Linux: inode_set_ctime_current + inode_inc_link_count before add_link.
-        {
-            let mut old_meta = old.inner.meta_write();
-            if old_meta.links_count() >= MAX_LINK_COUNT {
-                return_errno!(Errno::EOVERFLOW);
-            }
-            old_meta.set_ctime(now());
-            old_meta.add_links_count_saturating(1);
+        if old_meta.links_count() >= MAX_LINK_COUNT {
+            return_errno!(Errno::EOVERFLOW);
         }
-        if let Err(err) = self.add_entry(name, old.ino, dir_ft) {
+        old_meta.set_ctime(now());
+        old_meta.add_links_count_saturating(1);
+
+        let add_result = (|| -> Result<()> {
+            let slot = match self.inner.scan_dir_for_slot(&dir_meta, &fs, name)? {
+                DirScanResult::Slot(slot) => slot,
+                DirScanResult::NeedGrowth => self.inner.grow_dir_block(&mut dir_meta, &fs)?,
+            };
+            self.inner
+                .write_dir_entry(&dir_meta, &fs, &slot, name, old.ino, dir_ft as u8)?;
+            self.inner.update_dir_timestamps_and_flags(&mut dir_meta)?;
+            Ok(())
+        })();
+
+        if let Err(err) = add_result {
             // SPEC: rollback link count on add_entry failure.
-            let mut old_meta = old.inner.meta_write();
             old_meta.sub_links_count_saturating(1);
             return Err(err);
         }
 
-        let mut old_meta = old.inner.meta_write();
+        let mut dir_mapping = self.inner.mapping_write();
+        InodeInner::persist_inode_locked(
+            &mut dir_meta,
+            &mut dir_mapping,
+            self.ino,
+            self.type_,
+            &fs,
+        )?;
         let mut old_mapping = old.inner.mapping_write();
         InodeInner::persist_inode_locked(
             &mut old_meta,
@@ -1375,279 +1381,439 @@ impl Inode {
             return Ok(());
         }
 
-        // Acquire directory write locks by ascending inode number to avoid deadlock.
-        let same_dir = self.ino == target.ino;
-
-        if same_dir {
-            self.rename_same_dir(old_name, new_name, &fs)
+        if self.ino == target.ino {
+            self.rename_same_dir_with_ordered_locks(old_name, new_name, &fs)
         } else {
-            let (self_inner, target_inner) = meta_write_lock_two_inodes(self, target);
-            Self::rename_inner(
-                self,
-                target,
-                self_inner,
-                target_inner,
-                self.ino,
-                target.ino,
-                old_name,
-                new_name,
-                &fs,
-            )
+            self.rename_cross_dir_with_ordered_locks(target, old_name, new_name, &fs)
         }
     }
 
-    fn apply_rename_target_entry(
-        target: &Inode,
-        target_meta: &mut InodeMeta,
-        fs: &Arc<Ext2>,
+    fn rename_same_dir_with_ordered_locks(
+        &self,
+        old_name: &str,
         new_name: &str,
-        old_ino: u32,
-        old_is_dir: bool,
-        moved_ft: u8,
-    ) -> Result<Option<Arc<Inode>>> {
-        let existing_ino = target.inner.find_entry(target_meta, fs, new_name).ok();
+        fs: &Arc<Ext2>,
+    ) -> Result<()> {
+        const RENAME_RETRY_LIMIT: usize = 8;
+        for _ in 0..RENAME_RETRY_LIMIT {
+            let old_ino = {
+                let dir_meta = self.inner.meta_read();
+                self.inner.find_entry(&dir_meta, fs, old_name)?
+            };
+            let old_inode = fs.read_inode(old_ino)?;
+            let old_is_dir = old_inode.type_ == InodeType::Dir;
+            let moved_ft = Self::inode_type_to_dir_file_type(old_inode.type_) as u8;
 
-        if let Some(existing_ino) = existing_ino {
-            let existing = fs.read_inode(existing_ino)?;
-            let existing_is_dir = existing.type_ == InodeType::Dir;
+            let existing_ino = {
+                let dir_meta = self.inner.meta_read();
+                self.inner.find_entry(&dir_meta, fs, new_name).ok()
+            };
+            let existing_inode = if let Some(ino) = existing_ino {
+                Some(fs.read_inode(ino)?)
+            } else {
+                None
+            };
 
-            // SPEC: type compatibility.
-            if old_is_dir && !existing_is_dir {
-                return_errno!(Errno::ENOTDIR);
+            let mut lock_targets = Vec::new();
+            let dir_idx = Self::push_unique_lock_target(&mut lock_targets, self);
+            let old_idx = Self::push_unique_lock_target(&mut lock_targets, old_inode.as_ref());
+            let existing_idx = existing_inode
+                .as_ref()
+                .map(|inode| Self::push_unique_lock_target(&mut lock_targets, inode.as_ref()));
+            let mut meta_guards: Vec<Option<RwMutexWriteGuard<'_, InodeMeta>>> =
+                meta_write_lock_multiple_inodes(&lock_targets)
+                    .into_iter()
+                    .map(Some)
+                    .collect();
+
+            let rechecked_old_ino = {
+                let dir_meta = meta_guards[dir_idx].as_ref().ok_or_else(|| {
+                    Error::with_message(Errno::EIO, "missing directory meta lock")
+                })?;
+                self.inner.find_entry(dir_meta, fs, old_name)?
+            };
+            if rechecked_old_ino != old_ino {
+                continue;
             }
-            if !old_is_dir && existing_is_dir {
-                return_errno!(Errno::EISDIR);
+
+            let rechecked_existing_ino = {
+                let dir_meta = meta_guards[dir_idx].as_ref().ok_or_else(|| {
+                    Error::with_message(Errno::EIO, "missing directory meta lock")
+                })?;
+                self.inner.find_entry(dir_meta, fs, new_name).ok()
+            };
+            if rechecked_existing_ino != existing_ino {
+                continue;
             }
 
-            if existing_is_dir {
-                let existing_meta = existing.inner.meta_read();
-                if !existing.inner.empty_dir(&existing_meta, fs, existing.ino()) {
-                    return_errno!(Errno::ENOTEMPTY);
+            if let Some(existing) = existing_inode.as_ref() {
+                let existing_is_dir = existing.type_ == InodeType::Dir;
+                if old_is_dir && !existing_is_dir {
+                    return_errno!(Errno::ENOTDIR);
+                }
+                if !old_is_dir && existing_is_dir {
+                    return_errno!(Errno::EISDIR);
+                }
+                if existing_is_dir {
+                    let idx = existing_idx.ok_or_else(|| {
+                        Error::with_message(Errno::EIO, "missing existing inode lock index")
+                    })?;
+                    let existing_meta = meta_guards[idx].as_ref().ok_or_else(|| {
+                        Error::with_message(Errno::EIO, "missing existing inode meta lock")
+                    })?;
+                    if !existing.inner.empty_dir(existing_meta, fs, existing.ino()) {
+                        return_errno!(Errno::ENOTEMPTY);
+                    }
                 }
             }
 
-            // Replace destination: ext2_set_link(new_dir, ..., old_inode, true).
-            let target_de = target.inner.find_entry_target(target_meta, fs, new_name)?;
-            target
-                .inner
-                .set_link_in_cache(target_meta, fs, &target_de, old_ino, moved_ft)?;
-            Ok(Some(existing))
-        } else {
-            // No existing entry: ext2_add_link.
-            let slot = match target.inner.scan_dir_for_slot(target_meta, fs, new_name)? {
-                DirScanResult::Slot(slot) => slot,
-                DirScanResult::NeedGrowth => target.inner.grow_dir_block(target_meta, fs)?,
-            };
-            target
-                .inner
-                .write_dir_entry(target_meta, fs, &slot, new_name, old_ino, moved_ft)?;
-            Ok(None)
-        }
-    }
-
-    fn finalize_replaced_inode_after_rename(
-        existing_inode: Option<Arc<Inode>>,
-        old_is_dir: bool,
-        fs: &Arc<Ext2>,
-    ) -> Result<()> {
-        // Update replaced inode after directory mutation/persist.
-        if let Some(existing) = existing_inode {
-            let mut existing_meta = existing.inner.meta_write();
-            existing_meta.set_ctime(now());
-            if old_is_dir {
-                existing_meta.sub_links_count_saturating(1);
-            }
-            existing_meta.sub_links_count_saturating(1);
-
-            if existing_meta.links_count() == 0 {
-                existing_meta.set_dtime(now());
-                existing_meta.set_freed(true);
-            }
-            let mut existing_mapping = existing.inner.mapping_write();
-            InodeInner::persist_inode_locked(
-                &mut existing_meta,
-                &mut existing_mapping,
-                existing.ino(),
-                existing.type_,
+            let dir_meta = meta_guards[dir_idx]
+                .as_mut()
+                .ok_or_else(|| Error::with_message(Errno::EIO, "missing directory meta lock"))?;
+            Self::apply_rename_target_locked(
+                self,
+                dir_meta,
                 fs,
+                new_name,
+                old_ino,
+                moved_ft,
+                existing_inode.is_some(),
             )?;
-        }
-
-        Ok(())
-    }
-
-    /// Rename within the same directory (single lock).
-    fn rename_same_dir(&self, old_name: &str, new_name: &str, fs: &Arc<Ext2>) -> Result<()> {
-        let mut meta = self.inner.meta_write();
-
-        let old_ino = self.inner.find_entry(&meta, fs, old_name)?;
-        let old_inode = fs.read_inode(old_ino)?;
-        let old_is_dir = old_inode.type_ == InodeType::Dir;
-        let moved_ft = Self::inode_type_to_dir_file_type(old_inode.type_);
-
-        // Apply destination entry update (replace or add).
-        let existing_inode = Self::apply_rename_target_entry(
-            self,
-            &mut meta,
-            fs,
-            new_name,
-            old_ino,
-            old_is_dir,
-            moved_ft as u8,
-        )?;
-
-        // Delete old entry.
-        let old_target = self.inner.find_entry_target(&meta, fs, old_name)?;
-        self.inner.delete_entry_in_cache(&meta, fs, &old_target)?;
-
-        // Linux: when old_is_dir, always inode_dec_link_count(old_dir).
-        // For same-dir without replacement, add_entry above implicitly
-        // paired with inode_inc_link_count(new_dir) — since same dir,
-        // the net effect is zero. But we must still track both sides.
-        if old_is_dir {
-            if existing_inode.is_none() {
-                // Linux: inode_inc_link_count(new_dir) was done in the else branch
-                // of the replacement check. For same dir, this is self.
-                meta.add_links_count_saturating(1);
+            let old_target = self.inner.find_entry_target(dir_meta, fs, old_name)?;
+            self.inner
+                .delete_entry_in_cache(dir_meta, fs, &old_target)?;
+            if old_is_dir {
+                if existing_inode.is_none() {
+                    dir_meta.add_links_count_saturating(1);
+                }
+                dir_meta.sub_links_count_saturating(1);
             }
-            // Linux line 397: inode_dec_link_count(old_dir) — always when old_is_dir.
-            meta.sub_links_count_saturating(1);
-        }
-        self.inner.update_dir_timestamps_and_flags(&mut meta)?;
-        let mut mapping = self.inner.mapping_write();
-        InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, fs)?;
-        drop(mapping);
-        drop(meta);
+            self.inner.update_dir_timestamps_and_flags(dir_meta)?;
+            let mut dir_mapping = self.inner.mapping_write();
+            InodeInner::persist_inode_locked(dir_meta, &mut dir_mapping, self.ino, self.type_, fs)?;
 
-        Self::finalize_replaced_inode_after_rename(existing_inode, old_is_dir, fs)?;
+            if let (Some(existing), Some(idx)) = (existing_inode.as_ref(), existing_idx) {
+                if idx == old_idx {
+                    let old_meta = meta_guards[old_idx].as_mut().ok_or_else(|| {
+                        Error::with_message(Errno::EIO, "missing old inode meta lock")
+                    })?;
+                    old_meta.set_ctime(now());
+                    old_meta.sub_links_count_saturating(1);
+                    if old_meta.links_count() == 0 {
+                        old_meta.set_dtime(now());
+                        old_meta.set_freed(true);
+                    }
+                    let mut old_mapping = old_inode.inner.mapping_write();
+                    InodeInner::persist_inode_locked(
+                        old_meta,
+                        &mut old_mapping,
+                        old_inode.ino(),
+                        old_inode.type_,
+                        fs,
+                    )?;
+                    return Ok(());
+                }
 
-        // Linux: inode_set_ctime_current(old_inode) + mark_inode_dirty.
-        {
-            let mut old_meta = old_inode.inner.meta_write();
+                let existing_meta = meta_guards[idx].as_mut().ok_or_else(|| {
+                    Error::with_message(Errno::EIO, "missing existing inode meta lock")
+                })?;
+                existing_meta.set_ctime(now());
+                if old_is_dir {
+                    existing_meta.sub_links_count_saturating(1);
+                }
+                existing_meta.sub_links_count_saturating(1);
+                if existing_meta.links_count() == 0 {
+                    existing_meta.set_dtime(now());
+                    existing_meta.set_freed(true);
+                }
+                let mut existing_mapping = existing.inner.mapping_write();
+                InodeInner::persist_inode_locked(
+                    existing_meta,
+                    &mut existing_mapping,
+                    existing.ino(),
+                    existing.type_,
+                    fs,
+                )?;
+            }
+
+            let old_meta = meta_guards[old_idx]
+                .as_mut()
+                .ok_or_else(|| Error::with_message(Errno::EIO, "missing old inode meta lock"))?;
             old_meta.set_ctime(now());
             let mut old_mapping = old_inode.inner.mapping_write();
             InodeInner::persist_inode_locked(
-                &mut old_meta,
+                old_meta,
                 &mut old_mapping,
                 old_inode.ino(),
                 old_inode.type_,
                 fs,
             )?;
+            return Ok(());
         }
 
-        Ok(())
+        return_errno_with_message!(
+            Errno::EAGAIN,
+            "rename retried due concurrent directory updates"
+        );
     }
 
-    /// Core rename logic when locks are already held.
-    fn rename_inner<'a>(
-        source: &'a Inode,
-        target: &'a Inode,
-        mut source_meta: RwMutexWriteGuard<'a, InodeMeta>,
-        mut target_meta: RwMutexWriteGuard<'a, InodeMeta>,
-        self_ino: u32,
-        target_ino: u32,
+    fn rename_cross_dir_with_ordered_locks(
+        &self,
+        target: &Inode,
         old_name: &str,
         new_name: &str,
         fs: &Arc<Ext2>,
     ) -> Result<()> {
-        let old_ino = source.inner.find_entry(&source_meta, fs, old_name)?;
-        let old_inode = fs.read_inode(old_ino)?;
-        let old_is_dir = old_inode.type_ == InodeType::Dir;
-        let moved_ft = Self::inode_type_to_dir_file_type(old_inode.type_);
+        const RENAME_RETRY_LIMIT: usize = 8;
+        for _ in 0..RENAME_RETRY_LIMIT {
+            let old_ino = {
+                let source_meta = self.inner.meta_read();
+                self.inner.find_entry(&source_meta, fs, old_name)?
+            };
+            let old_inode = fs.read_inode(old_ino)?;
+            let old_is_dir = old_inode.type_ == InodeType::Dir;
+            let moved_ft = Self::inode_type_to_dir_file_type(old_inode.type_) as u8;
 
-        // If moving a directory across parents, verify `..` is accessible.
-        // Linux: ext2_dotdot check.
-        if old_is_dir {
-            let old_inner = old_inode.inner.meta_read();
-            // Verify `..` entry exists and points to self_ino.
-            let dotdot_ino = old_inode.inner.find_entry(&old_inner, fs, "..")?;
-            if dotdot_ino != self_ino {
-                return_errno_with_message!(Errno::EIO, "failed to update dotdot entry");
+            let existing_ino = {
+                let target_meta = target.inner.meta_read();
+                target.inner.find_entry(&target_meta, fs, new_name).ok()
+            };
+            let existing_inode = if let Some(ino) = existing_ino {
+                Some(fs.read_inode(ino)?)
+            } else {
+                None
+            };
+
+            let mut lock_targets = Vec::new();
+            let source_idx = Self::push_unique_lock_target(&mut lock_targets, self);
+            let target_idx = Self::push_unique_lock_target(&mut lock_targets, target);
+            let old_idx = Self::push_unique_lock_target(&mut lock_targets, old_inode.as_ref());
+            let existing_idx = existing_inode
+                .as_ref()
+                .map(|inode| Self::push_unique_lock_target(&mut lock_targets, inode.as_ref()));
+            let mut meta_guards: Vec<Option<RwMutexWriteGuard<'_, InodeMeta>>> =
+                meta_write_lock_multiple_inodes(&lock_targets)
+                    .into_iter()
+                    .map(Some)
+                    .collect();
+
+            let rechecked_old_ino = {
+                let source_meta = meta_guards[source_idx]
+                    .as_ref()
+                    .ok_or_else(|| Error::with_message(Errno::EIO, "missing source meta lock"))?;
+                self.inner.find_entry(source_meta, fs, old_name)?
+            };
+            if rechecked_old_ino != old_ino {
+                continue;
             }
-        }
 
-        // Apply destination entry update (replace or add).
-        let existing_inode = Self::apply_rename_target_entry(
-            target,
-            &mut target_meta,
-            fs,
-            new_name,
-            old_ino,
-            old_is_dir,
-            moved_ft as u8,
-        )?;
-        if existing_inode.is_none() && old_is_dir {
-            // Linux: inode_inc_link_count(new_dir) for new subdir.
-            target_meta.add_links_count_saturating(1);
-        }
-        target
-            .inner
-            .update_dir_timestamps_and_flags(&mut target_meta)?;
+            let rechecked_existing_ino = {
+                let target_meta = meta_guards[target_idx]
+                    .as_ref()
+                    .ok_or_else(|| Error::with_message(Errno::EIO, "missing target meta lock"))?;
+                target.inner.find_entry(target_meta, fs, new_name).ok()
+            };
+            if rechecked_existing_ino != existing_ino {
+                continue;
+            }
 
-        // Delete old entry from source directory.
-        let source_de = source.inner.find_entry_target(&source_meta, fs, old_name)?;
-        source
-            .inner
-            .delete_entry_in_cache(&source_meta, fs, &source_de)?;
+            if old_is_dir {
+                let old_meta = meta_guards[old_idx].as_ref().ok_or_else(|| {
+                    Error::with_message(Errno::EIO, "missing old inode meta lock")
+                })?;
+                let dotdot_ino = old_inode.inner.find_entry(old_meta, fs, "..")?;
+                if dotdot_ino != self.ino {
+                    return_errno_with_message!(Errno::EIO, "failed to update dotdot entry");
+                }
+            }
 
-        // If moving a directory across parents, old parent loses a subdir.
-        if old_is_dir {
-            source_meta.sub_links_count_saturating(1);
-        }
-        source
-            .inner
-            .update_dir_timestamps_and_flags(&mut source_meta)?;
+            if let Some(existing) = existing_inode.as_ref() {
+                let existing_is_dir = existing.type_ == InodeType::Dir;
+                if old_is_dir && !existing_is_dir {
+                    return_errno!(Errno::ENOTDIR);
+                }
+                if !old_is_dir && existing_is_dir {
+                    return_errno!(Errno::EISDIR);
+                }
+                if existing_is_dir {
+                    let idx = existing_idx.ok_or_else(|| {
+                        Error::with_message(Errno::EIO, "missing existing inode lock index")
+                    })?;
+                    let existing_meta = meta_guards[idx].as_ref().ok_or_else(|| {
+                        Error::with_message(Errno::EIO, "missing existing inode meta lock")
+                    })?;
+                    if !existing.inner.empty_dir(existing_meta, fs, existing.ino()) {
+                        return_errno!(Errno::ENOTEMPTY);
+                    }
+                }
+            }
 
-        let mut target_mapping = target.inner.mapping_write();
-        InodeInner::persist_inode_locked(
-            &mut target_meta,
-            &mut target_mapping,
-            target.ino,
-            target.type_,
-            fs,
-        )?;
-        drop(target_mapping);
+            {
+                let target_meta = meta_guards[target_idx].as_mut().ok_or_else(|| {
+                    Error::with_message(Errno::EIO, "missing target directory meta lock")
+                })?;
+                Self::apply_rename_target_locked(
+                    target,
+                    target_meta,
+                    fs,
+                    new_name,
+                    old_ino,
+                    moved_ft,
+                    existing_inode.is_some(),
+                )?;
+                if old_is_dir && existing_inode.is_none() {
+                    target_meta.add_links_count_saturating(1);
+                }
+                target.inner.update_dir_timestamps_and_flags(target_meta)?;
+            }
+            {
+                let source_meta = meta_guards[source_idx].as_mut().ok_or_else(|| {
+                    Error::with_message(Errno::EIO, "missing source directory meta lock")
+                })?;
+                let source_de = self.inner.find_entry_target(source_meta, fs, old_name)?;
+                self.inner
+                    .delete_entry_in_cache(source_meta, fs, &source_de)?;
+                if old_is_dir {
+                    source_meta.sub_links_count_saturating(1);
+                }
+                self.inner.update_dir_timestamps_and_flags(source_meta)?;
+            }
 
-        let mut source_mapping = source.inner.mapping_write();
-        InodeInner::persist_inode_locked(
-            &mut source_meta,
-            &mut source_mapping,
-            source.ino,
-            source.type_,
-            fs,
-        )?;
-        drop(source_mapping);
-        drop(target_meta);
-        drop(source_meta);
+            {
+                let target_meta = meta_guards[target_idx].as_mut().ok_or_else(|| {
+                    Error::with_message(Errno::EIO, "missing target directory meta lock")
+                })?;
+                let mut target_mapping = target.inner.mapping_write();
+                InodeInner::persist_inode_locked(
+                    target_meta,
+                    &mut target_mapping,
+                    target.ino,
+                    target.type_,
+                    fs,
+                )?;
+            }
+            {
+                let source_meta = meta_guards[source_idx].as_mut().ok_or_else(|| {
+                    Error::with_message(Errno::EIO, "missing source directory meta lock")
+                })?;
+                let mut source_mapping = self.inner.mapping_write();
+                InodeInner::persist_inode_locked(
+                    source_meta,
+                    &mut source_mapping,
+                    self.ino,
+                    self.type_,
+                    fs,
+                )?;
+            }
 
-        Self::finalize_replaced_inode_after_rename(existing_inode, old_is_dir, fs)?;
+            if let (Some(existing), Some(idx)) = (existing_inode.as_ref(), existing_idx) {
+                if idx == old_idx {
+                    let old_meta = meta_guards[old_idx].as_mut().ok_or_else(|| {
+                        Error::with_message(Errno::EIO, "missing old inode meta lock")
+                    })?;
+                    old_meta.set_ctime(now());
+                    old_meta.sub_links_count_saturating(1);
+                    if old_meta.links_count() == 0 {
+                        old_meta.set_dtime(now());
+                        old_meta.set_freed(true);
+                    }
+                    let mut old_mapping = old_inode.inner.mapping_write();
+                    InodeInner::persist_inode_locked(
+                        old_meta,
+                        &mut old_mapping,
+                        old_inode.ino(),
+                        old_inode.type_,
+                        fs,
+                    )?;
+                    return Ok(());
+                }
 
-        // Linux: inode_set_ctime_current(old_inode) + mark_inode_dirty.
-        // If moving a directory across parents, also rewrite `..` to target.
-        {
-            let mut old_meta = old_inode.inner.meta_write();
+                let existing_meta = meta_guards[idx].as_mut().ok_or_else(|| {
+                    Error::with_message(Errno::EIO, "missing existing inode meta lock")
+                })?;
+                existing_meta.set_ctime(now());
+                if old_is_dir {
+                    existing_meta.sub_links_count_saturating(1);
+                }
+                existing_meta.sub_links_count_saturating(1);
+                if existing_meta.links_count() == 0 {
+                    existing_meta.set_dtime(now());
+                    existing_meta.set_freed(true);
+                }
+                let mut existing_mapping = existing.inner.mapping_write();
+                InodeInner::persist_inode_locked(
+                    existing_meta,
+                    &mut existing_mapping,
+                    existing.ino(),
+                    existing.type_,
+                    fs,
+                )?;
+            }
+
+            let old_meta = meta_guards[old_idx]
+                .as_mut()
+                .ok_or_else(|| Error::with_message(Errno::EIO, "missing old inode meta lock"))?;
             old_meta.set_ctime(now());
             if old_is_dir {
-                let dotdot = old_inode.inner.find_entry_target(&old_meta, fs, "..")?;
+                let dotdot = old_inode.inner.find_entry_target(old_meta, fs, "..")?;
                 old_inode.inner.set_link_in_cache(
-                    &old_meta,
+                    old_meta,
                     fs,
                     &dotdot,
-                    target_ino,
+                    target.ino,
                     DirEntryFileType::Dir as u8,
                 )?;
                 old_meta.remove_flags(FileFlags::INDEX_DIR);
             }
             let mut old_mapping = old_inode.inner.mapping_write();
             InodeInner::persist_inode_locked(
-                &mut old_meta,
+                old_meta,
                 &mut old_mapping,
                 old_inode.ino(),
                 old_inode.type_,
                 fs,
             )?;
+            return Ok(());
         }
 
+        return_errno_with_message!(
+            Errno::EAGAIN,
+            "rename retried due concurrent directory updates"
+        );
+    }
+
+    fn push_unique_lock_target<'a>(targets: &mut Vec<&'a Inode>, inode: &'a Inode) -> usize {
+        if let Some(index) = targets.iter().position(|target| target.ino == inode.ino) {
+            return index;
+        }
+        targets.push(inode);
+        targets.len() - 1
+    }
+
+    fn apply_rename_target_locked(
+        target: &Inode,
+        target_meta: &mut InodeMeta,
+        fs: &Arc<Ext2>,
+        new_name: &str,
+        old_ino: u32,
+        moved_ft: u8,
+        has_existing: bool,
+    ) -> Result<()> {
+        if has_existing {
+            let target_de = target.inner.find_entry_target(target_meta, fs, new_name)?;
+            target
+                .inner
+                .set_link_in_cache(target_meta, fs, &target_de, old_ino, moved_ft)?;
+            return Ok(());
+        }
+
+        let slot = match target.inner.scan_dir_for_slot(target_meta, fs, new_name)? {
+            DirScanResult::Slot(slot) => slot,
+            DirScanResult::NeedGrowth => target.inner.grow_dir_block(target_meta, fs)?,
+        };
+        target
+            .inner
+            .write_dir_entry(target_meta, fs, &slot, new_name, old_ino, moved_ft)?;
         Ok(())
     }
 
@@ -1821,20 +1987,20 @@ impl InodeInner {
         self.meta.write()
     }
 
-    pub(super) fn mapping_read(&self) -> RwMutexReadGuard<'_, InodeMapping> {
-        self.mapping.read()
-    }
-
-    pub(super) fn mapping_write(&self) -> RwMutexWriteGuard<'_, InodeMapping> {
-        self.mapping.write()
-    }
-
     pub(super) fn meta_upread(&self) -> RwMutexUpgradeableGuard<'_, InodeMeta> {
         self.meta.upread()
     }
 
     pub(super) fn mapping_upread(&self) -> RwMutexUpgradeableGuard<'_, InodeMapping> {
         self.mapping.upread()
+    }
+
+    pub(super) fn mapping_read(&self) -> RwMutexReadGuard<'_, InodeMapping> {
+        self.mapping.read()
+    }
+
+    pub(super) fn mapping_write(&self) -> RwMutexWriteGuard<'_, InodeMapping> {
+        self.mapping.write()
     }
 
     pub(super) fn page_cache(&self) -> &PageCache {
