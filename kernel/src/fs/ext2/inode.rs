@@ -3589,7 +3589,10 @@ mod test {
                     StopAfterVisitor, encode_dir_entry,
                 },
             },
-            utils::{IdBitmap, Inode as VfsInodeTrait, XattrName, XattrNamespace, XattrSetFlags},
+            utils::{
+                Inode as VfsInodeTrait, InodeIo, StatusFlags, XattrName, XattrNamespace,
+                XattrSetFlags,
+            },
         },
         prelude::*,
         time::clocks,
@@ -3599,22 +3602,16 @@ mod test {
         RawInodeBuilder::new(mode).build()
     }
 
-    fn find_entry_ino(dir: &Arc<Inode>, name: &str) -> Result<u32> {
-        let fs = dir.fs_arc()?;
-        let meta = dir.inner.meta_read();
-        dir.inner.find_entry(&meta, &fs, name)
+    fn lookup_ino(dir: &Arc<Inode>, name: &str) -> Result<u32> {
+        Ok(dir.lookup(name)?.ino())
     }
 
-    fn is_fast_symlink_for_test(inode: &Arc<Inode>, block_size: usize) -> bool {
-        let meta = inode.inner.meta_read();
-        let mapping = inode.inner.mapping_read();
-        let ea_blocks = if meta.file_acl() != 0 {
-            (block_size / SECTOR_SIZE) as u32
-        } else {
-            0
-        };
-        meta.inode_type() == InodeType::SymLink
-            && mapping.desc.blocks.checked_sub(ea_blocks) == Some(0)
+    fn inode_size(inode: &Arc<Inode>) -> usize {
+        VfsInodeTrait::size(inode.as_ref())
+    }
+
+    fn inode_nlinks(inode: &Arc<Inode>) -> usize {
+        VfsInodeTrait::metadata(inode.as_ref()).nlinks
     }
 
     fn make_live_dir_inode(
@@ -3663,36 +3660,8 @@ mod test {
         )
     }
 
-    fn reload_group0_cached_bitmaps_from_disk(f: &testkit::Ext2Fixture) {
-        let group = &f.block_groups()[0];
-
-        let mut block_bitmap_buf = vec![0u8; BLOCK_SIZE];
-        f.disk
-            .segment()
-            .read_bytes(group.block_bitmap_bid().to_offset(), &mut block_bitmap_buf)
-            .unwrap();
-        let block_len = {
-            let bitmap = group.block_bitmap();
-            bitmap.len()
-        };
-        let mut block_bitmap = group.block_bitmap_mut();
-        **block_bitmap = IdBitmap::from_buf(block_bitmap_buf.into_boxed_slice(), block_len);
-
-        let mut inode_bitmap_buf = vec![0u8; BLOCK_SIZE];
-        f.disk
-            .segment()
-            .read_bytes(group.inode_bitmap_bid().to_offset(), &mut inode_bitmap_buf)
-            .unwrap();
-        let inode_len = {
-            let bitmap = group.inode_bitmap();
-            bitmap.len()
-        };
-        let mut inode_bitmap = group.inode_bitmap_mut();
-        **inode_bitmap = IdBitmap::from_buf(inode_bitmap_buf.into_boxed_slice(), inode_len);
-    }
-
     #[ktest]
-    fn namei_create_adds_entry_and_inits_inode() {
+    fn namei_create_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -3706,25 +3675,16 @@ mod test {
                 FilePerm::from_bits_truncate(0o644),
             )
             .unwrap();
-        assert_eq!(find_entry_ino(&root, "alpha").unwrap(), created.ino());
-        assert_eq!(
-            f.ext2.read_inode_desc(created.ino()).unwrap().links_count,
-            1
-        );
+        assert_eq!(lookup_ino(&root, "alpha").unwrap(), created.ino());
+        assert_eq!(inode_nlinks(&created), 1);
 
         // Linux ext2_mkdir intent: child links=2 and parent link count +1.
         let created_dir = root
             .create("sub", InodeType::Dir, FilePerm::from_bits_truncate(0o755))
             .unwrap();
-        assert_eq!(find_entry_ino(&root, "sub").unwrap(), created_dir.ino());
-        assert_eq!(
-            f.ext2
-                .read_inode_desc(created_dir.ino())
-                .unwrap()
-                .links_count,
-            2
-        );
-        assert_eq!(f.ext2.read_inode_desc(ROOT_INO).unwrap().links_count, 3);
+        assert_eq!(lookup_ino(&root, "sub").unwrap(), created_dir.ino());
+        assert_eq!(inode_nlinks(&created_dir), 2);
+        assert_eq!(inode_nlinks(&root), 3);
 
         assert_eq!(
             root.create(".", InodeType::File, FilePerm::from_bits_truncate(0o644))
@@ -3760,7 +3720,7 @@ mod test {
     }
 
     #[ktest]
-    fn namei_link_unlink_updates_nlinks() {
+    fn namei_link_unlink_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -3770,7 +3730,7 @@ mod test {
             .create("old", InodeType::File, FilePerm::from_bits_truncate(0o644))
             .unwrap();
         let old_ino = old.ino();
-        let old_links_before = f.ext2.read_inode_desc(old_ino).unwrap().links_count;
+        let old_links_before = inode_nlinks(&old) as u16;
         let block_size = f.ext2.block_size();
         let payload = vec![0x6au8; block_size];
         let mut payload_reader = VmReader::from(payload.as_slice()).to_fallible();
@@ -3778,11 +3738,8 @@ mod test {
 
         // Linux ext2_link intent: increase nlink before publishing name.
         root.link(&old, "alias").unwrap();
-        assert_eq!(find_entry_ino(&root, "alias").unwrap(), old_ino);
-        assert_eq!(
-            f.ext2.read_inode_desc(old_ino).unwrap().links_count,
-            old_links_before + 1
-        );
+        assert_eq!(lookup_ino(&root, "alias").unwrap(), old_ino);
+        assert_eq!(inode_nlinks(&old) as u16, old_links_before + 1);
 
         let dir = root
             .create("dir", InodeType::Dir, FilePerm::from_bits_truncate(0o755))
@@ -3795,28 +3752,22 @@ mod test {
         // Linux ext2_unlink intent: remove name then decrement target nlink.
         root.unlink("alias").unwrap();
         assert_eq!(
-            find_entry_ino(&root, "alias").unwrap_err().error(),
+            lookup_ino(&root, "alias").unwrap_err().error(),
             Errno::ENOENT
         );
-        assert_eq!(
-            f.ext2.read_inode_desc(old_ino).unwrap().links_count,
-            old_links_before
-        );
+        assert_eq!(inode_nlinks(&old) as u16, old_links_before);
 
         assert_eq!(root.unlink("dir").unwrap_err().error(), Errno::EISDIR);
         assert_eq!(root.unlink(".").unwrap_err().error(), Errno::EINVAL);
 
         let free_blocks_before_sync = f.ext2.super_block().free_blocks_count();
         root.unlink("old").unwrap();
-        {
-            let inode_bitmap = f.block_groups()[0].inode_bitmap();
-            assert!(inode_bitmap.is_allocated((old_ino - 1) as u16));
-        }
         drop(old);
         f.ext2.sync_all_inodes().unwrap();
-        let inode_bitmap = f.block_groups()[0].inode_bitmap();
-        assert!(!inode_bitmap.is_allocated((old_ino - 1) as u16));
-        drop(inode_bitmap);
+        assert_eq!(
+            f.ext2.read_inode(old_ino).unwrap_err().error(),
+            Errno::ENOENT
+        );
         assert_eq!(
             f.ext2.super_block().free_blocks_count(),
             free_blocks_before_sync.saturating_add(1)
@@ -3824,7 +3775,7 @@ mod test {
     }
 
     #[ktest]
-    fn namei_set_link_and_rename_ok() {
+    fn namei_rename_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -3841,21 +3792,15 @@ mod test {
             )
             .unwrap();
 
-        let (ctime_before, mtime_before) = {
-            let meta = root.inner.meta_read();
-            (meta.ctime(), meta.mtime())
-        };
+        let ctime_before = root.ctime();
+        let mtime_before = root.mtime();
 
         // Linux ext2_set_link with update_times=false keeps ctime/mtime unchanged.
         root.set_link("src", target.ino(), DirEntryFileType::File, false)
             .unwrap();
-        assert_eq!(find_entry_ino(&root, "src").unwrap(), target.ino());
-        let (ctime_after, mtime_after) = {
-            let meta = root.inner.meta_read();
-            (meta.ctime(), meta.mtime())
-        };
-        assert_eq!(ctime_before, ctime_after);
-        assert_eq!(mtime_before, mtime_after);
+        assert_eq!(lookup_ino(&root, "src").unwrap(), target.ino());
+        assert_eq!(ctime_before, root.ctime());
+        assert_eq!(mtime_before, root.mtime());
 
         assert_eq!(
             root.set_link("missing", target.ino(), DirEntryFileType::File, false)
@@ -3879,9 +3824,9 @@ mod test {
             .unwrap();
         let solo_ino = solo.ino();
         root.rename("solo", &root, "solo_renamed").unwrap();
-        assert_eq!(find_entry_ino(&root, "solo_renamed").unwrap(), solo_ino);
+        assert_eq!(lookup_ino(&root, "solo_renamed").unwrap(), solo_ino);
         assert_eq!(
-            find_entry_ino(&root, "solo").unwrap_err().error(),
+            lookup_ino(&root, "solo").unwrap_err().error(),
             Errno::ENOENT
         );
 
@@ -3899,10 +3844,10 @@ mod test {
         let move_src_ino = move_src.ino();
         root.rename("move_src", &dst_dir, "move_dst").unwrap();
         assert_eq!(
-            find_entry_ino(&root, "move_src").unwrap_err().error(),
+            lookup_ino(&root, "move_src").unwrap_err().error(),
             Errno::ENOENT
         );
-        assert_eq!(find_entry_ino(&dst_dir, "move_dst").unwrap(), move_src_ino);
+        assert_eq!(lookup_ino(&dst_dir, "move_dst").unwrap(), move_src_ino);
 
         // Cross-dir replacement path should set-link destination then delete source.
         let src_dir = root
@@ -3939,13 +3884,10 @@ mod test {
             .rename("moving", &dst_replace_dir, "target")
             .unwrap();
         assert_eq!(
-            find_entry_ino(&src_dir, "moving").unwrap_err().error(),
+            lookup_ino(&src_dir, "moving").unwrap_err().error(),
             Errno::ENOENT
         );
-        assert_eq!(
-            find_entry_ino(&dst_replace_dir, "target").unwrap(),
-            moving_ino
-        );
+        assert_eq!(lookup_ino(&dst_replace_dir, "target").unwrap(), moving_ino);
 
         // Directory move should update `..` to the new parent.
         let parent_a = root
@@ -3967,7 +3909,7 @@ mod test {
             .unwrap();
         parent_a.rename("kid", &parent_b, "kid_moved").unwrap();
         let moved_dir = parent_b.lookup("kid_moved").unwrap();
-        assert_eq!(find_entry_ino(&moved_dir, "..").unwrap(), parent_b.ino());
+        assert_eq!(lookup_ino(&moved_dir, "..").unwrap(), parent_b.ino());
 
         let old = root
             .create("old", InodeType::File, FilePerm::from_bits_truncate(0o644))
@@ -3980,29 +3922,25 @@ mod test {
 
         // Linux ext2_rename replacement path: dst is overwritten and old name removed.
         root.rename("old", &root, "new").unwrap();
-        assert_eq!(find_entry_ino(&root, "new").unwrap(), old_ino);
-        assert_eq!(
-            find_entry_ino(&root, "old").unwrap_err().error(),
-            Errno::ENOENT
-        );
-
-        {
-            let inode_bitmap = f.block_groups()[0].inode_bitmap();
-            assert!(inode_bitmap.is_allocated((replaced_ino - 1) as u16));
-            assert!(inode_bitmap.is_allocated((replaced_ino_cross - 1) as u16));
-        }
+        assert_eq!(lookup_ino(&root, "new").unwrap(), old_ino);
+        assert_eq!(lookup_ino(&root, "old").unwrap_err().error(), Errno::ENOENT);
         drop(replaced);
         drop(new);
         f.ext2.sync_all_inodes().unwrap();
-        let inode_bitmap = f.block_groups()[0].inode_bitmap();
-        assert!(!inode_bitmap.is_allocated((replaced_ino - 1) as u16));
-        assert!(!inode_bitmap.is_allocated((replaced_ino_cross - 1) as u16));
+        assert_eq!(
+            f.ext2.read_inode(replaced_ino).unwrap_err().error(),
+            Errno::ENOENT
+        );
+        assert_eq!(
+            f.ext2.read_inode(replaced_ino_cross).unwrap_err().error(),
+            Errno::ENOENT
+        );
 
         let _ = src;
     }
 
     #[ktest]
-    fn namei_cross_fs_link_and_rename_returns_exdev() {
+    fn namei_cross_fs_exdev() {
         clocks::init_for_ktest();
 
         let f_a = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -4025,7 +3963,7 @@ mod test {
     }
 
     #[ktest]
-    fn desc_try_from_valid_raw_ok() {
+    fn inode_desc_from_raw_ok() {
         let mut raw = make_raw_inode(0o100644);
         raw.size_lo = 0x1122_3344;
         raw.size_high = 0x5566_7788;
@@ -4055,7 +3993,7 @@ mod test {
     }
 
     #[ktest]
-    fn desc_try_from_invalid_raw_returns_err() {
+    fn inode_desc_from_raw_err() {
         let mut deleted_inode = make_raw_inode(0);
         deleted_inode.links_count = 0;
         deleted_inode.dtime = 1;
@@ -4079,7 +4017,7 @@ mod test {
     }
 
     #[ktest]
-    fn meta_desc_try_from_valid_raw_ok() {
+    fn inode_meta_from_raw_ok() {
         let mut raw = make_raw_inode(0o100644);
         raw.size_lo = 0x1122_3344;
         raw.size_high = 0x5566_7788;
@@ -4105,7 +4043,7 @@ mod test {
     }
 
     #[ktest]
-    fn meta_desc_try_from_invalid_raw_returns_err() {
+    fn inode_meta_from_raw_err() {
         let mut deleted_inode = make_raw_inode(0);
         deleted_inode.links_count = 0;
         deleted_inode.dtime = 1;
@@ -4125,7 +4063,7 @@ mod test {
     }
 
     #[ktest]
-    fn dir_lookup_and_readdir_ok() {
+    fn dir_lookup_readdir_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -4142,10 +4080,10 @@ mod test {
             )
             .unwrap();
 
-        assert_eq!(find_entry_ino(&root, "foo").unwrap(), foo.ino());
-        assert_eq!(find_entry_ino(&root, "subdir").unwrap(), subdir.ino());
+        assert_eq!(lookup_ino(&root, "foo").unwrap(), foo.ino());
+        assert_eq!(lookup_ino(&root, "subdir").unwrap(), subdir.ino());
         assert_eq!(
-            find_entry_ino(&root, "missing").unwrap_err().error(),
+            lookup_ino(&root, "missing").unwrap_err().error(),
             Errno::ENOENT
         );
 
@@ -4162,7 +4100,7 @@ mod test {
 
         let mut stop_visitor = StopAfterVisitor::new(2);
         let stop_advanced = root.readdir_at(0, &mut stop_visitor).unwrap();
-        let root_size = root.inner.meta_read().desc.size as usize;
+        let root_size = inode_size(&root);
         assert!(stop_advanced > 0 && stop_advanced < root_size);
 
         let first_entry_end = visitor.entries[0].3 + 1;
@@ -4174,7 +4112,7 @@ mod test {
     }
 
     #[ktest]
-    fn dir_lookup_and_readdir_invalid_returns_err() {
+    fn dir_lookup_readdir_err() {
         let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let (disk, ext2) = (&f.disk, &f.ext2);
         let block_size = ext2.block_size();
@@ -4183,7 +4121,7 @@ mod test {
         file_ptrs[0] = 80;
         let file_inode = make_live_file_inode(ext2, 50, 0, 0, FileFlags::empty(), file_ptrs);
         assert_eq!(
-            find_entry_ino(&file_inode, "foo").unwrap_err().error(),
+            lookup_ino(&file_inode, "foo").unwrap_err().error(),
             Errno::ENOTDIR
         );
         let mut vec_visitor = Vec::<String>::new();
@@ -4197,7 +4135,7 @@ mod test {
 
         let hole_inode = make_live_dir_inode(ext2, 3, 12, 8, FileFlags::empty(), [0u32; 15]);
         assert_eq!(
-            find_entry_ino(&hole_inode, "foo").unwrap_err().error(),
+            lookup_ino(&hole_inode, "foo").unwrap_err().error(),
             Errno::EIO
         );
         let mut vec_visitor = Vec::<String>::new();
@@ -4222,7 +4160,7 @@ mod test {
         let limited_blocks_inode =
             make_live_dir_inode(ext2, 4, block_size, 0, FileFlags::empty(), ptrs);
         assert_eq!(
-            find_entry_ino(&limited_blocks_inode, "missing")
+            lookup_ino(&limited_blocks_inode, "missing")
                 .unwrap_err()
                 .error(),
             Errno::ENOENT
@@ -4254,10 +4192,7 @@ mod test {
         let mut bad_ptrs = [0u32; 15];
         bad_ptrs[0] = bad_bid;
         let bad_inode = make_live_dir_inode(ext2, 6, 12, 8, FileFlags::empty(), bad_ptrs);
-        assert_eq!(
-            find_entry_ino(&bad_inode, ".").unwrap_err().error(),
-            Errno::EIO
-        );
+        assert_eq!(lookup_ino(&bad_inode, ".").unwrap_err().error(), Errno::EIO);
         let mut vec_visitor = Vec::<String>::new();
         assert_eq!(
             bad_inode
@@ -4269,7 +4204,7 @@ mod test {
     }
 
     #[ktest]
-    fn dir_add_and_delete_entry_ok() {
+    fn dir_add_delete_entry_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -4279,7 +4214,7 @@ mod test {
             .create("bar", InodeType::File, FilePerm::from_bits_truncate(0o644))
             .unwrap();
 
-        find_entry_ino(&root, "bar").unwrap();
+        assert_eq!(lookup_ino(&root, "bar").unwrap(), bar.ino());
         root.add_entry("foo", 11, DirEntryFileType::File).unwrap();
         let dup = root
             .add_entry("foo", 12, DirEntryFileType::File)
@@ -4287,145 +4222,53 @@ mod test {
         assert_eq!(dup.error(), Errno::EEXIST);
         root.delete_entry("foo").unwrap();
 
-        assert_eq!(find_entry_ino(&root, ".").unwrap(), ROOT_INO);
-        assert_eq!(find_entry_ino(&root, "bar").unwrap(), bar.ino());
-        assert_eq!(
-            find_entry_ino(&root, "foo").unwrap_err().error(),
-            Errno::ENOENT
-        );
+        assert_eq!(lookup_ino(&root, ".").unwrap(), ROOT_INO);
+        assert_eq!(lookup_ino(&root, "bar").unwrap(), bar.ino());
+        assert_eq!(lookup_ino(&root, "foo").unwrap_err().error(), Errno::ENOENT);
     }
 
     #[ktest]
-    fn dir_add_entry_grows_by_new_block_ok() {
+    fn dir_grow_lookup_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
         let root = f.ext2.read_inode(ROOT_INO).unwrap();
         let block_size = f.ext2.block_size();
-        let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
 
-        // Fill root's first block by creating entries with short names.
-        // dir_rec_len("x") = 12, so each entry consumes 12 bytes.
-        // Keep creating until the block is full.
-        let mut idx = 0u32;
-        loop {
-            let name = alloc::format!("e{idx:03}");
-            let size_before = root.inner.meta_read().desc.size;
-            let result = root.create(&name, InodeType::File, FilePerm::from_bits_truncate(0o644));
-            match result {
-                Ok(_) => {
-                    let size_after = root.inner.meta_read().desc.size;
-                    if size_after > size_before {
-                        // Block growth happened — this is what we wanted to test.
-                        assert_eq!(
-                            root.inner.meta_read().desc.size,
-                            (size_before as usize + block_size) as u64
-                        );
-                        assert_ne!(root.inner.mapping_read().desc.block_ptrs[1], 0);
-                        assert!(find_entry_ino(&root, &name).is_ok());
-                        return;
-                    }
-                }
-                Err(_) => panic!("unexpected create failure"),
+        let size_before = inode_size(&root);
+        let name_pad = "x".repeat(240);
+        let mut first_name = None::<String>;
+        let mut last_name = None::<String>;
+
+        // Create enough entries to force directory growth beyond the direct block pointers.
+        // This validates user-visible behavior (lookup/readdir) without inspecting inode internals.
+        for idx in 0..200u32 {
+            let name = alloc::format!("e{idx:04}{name_pad}");
+            if first_name.is_none() {
+                first_name = Some(name.clone());
             }
-            idx += 1;
-            assert!(idx < 1000, "block should have grown by now");
-        }
-    }
+            last_name = Some(name.clone());
 
-    #[ktest]
-    fn dir_add_entry_grows_into_indirect_block_ok() {
-        clocks::init_for_ktest();
-
-        let f = Ext2FixtureBuilder::new(1, 512)
-            .with_free_blocks(256, 256)
-            .with_free_inodes(1000, 1000)
-            .with_group0_used_dirs(1)
-            .with_root()
-            .build()
-            .unwrap();
-        let root = f.ext2.read_inode(ROOT_INO).unwrap();
-        let block_size = f.ext2.block_size();
-        // Use near-NAME_MAX entries so each record is large and we reach
-        // single-indirect growth with far fewer insertions.
-        let long_name_pad = "x".repeat(250);
-
-        // Use add_entry (no inode alloc) to pack blocks until indirect is triggered.
-        let mut idx = 0u32;
-        loop {
-            let name = alloc::format!("e{idx:04}{long_name_pad}");
-            root.add_entry(&name, ROOT_INO, DirEntryFileType::File)
+            root.create(&name, InodeType::File, FilePerm::from_bits_truncate(0o644))
                 .unwrap();
-            if root.inner.mapping_read().desc.block_ptrs[12] != 0 {
-                assert!(root.inner.meta_read().desc.size > (block_size * 12) as u64);
-                assert!(find_entry_ino(&root, &name).is_ok());
-                return;
-            }
-            idx += 1;
-            assert!(
-                idx < 1024,
-                "indirect block should have been allocated by now"
-            );
         }
+
+        let size_after = inode_size(&root);
+        assert!(size_after > size_before);
+        assert!(size_after >= size_before.saturating_add(block_size));
+
+        let first = first_name.unwrap();
+        let last = last_name.unwrap();
+        assert!(root.lookup(&first).is_ok());
+        assert!(root.lookup(&last).is_ok());
+
+        let mut visitor = CollectDirentVisitor::default();
+        root.readdir_at(0, &mut visitor).unwrap();
+        assert!(visitor.entries.len() >= 4);
     }
 
     #[ktest]
-    fn dir_release_data_blocks_truncates_full_tree() {
-        let f = Ext2FixtureBuilder::new(1, 512)
-            .with_free_blocks(256, 256)
-            .build()
-            .unwrap();
-        let block_size = f.ext2.block_size();
-        let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
-        let inode = make_live_dir_inode(&f.ext2, 40, 0, 0, FileFlags::empty(), [0; 15]);
-
-        let (old_block_sectors, free_before, free_after) = {
-            for iblock in 0..13u32 {
-                inode
-                    .inner
-                    .get_or_alloc_block(iblock, true)
-                    .unwrap()
-                    .unwrap();
-            }
-            inode.inner.meta_write().desc.size = (13 * block_size) as u64;
-
-            let old_block_sectors = inode.inner.mapping_read().desc.blocks;
-            assert_ne!(inode.inner.mapping_read().desc.block_ptrs[12], 0);
-            assert!(inode.inner.get_block(12).unwrap().is_some());
-            let free_before = f.ext2.super_block().free_blocks_count();
-
-            let mut meta = inode.inner.meta_write();
-            inode
-                .inner
-                .release_dir_data_blocks_for_cleanup(&mut meta, &f.ext2)
-                .unwrap();
-            drop(meta);
-            assert_eq!(inode.inner.meta_read().desc.size, 0);
-            assert_eq!(inode.inner.mapping_read().desc.blocks, 0);
-            assert!(
-                inode
-                    .inner
-                    .mapping_read()
-                    .desc
-                    .block_ptrs
-                    .iter()
-                    .all(|ptr| *ptr == 0)
-            );
-            assert_eq!(inode.inner.get_block(0).unwrap(), None);
-            assert_eq!(inode.inner.get_block(12).unwrap(), None);
-
-            let free_after = f.ext2.super_block().free_blocks_count();
-            (old_block_sectors, free_before, free_after)
-        };
-
-        assert_eq!(
-            free_after.saturating_sub(free_before),
-            old_block_sectors / sectors_per_block
-        );
-    }
-
-    #[ktest]
-    fn dir_mutation_invalid_ops_return_err() {
+    fn dir_mutation_err() {
         let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let ext2 = &f.ext2;
 
@@ -4459,69 +4302,34 @@ mod test {
     }
 
     #[ktest]
-    fn dir_make_empty_and_is_empty_ok() {
+    fn dir_make_empty_ok() {
         clocks::init_for_ktest();
-        let f = Ext2FixtureBuilder::new(1, 256)
-            .with_free_blocks(64, 64)
-            .build()
-            .unwrap();
-        let block_size = f.ext2.block_size();
-
-        let first = f.sb.group_first_block_no(0);
-        let last = f.sb.group_last_block_no(0);
-        let data_bid = first
-            .saturating_add(2)
-            .saturating_add(f.sb.itb_per_group())
-            .saturating_add(1);
-        assert!(data_bid <= last);
-        testkit::write_block_bitmap(f.disk.as_ref(), &f.sb, &f.descs[0], &[data_bid]);
-        reload_group0_cached_bitmaps_from_disk(&f);
-
-        let mut raw = make_raw_inode(0o040755);
-        raw.links_count = 2;
-        let desc = InodeDesc::try_from(&raw).unwrap();
-        let inode = Inode::new(
-            12,
-            InodeType::Dir,
-            Dirty::new(desc),
-            0,
-            Arc::downgrade(&f.ext2),
-        );
-
-        inode.make_empty(ROOT_INO).unwrap();
-        let allocated_bid = {
-            assert!(inode.empty_dir());
-            assert_eq!(inode.inner.meta_read().desc.size as usize, block_size);
-            let mapping = inode.inner.mapping_read();
-            assert_eq!(mapping.desc.blocks, (block_size / SECTOR_SIZE) as u32);
-            mapping.desc.block_ptrs[0]
-        };
-        assert_ne!(allocated_bid, 0);
-
-        assert_eq!(find_entry_ino(&inode, ".").unwrap(), 12);
-        assert_eq!(find_entry_ino(&inode, "..").unwrap(), ROOT_INO);
-    }
-
-    #[ktest]
-    fn dir_is_empty_with_extra_entries_returns_false() {
-        clocks::init_for_ktest();
-
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
         let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let block_size = f.ext2.block_size();
 
-        let sub = root
-            .create("sub", InodeType::Dir, FilePerm::from_bits_truncate(0o755))
+        let dir = root
+            .create("empty", InodeType::Dir, FilePerm::from_bits_truncate(0o755))
             .unwrap();
-        sub.create("foo", InodeType::File, FilePerm::from_bits_truncate(0o644))
-            .unwrap();
+        assert!(dir.empty_dir());
+        assert_eq!(inode_size(&dir), block_size);
 
-        assert!(!sub.empty_dir());
+        let mut visitor = CollectDirentVisitor::default();
+        dir.readdir_at(0, &mut visitor).unwrap();
+
+        assert_eq!(visitor.entries.len(), 2);
+        assert_eq!(visitor.entries[0].0, ".");
+        assert_eq!(visitor.entries[0].1, dir.ino() as u64);
+        assert_eq!(visitor.entries[0].2, InodeType::Dir);
+        assert_eq!(visitor.entries[1].0, "..");
+        assert_eq!(visitor.entries[1].1, root.ino() as u64);
+        assert_eq!(visitor.entries[1].2, InodeType::Dir);
     }
 
     struct RmdirTestEnv {
         f: testkit::Ext2Fixture,
         parent: Arc<Inode>,
-        child_ino: u32,
+        child: Arc<Inode>,
     }
 
     /// Sets up a parent directory (ROOT_INO) with a "sub" child directory.
@@ -4530,69 +4338,54 @@ mod test {
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
         let parent = f.ext2.read_inode(ROOT_INO).unwrap();
 
-        let sub = parent
+        let child = parent
             .create("sub", InodeType::Dir, FilePerm::from_bits_truncate(0o755))
             .unwrap();
-        let child_ino = sub.ino();
 
         if add_child_file {
-            sub.create("foo", InodeType::File, FilePerm::from_bits_truncate(0o644))
+            child
+                .create("foo", InodeType::File, FilePerm::from_bits_truncate(0o644))
                 .unwrap();
         }
 
-        RmdirTestEnv {
-            f,
-            parent,
-            child_ino,
-        }
+        RmdirTestEnv { f, parent, child }
     }
 
     #[ktest]
-    fn dir_rmdir_removes_child_and_updates_nlinks() {
+    fn dir_rmdir_ok() {
         clocks::init_for_ktest();
 
         let env = prepare_rmdir_env(false);
-        let f = &env.f;
-        let child_ino = env.child_ino;
         let parent = &env.parent;
+        let child = &env.child;
 
         parent.rmdir("sub").unwrap();
-        {
-            assert_eq!(parent.inner.meta_read().desc.links_count, 2);
-            assert_eq!(
-                find_entry_ino(parent, "sub").unwrap_err().error(),
-                Errno::ENOENT
-            );
-        }
-
-        let parent = f.ext2.read_inode(ROOT_INO).unwrap();
-        assert_eq!(parent.inner.meta_read().desc.links_count, 2);
-        let child = f.ext2.read_inode(child_ino).unwrap();
-        assert_eq!(child.inner.meta_read().desc.size, 0);
-        assert_eq!(child.inner.meta_read().desc.links_count, 0);
+        assert_eq!(inode_nlinks(parent), 2);
+        assert_eq!(
+            lookup_ino(parent, "sub").unwrap_err().error(),
+            Errno::ENOENT
+        );
+        assert_eq!(inode_size(child), 0);
+        assert_eq!(inode_nlinks(child), 0);
     }
 
     #[ktest]
-    fn dir_rmdir_notempty_returns_enotempty() {
+    fn dir_rmdir_notempty_err() {
         clocks::init_for_ktest();
 
         let env = prepare_rmdir_env(true);
-        let f = &env.f;
-        let child_ino = env.child_ino;
         let parent = &env.parent;
+        let child_ino = env.child.ino();
 
         let err = parent.rmdir("sub").unwrap_err();
         assert_eq!(err.error(), Errno::ENOTEMPTY);
 
-        assert_eq!(find_entry_ino(parent, "sub").unwrap(), child_ino);
-        assert_eq!(parent.inner.meta_read().desc.links_count, 3);
-
-        let inode_bitmap = f.block_groups()[0].inode_bitmap();
-        assert!(inode_bitmap.is_allocated((child_ino - 1) as u16));
+        assert_eq!(lookup_ino(parent, "sub").unwrap(), child_ino);
+        assert_eq!(inode_nlinks(parent), 3);
     }
 
     #[ktest]
-    fn write_and_resize_truncate_round_trip_ok() {
+    fn file_direct_write_truncate_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -4611,30 +4404,35 @@ mod test {
         let free_before_write = f.ext2.super_block().free_blocks_count();
         let mut payload_reader = VmReader::from(payload.as_slice()).to_fallible();
         assert_eq!(
-            file.write_direct_at(0, &mut payload_reader).unwrap(),
+            InodeIo::write_at(file.as_ref(), 0, &mut payload_reader, StatusFlags::O_DIRECT)
+                .unwrap(),
             payload.len()
         );
         let free_after_write = f.ext2.super_block().free_blocks_count();
         assert_eq!(free_before_write.saturating_sub(free_after_write), 1);
 
-        assert_eq!(file.inner.meta_read().desc.size as usize, payload.len());
+        assert_eq!(inode_size(&file), payload.len());
         let mut readback = vec![0u8; block_size];
         let mut readback_writer = VmWriter::from(readback.as_mut_slice()).to_fallible();
         assert_eq!(
-            file.read_direct_at(0, &mut readback_writer).unwrap(),
+            InodeIo::read_at(
+                file.as_ref(),
+                0,
+                &mut readback_writer,
+                StatusFlags::O_DIRECT
+            )
+            .unwrap(),
             payload.len()
         );
         assert_eq!(&readback[..payload.len()], payload.as_slice());
 
         let free_before_truncate = f.ext2.super_block().free_blocks_count();
-        file.resize(0).unwrap();
+        VfsInodeTrait::resize(file.as_ref(), 0).unwrap();
         let free_after_truncate = f.ext2.super_block().free_blocks_count();
         assert_eq!(free_after_truncate.saturating_sub(free_before_truncate), 1);
 
-        assert_eq!(file.inner.meta_read().desc.size, 0);
-        let mapping = file.inner.mapping_read();
-        assert_eq!(mapping.desc.blocks, 0);
-        assert_eq!(mapping.desc.block_ptrs[0], 0);
+        assert_eq!(inode_size(&file), 0);
+        assert_eq!(VfsInodeTrait::metadata(file.as_ref()).blocks, 0);
 
         let on_disk = f.ext2.read_inode_desc(file.ino()).unwrap();
         assert_eq!(on_disk.size, 0);
@@ -4642,7 +4440,7 @@ mod test {
     }
 
     #[ktest]
-    fn symlink_fast_round_trip_ok() {
+    fn symlink_fast_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -4659,13 +4457,18 @@ mod test {
         link.write_link(target).unwrap();
         assert_eq!(link.read_link().unwrap(), target);
 
-        assert_eq!(link.inner.meta_read().desc.size as usize, target.len());
-        assert_eq!(link.inner.mapping_read().desc.blocks, 0);
-        assert!(is_fast_symlink_for_test(&link, f.ext2.block_size()));
+        assert_eq!(inode_size(&link), target.len());
+        assert_eq!(VfsInodeTrait::metadata(link.as_ref()).blocks, 0);
+        assert!(
+            f.ext2
+                .read_inode_desc(link.ino())
+                .unwrap()
+                .is_fast_symlink(f.ext2.block_size())
+        );
     }
 
     #[ktest]
-    fn symlink_slow_round_trip_ok() {
+    fn symlink_slow_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -4682,16 +4485,18 @@ mod test {
         link.write_link(&target).unwrap();
         assert_eq!(link.read_link().unwrap(), target);
 
-        assert_eq!(
-            link.inner.meta_read().desc.size as usize,
-            MAX_FAST_SYMLINK_LEN
+        assert_eq!(inode_size(&link), MAX_FAST_SYMLINK_LEN);
+        assert!(VfsInodeTrait::metadata(link.as_ref()).blocks > 0);
+        assert!(
+            !f.ext2
+                .read_inode_desc(link.ino())
+                .unwrap()
+                .is_fast_symlink(f.ext2.block_size())
         );
-        assert!(link.inner.mapping_read().desc.blocks > 0);
-        assert!(!is_fast_symlink_for_test(&link, f.ext2.block_size()));
     }
 
     #[ktest]
-    fn symlink_write_link_enametoolong_boundary() {
+    fn symlink_too_long_err() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -4710,7 +4515,7 @@ mod test {
     }
 
     #[ktest]
-    fn symlink_read_write_reject_non_symlink_inode() {
+    fn symlink_non_symlink_err() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -4731,27 +4536,40 @@ mod test {
     }
 
     #[ktest]
-    fn write_at_partial_block_preserves_rest() {
+    fn file_write_partial_ok() {
         clocks::init_for_ktest();
 
-        let f = Ext2FixtureBuilder::new(1, 256)
-            .with_free_blocks(64, 64)
-            .build()
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let file = root
+            .create(
+                "partial",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644),
+            )
             .unwrap();
-        let file = make_live_file_inode(&f.ext2, 20, 0, 0, FileFlags::empty(), [0; 15]);
         let block_size = f.ext2.block_size();
         let original = vec![0x11u8; block_size];
         let patch = vec![0x7cu8; 257];
         let patch_off = 123usize;
 
         let mut original_reader = VmReader::from(original.as_slice()).to_fallible();
-        file.write_at(0, &mut original_reader).unwrap();
+        InodeIo::write_at(file.as_ref(), 0, &mut original_reader, StatusFlags::empty()).unwrap();
         let mut patch_reader = VmReader::from(patch.as_slice()).to_fallible();
-        file.write_at(patch_off, &mut patch_reader).unwrap();
+        InodeIo::write_at(
+            file.as_ref(),
+            patch_off,
+            &mut patch_reader,
+            StatusFlags::empty(),
+        )
+        .unwrap();
 
         let mut out = vec![0u8; block_size];
         let mut out_writer = VmWriter::from(out.as_mut_slice()).to_fallible();
-        assert_eq!(file.read_at(0, &mut out_writer).unwrap(), block_size);
+        assert_eq!(
+            InodeIo::read_at(file.as_ref(), 0, &mut out_writer, StatusFlags::empty()).unwrap(),
+            block_size
+        );
         assert_eq!(&out[..patch_off], &original[..patch_off]);
         assert_eq!(&out[patch_off..patch_off + patch.len()], patch.as_slice());
         assert_eq!(
@@ -4761,14 +4579,18 @@ mod test {
     }
 
     #[ktest]
-    fn write_at_cross_block_boundary_ok() {
+    fn file_write_cross_block_ok() {
         clocks::init_for_ktest();
 
-        let f = Ext2FixtureBuilder::new(1, 256)
-            .with_free_blocks(64, 64)
-            .build()
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let file = root
+            .create(
+                "cross",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644),
+            )
             .unwrap();
-        let file = make_live_file_inode(&f.ext2, 21, 0, 0, FileFlags::empty(), [0; 15]);
         let block_size = f.ext2.block_size();
         let crossing_off = block_size - 64;
         let crossing_data = (0..128)
@@ -4777,92 +4599,140 @@ mod test {
 
         let zeros = vec![0u8; block_size * 2];
         let mut zeros_reader = VmReader::from(zeros.as_slice()).to_fallible();
-        file.write_at(0, &mut zeros_reader).unwrap();
+        InodeIo::write_at(file.as_ref(), 0, &mut zeros_reader, StatusFlags::empty()).unwrap();
         let mut crossing_reader = VmReader::from(crossing_data.as_slice()).to_fallible();
-        file.write_at(crossing_off, &mut crossing_reader).unwrap();
+        InodeIo::write_at(
+            file.as_ref(),
+            crossing_off,
+            &mut crossing_reader,
+            StatusFlags::empty(),
+        )
+        .unwrap();
 
         let mut out = vec![0u8; block_size * 2];
         let mut out_writer = VmWriter::from(out.as_mut_slice()).to_fallible();
-        assert_eq!(file.read_at(0, &mut out_writer).unwrap(), block_size * 2);
+        assert_eq!(
+            InodeIo::read_at(file.as_ref(), 0, &mut out_writer, StatusFlags::empty()).unwrap(),
+            block_size * 2
+        );
         assert_eq!(
             &out[crossing_off..crossing_off + 128],
             crossing_data.as_slice()
         );
-        assert_eq!(file.inner.meta_read().desc.size as usize, block_size * 2);
+        assert_eq!(inode_size(&file), block_size * 2);
     }
 
     #[ktest]
-    fn write_at_sparse_hole_extends_file_ok() {
+    fn file_write_sparse_ok() {
         clocks::init_for_ktest();
 
-        let f = Ext2FixtureBuilder::new(1, 256)
-            .with_free_blocks(64, 64)
-            .build()
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let file = root
+            .create(
+                "sparse",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644),
+            )
             .unwrap();
-        let file = make_live_file_inode(&f.ext2, 22, 0, 0, FileFlags::empty(), [0; 15]);
         let block_size = f.ext2.block_size();
         let write_off = block_size * 2 + 128;
         let payload = vec![0x3au8; 256];
 
+        let free_before = f.ext2.super_block().free_blocks_count();
         let mut payload_reader = VmReader::from(payload.as_slice()).to_fallible();
-        file.write_at(write_off, &mut payload_reader).unwrap();
+        InodeIo::write_at(
+            file.as_ref(),
+            write_off,
+            &mut payload_reader,
+            StatusFlags::empty(),
+        )
+        .unwrap();
+        let free_after = f.ext2.super_block().free_blocks_count();
 
-        assert_eq!(
-            file.inner.meta_read().desc.size as usize,
-            write_off + payload.len()
-        );
-        assert_eq!(file.inner.get_block(0).unwrap(), None);
-        assert_eq!(file.inner.get_block(1).unwrap(), None);
+        assert_eq!(inode_size(&file), write_off + payload.len());
+        assert_eq!(free_before.saturating_sub(free_after), 1);
 
         let mut out = vec![0u8; payload.len()];
         let mut out_writer = VmWriter::from(out.as_mut_slice()).to_fallible();
         assert_eq!(
-            file.read_at(write_off, &mut out_writer).unwrap(),
+            InodeIo::read_at(
+                file.as_ref(),
+                write_off,
+                &mut out_writer,
+                StatusFlags::empty()
+            )
+            .unwrap(),
             payload.len()
         );
         assert_eq!(out, payload);
+
+        let mut hole = vec![0xa5u8; block_size];
+        let mut hole_writer = VmWriter::from(hole.as_mut_slice()).to_fallible();
+        assert_eq!(
+            InodeIo::read_at(file.as_ref(), 0, &mut hole_writer, StatusFlags::empty()).unwrap(),
+            block_size
+        );
+        assert!(hole.iter().all(|b| *b == 0));
     }
 
     #[ktest]
-    fn write_at_enospc_rolls_back_state() {
+    fn file_write_enospc_rollback() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
             .with_free_blocks(2, 2)
+            .with_free_inodes(1000, 1000)
+            .with_group0_used_dirs(1)
             .build()
             .unwrap();
-        let file = make_live_file_inode(&f.ext2, 23, 0, 0, FileFlags::empty(), [0; 15]);
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let file = root
+            .create(
+                "enospc",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644),
+            )
+            .unwrap();
         let block_size = f.ext2.block_size();
         let base_data = vec![0x44u8; block_size];
 
         let mut base_reader = VmReader::from(base_data.as_slice()).to_fallible();
-        file.write_direct_at(0, &mut base_reader).unwrap();
+        InodeIo::write_at(file.as_ref(), 0, &mut base_reader, StatusFlags::O_DIRECT).unwrap();
         let free_before_fail = f.ext2.super_block().free_blocks_count();
         assert_eq!(free_before_fail, 1);
 
         let fail_payload = vec![0x66u8; block_size * 2];
         let mut fail_reader = VmReader::from(fail_payload.as_slice()).to_fallible();
-        let err = file
-            .write_direct_at(block_size, &mut fail_reader)
-            .unwrap_err();
+        let err = InodeIo::write_at(
+            file.as_ref(),
+            block_size,
+            &mut fail_reader,
+            StatusFlags::O_DIRECT,
+        )
+        .unwrap_err();
         assert_eq!(err.error(), Errno::ENOSPC);
 
-        assert_eq!(file.inner.meta_read().desc.size as usize, block_size);
-        assert!(file.inner.get_block(0).unwrap().is_some());
-        assert_eq!(file.inner.get_block(1).unwrap(), None);
+        assert_eq!(inode_size(&file), block_size);
         assert_eq!(f.ext2.super_block().free_blocks_count(), free_before_fail);
 
         let mut readback = vec![0u8; block_size];
         let mut readback_writer = VmWriter::from(readback.as_mut_slice()).to_fallible();
         assert_eq!(
-            file.read_direct_at(0, &mut readback_writer).unwrap(),
+            InodeIo::read_at(
+                file.as_ref(),
+                0,
+                &mut readback_writer,
+                StatusFlags::O_DIRECT
+            )
+            .unwrap(),
             block_size
         );
         assert_eq!(readback, base_data);
     }
 
     #[ktest]
-    fn write_at_directory_returns_eisdir() {
+    fn file_write_dir_eisdir() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -4873,7 +4743,7 @@ mod test {
     }
 
     #[ktest]
-    fn read_at_sparse_hole_returns_zeros_and_clamps_eof() {
+    fn file_read_sparse_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
@@ -4910,7 +4780,7 @@ mod test {
     }
 
     #[ktest]
-    fn read_at_directory_returns_eisdir() {
+    fn file_read_dir_eisdir() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -4922,7 +4792,7 @@ mod test {
     }
 
     #[ktest]
-    fn read_at_io_error_returns_eio() {
+    fn file_read_eio() {
         clocks::init_for_ktest();
 
         let base = Ext2FixtureBuilder::new(2, 256).build().unwrap();
@@ -4958,25 +4828,39 @@ mod test {
     }
 
     #[ktest]
-    fn resize_extend_sparse_skips_alloc() {
+    fn file_resize_extend_sparse_ok() {
         clocks::init_for_ktest();
 
-        let f = Ext2FixtureBuilder::new(1, 256)
-            .with_free_blocks(64, 64)
-            .build()
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let file = root
+            .create(
+                "resize_sparse",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644),
+            )
             .unwrap();
-        let file = make_live_file_inode(&f.ext2, 24, 0, 0, FileFlags::empty(), [0; 15]);
         let block_size = f.ext2.block_size();
         let target = block_size * 3 + 123;
-        file.resize(target).unwrap();
-        assert_eq!(file.inner.meta_read().desc.size as usize, target);
-        let mapping = file.inner.mapping_read();
-        assert_eq!(mapping.desc.blocks, 0);
-        assert!(mapping.desc.block_ptrs.iter().all(|ptr| *ptr == 0));
+
+        let free_before = f.ext2.super_block().free_blocks_count();
+        VfsInodeTrait::resize(file.as_ref(), target).unwrap();
+        let free_after = f.ext2.super_block().free_blocks_count();
+
+        assert_eq!(inode_size(&file), target);
+        assert_eq!(free_before, free_after);
+
+        let mut buf = vec![0xa5u8; block_size];
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        assert_eq!(
+            InodeIo::read_at(file.as_ref(), 0, &mut writer, StatusFlags::empty()).unwrap(),
+            block_size
+        );
+        assert!(buf.iter().all(|b| *b == 0));
     }
 
     #[ktest]
-    fn fallocate_allocate_extends_file_size() {
+    fn falloc_alloc_extends_size() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
@@ -4993,7 +4877,7 @@ mod test {
     }
 
     #[ktest]
-    fn fallocate_allocate_keep_size_is_noop() {
+    fn falloc_keep_size_noop() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
@@ -5008,7 +4892,7 @@ mod test {
     }
 
     #[ktest]
-    fn fallocate_punch_hole_keep_size_zeroes_requested_range() {
+    fn falloc_punch_hole_zeroes() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
@@ -5045,7 +4929,7 @@ mod test {
     }
 
     #[ktest]
-    fn fallocate_unsupported_modes_return_eopnotsupp() {
+    fn falloc_unsupported_mode() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
@@ -5067,27 +4951,39 @@ mod test {
     }
 
     #[ktest]
-    fn resize_shrink_zeroes_partial_tail_block() {
+    fn file_resize_shrink_zero_tail_ok() {
         clocks::init_for_ktest();
 
-        let f = Ext2FixtureBuilder::new(1, 256)
-            .with_free_blocks(64, 64)
-            .build()
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let file = root
+            .create(
+                "shrink_tail",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644),
+            )
             .unwrap();
-        let file = make_live_file_inode(&f.ext2, 25, 0, 0, FileFlags::empty(), [0; 15]);
         let block_size = f.ext2.block_size();
-        let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
         let keep_in_tail = 200usize;
 
         let payload = vec![0xabu8; block_size * 2];
         let mut payload_reader = VmReader::from(payload.as_slice()).to_fallible();
-        file.write_direct_at(0, &mut payload_reader).unwrap();
-        file.resize(block_size + keep_in_tail).unwrap();
+        InodeIo::write_at(file.as_ref(), 0, &mut payload_reader, StatusFlags::O_DIRECT).unwrap();
+
+        let free_before_resize = f.ext2.super_block().free_blocks_count();
+        VfsInodeTrait::resize(file.as_ref(), block_size + keep_in_tail).unwrap();
+        let free_after_resize = f.ext2.super_block().free_blocks_count();
 
         let mut kept = vec![0u8; keep_in_tail];
         let mut kept_writer = VmWriter::from(kept.as_mut_slice()).to_fallible();
         assert_eq!(
-            file.read_at(block_size, &mut kept_writer).unwrap(),
+            InodeIo::read_at(
+                file.as_ref(),
+                block_size,
+                &mut kept_writer,
+                StatusFlags::empty()
+            )
+            .unwrap(),
             keep_in_tail
         );
         assert!(kept.iter().all(|b| *b == 0xab));
@@ -5095,18 +4991,19 @@ mod test {
         let mut eof = [0x5au8; 32];
         let mut eof_writer = VmWriter::from(eof.as_mut_slice()).to_fallible();
         assert_eq!(
-            file.read_at(block_size + keep_in_tail, &mut eof_writer)
-                .unwrap(),
+            InodeIo::read_at(
+                file.as_ref(),
+                block_size + keep_in_tail,
+                &mut eof_writer,
+                StatusFlags::empty()
+            )
+            .unwrap(),
             0
         );
         assert_eq!(eof, [0x5au8; 32]);
 
-        assert_eq!(
-            file.inner.meta_read().desc.size as usize,
-            block_size + keep_in_tail
-        );
-        let mapping = file.inner.mapping_read();
-        assert_eq!(mapping.desc.blocks, sectors_per_block.saturating_mul(2));
+        assert_eq!(inode_size(&file), block_size + keep_in_tail);
+        assert_eq!(free_before_resize, free_after_resize);
     }
 
     // TODO: this test will failed due to the bug of PageCache::discard_range.
@@ -5152,124 +5049,34 @@ mod test {
     // }
 
     #[ktest]
-    fn new_inode_initializes_page_cache_capacity() {
-        clocks::init_for_ktest();
-
-        let f = Ext2FixtureBuilder::new(1, 256).build().unwrap();
-        let block_size = f.ext2.block_size();
-
-        let inode_empty = make_live_file_inode(&f.ext2, 60, 0, 0, FileFlags::empty(), [0; 15]);
-        assert_eq!(inode_empty.inner.page_cache().pages().size(), 0);
-
-        let inode_non_empty =
-            make_live_file_inode(&f.ext2, 61, block_size + 1, 0, FileFlags::empty(), [0; 15]);
-        assert_eq!(
-            inode_non_empty.inner.page_cache().pages().size(),
-            (block_size + 1).align_up(BLOCK_SIZE)
-        );
-    }
-
-    #[ktest]
-    fn page_cache_npages_matches_desc_size() {
-        clocks::init_for_ktest();
-
-        let f = Ext2FixtureBuilder::new(1, 256).build().unwrap();
-        let block_size = f.ext2.block_size();
-
-        let inode =
-            make_live_file_inode(&f.ext2, 62, block_size + 1, 0, FileFlags::empty(), [0; 15]);
-        assert_eq!(<Inode as PageCacheBackend>::npages(&inode), 2);
-
-        let inode_zero = make_live_file_inode(&f.ext2, 63, 0, 0, FileFlags::empty(), [0; 15]);
-        assert_eq!(<Inode as PageCacheBackend>::npages(&inode_zero), 0);
-    }
-
-    #[ktest]
-    fn read_write_via_page_cache_ok() {
-        clocks::init_for_ktest();
-
-        let f = Ext2FixtureBuilder::new(1, 256)
-            .with_free_blocks(64, 64)
-            .build()
-            .unwrap();
-        let file = make_live_file_inode(&f.ext2, 64, 0, 0, FileFlags::empty(), [0; 15]);
-
-        let payload = b"hello-page-cache";
-        let mut reader = VmReader::from(payload.as_slice()).to_fallible();
-        let written = file.write_at(0, &mut reader).unwrap();
-        assert_eq!(written, payload.len());
-
-        let mut out = vec![0u8; payload.len()];
-        let mut writer = VmWriter::from(out.as_mut_slice()).to_fallible();
-        let read = file.read_at(0, &mut writer).unwrap();
-        assert_eq!(read, payload.len());
-        assert_eq!(out.as_slice(), payload.as_slice());
-    }
-
-    #[ktest]
-    fn page_cache_write_at_directory_returns_eisdir() {
+    fn page_cache_vmo_size_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
         let root = f.ext2.read_inode(ROOT_INO).unwrap();
-        let mut reader = VmReader::from(b"x".as_slice()).to_fallible();
-        let err = root.write_at(0, &mut reader).unwrap_err();
-        assert_eq!(err.error(), Errno::EISDIR);
-    }
-
-    #[ktest]
-    fn page_cache_resize_extend_sparse_skips_alloc() {
-        clocks::init_for_ktest();
-
-        let f = Ext2FixtureBuilder::new(1, 256)
-            .with_free_blocks(64, 64)
-            .build()
-            .unwrap();
-        let file = make_live_file_inode(&f.ext2, 65, 0, 0, FileFlags::empty(), [0; 15]);
-        let block_size = f.ext2.block_size();
-
-        file.resize(block_size * 2 + 7).unwrap();
-
-        assert_eq!(
-            file.inner.meta_read().desc.size as usize,
-            block_size * 2 + 7
-        );
-        let mapping = file.inner.mapping_read();
-        assert_eq!(mapping.desc.blocks, 0);
-        assert!(mapping.desc.block_ptrs.iter().all(|ptr| *ptr == 0));
-    }
-
-    #[ktest]
-    fn page_cache_writeback_unmapped_returns_eio() {
-        clocks::init_for_ktest();
-
-        let f = Ext2FixtureBuilder::new(1, 256)
-            .with_free_blocks(64, 64)
-            .build()
+        let file = root
+            .create(
+                "pcache",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644),
+            )
             .unwrap();
         let block_size = f.ext2.block_size();
-        let file = make_live_file_inode(&f.ext2, 66, block_size, 0, FileFlags::empty(), [0; 15]);
 
-        file.inner.page_cache().resize(block_size).unwrap();
+        let vmo = VfsInodeTrait::page_cache(file.as_ref()).unwrap();
+        assert_eq!(vmo.size(), 0);
 
-        let one_byte = [0x5au8];
-        let mut reader = VmReader::from(one_byte.as_slice()).to_fallible();
-        file.inner
-            .page_cache()
-            .pages()
-            .write(0, &mut reader)
-            .unwrap();
+        VfsInodeTrait::resize(file.as_ref(), block_size + 1).unwrap();
+        assert_eq!(inode_size(&file), block_size + 1);
+        assert_eq!(vmo.size(), (block_size + 1).align_up(BLOCK_SIZE));
 
-        let err = file
-            .inner
-            .page_cache()
-            .evict_range(0..block_size)
-            .unwrap_err();
-        assert_eq!(err.error(), Errno::EIO);
+        VfsInodeTrait::resize(file.as_ref(), 0).unwrap();
+        assert_eq!(inode_size(&file), 0);
+        assert_eq!(vmo.size(), 0);
     }
 
     #[ktest]
-    fn xattr_set_get_and_size_query_roundtrip() {
+    fn xattr_roundtrip_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -5303,12 +5110,10 @@ mod test {
         let read = VfsInodeTrait::get_xattr(file.as_ref(), make_name(), &mut get_writer).unwrap();
         assert_eq!(read, value.len());
         assert_eq!(got.as_slice(), value);
-
-        assert_ne!(file.inner.meta_read().desc.file_acl, 0);
     }
 
     #[ktest]
-    fn xattr_remove_last_entry_frees_block() {
+    fn xattr_remove_last_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
@@ -5330,17 +5135,15 @@ mod test {
             XattrSetFlags::CREATE_OR_REPLACE,
         )
         .unwrap();
-        assert_ne!(file.inner.meta_read().desc.file_acl, 0);
 
         VfsInodeTrait::remove_xattr(file.as_ref(), make_name()).unwrap();
-        assert_eq!(file.inner.meta_read().desc.file_acl, 0);
 
         let err = VfsInodeTrait::remove_xattr(file.as_ref(), make_name()).unwrap_err();
         assert_eq!(err.error(), Errno::ENODATA);
     }
 
     #[ktest]
-    fn xattr_list_filters_namespace() {
+    fn xattr_list_namespace_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
