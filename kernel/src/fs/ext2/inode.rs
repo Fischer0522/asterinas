@@ -47,7 +47,7 @@ impl FilePerm {
 pub struct Inode {
     ino: u32,
     type_: InodeType,
-    inner: RwMutex<InodeInner>,
+    inner: InodeInner,
     block_group_idx: usize,
     fs: Weak<Ext2>,
     xattr: Option<RwMutex<Xattr>>,
@@ -78,7 +78,7 @@ impl Inode {
                 ))),
                 _ => None,
             },
-            inner: RwMutex::new(InodeInner::new(desc, weak_self.clone(), fs.clone())),
+            inner: InodeInner::new(desc, weak_self.clone(), fs.clone()),
             fs,
             extension: Extension::new(),
         })
@@ -107,7 +107,7 @@ impl Inode {
     }
 
     pub(super) fn file_size(&self) -> usize {
-        self.inner.read().meta.desc.size as usize
+        self.inner.meta_read().desc.size as usize
     }
 
     /// Returns the encoded device ID for special files.
@@ -119,9 +119,9 @@ impl Inode {
             return 0;
         }
 
-        // SPEC: acquire inode read lock before reading i_block-based device encoding.
-        let inner = self.inner.read();
-        inner.decode_device_id()
+        // SPEC: i_block payload lives in mapping domain.
+        let mapping = self.inner.mapping_read();
+        mapping.desc.decode_device_id()
     }
 
     /// Sets the encoded device ID for special files and persists it.
@@ -133,13 +133,15 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        // SPEC: acquire inode write lock before mutating block_ptrs and timestamps.
-        let mut inner = self.inner.write();
+        let fs = self.fs_arc()?;
+        // Lock order: meta -> mapping.
+        let mut meta = self.inner.meta_write();
+        let mut mapping = self.inner.mapping_write();
         // DIFF from Linux: Linux caches dev_t in i_rdev and encodes during write_inode;
         // Asterinas stores the Linux-compatible on-disk encoding directly in block_ptrs.
-        inner.encode_device_id(device_id);
-        inner.meta.desc.ctime = now();
-        inner.persist_inode()
+        mapping.desc.encode_device_id(device_id);
+        meta.desc.ctime = now();
+        InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, &fs)
     }
 
     pub(super) fn resize(&self, new_size: usize) -> Result<()> {
@@ -149,10 +151,10 @@ impl Inode {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
         }
 
-        let inner = self.inner.upread();
-        if inner.meta.desc.type_ != InodeType::File
-            && inner.meta.desc.type_ != InodeType::Dir
-            && inner.meta.desc.type_ != InodeType::SymLink
+        let mut meta = self.inner.meta_write();
+        if meta.desc.type_ != InodeType::File
+            && meta.desc.type_ != InodeType::Dir
+            && meta.desc.type_ != InodeType::SymLink
         {
             return_errno!(Errno::EINVAL);
         }
@@ -160,12 +162,21 @@ impl Inode {
         // Linux: /root/linux/fs/ext2/inode.c:48-55 (ext2_inode_is_fast_symlink).
         // Keep resize invalid for existing fast symlinks (inline payload), but
         // allow empty newly-created symlink inodes to grow into slow symlinks.
-        if inner.is_fast_symlink(block_size) && inner.meta.desc.size != 0 {
-            return_errno!(Errno::EINVAL);
+        let ea_blocks = if meta.desc.file_acl != 0 {
+            (block_size / SECTOR_SIZE) as u32
+        } else {
+            0
+        };
+        {
+            let mapping = self.inner.mapping_read();
+            let is_fast = meta.desc.type_ == InodeType::SymLink
+                && mapping.desc.blocks.checked_sub(ea_blocks) == Some(0);
+            if is_fast && meta.desc.size != 0 {
+                return_errno!(Errno::EINVAL);
+            }
         }
 
-        if inner
-            .meta
+        if meta
             .desc
             .flags
             .intersects(FileFlags::APPEND_ONLY | FileFlags::IMMUTABLE)
@@ -173,7 +184,7 @@ impl Inode {
             return_errno!(Errno::EPERM);
         }
 
-        let old_size = inner.meta.desc.size as usize;
+        let old_size = meta.desc.size as usize;
 
         if new_size == old_size {
             return Ok(());
@@ -181,58 +192,68 @@ impl Inode {
 
         if new_size < old_size {
             // Linux: /root/linux/fs/buffer.c:2654 (block_truncate_page)
-            // Keep shrink tail-zeroing in a read-compatible phase before metadata
-            // mutation/truncate, then atomically upgrade for commit.
             if new_size % block_size != 0 {
                 let zero_to = new_size.align_up(block_size);
-                inner.page_cache.fill_zeros(new_size..zero_to)?;
+                self.inner.page_cache().fill_zeros(new_size..zero_to)?;
             }
-            inner.page_cache.resize(new_size)?;
-            let mut inner = inner.upgrade();
-            if let Err(_) = inner.shrink(new_size) {
-                // TODO: add a more elegant way to rollback this error.
-                inner.page_cache.resize(old_size)?;
-                return Err(Error::with_message(Errno::EIO, "failed to shrink inode"));
+            self.inner.page_cache().resize(new_size)?;
+
+            let mut mapping = self.inner.mapping_write();
+            if let Err(err) = mapping.truncate_blocks(&fs, new_size) {
+                let _ = self.inner.page_cache().resize(old_size);
+                return Err(err);
             }
+            let current = now();
+            meta.desc.size = new_size as u64;
+            meta.desc.mtime = current;
+            meta.desc.ctime = current;
+            InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, &fs)?;
         } else {
-            inner.page_cache.resize(new_size)?;
-            let mut inner = inner.upgrade();
-            if let Err(_) = inner.expand(new_size) {
-                // TODO: add a more elegant way to rollback this error.
-                inner.page_cache.resize(old_size)?;
-                return Err(Error::with_message(Errno::EIO, "failed to expand inode"));
+            self.inner.page_cache().resize(new_size)?;
+
+            let current = now();
+            meta.desc.size = new_size as u64;
+            meta.desc.mtime = current;
+            meta.desc.ctime = current;
+            let mut mapping = self.inner.mapping_write();
+            if let Err(err) =
+                InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, &fs)
+            {
+                let _ = self.inner.page_cache().resize(old_size);
+                return Err(err);
             }
         }
         Ok(())
     }
 
     pub(super) fn metadata(&self) -> Metadata {
-        // SPEC: hold inode read lock while reading metadata fields and rdev encoding.
-        let inner = self.inner.read();
+        // Lock order: meta -> mapping.
+        let meta = self.inner.meta_read();
+        let mapping = self.inner.mapping_read();
         let (dev, blk_size) = match self.fs.upgrade() {
             Some(fs) => (fs.block_device().id().as_encoded_u64(), fs.block_size()),
             None => (0, BLOCK_SIZE),
         };
         let rdev = if self.type_ == InodeType::CharDevice || self.type_ == InodeType::BlockDevice {
             // SPEC: for device inodes, decode rdev from i_block old/new format.
-            inner.decode_device_id()
+            mapping.desc.decode_device_id()
         } else {
             0
         };
         Metadata {
             dev,
             ino: self.ino as u64,
-            size: inner.meta.desc.size as usize,
+            size: meta.desc.size as usize,
             blk_size,
-            blocks: inner.mapping.desc.blocks as usize,
-            atime: inner.meta.desc.atime,
-            mtime: inner.meta.desc.mtime,
-            ctime: inner.meta.desc.ctime,
+            blocks: mapping.desc.blocks as usize,
+            atime: meta.desc.atime,
+            mtime: meta.desc.mtime,
+            ctime: meta.desc.ctime,
             type_: self.type_,
-            mode: InodeMode::from_bits_truncate(inner.meta.desc.perm.bits() as _),
-            nlinks: inner.meta.desc.links_count as usize,
-            uid: Uid::new(inner.meta.desc.uid),
-            gid: Gid::new(inner.meta.desc.gid),
+            mode: InodeMode::from_bits_truncate(meta.desc.perm.bits() as _),
+            nlinks: meta.desc.links_count as usize,
+            uid: Uid::new(meta.desc.uid),
+            gid: Gid::new(meta.desc.gid),
             rdev,
         }
     }
@@ -242,59 +263,61 @@ impl Inode {
     }
 
     pub(super) fn mode(&self) -> InodeMode {
-        self.inner.read().mode()
+        let meta = self.inner.meta_read();
+        InodeMode::from_bits_truncate(meta.desc.perm.bits())
     }
 
     pub(super) fn set_mode(&self, mode: InodeMode) -> Result<()> {
-        let mut inner = self.inner.write();
-        inner.set_mode(mode);
+        let mut meta = self.inner.meta_write();
+        meta.desc.perm = FilePerm::from_bits_truncate(mode.bits() as u16);
+        meta.desc.ctime = now();
         Ok(())
     }
 
     pub(super) fn uid(&self) -> u32 {
-        self.inner.read().uid()
+        self.inner.meta_read().desc.uid
     }
 
     pub(super) fn set_uid(&self, uid: u32) -> Result<()> {
-        let mut inner = self.inner.write();
-        inner.set_uid(uid);
-        inner.set_ctime(now());
+        let mut meta = self.inner.meta_write();
+        meta.desc.uid = uid;
+        meta.desc.ctime = now();
         Ok(())
     }
 
     pub(super) fn gid(&self) -> u32 {
-        self.inner.read().gid()
+        self.inner.meta_read().desc.gid
     }
 
     pub(super) fn set_gid(&self, gid: u32) -> Result<()> {
-        let mut inner = self.inner.write();
-        inner.set_gid(gid);
-        inner.set_ctime(now());
+        let mut meta = self.inner.meta_write();
+        meta.desc.gid = gid;
+        meta.desc.ctime = now();
         Ok(())
     }
 
     pub(super) fn atime(&self) -> Duration {
-        self.inner.read().atime()
+        self.inner.meta_read().desc.atime
     }
 
     pub(super) fn set_atime(&self, time: Duration) {
-        self.inner.write().set_atime(time);
+        self.inner.meta_write().desc.atime = time;
     }
 
     pub(super) fn mtime(&self) -> Duration {
-        self.inner.read().mtime()
+        self.inner.meta_read().desc.mtime
     }
 
     pub(super) fn set_mtime(&self, time: Duration) {
-        self.inner.write().set_mtime(time);
+        self.inner.meta_write().desc.mtime = time;
     }
 
     pub(super) fn ctime(&self) -> Duration {
-        self.inner.read().ctime()
+        self.inner.meta_read().desc.ctime
     }
 
     pub(super) fn set_ctime(&self, time: Duration) {
-        self.inner.write().set_ctime(time);
+        self.inner.meta_write().desc.ctime = time;
     }
 
     /// Reads one extended-attribute value and writes it to `value_writer`.
@@ -352,10 +375,12 @@ impl Inode {
         let new_bid = xattr.bid();
         drop(xattr);
 
-        let mut inner = self.inner.write();
-        inner.meta.desc.file_acl = new_bid;
-        inner.meta.desc.ctime = now();
-        inner.persist_inode()
+        let fs = self.fs_arc()?;
+        let mut meta = self.inner.meta_write();
+        meta.desc.file_acl = new_bid;
+        meta.desc.ctime = now();
+        let mut mapping = self.inner.mapping_write();
+        InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, &fs)
     }
 
     /// Removes one extended attribute.
@@ -374,9 +399,11 @@ impl Inode {
         let new_bid = xattr.bid();
         drop(xattr);
 
-        let mut inner = self.inner.write();
-        inner.meta.desc.file_acl = new_bid;
-        inner.persist_inode()
+        let fs = self.fs_arc()?;
+        let mut meta = self.inner.meta_write();
+        meta.desc.file_acl = new_bid;
+        let mut mapping = self.inner.mapping_write();
+        InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, &fs)
     }
 
     /// Reads symbolic-link target bytes and decodes them as UTF-8.
@@ -394,25 +421,38 @@ impl Inode {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
         }
 
-        let inner = self.inner.read();
-        let link_size = inner.meta.desc.size as usize;
+        // Lock order: meta -> mapping.
+        let meta = self.inner.meta_read();
+        let link_size = meta.desc.size as usize;
+        let ea_blocks = if meta.desc.file_acl != 0 {
+            (block_size / SECTOR_SIZE) as u32
+        } else {
+            0
+        };
 
-        if inner.is_fast_symlink(block_size) {
-            let read_len = link_size.min(MAX_FAST_SYMLINK_LEN - 1);
-            let mut raw_bytes = [0u8; MAX_FAST_SYMLINK_LEN];
-            for (idx, block_ptr) in inner.mapping.desc.block_ptrs.iter().enumerate() {
-                let offset = idx * size_of::<u32>();
-                raw_bytes[offset..offset + size_of::<u32>()]
-                    .copy_from_slice(&block_ptr.to_le_bytes());
+        {
+            let mapping = self.inner.mapping_read();
+            let is_fast = meta.desc.type_ == InodeType::SymLink
+                && mapping.desc.blocks.checked_sub(ea_blocks) == Some(0);
+            if is_fast {
+                let read_len = link_size.min(MAX_FAST_SYMLINK_LEN - 1);
+                let mut raw_bytes = [0u8; MAX_FAST_SYMLINK_LEN];
+                for (idx, block_ptr) in mapping.desc.block_ptrs.iter().enumerate() {
+                    let offset = idx * size_of::<u32>();
+                    raw_bytes[offset..offset + size_of::<u32>()]
+                        .copy_from_slice(&block_ptr.to_le_bytes());
+                }
+
+                return String::from_utf8(raw_bytes[..read_len].to_vec()).map_err(|_| {
+                    Error::with_message(Errno::EIO, "symlink target is not valid UTF-8")
+                });
             }
-
-            return String::from_utf8(raw_bytes[..read_len].to_vec())
-                .map_err(|_| Error::with_message(Errno::EIO, "symlink target is not valid UTF-8"));
         }
+        drop(meta);
 
         let mut target = vec![0u8; link_size];
-        inner
-            .page_cache
+        self.inner
+            .page_cache()
             .pages()
             .read_bytes(0, &mut target)
             .map_err(|_| {
@@ -448,14 +488,15 @@ impl Inode {
             return_errno!(Errno::ENAMETOOLONG);
         }
 
+        let mut meta = self.inner.meta_write();
         if with_nul <= MAX_FAST_SYMLINK_LEN {
-            let mut inner = self.inner.write();
+            let mut mapping = self.inner.mapping_write();
             let mut raw_bytes = [0u8; MAX_FAST_SYMLINK_LEN];
             raw_bytes[..target_len].copy_from_slice(target.as_bytes());
 
-            for idx in 0..inner.mapping.desc.block_ptrs.len() {
+            for idx in 0..mapping.desc.block_ptrs.len() {
                 let offset = idx * size_of::<u32>();
-                inner.mapping.desc.block_ptrs[idx] = u32::from_le_bytes([
+                mapping.desc.block_ptrs[idx] = u32::from_le_bytes([
                     raw_bytes[offset],
                     raw_bytes[offset + 1],
                     raw_bytes[offset + 2],
@@ -463,66 +504,45 @@ impl Inode {
                 ]);
             }
 
-            inner.meta.desc.size = target_len as u64;
-            inner.mapping.desc.blocks = 0;
-            inner.persist_inode()?;
+            meta.desc.size = target_len as u64;
+            mapping.desc.blocks = 0;
+            let current = now();
+            meta.desc.mtime = current;
+            meta.desc.ctime = current;
+            InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, &fs)?;
             return Ok(());
         }
 
-        // Slow symlink: two-phase write with rollback, mirroring write_at's pattern.
-        // Phase 1 (write lock): allocate blocks + grow page cache + update size.
-        // Phase 2 (read lock): write target bytes into page cache.
-        // Persist only after both phases succeed.
-        //
-        // Linux: ext2_write_begin calls ext2_write_failed on allocation failure (inode.c:934-935).
-        // Linux: ext2_write_end calls ext2_write_failed on short write (inode.c:947-948).
-        let old_size;
+        // Slow symlink: allocate first, then write through page cache, rollback on failure.
+        let old_size = meta.desc.size as usize;
+        if let Err(err) = self
+            .inner
+            .prepare_continuous_blocks(&mut meta, &fs, 0, target_len, block_size, false)
         {
-            let mut inner = self.inner.write();
-            old_size = inner.meta.desc.size as usize;
-            let end_block = target_len.div_ceil(block_size);
-
-            let phase1_result = (|| -> Result<()> {
-                for iblock in 0..end_block {
-                    let iblock = u32::try_from(iblock).map_err(|_| {
-                        Error::with_message(Errno::EINVAL, "logical block number overflow")
-                    })?;
-                    if inner.get_or_alloc_block(iblock, true)?.is_none() {
-                        return_errno_with_message!(
-                            Errno::ENOSPC,
-                            "failed to allocate symlink data block"
-                        );
-                    }
-                }
-
-                inner.page_cache.resize(target_len.align_up(block_size))?;
-                inner.meta.desc.size = target_len as u64;
-                Ok(())
-            })();
-
-            if let Err(err) = phase1_result {
-                Self::write_failed_cleanup(&mut inner, old_size, target_len, block_size);
-                return Err(err);
-            }
+            self.inner
+                .write_failed_cleanup(&mut meta, &fs, old_size, target_len, block_size);
+            return Err(err);
         }
 
-        // Phase 2 (read lock): write symlink target into page cache.
-        let upread_inner = self.inner.upread();
-        if let Err(_) = upread_inner
-            .page_cache
+        if let Err(_) = self
+            .inner
+            .page_cache()
             .pages()
             .write_bytes(0, target.as_bytes())
         {
-            let mut inner = upread_inner.upgrade();
-            Self::write_failed_cleanup(&mut inner, old_size, target_len, block_size);
+            self.inner
+                .write_failed_cleanup(&mut meta, &fs, old_size, target_len, block_size);
             return Err(Error::with_message(
                 Errno::EIO,
                 "failed to write symlink target to page cache",
             ));
         }
 
-        let mut inner = upread_inner.upgrade();
-        inner.persist_inode()?;
+        let current = now();
+        meta.desc.mtime = current;
+        meta.desc.ctime = current;
+        let mut mapping = self.inner.mapping_write();
+        InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, &fs)?;
         Ok(())
     }
 
@@ -536,16 +556,15 @@ impl Inode {
         }
 
         let read_len = {
-            let inner = self.inner.read();
-            let file_size = inner.meta.desc.size as usize;
+            let meta = self.inner.meta_read();
+            let file_size = meta.desc.size as usize;
             if offset >= file_size {
                 return Ok(0);
             }
-            let read_len = writer.avail().min(file_size - offset);
-            writer.limit(read_len);
-            inner.page_cache.pages().read(offset, writer)?;
-            read_len
+            writer.avail().min(file_size - offset)
         };
+        writer.limit(read_len);
+        self.inner.page_cache().pages().read(offset, writer)?;
 
         self.set_atime(now());
         Ok(read_len)
@@ -571,32 +590,28 @@ impl Inode {
             .checked_add(write_len)
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
 
-        let old_size;
+        let mut meta = self.inner.meta_write();
+        let old_size = meta.desc.size as usize;
+        if let Err(err) = self
+            .inner
+            .prepare_continuous_blocks(&mut meta, &fs, offset, end, block_size, false)
         {
-            let mut inner = self.inner.write();
-            old_size = inner.meta.desc.size as usize;
-
-            let phase1_result = inner.prepare_continuous_blocks(offset, end, block_size, false);
-
-            if let Err(err) = phase1_result {
-                Self::write_failed_cleanup(&mut inner, old_size, end, block_size);
-                return Err(err);
-            }
+            self.inner
+                .write_failed_cleanup(&mut meta, &fs, old_size, end, block_size);
+            return Err(err);
         }
 
-        let upread_inner = self.inner.upread();
-        // Phase 2: copy user data through VMO-backed page cache under upread.
-        if let Err(err) = upread_inner.page_cache.pages().write(offset, reader) {
-            let mut inner = upread_inner.upgrade();
-            Self::write_failed_cleanup(&mut inner, old_size, end, block_size);
+        if let Err(err) = self.inner.page_cache().pages().write(offset, reader) {
+            self.inner
+                .write_failed_cleanup(&mut meta, &fs, old_size, end, block_size);
             return Err(err.into());
         }
 
-        let mut inner = upread_inner.upgrade();
         let current = now();
-        inner.meta.desc.mtime = current;
-        inner.meta.desc.ctime = current;
-        inner.persist_inode()?;
+        meta.desc.mtime = current;
+        meta.desc.ctime = current;
+        let mut mapping = self.inner.mapping_write();
+        InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, &fs)?;
         Ok(write_len)
     }
 
@@ -617,21 +632,23 @@ impl Inode {
             return_errno_with_message!(Errno::EINVAL, "not block-aligned");
         }
 
-        let read_len = {
-            let inner = self.inner.read();
-            let file_size = inner.meta.desc.size as usize;
-            if offset >= file_size || writer.avail() == 0 {
-                0
-            } else {
-                let read_len = writer.avail().min(file_size - offset);
-                let end = offset
-                    .checked_add(read_len)
-                    .ok_or_else(|| Error::with_message(Errno::EINVAL, "read range overflow"))?;
-                inner.page_cache.evict_range(offset..end)?;
-                inner.read_direct_at(offset, end, writer)?;
-                read_len
-            }
-        };
+        let meta = self.inner.meta_read();
+        let file_size = meta.desc.size as usize;
+        if offset >= file_size || writer.avail() == 0 {
+            return Ok(0);
+        }
+        drop(meta);
+
+        let read_len = writer.avail().min(file_size - offset);
+        writer.limit(read_len);
+        let end = offset
+            .checked_add(read_len)
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "read range overflow"))?;
+
+        self.inner.page_cache().evict_range(offset..end)?;
+        let mapping = self.inner.mapping_read();
+        self.inner
+            .read_direct_at(&mapping, &fs, offset, end, writer)?;
 
         self.set_atime(now());
         Ok(read_len)
@@ -663,65 +680,33 @@ impl Inode {
         let end = offset
             .checked_add(write_len)
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
-        let old_size;
+        let mut meta = self.inner.meta_write();
+        let old_size = meta.desc.size as usize;
 
+        if let Err(err) = self
+            .inner
+            .prepare_continuous_blocks(&mut meta, &fs, offset, end, block_size, true)
         {
-            let mut inner = self.inner.write();
-            old_size = inner.meta.desc.size as usize;
-
-            let prepare_ret = inner.prepare_continuous_blocks(offset, end, block_size, true);
-            if let Err(err) = prepare_ret {
-                Self::write_failed_cleanup(&mut inner, old_size, end, block_size);
-                return Err(err);
-            }
-        }
-
-        let upread_inner = self.inner.upread();
-        if let Err(err) = upread_inner.write_direct_at(offset, reader) {
-            let mut inner = upread_inner.upgrade();
-            Self::write_failed_cleanup(&mut inner, old_size, end, block_size);
+            self.inner
+                .write_failed_cleanup(&mut meta, &fs, old_size, end, block_size);
             return Err(err);
         }
 
-        let mut inner = upread_inner.upgrade();
+        let mapping = self.inner.mapping_read();
+        if let Err(err) = self.inner.write_direct_at(&mapping, &fs, offset, reader) {
+            drop(mapping);
+            self.inner
+                .write_failed_cleanup(&mut meta, &fs, old_size, end, block_size);
+            return Err(err);
+        }
+
         let current = now();
-        inner.set_mtime(current);
-        inner.set_ctime(current);
-        inner.persist_inode()?;
+        meta.desc.mtime = current;
+        meta.desc.ctime = current;
+        drop(mapping);
+        let mut mapping = self.inner.mapping_write();
+        InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, &fs)?;
         Ok(write_len)
-    }
-
-    fn write_failed_cleanup(
-        inner: &mut InodeInner,
-        old_size: usize,
-        end: usize,
-        block_size: usize,
-    ) {
-        if end <= old_size {
-            return;
-        }
-
-        let old_size_aligned = old_size.align_up(block_size);
-        let end_aligned = end.align_up(block_size);
-        // Mirrors Linux ext2 write failure rollback: drop speculative cache range
-        // and truncate newly allocated blocks back to the old size.
-        inner
-            .page_cache
-            .discard_range(old_size_aligned..end_aligned);
-
-        if let Err(err) = inner.page_cache.resize(old_size_aligned) {
-            error!(
-                "ext2: write_at cleanup page cache resize failed: old_size_aligned={}, err={:?}",
-                old_size_aligned, err
-            );
-        }
-        if let Err(err) = inner.truncate_blocks(old_size) {
-            error!(
-                "ext2: write_at cleanup truncate_blocks failed: old_size={}, err={:?}",
-                old_size, err
-            );
-        }
-        inner.meta.desc.size = old_size as u64;
     }
 
     pub(super) fn lookup(&self, name: &str) -> Result<Arc<Inode>> {
@@ -729,8 +714,10 @@ impl Inode {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let ino = self.inner.read().find_entry(name)?;
-        self.fs_arc()?.read_inode(ino)
+        let fs = self.fs_arc()?;
+        let meta = self.inner.meta_read();
+        let ino = self.inner.find_entry(&meta, &fs, name)?;
+        fs.read_inode(ino)
     }
 
     /// Adds a new directory entry using upread/upgrade phases.
@@ -744,9 +731,17 @@ impl Inode {
     ) -> Result<()> {
         let fs = self.fs_arc()?;
         self.validate_add_entry_input(name, ino, &fs)?;
+        let mut meta = self.inner.meta_write();
+        let slot = match self.inner.scan_dir_for_slot(&meta, &fs, name)? {
+            DirScanResult::Slot(slot) => slot,
+            DirScanResult::NeedGrowth => self.inner.grow_dir_block(&mut meta, &fs)?,
+        };
 
-        let upread_inner = self.inner.upread();
-        let _ = self.add_entry_with_upread_guard(upread_inner, &fs, name, ino, file_type)?;
+        self.inner
+            .write_dir_entry(&meta, &fs, &slot, name, ino, file_type as u8)?;
+        self.inner.update_dir_timestamps_and_flags(&mut meta)?;
+        let mut mapping = self.inner.mapping_write();
+        InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, &fs)?;
         Ok(())
     }
 
@@ -768,49 +763,6 @@ impl Inode {
         Ok(())
     }
 
-    /// Runs ext2_add_link phases with an existing upread guard.
-    fn add_entry_with_upread_guard<'a>(
-        &self,
-        mut upread_inner: RwMutexUpgradeableGuard<'a, InodeInner>,
-        fs: &Ext2,
-        name: &str,
-        ino: u32,
-        file_type: DirEntryFileType,
-    ) -> Result<RwMutexWriteGuard<'a, InodeInner>> {
-        let slot = match upread_inner.scan_dir_for_slot(name, fs)? {
-            DirScanResult::Slot(slot) => slot,
-            DirScanResult::NeedGrowth => {
-                let mut write_inner = upread_inner.upgrade();
-                let grown = write_inner.grow_dir_block(fs)?;
-                upread_inner = write_inner.downgrade();
-                grown
-            }
-        };
-
-        upread_inner.write_dir_entry(&slot, name, ino, file_type as u8)?;
-
-        let mut write_inner = upread_inner.upgrade();
-        write_inner.commit_dir_metadata()?;
-        Ok(write_inner)
-    }
-
-    /// Adds a directory entry while starting from an already-held write guard.
-    ///
-    /// Used by rename no-replacement branches to avoid write-lock + PageCache
-    /// callback self-deadlock.
-    fn add_entry_from_write_guard<'a>(
-        &'a self,
-        write_inner: RwMutexWriteGuard<'a, InodeInner>,
-        name: &str,
-        ino: u32,
-        file_type: DirEntryFileType,
-    ) -> Result<RwMutexWriteGuard<'a, InodeInner>> {
-        let fs = self.fs_arc()?;
-        self.validate_add_entry_input(name, ino, &fs)?;
-        let upread_inner = write_inner.downgrade();
-        self.add_entry_with_upread_guard(upread_inner, &fs, name, ino, file_type)
-    }
-
     pub(super) fn readdir_at(
         &self,
         offset: usize,
@@ -820,7 +772,9 @@ impl Inode {
             return_errno!(Errno::ENOTDIR);
         }
 
-        self.inner.read().readdir_at(offset, visitor)
+        let fs = self.fs_arc()?;
+        let meta = self.inner.meta_read();
+        self.inner.readdir_at(&meta, &fs, offset, visitor)
     }
 
     /// Deletes a directory entry by name using upread/upgrade phases.
@@ -828,8 +782,22 @@ impl Inode {
     /// Linux: /root/linux/fs/ext2/dir.c:560 (ext2_delete_entry)
     pub(super) fn delete_entry(&self, name: &str) -> Result<()> {
         self.validate_delete_entry_input(name)?;
-        let upread_inner = self.inner.upread();
-        let _ = self.delete_entry_with_upread_guard(upread_inner, name)?;
+        let fs = self.fs_arc()?;
+        let mut meta = self.inner.meta_write();
+        let target = self
+            .inner
+            .find_entry_target(&meta, &fs, name)
+            .map_err(|err| {
+                if err.error() == Errno::ENOENT {
+                    Error::with_message(Errno::EIO, "dir entry not found for delete")
+                } else {
+                    err
+                }
+            })?;
+        self.inner.delete_entry_in_cache(&meta, &fs, &target)?;
+        self.inner.update_dir_timestamps_and_flags(&mut meta)?;
+        let mut mapping = self.inner.mapping_write();
+        InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, &fs)?;
         Ok(())
     }
 
@@ -846,39 +814,7 @@ impl Inode {
         Ok(())
     }
 
-    fn delete_entry_with_upread_guard<'a>(
-        &self,
-        upread_inner: RwMutexUpgradeableGuard<'a, InodeInner>,
-        name: &str,
-    ) -> Result<RwMutexWriteGuard<'a, InodeInner>> {
-        let target = upread_inner.find_entry_target(name).map_err(|err| {
-            if err.error() == Errno::ENOENT {
-                Error::with_message(Errno::EIO, "dir entry not found for delete")
-            } else {
-                err
-            }
-        })?;
-        upread_inner.delete_entry_in_cache(&target)?;
-
-        let mut write_inner = upread_inner.upgrade();
-        write_inner.commit_dir_metadata()?;
-        Ok(write_inner)
-    }
-
-    /// Deletes a directory entry while starting from an already-held write guard.
-    ///
-    /// Used by rename paths to avoid write-lock + PageCache callback self-deadlock.
-    fn delete_entry_from_write_guard<'a>(
-        &'a self,
-        write_inner: RwMutexWriteGuard<'a, InodeInner>,
-        name: &str,
-    ) -> Result<RwMutexWriteGuard<'a, InodeInner>> {
-        self.validate_delete_entry_input(name)?;
-        let upread_inner = write_inner.downgrade();
-        self.delete_entry_with_upread_guard(upread_inner, name)
-    }
-
-    /// Initializes a directory with `.` and `..` using write->upread->write phases.
+    /// Initializes a directory with `.` and `..`.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:617 (ext2_make_empty)
     pub(super) fn make_empty(&self, parent_ino: u32) -> Result<()> {
@@ -893,35 +829,35 @@ impl Inode {
         }
 
         let block_size = fs.block_size();
-        let mut write_inner = self.inner.write();
-        if write_inner.mapping.desc.block_ptrs[0] != 0 {
-            return_errno_with_message!(Errno::EIO, "dir block pointer already occupied");
-        }
+        let mut meta = self.inner.meta_write();
+        let old_size = meta.desc.size;
+        let (old_ptr0, old_blocks, new_bid) = {
+            let mut mapping = self.inner.mapping_write();
+            if mapping.desc.block_ptrs[0] != 0 {
+                return_errno_with_message!(Errno::EIO, "dir block pointer already occupied");
+            }
+            let old_ptr0 = mapping.desc.block_ptrs[0];
+            let old_blocks = mapping.desc.blocks;
+            let bid = mapping
+                .get_or_alloc_block(&fs, 0, true)?
+                .ok_or_else(|| {
+                    Error::with_message(Errno::ENOSPC, "failed to allocate first dir block")
+                })?
+                .to_raw() as u32;
+            (old_ptr0, old_blocks, bid)
+        };
+        meta.desc.size = block_size as u64;
 
-        let old_ptr0 = write_inner.mapping.desc.block_ptrs[0];
-        let old_size = write_inner.meta.desc.size;
-        let old_blocks = write_inner.mapping.desc.blocks;
-
-        // SPEC: allocate first data block under write lock (&mut self required).
-        let new_bid = write_inner
-            .get_or_alloc_block(0, true)?
-            .ok_or_else(|| {
-                Error::with_message(Errno::ENOSPC, "failed to allocate first dir block")
-            })?
-            .to_raw() as u32;
-        write_inner.meta.desc.size = block_size as u64;
-
-        if let Err(err) = write_inner.page_cache.resize(block_size) {
-            write_inner.page_cache.discard_range(0..block_size);
-            write_inner.mapping.desc.block_ptrs[0] = old_ptr0;
-            write_inner.meta.desc.size = old_size;
-            write_inner.mapping.desc.blocks = old_blocks;
+        if let Err(err) = self.inner.page_cache().resize(block_size) {
+            self.inner.page_cache().discard_range(0..block_size);
+            meta.desc.size = old_size;
+            let mut mapping = self.inner.mapping_write();
+            mapping.desc.block_ptrs[0] = old_ptr0;
+            mapping.desc.blocks = old_blocks;
             let _ = fs.free_blocks(new_bid, 1);
             return Err(err);
         }
 
-        // SPEC: downgrade for PageCache write path.
-        let upread_inner = write_inner.downgrade();
         let mut buf = vec![0u8; block_size];
         InodeInner::write_dir_entry_bytes(
             &mut buf,
@@ -941,23 +877,24 @@ impl Inode {
             DirEntryFileType::Dir as u8,
         )?;
 
-        if let Err(err) = upread_inner.page_cache.pages().write_bytes(0, &buf) {
-            let mut write_inner = upread_inner.upgrade();
-            write_inner.page_cache.discard_range(0..block_size);
-            write_inner.mapping.desc.block_ptrs[0] = old_ptr0;
-            write_inner.meta.desc.size = old_size;
-            write_inner.mapping.desc.blocks = old_blocks;
+        if let Err(err) = self.inner.page_cache().pages().write_bytes(0, &buf) {
+            self.inner.page_cache().discard_range(0..block_size);
+            meta.desc.size = old_size;
+            let mut mapping = self.inner.mapping_write();
+            mapping.desc.block_ptrs[0] = old_ptr0;
+            mapping.desc.blocks = old_blocks;
             let _ = fs.free_blocks(new_bid, 1);
             return Err(err.into());
         }
 
-        let mut write_inner = upread_inner.upgrade();
-        if let Err(err) = write_inner.persist_inode() {
-            let mut write_inner = write_inner;
-            write_inner.page_cache.discard_range(0..block_size);
-            write_inner.mapping.desc.block_ptrs[0] = old_ptr0;
-            write_inner.meta.desc.size = old_size;
-            write_inner.mapping.desc.blocks = old_blocks;
+        let mut mapping = self.inner.mapping_write();
+        if let Err(err) =
+            InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, &fs)
+        {
+            self.inner.page_cache().discard_range(0..block_size);
+            meta.desc.size = old_size;
+            mapping.desc.block_ptrs[0] = old_ptr0;
+            mapping.desc.blocks = old_blocks;
             let _ = fs.free_blocks(new_bid, 1);
             return Err(err);
         }
@@ -966,7 +903,11 @@ impl Inode {
     }
 
     pub(super) fn empty_dir(&self) -> bool {
-        self.inner.read().empty_dir()
+        let Ok(fs) = self.fs_arc() else {
+            return false;
+        };
+        let meta = self.inner.meta_read();
+        self.inner.empty_dir(&meta, &fs, self.ino)
     }
 
     pub(super) fn rmdir(&self, name: &str) -> Result<()> {
@@ -979,43 +920,58 @@ impl Inode {
         }
 
         let fs = self.fs_arc()?;
-        let parent_upread = self.inner.upread();
-        let child_ino = parent_upread.find_entry(name)?;
+        let parent_meta = self.inner.meta_read();
+        let child_ino = self.inner.find_entry(&parent_meta, &fs, name)?;
+        drop(parent_meta);
         let child = fs.read_inode(child_ino)?;
 
         {
-            let child_read = child.inner.read();
-            if child_read.meta.desc.type_ != InodeType::Dir {
+            let child_meta = child.inner.meta_read();
+            if child_meta.desc.type_ != InodeType::Dir {
                 return_errno!(Errno::ENOTDIR);
             }
-            if !child_read.empty_dir() {
+            if !child.inner.empty_dir(&child_meta, &fs, child.ino()) {
                 return_errno!(Errno::ENOTEMPTY);
             }
         }
 
-        let target = parent_upread.find_entry_target(name)?;
-        parent_upread.delete_entry_in_cache(&target)?;
-        let mut parent_write = parent_upread.upgrade();
-        parent_write.commit_dir_metadata()?;
+        self.delete_entry(name)?;
 
         {
-            let mut child_write = child.inner.write();
-            child_write.meta.desc.size = 0;
-            child_write.meta.desc.links_count = child_write.meta.desc.links_count.saturating_sub(2);
-            child_write.meta.desc.dtime = now();
-            child_write.meta.is_freed = true;
-            child_write.persist_inode()?;
+            let mut child_meta = child.inner.meta_write();
+            child_meta.desc.size = 0;
+            child_meta.desc.links_count = child_meta.desc.links_count.saturating_sub(2);
+            child_meta.desc.dtime = now();
+            child_meta.is_freed = true;
+            let mut child_mapping = child.inner.mapping_write();
+            InodeInner::persist_inode_locked(
+                &mut child_meta,
+                &mut child_mapping,
+                child.ino(),
+                child.type_,
+                &fs,
+            )?;
         }
 
-        parent_write.meta.desc.links_count = parent_write.meta.desc.links_count.saturating_sub(1);
+        let mut parent_meta = self.inner.meta_write();
+        parent_meta.desc.links_count = parent_meta.desc.links_count.saturating_sub(1);
         // SPEC: parent link-count change in rmdir is a directory mutation; refresh
         // ctime/mtime the same way as add/delete entry paths.
         // Linux: /root/linux/fs/ext2/namei.c:312 (inode_dec_link_count(dir)).
-        parent_write.commit_dir_metadata()?;
+        self.inner
+            .update_dir_timestamps_and_flags(&mut parent_meta)?;
+        let mut parent_mapping = self.inner.mapping_write();
+        InodeInner::persist_inode_locked(
+            &mut parent_meta,
+            &mut parent_mapping,
+            self.ino,
+            self.type_,
+            &fs,
+        )?;
         Ok(())
     }
 
-    /// Creates a subdirectory under this directory using phased locking.
+    /// Creates a subdirectory under this directory.
     ///
     /// Linux: /root/linux/fs/ext2/namei.c:228 (ext2_mkdir)
     pub(super) fn mkdir(&self, name: &str, perm: FilePerm) -> Result<Arc<Inode>> {
@@ -1028,29 +984,18 @@ impl Inode {
         }
 
         let fs = self.fs_arc()?;
-
-        // SPEC: hold upread for directory-data phases and upgrade for metadata phases.
-        let mut parent_guard = self.inner.upread();
-        let slot = match parent_guard.scan_dir_for_slot(name, &fs)? {
+        let mut parent_meta = self.inner.meta_write();
+        let slot = match self.inner.scan_dir_for_slot(&parent_meta, &fs, name)? {
             DirScanResult::Slot(slot) => slot,
-            DirScanResult::NeedGrowth => {
-                let mut parent_write = parent_guard.upgrade();
-                let grown = parent_write.grow_dir_block(&fs)?;
-                parent_guard = parent_write.downgrade();
-                grown
-            }
+            DirScanResult::NeedGrowth => self.inner.grow_dir_block(&mut parent_meta, &fs)?,
         };
 
-        let mut parent_write = parent_guard.upgrade();
-        parent_write.meta.desc.links_count = parent_write.meta.desc.links_count.saturating_add(1);
-        parent_guard = parent_write.downgrade();
+        parent_meta.desc.links_count = parent_meta.desc.links_count.saturating_add(1);
 
         let child = match fs.create_inode(self.ino, InodeType::Dir, perm) {
             Ok(child) => child,
             Err(err) => {
-                let mut parent_write = parent_guard.upgrade();
-                parent_write.meta.desc.links_count =
-                    parent_write.meta.desc.links_count.saturating_sub(1);
+                parent_meta.desc.links_count = parent_meta.desc.links_count.saturating_sub(1);
                 return Err(err);
             }
         };
@@ -1058,36 +1003,50 @@ impl Inode {
 
         if let Err(err) = child.make_empty(self.ino) {
             let _ = fs.free_inode(child_ino, true);
-            let mut parent_write = parent_guard.upgrade();
-            parent_write.meta.desc.links_count =
-                parent_write.meta.desc.links_count.saturating_sub(1);
+            parent_meta.desc.links_count = parent_meta.desc.links_count.saturating_sub(1);
             return Err(err);
         }
 
-        if let Err(err) =
-            parent_guard.write_dir_entry(&slot, name, child_ino, DirEntryFileType::Dir as u8)
-        {
+        if let Err(err) = self.inner.write_dir_entry(
+            &parent_meta,
+            &fs,
+            &slot,
+            name,
+            child_ino,
+            DirEntryFileType::Dir as u8,
+        ) {
             {
-                let mut child_inner = child.inner.write();
-                let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
+                let mut child_meta = child.inner.meta_write();
+                let _ = child
+                    .inner
+                    .release_dir_data_blocks_for_cleanup(&mut child_meta, &fs);
             }
             let _ = fs.free_inode(child_ino, true);
-            let mut parent_write = parent_guard.upgrade();
-            parent_write.meta.desc.links_count =
-                parent_write.meta.desc.links_count.saturating_sub(1);
+            parent_meta.desc.links_count = parent_meta.desc.links_count.saturating_sub(1);
             return Err(err);
         }
 
-        let mut parent_write = parent_guard.upgrade();
-        if let Err(err) = parent_write.commit_dir_metadata() {
+        self.inner
+            .update_dir_timestamps_and_flags(&mut parent_meta)?;
+        let mut parent_mapping = self.inner.mapping_write();
+        if let Err(err) = InodeInner::persist_inode_locked(
+            &mut parent_meta,
+            &mut parent_mapping,
+            self.ino,
+            self.type_,
+            &fs,
+        ) {
+            parent_meta.desc.links_count = parent_meta.desc.links_count.saturating_sub(1);
+            drop(parent_mapping);
+            drop(parent_meta);
             let _ = self.delete_entry(name);
             {
-                let mut child_inner = child.inner.write();
-                let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
+                let mut child_meta = child.inner.meta_write();
+                let _ = child
+                    .inner
+                    .release_dir_data_blocks_for_cleanup(&mut child_meta, &fs);
             }
             let _ = fs.free_inode(child_ino, true);
-            parent_write.meta.desc.links_count =
-                parent_write.meta.desc.links_count.saturating_sub(1);
             return Err(err);
         }
 
@@ -1105,16 +1064,20 @@ impl Inode {
     pub(super) fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {
         match mode {
             FallocMode::PunchHoleKeepSize => {
-                let inner = self.inner.read();
-                let file_size = inner.meta.desc.size as usize;
+                let file_size = self.inner.meta_read().desc.size as usize;
                 if offset >= file_size {
                     return Ok(());
                 }
-                let end = file_size.min(offset + len);
-                inner.page_cache.fill_zeros(offset..end)
+                let end = offset
+                    .checked_add(len)
+                    .ok_or_else(|| Error::with_message(Errno::EINVAL, "fallocate range overflow"))?
+                    .min(file_size);
+                self.inner.page_cache().fill_zeros(offset..end)
             }
             FallocMode::Allocate => {
-                let new_size = offset + len;
+                let new_size = offset.checked_add(len).ok_or_else(|| {
+                    Error::with_message(Errno::EINVAL, "fallocate range overflow")
+                })?;
                 if new_size > self.file_size() {
                     self.resize(new_size)?;
                 }
@@ -1136,13 +1099,16 @@ impl Inode {
         // SPEC: fsync step 1 flushes dirty data pages first.
         // Linux: /root/linux/fs/buffer.c:646 (generic_buffers_fsync)
         // -> /root/linux/mm/filemap.c:777 (file_write_and_wait_range).
-        let inner = self.inner.upread();
-        inner.sync_data()?;
+        {
+            let meta = self.inner.meta_read();
+            self.inner.sync_data_pages(&meta)?;
+        }
 
         // SPEC: fsync step 2 persists inode metadata after data writeback.
         // Linux: /root/linux/fs/buffer.c:619 (sync_inode_metadata).
-        let mut inner = inner.upgrade();
-        inner.persist_inode()?;
+        let mut meta = self.inner.meta_write();
+        let mut mapping = self.inner.mapping_write();
+        InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, &fs)?;
 
         // SPEC: fsync step 3 flushes device write cache.
         // Linux: /root/linux/fs/buffer.c:654 (blkdev_issue_flush).
@@ -1157,7 +1123,7 @@ impl Inode {
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:72 (ext2_evict_inode)
     pub(super) fn prepare_for_evict(&self) -> Result<bool> {
-        if self.inner.read().meta.desc.links_count > 0 {
+        if self.inner.meta_read().desc.links_count > 0 {
             self.sync_all()?;
             return Ok(false);
         }
@@ -1166,13 +1132,15 @@ impl Inode {
             xattr.write().delete_xattr_block()?;
         }
 
-        let mut inner = self.inner.write();
-        inner.meta.desc.dtime = now();
-        inner.meta.is_freed = true;
-        inner.meta.desc.size = 0;
-        inner.meta.desc.file_acl = 0;
-        inner.truncate_blocks(0)?;
-        inner.persist_inode()?;
+        let fs = self.fs_arc()?;
+        let mut meta = self.inner.meta_write();
+        let mut mapping = self.inner.mapping_write();
+        meta.desc.dtime = now();
+        meta.is_freed = true;
+        meta.desc.size = 0;
+        meta.desc.file_acl = 0;
+        mapping.truncate_blocks(&fs, 0)?;
+        InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, &fs)?;
 
         Ok(true)
     }
@@ -1183,16 +1151,24 @@ impl Inode {
         {
             // SPEC: fdatasync always writes back dirty data pages first.
             // Linux: /root/linux/fs/buffer.c:609 (file_write_and_wait_range).
-            let inner = self.inner.upread();
-            inner.sync_data()?;
+            let meta = self.inner.meta_read();
+            self.inner.sync_data_pages(&meta)?;
 
             // SPEC: Linux writes metadata when I_DIRTY_DATASYNC is set.
             // Linux: /root/linux/fs/buffer.c:616-619.
             // Asterinas uses desc.is_dirty() as a conservative approximation
             // so fdatasync never misses i_size/block-mapping persistence.
-            let mut inner = inner.upgrade();
-            if inner.meta.desc.is_dirty() || inner.mapping.desc.is_dirty() {
-                inner.persist_inode()?;
+            drop(meta);
+            let mut meta = self.inner.meta_write();
+            let mut mapping = self.inner.mapping_write();
+            if meta.desc.is_dirty() || mapping.desc.is_dirty() {
+                InodeInner::persist_inode_locked(
+                    &mut meta,
+                    &mut mapping,
+                    self.ino,
+                    self.type_,
+                    &fs,
+                )?;
             }
         }
 
@@ -1283,10 +1259,6 @@ impl Inode {
             return_errno!(Errno::EPERM);
         }
 
-        if old.inner.read().meta.desc.links_count >= MAX_LINK_COUNT {
-            return_errno!(Errno::EOVERFLOW);
-        }
-
         if Self::has_invalid_child_name(name) {
             return_errno!(Errno::EINVAL);
         }
@@ -1302,18 +1274,29 @@ impl Inode {
 
         // Linux: inode_set_ctime_current + inode_inc_link_count before add_link.
         {
-            let mut old_inner = old.inner.write();
-            old_inner.meta.desc.ctime = now();
-            old_inner.meta.desc.links_count = old_inner.meta.desc.links_count.saturating_add(1);
+            let mut old_meta = old.inner.meta_write();
+            if old_meta.desc.links_count >= MAX_LINK_COUNT {
+                return_errno!(Errno::EOVERFLOW);
+            }
+            old_meta.desc.ctime = now();
+            old_meta.desc.links_count = old_meta.desc.links_count.saturating_add(1);
         }
         if let Err(err) = self.add_entry(name, old.ino, dir_ft) {
             // SPEC: rollback link count on add_entry failure.
-            let mut old_inner = old.inner.write();
-            old_inner.meta.desc.links_count = old_inner.meta.desc.links_count.saturating_sub(1);
+            let mut old_meta = old.inner.meta_write();
+            old_meta.desc.links_count = old_meta.desc.links_count.saturating_sub(1);
             return Err(err);
         }
 
-        old.inner.write().persist_inode()?;
+        let mut old_meta = old.inner.meta_write();
+        let mut old_mapping = old.inner.mapping_write();
+        InodeInner::persist_inode_locked(
+            &mut old_meta,
+            &mut old_mapping,
+            old.ino(),
+            old.type_,
+            &fs,
+        )?;
         Ok(())
     }
 
@@ -1331,8 +1314,9 @@ impl Inode {
         }
 
         let fs = self.fs_arc()?;
-
-        let child_ino = self.inner.read().find_entry(name)?;
+        let parent_meta = self.inner.meta_read();
+        let child_ino = self.inner.find_entry(&parent_meta, &fs, name)?;
+        drop(parent_meta);
         let child = fs.read_inode(child_ino)?;
 
         // SPEC: unlink rejects directories — use rmdir instead.
@@ -1345,16 +1329,23 @@ impl Inode {
 
         // Linux: inode_set_ctime_to_ts(inode, inode_get_ctime(dir))
         // then inode_dec_link_count.
-        let mut child_inner = child.inner.write();
-        child_inner.meta.desc.ctime = now();
-        child_inner.meta.desc.links_count = child_inner.meta.desc.links_count.saturating_sub(1);
+        let mut child_meta = child.inner.meta_write();
+        child_meta.desc.ctime = now();
+        child_meta.desc.links_count = child_meta.desc.links_count.saturating_sub(1);
 
         // Defer ext2_evict_inode-style reclamation to cache eviction.
-        if child_inner.meta.desc.links_count == 0 {
-            child_inner.meta.desc.dtime = now();
-            child_inner.meta.is_freed = true;
+        if child_meta.desc.links_count == 0 {
+            child_meta.desc.dtime = now();
+            child_meta.is_freed = true;
         }
-        child_inner.persist_inode()?;
+        let mut child_mapping = child.inner.mapping_write();
+        InodeInner::persist_inode_locked(
+            &mut child_meta,
+            &mut child_mapping,
+            child.ino(),
+            child.type_,
+            &fs,
+        )?;
 
         Ok(())
     }
@@ -1396,7 +1387,7 @@ impl Inode {
         if same_dir {
             self.rename_same_dir(old_name, new_name, &fs)
         } else {
-            let (self_inner, target_inner) = write_lock_two_inodes(self, target);
+            let (self_inner, target_inner) = meta_write_lock_two_inodes(self, target);
             Self::rename_inner(
                 self,
                 target,
@@ -1413,15 +1404,16 @@ impl Inode {
 
     /// Rename within the same directory (single lock).
     fn rename_same_dir(&self, old_name: &str, new_name: &str, fs: &Arc<Ext2>) -> Result<()> {
-        let mut inner = self.inner.write();
+        let mut meta = self.inner.meta_write();
 
-        let old_ino = inner.find_entry(old_name)?;
+        let old_ino = self.inner.find_entry(&meta, fs, old_name)?;
         let old_inode = fs.read_inode(old_ino)?;
         let old_is_dir = old_inode.type_ == InodeType::Dir;
         let moved_ft = Self::inode_type_to_dir_file_type(old_inode.type_);
 
         // Check if new_name already exists.
-        let existing_ino = inner.find_entry(new_name).ok();
+        let existing_ino = self.inner.find_entry(&meta, fs, new_name).ok();
+        let mut existing_inode = None;
 
         if let Some(existing_ino) = existing_ino {
             let existing = fs.read_inode(existing_ino)?;
@@ -1437,46 +1429,30 @@ impl Inode {
 
             // SPEC: replacing a directory requires it to be empty.
             if existing_is_dir {
-                let existing_inner = existing.inner.write();
-                if !existing_inner.empty_dir() {
+                let existing_meta = existing.inner.meta_read();
+                if !existing.inner.empty_dir(&existing_meta, fs, existing.ino()) {
                     return_errno!(Errno::ENOTEMPTY);
                 }
-                drop(existing_inner);
             }
+            existing_inode = Some(existing);
 
             // Replace destination entry: set_link(new_name, old_ino, ..., true).
-            inner = self.set_link_from_write_guard(inner, new_name, old_ino, moved_ft, true)?;
-
-            // Update replaced inode: set ctime, decrement links.
-            let mut existing_inner = existing.inner.write();
-            existing_inner.meta.desc.ctime = now();
-            if old_is_dir {
-                // Directory replacement: drop extra link for `..`.
-                existing_inner.meta.desc.links_count =
-                    existing_inner.meta.desc.links_count.saturating_sub(1);
-            }
-            existing_inner.meta.desc.links_count =
-                existing_inner.meta.desc.links_count.saturating_sub(1);
-
-            if existing_inner.meta.desc.links_count == 0 {
-                existing_inner.meta.desc.dtime = now();
-                existing_inner.meta.is_freed = true;
-            }
-            existing_inner.persist_inode()?;
+            let target = self.inner.find_entry_target(&meta, fs, new_name)?;
+            self.inner
+                .set_link_in_cache(&meta, fs, &target, old_ino, moved_ft as u8)?;
         } else {
-            // No existing entry: downgrade to upread while performing PageCache I/O.
-            inner = self.add_entry_from_write_guard(inner, new_name, old_ino, moved_ft)?;
-        }
-
-        // Linux: inode_set_ctime_current(old_inode) + mark_inode_dirty.
-        {
-            let mut old_inner = old_inode.inner.write();
-            old_inner.meta.desc.ctime = now();
-            old_inner.persist_inode()?;
+            // No existing entry: add a new destination dirent.
+            let slot = match self.inner.scan_dir_for_slot(&meta, fs, new_name)? {
+                DirScanResult::Slot(slot) => slot,
+                DirScanResult::NeedGrowth => self.inner.grow_dir_block(&mut meta, fs)?,
+            };
+            self.inner
+                .write_dir_entry(&meta, fs, &slot, new_name, old_ino, moved_ft as u8)?;
         }
 
         // Delete old entry.
-        inner = self.delete_entry_from_write_guard(inner, old_name)?;
+        let old_target = self.inner.find_entry_target(&meta, fs, old_name)?;
+        self.inner.delete_entry_in_cache(&meta, fs, &old_target)?;
 
         // Linux: when old_is_dir, always inode_dec_link_count(old_dir).
         // For same-dir without replacement, add_entry above implicitly
@@ -1486,11 +1462,52 @@ impl Inode {
             if existing_ino.is_none() {
                 // Linux: inode_inc_link_count(new_dir) was done in the else branch
                 // of the replacement check. For same dir, this is self.
-                inner.meta.desc.links_count = inner.meta.desc.links_count.saturating_add(1);
+                meta.desc.links_count = meta.desc.links_count.saturating_add(1);
             }
             // Linux line 397: inode_dec_link_count(old_dir) — always when old_is_dir.
-            inner.meta.desc.links_count = inner.meta.desc.links_count.saturating_sub(1);
-            inner.persist_inode()?;
+            meta.desc.links_count = meta.desc.links_count.saturating_sub(1);
+        }
+        self.inner.update_dir_timestamps_and_flags(&mut meta)?;
+        let mut mapping = self.inner.mapping_write();
+        InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, fs)?;
+        drop(mapping);
+        drop(meta);
+
+        // Update replaced inode after directory mutation/persist.
+        if let Some(existing) = existing_inode {
+            let mut existing_meta = existing.inner.meta_write();
+            existing_meta.desc.ctime = now();
+            if old_is_dir {
+                // Directory replacement: drop extra link for `..`.
+                existing_meta.desc.links_count = existing_meta.desc.links_count.saturating_sub(1);
+            }
+            existing_meta.desc.links_count = existing_meta.desc.links_count.saturating_sub(1);
+            if existing_meta.desc.links_count == 0 {
+                existing_meta.desc.dtime = now();
+                existing_meta.is_freed = true;
+            }
+            let mut existing_mapping = existing.inner.mapping_write();
+            InodeInner::persist_inode_locked(
+                &mut existing_meta,
+                &mut existing_mapping,
+                existing.ino(),
+                existing.type_,
+                fs,
+            )?;
+        }
+
+        // Linux: inode_set_ctime_current(old_inode) + mark_inode_dirty.
+        {
+            let mut old_meta = old_inode.inner.meta_write();
+            old_meta.desc.ctime = now();
+            let mut old_mapping = old_inode.inner.mapping_write();
+            InodeInner::persist_inode_locked(
+                &mut old_meta,
+                &mut old_mapping,
+                old_inode.ino(),
+                old_inode.type_,
+                fs,
+            )?;
         }
 
         Ok(())
@@ -1500,15 +1517,15 @@ impl Inode {
     fn rename_inner<'a>(
         source: &'a Inode,
         target: &'a Inode,
-        mut self_inner: RwMutexWriteGuard<'a, InodeInner>,
-        mut target_inner: RwMutexWriteGuard<'a, InodeInner>,
+        mut source_meta: RwMutexWriteGuard<'a, InodeMeta>,
+        mut target_meta: RwMutexWriteGuard<'a, InodeMeta>,
         self_ino: u32,
         target_ino: u32,
         old_name: &str,
         new_name: &str,
         fs: &Arc<Ext2>,
     ) -> Result<()> {
-        let old_ino = self_inner.find_entry(old_name)?;
+        let old_ino = source.inner.find_entry(&source_meta, fs, old_name)?;
         let old_inode = fs.read_inode(old_ino)?;
         let old_is_dir = old_inode.type_ == InodeType::Dir;
         let moved_ft = Self::inode_type_to_dir_file_type(old_inode.type_);
@@ -1516,18 +1533,17 @@ impl Inode {
         // If moving a directory across parents, verify `..` is accessible.
         // Linux: ext2_dotdot check.
         if old_is_dir {
-            let old_inner = old_inode.inner.write();
+            let old_inner = old_inode.inner.meta_read();
             // Verify `..` entry exists and points to self_ino.
-            let dotdot_ino = old_inner.find_entry("..")?;
+            let dotdot_ino = old_inode.inner.find_entry(&old_inner, fs, "..")?;
             if dotdot_ino != self_ino {
-                drop(old_inner);
                 return_errno_with_message!(Errno::EIO, "failed to update dotdot entry");
             }
-            drop(old_inner);
         }
 
         // Check if new_name already exists in target.
-        let existing_ino = target_inner.find_entry(new_name).ok();
+        let existing_ino = target.inner.find_entry(&target_meta, fs, new_name).ok();
+        let mut existing_inode = None;
 
         if let Some(existing_ino) = existing_ino {
             let existing = fs.read_inode(existing_ino)?;
@@ -1542,79 +1558,131 @@ impl Inode {
             }
 
             if existing_is_dir {
-                let existing_inner = existing.inner.write();
-                if !existing_inner.empty_dir() {
+                let existing_meta = existing.inner.meta_read();
+                if !existing.inner.empty_dir(&existing_meta, fs, existing.ino()) {
                     return_errno!(Errno::ENOTEMPTY);
                 }
-                drop(existing_inner);
             }
+            existing_inode = Some(existing);
 
             // Replace destination: ext2_set_link(new_dir, ..., old_inode, true).
-            target_inner = target.set_link_from_write_guard(
-                target_inner,
-                new_name,
+            let target_de = target.inner.find_entry_target(&target_meta, fs, new_name)?;
+            target.inner.set_link_in_cache(
+                &target_meta,
+                fs,
+                &target_de,
                 old_ino,
-                moved_ft,
-                true,
+                moved_ft as u8,
             )?;
-
-            // Update replaced inode.
-            let mut existing_inner = existing.inner.write();
-            existing_inner.meta.desc.ctime = now();
-            if old_is_dir {
-                existing_inner.meta.desc.links_count =
-                    existing_inner.meta.desc.links_count.saturating_sub(1);
-            }
-            existing_inner.meta.desc.links_count =
-                existing_inner.meta.desc.links_count.saturating_sub(1);
-
-            if existing_inner.meta.desc.links_count == 0 {
-                existing_inner.meta.desc.dtime = now();
-                existing_inner.meta.is_freed = true;
-            }
-            existing_inner.persist_inode()?;
+            target
+                .inner
+                .update_dir_timestamps_and_flags(&mut target_meta)?;
         } else {
             // No existing entry: ext2_add_link.
-            target_inner =
-                target.add_entry_from_write_guard(target_inner, new_name, old_ino, moved_ft)?;
+            let slot = match target.inner.scan_dir_for_slot(&target_meta, fs, new_name)? {
+                DirScanResult::Slot(slot) => slot,
+                DirScanResult::NeedGrowth => target.inner.grow_dir_block(&mut target_meta, fs)?,
+            };
+            target.inner.write_dir_entry(
+                &target_meta,
+                fs,
+                &slot,
+                new_name,
+                old_ino,
+                moved_ft as u8,
+            )?;
             if old_is_dir {
                 // Linux: inode_inc_link_count(new_dir) for new subdir.
-                target_inner.meta.desc.links_count =
-                    target_inner.meta.desc.links_count.saturating_add(1);
+                target_meta.desc.links_count = target_meta.desc.links_count.saturating_add(1);
             }
-        }
-
-        // Linux: inode_set_ctime_current(old_inode) + mark_inode_dirty.
-        {
-            let mut old_inner = old_inode.inner.write();
-            old_inner.meta.desc.ctime = now();
-            old_inner.persist_inode()?;
+            target
+                .inner
+                .update_dir_timestamps_and_flags(&mut target_meta)?;
         }
 
         // Delete old entry from source directory.
-        self_inner = source.delete_entry_from_write_guard(self_inner, old_name)?;
+        let source_de = source.inner.find_entry_target(&source_meta, fs, old_name)?;
+        source
+            .inner
+            .delete_entry_in_cache(&source_meta, fs, &source_de)?;
 
-        // If moving a directory across parents, update `..` to point to target.
+        // If moving a directory across parents, old parent loses a subdir.
         if old_is_dir {
-            // ext2_set_link(old_inode, dir_de, ..., new_dir, false)
-            let old_inner = old_inode.inner.write();
-            let _old_inner = old_inode.set_link_from_write_guard(
-                old_inner,
-                "..",
-                target_ino,
-                DirEntryFileType::Dir,
-                false,
+            source_meta.desc.links_count = source_meta.desc.links_count.saturating_sub(1);
+        }
+        source
+            .inner
+            .update_dir_timestamps_and_flags(&mut source_meta)?;
+
+        let mut target_mapping = target.inner.mapping_write();
+        InodeInner::persist_inode_locked(
+            &mut target_meta,
+            &mut target_mapping,
+            target.ino,
+            target.type_,
+            fs,
+        )?;
+        drop(target_mapping);
+
+        let mut source_mapping = source.inner.mapping_write();
+        InodeInner::persist_inode_locked(
+            &mut source_meta,
+            &mut source_mapping,
+            source.ino,
+            source.type_,
+            fs,
+        )?;
+        drop(source_mapping);
+        drop(target_meta);
+        drop(source_meta);
+
+        // Update replaced inode after directory mutation/persist.
+        if let Some(existing) = existing_inode {
+            let mut existing_meta = existing.inner.meta_write();
+            existing_meta.desc.ctime = now();
+            if old_is_dir {
+                existing_meta.desc.links_count = existing_meta.desc.links_count.saturating_sub(1);
+            }
+            existing_meta.desc.links_count = existing_meta.desc.links_count.saturating_sub(1);
+
+            if existing_meta.desc.links_count == 0 {
+                existing_meta.desc.dtime = now();
+                existing_meta.is_freed = true;
+            }
+            let mut existing_mapping = existing.inner.mapping_write();
+            InodeInner::persist_inode_locked(
+                &mut existing_meta,
+                &mut existing_mapping,
+                existing.ino(),
+                existing.type_,
+                fs,
             )?;
+        }
 
-            // Linux: inode_dec_link_count(old_dir) — old parent loses a subdir.
-            self_inner.meta.desc.links_count = self_inner.meta.desc.links_count.saturating_sub(1);
-            self_inner.persist_inode()?;
-
-            // If destination didn't already have the entry (no replacement),
-            // target link count was already incremented above.
-            // If replacement happened, the replaced dir's link decrement
-            // already accounts for it.
-            target_inner.persist_inode()?;
+        // Linux: inode_set_ctime_current(old_inode) + mark_inode_dirty.
+        // If moving a directory across parents, also rewrite `..` to target.
+        {
+            let mut old_meta = old_inode.inner.meta_write();
+            old_meta.desc.ctime = now();
+            if old_is_dir {
+                let dotdot = old_inode.inner.find_entry_target(&old_meta, fs, "..")?;
+                old_inode.inner.set_link_in_cache(
+                    &old_meta,
+                    fs,
+                    &dotdot,
+                    target_ino,
+                    DirEntryFileType::Dir as u8,
+                )?;
+                old_meta.desc.flags.remove(FileFlags::INDEX_DIR);
+            }
+            let mut old_mapping = old_inode.inner.mapping_write();
+            InodeInner::persist_inode_locked(
+                &mut old_meta,
+                &mut old_mapping,
+                old_inode.ino(),
+                old_inode.type_,
+                fs,
+            )?;
         }
 
         Ok(())
@@ -1638,41 +1706,6 @@ impl Inode {
         Ok(())
     }
 
-    fn set_link_with_upread_guard<'a>(
-        &self,
-        upread_inner: RwMutexUpgradeableGuard<'a, InodeInner>,
-        name: &str,
-        new_ino: u32,
-        file_type: DirEntryFileType,
-        update_times: bool,
-    ) -> Result<RwMutexWriteGuard<'a, InodeInner>> {
-        let target = upread_inner.find_entry_target(name)?;
-        upread_inner.set_link_in_cache(&target, new_ino, file_type as u8)?;
-
-        let mut write_inner = upread_inner.upgrade();
-        if update_times {
-            write_inner.commit_dir_metadata()?;
-        } else {
-            write_inner.meta.desc.flags.remove(FileFlags::INDEX_DIR);
-            write_inner.persist_inode()?;
-        }
-        Ok(write_inner)
-    }
-
-    fn set_link_from_write_guard<'a>(
-        &'a self,
-        write_inner: RwMutexWriteGuard<'a, InodeInner>,
-        name: &str,
-        new_ino: u32,
-        file_type: DirEntryFileType,
-        update_times: bool,
-    ) -> Result<RwMutexWriteGuard<'a, InodeInner>> {
-        let fs = self.fs_arc()?;
-        self.validate_set_link_input(name, new_ino, &fs)?;
-        let upread_inner = write_inner.downgrade();
-        self.set_link_with_upread_guard(upread_inner, name, new_ino, file_type, update_times)
-    }
-
     /// Rewrites an existing directory entry to point to a new inode.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:450 (ext2_set_link)
@@ -1686,10 +1719,17 @@ impl Inode {
     ) -> Result<()> {
         let fs = self.fs_arc()?;
         self.validate_set_link_input(name, new_ino, &fs)?;
-
-        let upread_inner = self.inner.upread();
-        let _ =
-            self.set_link_with_upread_guard(upread_inner, name, new_ino, file_type, update_times)?;
+        let mut meta = self.inner.meta_write();
+        let target = self.inner.find_entry_target(&meta, &fs, name)?;
+        self.inner
+            .set_link_in_cache(&meta, &fs, &target, new_ino, file_type as u8)?;
+        if update_times {
+            self.inner.update_dir_timestamps_and_flags(&mut meta)?;
+        } else {
+            meta.desc.flags.remove(FileFlags::INDEX_DIR);
+        }
+        let mut mapping = self.inner.mapping_write();
+        InodeInner::persist_inode_locked(&mut meta, &mut mapping, self.ino, self.type_, &fs)?;
         Ok(())
     }
 
@@ -1698,18 +1738,18 @@ impl Inode {
     }
 
     pub(super) fn page_cache_vmo(&self) -> Arc<Vmo> {
-        self.inner.read().page_cache.pages().clone()
+        self.inner.page_cache().pages().clone()
     }
 }
 
 impl PageCacheBackend for Inode {
     fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
-        let inner = self.inner.read();
+        let mapping = self.inner.mapping_read();
         let fs = self.fs_arc()?;
         let iblock = u32::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
 
-        match inner.get_block(iblock)? {
+        match mapping.get_block(&fs, iblock)? {
             Some(bid) => {
                 let bio_segment = BioSegment::new_from_segment(
                     Segment::from(frame.clone()).into(),
@@ -1726,12 +1766,12 @@ impl PageCacheBackend for Inode {
     }
 
     fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
-        let inner = self.inner.read();
+        let mapping = self.inner.mapping_read();
         let fs = self.fs_arc()?;
         let iblock = u32::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
 
-        let bid = inner.get_block(iblock)?.ok_or_else(|| {
+        let bid = mapping.get_block(&fs, iblock)?.ok_or_else(|| {
             error!("write_page_async: no block mapping for idx {}", idx);
             Error::with_message(Errno::EIO, "missing block mapping for writeback")
         })?;
@@ -1744,15 +1784,14 @@ impl PageCacheBackend for Inode {
     }
 
     fn npages(&self) -> usize {
-        let inner = self.inner.read();
-        (inner.meta.desc.size as usize).align_up(BLOCK_SIZE) / BLOCK_SIZE
+        self.inner.page_cache().pages().size() / BLOCK_SIZE
     }
 }
 
 #[derive(Debug)]
 pub struct InodeInner {
-    meta: InodeMeta,
-    mapping: InodeMapping,
+    meta: RwMutex<InodeMeta>,
+    mapping: RwMutex<InodeMapping>,
     weak_self: Weak<Inode>,
     fs: Weak<Ext2>,
     page_cache: PageCache,
@@ -1790,8 +1829,8 @@ struct DirEntryTarget {
 impl InodeInner {
     pub fn new(desc: Dirty<InodeDesc>, weak_self: Weak<Inode>, fs: Weak<Ext2>) -> Self {
         let num_page_bytes = (desc.size as usize).align_up(BLOCK_SIZE);
-        let meta = InodeMeta::new(desc.meta_desc());
-        let mapping = InodeMapping::new(desc.mapping_desc());
+        let meta = RwMutex::new(InodeMeta::new(desc.meta_desc()));
+        let mapping = RwMutex::new(InodeMapping::new(desc.mapping_desc()));
         let backend: Weak<dyn PageCacheBackend> = weak_self.clone();
         // Keep page-cache capacity aligned with inode size so `npages`/VMO window
         // and on-disk data extent stay consistent from mount time.
@@ -1811,103 +1850,156 @@ impl InodeInner {
         }
     }
 
+    pub(super) fn meta_read(&self) -> RwMutexReadGuard<'_, InodeMeta> {
+        self.meta.read()
+    }
+
+    pub(super) fn meta_write(&self) -> RwMutexWriteGuard<'_, InodeMeta> {
+        self.meta.write()
+    }
+
+    pub(super) fn mapping_read(&self) -> RwMutexReadGuard<'_, InodeMapping> {
+        self.mapping.read()
+    }
+
+    pub(super) fn mapping_write(&self) -> RwMutexWriteGuard<'_, InodeMapping> {
+        self.mapping.write()
+    }
+
+    pub(super) fn meta_upread(&self) -> RwMutexUpgradeableGuard<'_, InodeMeta> {
+        self.meta.upread()
+    }
+
+    pub(super) fn mapping_upread(&self) -> RwMutexUpgradeableGuard<'_, InodeMapping> {
+        self.mapping.upread()
+    }
+
+    pub(super) fn page_cache(&self) -> &PageCache {
+        &self.page_cache
+    }
+
     fn fs_arc(&self) -> Result<Arc<Ext2>> {
         self.fs
             .upgrade()
             .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))
     }
 
-    fn is_fast_symlink(&self, block_size: usize) -> bool {
-        let ea_blocks = if self.meta.desc.file_acl != 0 {
-            (block_size / SECTOR_SIZE) as u32
-        } else {
-            0
-        };
-        self.meta.desc.type_ == InodeType::SymLink
-            && self.mapping.desc.blocks.checked_sub(ea_blocks) == Some(0)
+    /// Persists inode meta+mapping to disk.
+    ///
+    /// # Lock
+    /// The caller must hold both `meta.write()` and `mapping.write()`.
+    pub(super) fn persist_inode_locked(
+        meta: &mut InodeMeta,
+        mapping: &mut InodeMapping,
+        ino: u32,
+        type_: InodeType,
+        fs: &Ext2,
+    ) -> Result<()> {
+        debug_assert_eq!(meta.desc.type_, type_);
+        let raw = RawInode::from_parts(&meta.desc, &mapping.get_desc());
+        fs.write_inode_desc(ino, &raw)?;
+        meta.desc.clear_dirty();
+        mapping.desc.clear_dirty();
+        Ok(())
     }
 
-    fn decode_device_id(&self) -> u64 {
-        let (major, minor) = if self.mapping.desc.block_ptrs[0] != 0 {
-            let val = self.mapping.desc.block_ptrs[0];
-            (((val >> 8) & 0xFF), (val & 0xFF))
-        } else {
-            let dev = self.mapping.desc.block_ptrs[1];
-            (
-                ((dev & 0xFFF00) >> 8),
-                ((dev & 0xFF) | ((dev >> 12) & 0xFFF00)),
-            )
-        };
-        encode_device_numbers(major, minor)
-    }
+    // fn is_fast_symlink(&self, block_size: usize) -> bool {
+    //     let ea_blocks = if self.meta.desc.file_acl != 0 {
+    //         (block_size / SECTOR_SIZE) as u32
+    //     } else {
+    //         0
+    //     };
+    //     self.meta.desc.type_ == InodeType::SymLink
+    //         && self.mapping.desc.blocks.checked_sub(ea_blocks) == Some(0)
+    // }
 
-    fn encode_device_id(&mut self, device_id: u64) {
-        let (major, minor) = decode_device_numbers(device_id);
-        if major < 256 && minor < 256 {
-            self.mapping.desc.block_ptrs[0] = (major << 8) | minor;
-            self.mapping.desc.block_ptrs[1] = 0;
-        } else {
-            self.mapping.desc.block_ptrs[0] = 0;
-            self.mapping.desc.block_ptrs[1] =
-                (minor & 0xFF) | (major << 8) | ((minor & !0xFF) << 12);
-            self.mapping.desc.block_ptrs[2] = 0;
-        }
-    }
+    // fn decode_device_id(&self) -> u64 {
+    //     let (major, minor) = if self.mapping.desc.block_ptrs[0] != 0 {
+    //         let val = self.mapping.desc.block_ptrs[0];
+    //         (((val >> 8) & 0xFF), (val & 0xFF))
+    //     } else {
+    //         let dev = self.mapping.desc.block_ptrs[1];
+    //         (
+    //             ((dev & 0xFFF00) >> 8),
+    //             ((dev & 0xFF) | ((dev >> 12) & 0xFFF00)),
+    //         )
+    //     };
+    //     encode_device_numbers(major, minor)
+    // }
 
-    fn mode(&self) -> InodeMode {
-        InodeMode::from_bits_truncate(self.meta.desc.perm.bits())
-    }
+    // fn encode_device_id(&mut self, device_id: u64) {
+    //     let (major, minor) = decode_device_numbers(device_id);
+    //     if major < 256 && minor < 256 {
+    //         self.mapping.desc.block_ptrs[0] = (major << 8) | minor;
+    //         self.mapping.desc.block_ptrs[1] = 0;
+    //     } else {
+    //         self.mapping.desc.block_ptrs[0] = 0;
+    //         self.mapping.desc.block_ptrs[1] =
+    //             (minor & 0xFF) | (major << 8) | ((minor & !0xFF) << 12);
+    //         self.mapping.desc.block_ptrs[2] = 0;
+    //     }
+    // }
 
-    fn set_mode(&mut self, mode: InodeMode) {
-        self.meta.desc.perm = FilePerm::from_bits_truncate(mode.bits() as u16);
-        self.set_ctime(now());
-    }
+    // fn mode(&self) -> InodeMode {
+    //     InodeMode::from_bits_truncate(self.meta.desc.perm.bits())
+    // }
 
-    fn uid(&self) -> u32 {
-        self.meta.desc.uid
-    }
+    // fn set_mode(&mut self, mode: InodeMode) {
+    //     self.meta.desc.perm = FilePerm::from_bits_truncate(mode.bits() as u16);
+    //     self.set_ctime(now());
+    // }
 
-    fn set_uid(&mut self, uid: u32) {
-        self.meta.desc.uid = uid;
-    }
+    // fn uid(&self) -> u32 {
+    //     self.meta.desc.uid
+    // }
 
-    fn gid(&self) -> u32 {
-        self.meta.desc.gid
-    }
+    // fn set_uid(&mut self, uid: u32) {
+    //     self.meta.desc.uid = uid;
+    // }
 
-    fn set_gid(&mut self, gid: u32) {
-        self.meta.desc.gid = gid;
-    }
+    // fn gid(&self) -> u32 {
+    //     self.meta.desc.gid
+    // }
 
-    fn atime(&self) -> Duration {
-        self.meta.desc.atime
-    }
+    // fn set_gid(&mut self, gid: u32) {
+    //     self.meta.desc.gid = gid;
+    // }
 
-    fn set_atime(&mut self, time: Duration) {
-        self.meta.desc.atime = time;
-    }
+    // fn atime(&self) -> Duration {
+    //     self.meta.desc.atime
+    // }
 
-    fn mtime(&self) -> Duration {
-        self.meta.desc.mtime
-    }
+    // fn set_atime(&mut self, time: Duration) {
+    //     self.meta.desc.atime = time;
+    // }
 
-    fn set_mtime(&mut self, time: Duration) {
-        self.meta.desc.mtime = time;
-    }
+    // fn mtime(&self) -> Duration {
+    //     self.meta.desc.mtime
+    // }
 
-    fn ctime(&self) -> Duration {
-        self.meta.desc.ctime
-    }
+    // fn set_mtime(&mut self, time: Duration) {
+    //     self.meta.desc.mtime = time;
+    // }
 
-    fn set_ctime(&mut self, time: Duration) {
-        self.meta.desc.ctime = time;
-    }
+    // fn ctime(&self) -> Duration {
+    //     self.meta.desc.ctime
+    // }
+
+    // fn set_ctime(&mut self, time: Duration) {
+    //     self.meta.desc.ctime = time;
+    // }
 
     /// Reads file data directly from data blocks into `writer`.
     ///
     /// Linux: /root/linux/fs/ext2/file.c:168 (ext2_dio_read_iter)
-    pub fn read_direct_at(&self, offset: usize, end: usize, writer: &mut VmWriter) -> Result<()> {
-        let fs = self.fs_arc()?;
+    pub(super) fn read_direct_at(
+        &self,
+        mapping: &InodeMapping,
+        fs: &Ext2,
+        offset: usize,
+        end: usize,
+        writer: &mut VmWriter,
+    ) -> Result<()> {
         let block_size = fs.block_size();
         let mut current_offset = offset;
 
@@ -1917,7 +2009,7 @@ impl InodeInner {
             let offset_in_block = current_offset % block_size;
             let bytes_this_block = (block_size - offset_in_block).min(end - current_offset);
 
-            match self.get_block(iblock)? {
+            match mapping.get_block(fs, iblock)? {
                 Some(bid) => {
                     let bio_segment = BioSegment::alloc(1, BioDirection::FromDevice);
                     let status = fs
@@ -1972,8 +2064,13 @@ impl InodeInner {
     /// Writes file data directly to already-allocated data blocks.
     ///
     /// Linux: /root/linux/fs/ext2/file.c:214 (ext2_dio_write_iter)
-    pub fn write_direct_at(&self, offset: usize, reader: &mut VmReader) -> Result<()> {
-        let fs = self.fs_arc()?;
+    pub(super) fn write_direct_at(
+        &self,
+        mapping: &InodeMapping,
+        fs: &Ext2,
+        offset: usize,
+        reader: &mut VmReader,
+    ) -> Result<()> {
         let block_size = fs.block_size();
         let write_len = reader.remain();
         // end is already checked in `Inode::write_direct_at`.
@@ -1985,7 +2082,7 @@ impl InodeInner {
                 .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
             let offset_in_block = current_offset % block_size;
             let bytes_this_block = (block_size - offset_in_block).min(end - current_offset);
-            let bid = self.get_block(iblock)?.ok_or_else(|| {
+            let bid = mapping.get_block(fs, iblock)?.ok_or_else(|| {
                 Error::with_message(Errno::EIO, "missing block mapping for direct write")
             })?;
 
@@ -2042,70 +2139,16 @@ impl InodeInner {
         Ok(())
     }
 
-    fn expand(&mut self, new_size: usize) -> Result<()> {
-        self.meta.desc.size = new_size as u64;
-        let current = now();
-        self.meta.desc.mtime = current;
-        self.meta.desc.ctime = current;
-        self.persist_inode()
-    }
-
-    fn shrink(&mut self, new_size: usize) -> Result<()> {
-        let old_size = self.meta.desc.size as usize;
-        if new_size == old_size {
-            return Ok(());
-        }
-
-        self.truncate_blocks(new_size)?;
-        self.meta.desc.size = new_size as u64;
-
-        let current = now();
-        self.meta.desc.mtime = current;
-        self.meta.desc.ctime = current;
-        self.persist_inode()
-    }
-
-    /// Frees blocks beyond `new_size`.
-    ///
-    /// This function implements the core truncation logic for ext2 files. It handles
-    /// both direct blocks and indirect blocks (single, double, and triple indirect).
-    /// The algorithm follows Linux's __ext2_truncate_blocks closely, including the
-    /// all_zeroes optimization for sparse files.
-    ///
-    /// Linux: /root/linux/fs/ext2/inode.c:1172 (__ext2_truncate_blocks)
-    fn truncate_blocks(&mut self, new_size: usize) -> Result<()> {
-        let fs = self.fs_arc()?;
-        self.mapping.truncate_blocks(&fs, new_size)
-    }
-
-    /// Recursively frees an indirect branch.
-    ///
-    /// Linux: /root/linux/fs/ext2/inode.c:1136 (ext2_free_branches)
-    /// Linux: /root/linux/fs/ext2/inode.c:1096 (ext2_free_data)
-    fn free_branches(&mut self, fs: &Ext2, block_nr: u32, depth: u32) {
-        self.mapping.free_branches(fs, block_nr, depth)
-    }
-
     /// Checks whether this directory contains only `.` and `..` as live entries.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:659 (ext2_empty_dir)
-    pub(super) fn empty_dir(&self) -> bool {
-        if self.meta.desc.type_ != InodeType::Dir {
+    pub(super) fn empty_dir(&self, meta: &InodeMeta, fs: &Ext2, self_ino: u32) -> bool {
+        if meta.desc.type_ != InodeType::Dir {
             return false;
         }
 
-        let fs = match self.fs.upgrade() {
-            Some(fs) => fs,
-            None => return false,
-        };
-
-        let self_ino = match self.weak_self.upgrade() {
-            Some(inode) => inode.ino(),
-            None => return false,
-        };
-
         let block_size = fs.block_size();
-        let size = self.meta.desc.size as usize;
+        let size = meta.desc.size as usize;
         let max_inumber = fs.super_block().total_inodes();
         let data_blocks = size.div_ceil(block_size);
 
@@ -2163,15 +2206,14 @@ impl InodeInner {
     /// Finds a directory entry by name and returns its inode number.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:342 (ext2_find_entry)
-    pub(super) fn find_entry(&self, name: &str) -> Result<u32> {
-        if self.meta.desc.type_ != InodeType::Dir {
+    pub(super) fn find_entry(&self, meta: &InodeMeta, fs: &Ext2, name: &str) -> Result<u32> {
+        if meta.desc.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let fs = self.fs_arc()?;
         let sb = fs.super_block();
         let block_size = fs.block_size();
-        let size = self.meta.desc.size as usize;
+        let size = meta.desc.size as usize;
         let max_inumber = sb.total_inodes();
         // SPEC: bound directory scan by i_size-derived pages (Linux dir_pages).
         // Linux: /root/linux/fs/ext2/dir.c:349 (npages = dir_pages(dir)).
@@ -2218,20 +2260,21 @@ impl InodeInner {
     /// Linux: /root/linux/fs/ext2/dir.c:257 (ext2_readdir)
     pub(super) fn readdir_at(
         &self,
+        meta: &InodeMeta,
+        fs: &Ext2,
         offset: usize,
         visitor: &mut dyn DirentVisitor,
     ) -> Result<usize> {
-        if self.meta.desc.type_ != InodeType::Dir {
+        if meta.desc.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let size = self.meta.desc.size as usize;
+        let size = meta.desc.size as usize;
         let min_rec_len = DirEntry::dir_rec_len(1) as usize;
         if size < min_rec_len || offset > size - min_rec_len {
             return Ok(0);
         }
 
-        let fs = self.fs_arc()?;
         let sb = fs.super_block();
         let block_size = fs.block_size();
         let max_inumber = sb.total_inodes();
@@ -2310,7 +2353,8 @@ impl InodeInner {
     /// Linux: /root/linux/fs/ext2/inode.c:163 (ext2_block_to_path)
     pub(super) fn block_to_path(&self, iblock: u32) -> Result<BlockPath> {
         let fs = self.fs_arc()?;
-        self.mapping.block_to_path(&fs, iblock)
+        let mapping = self.mapping_read();
+        mapping.block_to_path(&fs, iblock)
     }
 
     /// Maps a logical block to a physical block (read-only path).
@@ -2318,31 +2362,49 @@ impl InodeInner {
     /// Linux: /root/linux/fs/ext2/inode.c:783 (ext2_get_block)
     pub(super) fn get_block(&self, iblock: u32) -> Result<Option<Bid>> {
         let fs = self.fs_arc()?;
-        self.mapping.get_block(&fs, iblock)
+        let mapping = self.mapping_read();
+        mapping.get_block(&fs, iblock)
     }
 
-    fn prepare_continuous_blocks(
-        &mut self,
+    pub(super) fn prepare_continuous_blocks(
+        &self,
+        meta: &mut InodeMeta,
+        fs: &Ext2,
         offset: usize,
         end: usize,
         block_size: usize,
         discard_page_cache: bool,
     ) -> Result<()> {
+        if block_size == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+        }
+
         let start_block = offset / block_size;
         let end_block = end.div_ceil(block_size);
-        let old_size = self.meta.desc.size as usize;
+        let old_size = meta.desc.size as usize;
 
-        for iblock in start_block..end_block {
-            let iblock = u32::try_from(iblock)
-                .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
-            if self.get_or_alloc_block(iblock, true)?.is_none() {
-                return_errno_with_message!(Errno::EIO, "missing block mapping after allocation");
+        {
+            let mut mapping = self.mapping_write();
+            for iblock in start_block..end_block {
+                let iblock = u32::try_from(iblock).map_err(|_| {
+                    Error::with_message(Errno::EINVAL, "logical block number overflow")
+                })?;
+                let old_blocks = mapping.blocks_512();
+                if mapping.get_or_alloc_block(fs, iblock, true)?.is_none() {
+                    return_errno_with_message!(
+                        Errno::EIO,
+                        "missing block mapping after allocation"
+                    );
+                }
+                if mapping.blocks_512() != old_blocks {
+                    meta.set_ctime(now());
+                }
             }
         }
 
         if end > old_size {
             self.page_cache.resize(end.align_up(block_size))?;
-            self.meta.desc.size = end as u64;
+            meta.desc.size = end as u64;
         }
 
         if discard_page_cache {
@@ -2356,15 +2418,50 @@ impl InodeInner {
         Ok(())
     }
 
+    pub(super) fn write_failed_cleanup(
+        &self,
+        meta: &mut InodeMeta,
+        fs: &Ext2,
+        old_size: usize,
+        end: usize,
+        block_size: usize,
+    ) {
+        if end <= old_size {
+            return;
+        }
+
+        let old_size_aligned = old_size.align_up(block_size);
+        let end_aligned = end.align_up(block_size);
+        self.page_cache.discard_range(old_size_aligned..end_aligned);
+
+        if let Err(err) = self.page_cache.resize(old_size_aligned) {
+            error!(
+                "ext2: write_at cleanup page cache resize failed: old_size_aligned={}, err={:?}",
+                old_size_aligned, err
+            );
+        }
+
+        if let Err(err) = self.mapping_write().truncate_blocks(fs, old_size) {
+            error!(
+                "ext2: write_at cleanup truncate_blocks failed: old_size={}, err={:?}",
+                old_size, err
+            );
+        }
+
+        meta.desc.size = old_size as u64;
+    }
+
     /// Resolves a logical block to physical, allocating a missing branch if requested.
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:624 (ext2_get_blocks, create path)
-    pub(super) fn get_or_alloc_block(&mut self, iblock: u32, create: bool) -> Result<Option<Bid>> {
+    pub(super) fn get_or_alloc_block(&self, iblock: u32, create: bool) -> Result<Option<Bid>> {
         let fs = self.fs_arc()?;
-        let old_blocks = self.mapping.blocks_512();
-        let mapped = self.mapping.get_or_alloc_block(&fs, iblock, create)?;
-        if self.mapping.blocks_512() != old_blocks {
-            self.meta.set_ctime(now());
+        let mut meta = self.meta_write();
+        let mut mapping = self.mapping_write();
+        let old_blocks = mapping.blocks_512();
+        let mapped = mapping.get_or_alloc_block(&fs, iblock, create)?;
+        if mapping.blocks_512() != old_blocks {
+            meta.set_ctime(now());
         }
         Ok(mapped)
     }
@@ -2372,8 +2469,13 @@ impl InodeInner {
     /// Phase 1: scan directory blocks for reusable slot or duplicate.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link scan loop)
-    fn scan_dir_for_slot(&self, name: &str, fs: &Ext2) -> Result<DirScanResult> {
-        if self.meta.desc.type_ != InodeType::Dir {
+    pub(super) fn scan_dir_for_slot(
+        &self,
+        meta: &InodeMeta,
+        fs: &Ext2,
+        name: &str,
+    ) -> Result<DirScanResult> {
+        if meta.desc.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
 
@@ -2388,7 +2490,7 @@ impl InodeInner {
             return_errno_with_message!(Errno::ENOSPC, "dir entry too large for block");
         }
 
-        let size = self.meta.desc.size as usize;
+        let size = meta.desc.size as usize;
         let max_inumber = fs.super_block().total_inodes();
         let data_blocks = size.div_ceil(block_size);
 
@@ -2439,26 +2541,31 @@ impl InodeInner {
     /// Phase 2: grow directory by one data block.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link growth path)
-    fn grow_dir_block(&mut self, fs: &Ext2) -> Result<DirSlotInfo> {
+    pub(super) fn grow_dir_block(&self, meta: &mut InodeMeta, fs: &Ext2) -> Result<DirSlotInfo> {
         let block_size = fs.block_size();
-        let old_size = self.meta.desc.size as usize;
-        let old_blocks = self.mapping.desc.blocks;
+        let old_size = meta.desc.size as usize;
         let data_blocks = old_size.div_ceil(block_size);
         let growth_iblock = u32::try_from(data_blocks)
             .map_err(|_| Error::with_message(Errno::EINVAL, "directory block index overflow"))?;
 
-        // SPEC: allocation under write lock; no PageCache I/O.
-        self.get_or_alloc_block(growth_iblock, true)?
-            .ok_or_else(|| Error::with_message(Errno::ENOSPC, "failed to grow directory block"))?;
+        // SPEC: allocation under mapping.write(); no PageCache/VMO operations in this scope.
+        {
+            let mut mapping = self.mapping_write();
+            mapping
+                .get_or_alloc_block(fs, growth_iblock, true)?
+                .ok_or_else(|| {
+                    Error::with_message(Errno::ENOSPC, "failed to grow directory block")
+                })?;
+        }
 
         let new_size = old_size.saturating_add(block_size);
-        self.meta.desc.size = new_size as u64;
+        meta.desc.size = new_size as u64;
         if let Err(err) = self.page_cache.resize(new_size) {
             // SPEC: rollback allocated growth on resize failure.
             self.page_cache.discard_range(old_size..new_size);
-            self.meta.desc.size = old_size as u64;
-            self.mapping.desc.blocks = old_blocks;
-            self.truncate_blocks(old_size)?;
+            meta.desc.size = old_size as u64;
+            let mut mapping = self.mapping_write();
+            mapping.truncate_blocks(fs, old_size)?;
             return Err(err);
         }
 
@@ -2472,8 +2579,15 @@ impl InodeInner {
     /// Phase 3: write a new entry into a selected slot via PageCache.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link commit)
-    fn write_dir_entry(&self, slot: &DirSlotInfo, name: &str, ino: u32, ft: u8) -> Result<()> {
-        let fs = self.fs_arc()?;
+    pub(super) fn write_dir_entry(
+        &self,
+        _meta: &InodeMeta,
+        fs: &Ext2,
+        slot: &DirSlotInfo,
+        name: &str,
+        ino: u32,
+        ft: u8,
+    ) -> Result<()> {
         let max_inumber = fs.super_block().total_inodes();
         if ino == 0 || ino > max_inumber {
             return_errno!(Errno::EINVAL);
@@ -2510,22 +2624,18 @@ impl InodeInner {
         Ok(())
     }
 
-    /// Phase 4: update directory ctime/mtime and persist inode.
-    ///
-    /// Linux: /root/linux/fs/ext2/dir.c:84 (ext2_commit_chunk)
-    fn commit_dir_metadata(&mut self) -> Result<()> {
-        self.update_dir_timestamps_and_flags()?;
-        self.persist_inode()
-    }
-
     /// Locate a target entry by name for delete/set_link operations.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:342 (ext2_find_entry)
-    fn find_entry_target(&self, name: &str) -> Result<DirEntryTarget> {
-        let fs = self.fs_arc()?;
+    pub(super) fn find_entry_target(
+        &self,
+        meta: &InodeMeta,
+        fs: &Ext2,
+        name: &str,
+    ) -> Result<DirEntryTarget> {
         let max_inumber = fs.super_block().total_inodes();
         let block_size = fs.block_size();
-        let size = self.meta.desc.size as usize;
+        let size = meta.desc.size as usize;
         let name_bytes = name.as_bytes();
 
         for block_idx in 0..size.div_ceil(block_size) {
@@ -2561,12 +2671,16 @@ impl InodeInner {
     /// Delete a located entry by zeroing inode and merging rec_len.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:560 (ext2_delete_entry)
-    fn delete_entry_in_cache(&self, target: &DirEntryTarget) -> Result<()> {
-        let fs = self.fs_arc()?;
+    pub(super) fn delete_entry_in_cache(
+        &self,
+        meta: &InodeMeta,
+        fs: &Ext2,
+        target: &DirEntryTarget,
+    ) -> Result<()> {
         let block_size = fs.block_size();
         let block_base = (target.dir_offset / block_size).saturating_mul(block_size);
         let entry_offset = target.dir_offset.saturating_sub(block_base);
-        let limit = (self.meta.desc.size as usize)
+        let limit = (meta.desc.size as usize)
             .saturating_sub(block_base)
             .min(block_size);
 
@@ -2590,8 +2704,14 @@ impl InodeInner {
     /// Rewrite a located entry's inode/type via PageCache.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:450 (ext2_set_link)
-    fn set_link_in_cache(&self, target: &DirEntryTarget, new_ino: u32, ft: u8) -> Result<()> {
-        let fs = self.fs_arc()?;
+    pub(super) fn set_link_in_cache(
+        &self,
+        _meta: &InodeMeta,
+        fs: &Ext2,
+        target: &DirEntryTarget,
+        new_ino: u32,
+        ft: u8,
+    ) -> Result<()> {
         let block_size = fs.block_size();
         let block_base = (target.dir_offset / block_size).saturating_mul(block_size);
         let entry_offset = target.dir_offset.saturating_sub(block_base);
@@ -2751,7 +2871,11 @@ impl InodeInner {
         Ok(())
     }
 
-    fn release_dir_data_blocks_for_cleanup(&mut self, _fs: &Ext2) -> Result<()> {
+    pub(super) fn release_dir_data_blocks_for_cleanup(
+        &self,
+        meta: &mut InodeMeta,
+        fs: &Ext2,
+    ) -> Result<()> {
         // DIFF from Linux:
         // Linux mkdir-failure/rmdir cleanup reaches block release through
         // discard_new_inode()/iput() -> ext2_evict_inode() -> ext2_truncate_blocks().
@@ -2759,25 +2883,30 @@ impl InodeInner {
         // explicitly trigger truncate-based release on rollback/removal paths.
         // TODO: Move this logic into a shared truncate/evict pipeline, and make
         // free_inode trigger it instead of per-call-site cleanup.
-        // SPEC: delegate to full indirect-tree truncation path.
-        self.truncate_blocks(0)?;
+        // SPEC: mapping truncation happens under mapping.write().
+        {
+            let mut mapping = self.mapping_write();
+            mapping.truncate_blocks(fs, 0)?;
+        }
+        self.page_cache.discard_range(0..meta.desc.size as usize);
+        self.page_cache.resize(0)?;
         // SPEC: cleanup path must leave directory size at zero.
-        self.meta.desc.size = 0;
+        meta.desc.size = 0;
         Ok(())
     }
 
-    fn update_dir_timestamps_and_flags(&mut self) -> Result<()> {
+    fn update_dir_timestamps_and_flags(&self, meta: &mut InodeMeta) -> Result<()> {
         let current = now();
-        self.meta.desc.ctime = current;
-        self.meta.desc.mtime = current;
-        self.meta.desc.flags.remove(FileFlags::INDEX_DIR);
+        meta.desc.ctime = current;
+        meta.desc.mtime = current;
+        meta.desc.flags.remove(FileFlags::INDEX_DIR);
         Ok(())
     }
 
-    fn sync_data(&self) -> Result<()> {
+    pub(super) fn sync_data_pages(&self, meta: &InodeMeta) -> Result<()> {
         // SPEC: file_write_and_wait_range on an empty file is a no-op.
         // Linux: /root/linux/mm/filemap.c:782-783.
-        let file_size = self.meta.desc.size as usize;
+        let file_size = meta.desc.size as usize;
         if file_size == 0 {
             return Ok(());
         }
@@ -2792,60 +2921,58 @@ impl InodeInner {
             .weak_self
             .upgrade()
             .ok_or_else(|| Error::with_message(Errno::EIO, "inode already dropped"))?;
-        let meta = *self.meta.desc;
-        let mapping = *self.mapping.desc;
-        let raw = RawInode::from_parts(&meta, &mapping);
         let fs = self.fs_arc()?;
-        fs.write_inode_desc(inode.ino, &raw)?;
-        self.meta.desc.clear_dirty();
-        self.mapping.desc.clear_dirty();
-        Ok(())
+        let mut meta = self.meta.write();
+        let mut mapping = self.mapping.write();
+        Self::persist_inode_locked(&mut meta, &mut mapping, inode.ino, inode.type_, &fs)
     }
 }
 
-/// Acquires read locks on two inodes in ascending ino order to prevent deadlock.
+/// Acquires `meta.read()` locks on two inodes in ascending ino order.
 /// Returns guards in `(a, b)` order regardless of which ino is smaller.
-fn read_lock_two_inodes<'a>(
+fn meta_read_lock_two_inodes<'a>(
     a: &'a Inode,
     b: &'a Inode,
 ) -> (
-    RwMutexReadGuard<'a, InodeInner>,
-    RwMutexReadGuard<'a, InodeInner>,
+    RwMutexReadGuard<'a, InodeMeta>,
+    RwMutexReadGuard<'a, InodeMeta>,
 ) {
     if a.ino <= b.ino {
-        let ga = a.inner.read();
-        let gb = b.inner.read();
+        let ga = a.inner.meta_read();
+        let gb = b.inner.meta_read();
         (ga, gb)
     } else {
-        let gb = b.inner.read();
-        let ga = a.inner.read();
+        let gb = b.inner.meta_read();
+        let ga = a.inner.meta_read();
         (ga, gb)
     }
 }
 
-/// Acquires write locks on two inodes in ascending ino order to prevent deadlock.
+/// Acquires `meta.write()` locks on two inodes in ascending ino order.
 /// Returns guards in `(a, b)` order regardless of which ino is smaller.
-fn write_lock_two_inodes<'a>(
+fn meta_write_lock_two_inodes<'a>(
     a: &'a Inode,
     b: &'a Inode,
 ) -> (
-    RwMutexWriteGuard<'a, InodeInner>,
-    RwMutexWriteGuard<'a, InodeInner>,
+    RwMutexWriteGuard<'a, InodeMeta>,
+    RwMutexWriteGuard<'a, InodeMeta>,
 ) {
     if a.ino <= b.ino {
-        let ga = a.inner.write();
-        let gb = b.inner.write();
+        let ga = a.inner.meta_write();
+        let gb = b.inner.meta_write();
         (ga, gb)
     } else {
-        let gb = b.inner.write();
-        let ga = a.inner.write();
+        let gb = b.inner.meta_write();
+        let ga = a.inner.meta_write();
         (ga, gb)
     }
 }
 
-/// Acquires write locks on an arbitrary number of inodes in ascending ino order.
+/// Acquires `meta.write()` locks on an arbitrary number of inodes in ascending ino order.
 /// Returns guards in the same order as the input slice.
-fn write_lock_multiple_inodes<'a>(inodes: &[&'a Inode]) -> Vec<RwMutexWriteGuard<'a, InodeInner>> {
+fn meta_write_lock_multiple_inodes<'a>(
+    inodes: &[&'a Inode],
+) -> Vec<RwMutexWriteGuard<'a, InodeMeta>> {
     use alloc::rc::Rc;
     use core::cell::RefCell;
 
@@ -2859,10 +2986,10 @@ fn write_lock_multiple_inodes<'a>(inodes: &[&'a Inode]) -> Vec<RwMutexWriteGuard
 
     // Acquire locks in sorted (ascending ino) order, wrapping in Rc so we can
     // later move them into the output vec in original order.
-    let mut slots: Vec<Option<Rc<RefCell<Option<RwMutexWriteGuard<'a, InodeInner>>>>>> =
+    let mut slots: Vec<Option<Rc<RefCell<Option<RwMutexWriteGuard<'a, InodeMeta>>>>>> =
         vec![None; inodes.len()];
     for &(orig_idx, _, inode) in &indexed {
-        let guard = inode.inner.write();
+        let guard = inode.inner.meta_write();
         slots[orig_idx] = Some(Rc::new(RefCell::new(Some(guard))));
     }
 
@@ -3358,6 +3485,24 @@ mod test {
         RawInodeBuilder::new(mode).build()
     }
 
+    fn find_entry_ino(dir: &Arc<Inode>, name: &str) -> Result<u32> {
+        let fs = dir.fs_arc()?;
+        let meta = dir.inner.meta_read();
+        dir.inner.find_entry(&meta, &fs, name)
+    }
+
+    fn is_fast_symlink_for_test(inode: &Arc<Inode>, block_size: usize) -> bool {
+        let meta = inode.inner.meta_read();
+        let mapping = inode.inner.mapping_read();
+        let ea_blocks = if meta.desc.file_acl != 0 {
+            (block_size / SECTOR_SIZE) as u32
+        } else {
+            0
+        };
+        meta.desc.type_ == InodeType::SymLink
+            && mapping.desc.blocks.checked_sub(ea_blocks) == Some(0)
+    }
+
     fn make_live_dir_inode(
         ext2: &Arc<Ext2>,
         ino: u32,
@@ -3448,7 +3593,7 @@ mod test {
             )
             .unwrap();
         assert_eq!(
-            root.inner.read().find_entry("alpha").unwrap(),
+            find_entry_ino(&root, "alpha").unwrap(),
             created.ino()
         );
         assert_eq!(
@@ -3461,7 +3606,7 @@ mod test {
             .create("sub", InodeType::Dir, FilePerm::from_bits_truncate(0o755))
             .unwrap();
         assert_eq!(
-            root.inner.read().find_entry("sub").unwrap(),
+            find_entry_ino(&root, "sub").unwrap(),
             created_dir.ino()
         );
         assert_eq!(
@@ -3525,7 +3670,7 @@ mod test {
 
         // Linux ext2_link intent: increase nlink before publishing name.
         root.link(&old, "alias").unwrap();
-        assert_eq!(root.inner.read().find_entry("alias").unwrap(), old_ino);
+        assert_eq!(find_entry_ino(&root, "alias").unwrap(), old_ino);
         assert_eq!(
             f.ext2.read_inode_desc(old_ino).unwrap().links_count,
             old_links_before + 1
@@ -3542,7 +3687,7 @@ mod test {
         // Linux ext2_unlink intent: remove name then decrement target nlink.
         root.unlink("alias").unwrap();
         assert_eq!(
-            root.inner.read().find_entry("alias").unwrap_err().error(),
+            find_entry_ino(&root, "alias").unwrap_err().error(),
             Errno::ENOENT
         );
         assert_eq!(
@@ -3589,17 +3734,17 @@ mod test {
             .unwrap();
 
         let (ctime_before, mtime_before) = {
-            let guard = root.inner.read();
-            (guard.meta.desc.ctime, guard.meta.desc.mtime)
+            let meta = root.inner.meta_read();
+            (meta.desc.ctime, meta.desc.mtime)
         };
 
         // Linux ext2_set_link with update_times=false keeps ctime/mtime unchanged.
         root.set_link("src", target.ino(), DirEntryFileType::File, false)
             .unwrap();
-        assert_eq!(root.inner.read().find_entry("src").unwrap(), target.ino());
+        assert_eq!(find_entry_ino(&root, "src").unwrap(), target.ino());
         let (ctime_after, mtime_after) = {
-            let guard = root.inner.read();
-            (guard.meta.desc.ctime, guard.meta.desc.mtime)
+            let meta = root.inner.meta_read();
+            (meta.desc.ctime, meta.desc.mtime)
         };
         assert_eq!(ctime_before, ctime_after);
         assert_eq!(mtime_before, mtime_after);
@@ -3626,11 +3771,11 @@ mod test {
             .unwrap();
         let solo_ino = solo.ino();
         root.rename("solo", &root, "solo_renamed").unwrap();
-        {
-            let guard = root.inner.read();
-            assert_eq!(guard.find_entry("solo_renamed").unwrap(), solo_ino);
-            assert_eq!(guard.find_entry("solo").unwrap_err().error(), Errno::ENOENT);
-        }
+        assert_eq!(find_entry_ino(&root, "solo_renamed").unwrap(), solo_ino);
+        assert_eq!(
+            find_entry_ino(&root, "solo").unwrap_err().error(),
+            Errno::ENOENT
+        );
 
         // Cross-dir no-replacement path should use the same add-entry lock protocol.
         let dst_dir = root
@@ -3646,15 +3791,11 @@ mod test {
         let move_src_ino = move_src.ino();
         root.rename("move_src", &dst_dir, "move_dst").unwrap();
         assert_eq!(
-            root.inner
-                .read()
-                .find_entry("move_src")
-                .unwrap_err()
-                .error(),
+            find_entry_ino(&root, "move_src").unwrap_err().error(),
             Errno::ENOENT
         );
         assert_eq!(
-            dst_dir.inner.read().find_entry("move_dst").unwrap(),
+            find_entry_ino(&dst_dir, "move_dst").unwrap(),
             move_src_ino
         );
 
@@ -3693,16 +3834,11 @@ mod test {
             .rename("moving", &dst_replace_dir, "target")
             .unwrap();
         assert_eq!(
-            src_dir
-                .inner
-                .read()
-                .find_entry("moving")
-                .unwrap_err()
-                .error(),
+            find_entry_ino(&src_dir, "moving").unwrap_err().error(),
             Errno::ENOENT
         );
         assert_eq!(
-            dst_replace_dir.inner.read().find_entry("target").unwrap(),
+            find_entry_ino(&dst_replace_dir, "target").unwrap(),
             moving_ino
         );
 
@@ -3727,7 +3863,7 @@ mod test {
         parent_a.rename("kid", &parent_b, "kid_moved").unwrap();
         let moved_dir = parent_b.lookup("kid_moved").unwrap();
         assert_eq!(
-            moved_dir.inner.read().find_entry("..").unwrap(),
+            find_entry_ino(&moved_dir, "..").unwrap(),
             parent_b.ino()
         );
 
@@ -3742,11 +3878,11 @@ mod test {
 
         // Linux ext2_rename replacement path: dst is overwritten and old name removed.
         root.rename("old", &root, "new").unwrap();
-        {
-            let guard = root.inner.read();
-            assert_eq!(guard.find_entry("new").unwrap(), old_ino);
-            assert_eq!(guard.find_entry("old").unwrap_err().error(), Errno::ENOENT);
-        }
+        assert_eq!(find_entry_ino(&root, "new").unwrap(), old_ino);
+        assert_eq!(
+            find_entry_ino(&root, "old").unwrap_err().error(),
+            Errno::ENOENT
+        );
 
         {
             let inode_bitmap = f.block_groups()[0].inode_bitmap();
@@ -3904,16 +4040,15 @@ mod test {
             )
             .unwrap();
 
-        let inner = root.inner.read();
-        assert_eq!(inner.find_entry("foo").unwrap(), foo.ino());
-        assert_eq!(inner.find_entry("subdir").unwrap(), subdir.ino());
+        assert_eq!(find_entry_ino(&root, "foo").unwrap(), foo.ino());
+        assert_eq!(find_entry_ino(&root, "subdir").unwrap(), subdir.ino());
         assert_eq!(
-            inner.find_entry("missing").unwrap_err().error(),
+            find_entry_ino(&root, "missing").unwrap_err().error(),
             Errno::ENOENT
         );
 
         let mut visitor = CollectDirentVisitor::default();
-        inner.readdir_at(0, &mut visitor).unwrap();
+        root.readdir_at(0, &mut visitor).unwrap();
         // Root has ".", "..", "foo", "subdir".
         assert_eq!(visitor.entries.len(), 4);
         assert_eq!(visitor.entries[0].0, ".");
@@ -3924,14 +4059,13 @@ mod test {
         assert_eq!(visitor.entries[3].2, InodeType::Dir);
 
         let mut stop_visitor = StopAfterVisitor::new(2);
-        let stop_advanced = inner.readdir_at(0, &mut stop_visitor).unwrap();
-        assert!(stop_advanced > 0 && stop_advanced < inner.meta.desc.size as usize);
+        let stop_advanced = root.readdir_at(0, &mut stop_visitor).unwrap();
+        let root_size = root.inner.meta_read().desc.size as usize;
+        assert!(stop_advanced > 0 && stop_advanced < root_size);
 
         let first_entry_end = visitor.entries[0].3 + 1;
         let mut offset_visitor = CollectDirentVisitor::default();
-        inner
-            .readdir_at(first_entry_end, &mut offset_visitor)
-            .unwrap();
+        root.readdir_at(first_entry_end, &mut offset_visitor).unwrap();
         assert_eq!(offset_visitor.entries.len(), 3);
         assert_eq!(offset_visitor.entries[0].0, "..");
     }
@@ -3945,36 +4079,32 @@ mod test {
         let mut file_ptrs = [0u32; 15];
         file_ptrs[0] = 80;
         let file_inode = make_live_file_inode(ext2, 50, 0, 0, FileFlags::empty(), file_ptrs);
-        let file_inner = file_inode.inner.read();
         assert_eq!(
-            file_inner.find_entry("foo").unwrap_err().error(),
+            find_entry_ino(&file_inode, "foo").unwrap_err().error(),
             Errno::ENOTDIR
         );
         let mut vec_visitor = Vec::<String>::new();
         assert_eq!(
-            file_inner
+            file_inode
                 .readdir_at(0, &mut vec_visitor)
                 .unwrap_err()
                 .error(),
             Errno::ENOTDIR
         );
-        drop(file_inner);
 
         let hole_inode = make_live_dir_inode(ext2, 3, 12, 8, FileFlags::empty(), [0u32; 15]);
-        let hole_inner = hole_inode.inner.read();
         assert_eq!(
-            hole_inner.find_entry("foo").unwrap_err().error(),
+            find_entry_ino(&hole_inode, "foo").unwrap_err().error(),
             Errno::EIO
         );
         let mut vec_visitor = Vec::<String>::new();
         assert_eq!(
-            hole_inner
+            hole_inode
                 .readdir_at(0, &mut vec_visitor)
                 .unwrap_err()
                 .error(),
             Errno::EIO
         );
-        drop(hole_inner);
 
         let mut one_block = vec![0u8; block_size];
         encode_dir_entry(&mut one_block, 0, 2, 12, b".", 2);
@@ -3988,26 +4118,24 @@ mod test {
         ptrs[0] = data_bid;
         let limited_blocks_inode =
             make_live_dir_inode(ext2, 4, block_size, 0, FileFlags::empty(), ptrs);
-        let limited_inner = limited_blocks_inode.inner.read();
         assert_eq!(
-            limited_inner.find_entry("missing").unwrap_err().error(),
+            find_entry_ino(&limited_blocks_inode, "missing")
+                .unwrap_err()
+                .error(),
             Errno::ENOENT
         );
 
         let tiny_dir_inode = make_live_dir_inode(ext2, 5, 11, 8, FileFlags::empty(), ptrs);
-        let tiny_inner = tiny_dir_inode.inner.read();
         let mut vec_visitor = Vec::<String>::new();
-        assert_eq!(tiny_inner.readdir_at(0, &mut vec_visitor).unwrap(), 0);
-        drop(tiny_inner);
+        assert_eq!(tiny_dir_inode.readdir_at(0, &mut vec_visitor).unwrap(), 0);
 
         let mut vec_visitor = Vec::<String>::new();
         assert_eq!(
-            limited_inner
+            limited_blocks_inode
                 .readdir_at(block_size - 11, &mut vec_visitor)
                 .unwrap(),
             0
         );
-        drop(limited_inner);
 
         let mut bad_block = vec![0u8; block_size];
         bad_block[0..4].copy_from_slice(&2u32.to_le_bytes());
@@ -4023,11 +4151,10 @@ mod test {
         let mut bad_ptrs = [0u32; 15];
         bad_ptrs[0] = bad_bid;
         let bad_inode = make_live_dir_inode(ext2, 6, 12, 8, FileFlags::empty(), bad_ptrs);
-        let bad_inner = bad_inode.inner.read();
-        assert_eq!(bad_inner.find_entry(".").unwrap_err().error(), Errno::EIO);
+        assert_eq!(find_entry_ino(&bad_inode, ".").unwrap_err().error(), Errno::EIO);
         let mut vec_visitor = Vec::<String>::new();
         assert_eq!(
-            bad_inner
+            bad_inode
                 .readdir_at(0, &mut vec_visitor)
                 .unwrap_err()
                 .error(),
@@ -4046,7 +4173,7 @@ mod test {
             .create("bar", InodeType::File, FilePerm::from_bits_truncate(0o644))
             .unwrap();
 
-        root.inner.read().find_entry("bar").unwrap();
+        find_entry_ino(&root, "bar").unwrap();
         root.add_entry("foo", 11, DirEntryFileType::File).unwrap();
         let dup = root
             .add_entry("foo", 12, DirEntryFileType::File)
@@ -4054,10 +4181,12 @@ mod test {
         assert_eq!(dup.error(), Errno::EEXIST);
         root.delete_entry("foo").unwrap();
 
-        let inner = root.inner.read();
-        assert_eq!(inner.find_entry(".").unwrap(), ROOT_INO);
-        assert_eq!(inner.find_entry("bar").unwrap(), bar.ino());
-        assert_eq!(inner.find_entry("foo").unwrap_err().error(), Errno::ENOENT);
+        assert_eq!(find_entry_ino(&root, ".").unwrap(), ROOT_INO);
+        assert_eq!(find_entry_ino(&root, "bar").unwrap(), bar.ino());
+        assert_eq!(
+            find_entry_ino(&root, "foo").unwrap_err().error(),
+            Errno::ENOENT
+        );
     }
 
     #[ktest]
@@ -4075,20 +4204,19 @@ mod test {
         let mut idx = 0u32;
         loop {
             let name = alloc::format!("e{idx:03}");
-            let size_before = root.inner.read().meta.desc.size;
+            let size_before = root.inner.meta_read().desc.size;
             let result = root.create(&name, InodeType::File, FilePerm::from_bits_truncate(0o644));
             match result {
                 Ok(_) => {
-                    let size_after = root.inner.read().meta.desc.size;
+                    let size_after = root.inner.meta_read().desc.size;
                     if size_after > size_before {
                         // Block growth happened — this is what we wanted to test.
-                        let inner = root.inner.read();
                         assert_eq!(
-                            inner.meta.desc.size,
+                            root.inner.meta_read().desc.size,
                             (size_before as usize + block_size) as u64
                         );
-                        assert_ne!(inner.mapping.desc.block_ptrs[1], 0);
-                        assert!(inner.find_entry(&name).is_ok());
+                        assert_ne!(root.inner.mapping_read().desc.block_ptrs[1], 0);
+                        assert!(find_entry_ino(&root, &name).is_ok());
                         return;
                     }
                 }
@@ -4122,13 +4250,11 @@ mod test {
             let name = alloc::format!("e{idx:04}{long_name_pad}");
             root.add_entry(&name, ROOT_INO, DirEntryFileType::File)
                 .unwrap();
-            let inner = root.inner.read();
-            if inner.mapping.desc.block_ptrs[12] != 0 {
-                assert!(inner.meta.desc.size > (block_size * 12) as u64);
-                assert!(inner.find_entry(&name).is_ok());
+            if root.inner.mapping_read().desc.block_ptrs[12] != 0 {
+                assert!(root.inner.meta_read().desc.size > (block_size * 12) as u64);
+                assert!(find_entry_ino(&root, &name).is_ok());
                 return;
             }
-            drop(inner);
             idx += 1;
             assert!(
                 idx < 1024,
@@ -4148,23 +4274,26 @@ mod test {
         let inode = make_live_dir_inode(&f.ext2, 40, 0, 0, FileFlags::empty(), [0; 15]);
 
         let (old_block_sectors, free_before, free_after) = {
-            let mut inner = inode.inner.write();
             for iblock in 0..13u32 {
-                inner.get_or_alloc_block(iblock, true).unwrap().unwrap();
+                inode.inner.get_or_alloc_block(iblock, true).unwrap().unwrap();
             }
-            inner.meta.desc.size = (13 * block_size) as u64;
+            inode.inner.meta_write().desc.size = (13 * block_size) as u64;
 
-            let old_block_sectors = inner.mapping.desc.blocks;
-            assert!(inner.mapping.desc.block_ptrs[12] != 0);
-            assert!(inner.get_block(12).unwrap().is_some());
+            let old_block_sectors = inode.inner.mapping_read().desc.blocks;
+            assert_ne!(inode.inner.mapping_read().desc.block_ptrs[12], 0);
+            assert!(inode.inner.get_block(12).unwrap().is_some());
             let free_before = f.ext2.super_block().free_blocks_count();
 
-            inner.release_dir_data_blocks_for_cleanup(&f.ext2).unwrap();
-            assert_eq!(inner.meta.desc.size, 0);
-            assert_eq!(inner.mapping.desc.blocks, 0);
-            assert!(inner.mapping.desc.block_ptrs.iter().all(|ptr| *ptr == 0));
-            assert_eq!(inner.get_block(0).unwrap(), None);
-            assert_eq!(inner.get_block(12).unwrap(), None);
+            let mut meta = inode.inner.meta_write();
+            inode.inner
+                .release_dir_data_blocks_for_cleanup(&mut meta, &f.ext2)
+                .unwrap();
+            drop(meta);
+            assert_eq!(inode.inner.meta_read().desc.size, 0);
+            assert_eq!(inode.inner.mapping_read().desc.blocks, 0);
+            assert!(inode.inner.mapping_read().desc.block_ptrs.iter().all(|ptr| *ptr == 0));
+            assert_eq!(inode.inner.get_block(0).unwrap(), None);
+            assert_eq!(inode.inner.get_block(12).unwrap(), None);
 
             let free_after = f.ext2.super_block().free_blocks_count();
             (old_block_sectors, free_before, free_after)
@@ -4242,17 +4371,16 @@ mod test {
 
         inode.make_empty(ROOT_INO).unwrap();
         let allocated_bid = {
-            let inner = inode.inner.read();
-            assert!(inner.empty_dir());
-            assert_eq!(inner.meta.desc.size as usize, block_size);
-            assert_eq!(inner.mapping.desc.blocks, (block_size / SECTOR_SIZE) as u32);
-            inner.mapping.desc.block_ptrs[0]
+            assert!(inode.empty_dir());
+            assert_eq!(inode.inner.meta_read().desc.size as usize, block_size);
+            let mapping = inode.inner.mapping_read();
+            assert_eq!(mapping.desc.blocks, (block_size / SECTOR_SIZE) as u32);
+            mapping.desc.block_ptrs[0]
         };
         assert_ne!(allocated_bid, 0);
 
-        let inner = inode.inner.read();
-        assert_eq!(inner.find_entry(".").unwrap(), 12);
-        assert_eq!(inner.find_entry("..").unwrap(), ROOT_INO);
+        assert_eq!(find_entry_ino(&inode, ".").unwrap(), 12);
+        assert_eq!(find_entry_ino(&inode, "..").unwrap(), ROOT_INO);
     }
 
     #[ktest]
@@ -4268,7 +4396,7 @@ mod test {
         sub.create("foo", InodeType::File, FilePerm::from_bits_truncate(0o644))
             .unwrap();
 
-        assert!(!sub.inner.read().empty_dir());
+        assert!(!sub.empty_dir());
     }
 
     struct RmdirTestEnv {
@@ -4311,19 +4439,18 @@ mod test {
 
         parent.rmdir("sub").unwrap();
         {
-            let parent_inner = parent.inner.read();
-            assert_eq!(parent_inner.meta.desc.links_count, 2);
+            assert_eq!(parent.inner.meta_read().desc.links_count, 2);
             assert_eq!(
-                parent_inner.find_entry("sub").unwrap_err().error(),
+                find_entry_ino(parent, "sub").unwrap_err().error(),
                 Errno::ENOENT
             );
         }
 
         let parent = f.ext2.read_inode(ROOT_INO).unwrap();
-        assert_eq!(parent.inner.read().meta.desc.links_count, 2);
+        assert_eq!(parent.inner.meta_read().desc.links_count, 2);
         let child = f.ext2.read_inode(child_ino).unwrap();
-        assert_eq!(child.inner.read().meta.desc.size, 0);
-        assert_eq!(child.inner.read().meta.desc.links_count, 0);
+        assert_eq!(child.inner.meta_read().desc.size, 0);
+        assert_eq!(child.inner.meta_read().desc.links_count, 0);
     }
 
     #[ktest]
@@ -4338,9 +4465,8 @@ mod test {
         let err = parent.rmdir("sub").unwrap_err();
         assert_eq!(err.error(), Errno::ENOTEMPTY);
 
-        let parent_inner = parent.inner.read();
-        assert_eq!(parent_inner.find_entry("sub").unwrap(), child_ino);
-        assert_eq!(parent_inner.meta.desc.links_count, 3);
+        assert_eq!(find_entry_ino(parent, "sub").unwrap(), child_ino);
+        assert_eq!(parent.inner.meta_read().desc.links_count, 3);
 
         let inode_bitmap = f.block_groups()[0].inode_bitmap();
         assert!(inode_bitmap.is_allocated((child_ino - 1) as u16));
@@ -4372,10 +4498,7 @@ mod test {
         let free_after_write = f.ext2.super_block().free_blocks_count();
         assert_eq!(free_before_write.saturating_sub(free_after_write), 1);
 
-        {
-            let inner = file.inner.read();
-            assert_eq!(inner.meta.desc.size as usize, payload.len());
-        }
+        assert_eq!(file.inner.meta_read().desc.size as usize, payload.len());
         let mut readback = vec![0u8; block_size];
         let mut readback_writer = VmWriter::from(readback.as_mut_slice()).to_fallible();
         assert_eq!(
@@ -4389,12 +4512,10 @@ mod test {
         let free_after_truncate = f.ext2.super_block().free_blocks_count();
         assert_eq!(free_after_truncate.saturating_sub(free_before_truncate), 1);
 
-        {
-            let inner = file.inner.read();
-            assert_eq!(inner.meta.desc.size, 0);
-            assert_eq!(inner.mapping.desc.blocks, 0);
-            assert_eq!(inner.mapping.desc.block_ptrs[0], 0);
-        }
+        assert_eq!(file.inner.meta_read().desc.size, 0);
+        let mapping = file.inner.mapping_read();
+        assert_eq!(mapping.desc.blocks, 0);
+        assert_eq!(mapping.desc.block_ptrs[0], 0);
 
         let on_disk = f.ext2.read_inode_desc(file.ino()).unwrap();
         assert_eq!(on_disk.size, 0);
@@ -4419,10 +4540,9 @@ mod test {
         link.write_link(target).unwrap();
         assert_eq!(link.read_link().unwrap(), target);
 
-        let inner = link.inner.read();
-        assert_eq!(inner.meta.desc.size as usize, target.len());
-        assert_eq!(inner.mapping.desc.blocks, 0);
-        assert!(inner.is_fast_symlink(f.ext2.block_size()));
+        assert_eq!(link.inner.meta_read().desc.size as usize, target.len());
+        assert_eq!(link.inner.mapping_read().desc.blocks, 0);
+        assert!(is_fast_symlink_for_test(&link, f.ext2.block_size()));
     }
 
     #[ktest]
@@ -4443,10 +4563,9 @@ mod test {
         link.write_link(&target).unwrap();
         assert_eq!(link.read_link().unwrap(), target);
 
-        let inner = link.inner.read();
-        assert_eq!(inner.meta.desc.size as usize, MAX_FAST_SYMLINK_LEN);
-        assert!(inner.mapping.desc.blocks > 0);
-        assert!(!inner.is_fast_symlink(f.ext2.block_size()));
+        assert_eq!(link.inner.meta_read().desc.size as usize, MAX_FAST_SYMLINK_LEN);
+        assert!(link.inner.mapping_read().desc.blocks > 0);
+        assert!(!is_fast_symlink_for_test(&link, f.ext2.block_size()));
     }
 
     #[ktest]
@@ -4547,7 +4666,7 @@ mod test {
             &out[crossing_off..crossing_off + 128],
             crossing_data.as_slice()
         );
-        assert_eq!(file.inner.read().meta.desc.size as usize, block_size * 2);
+        assert_eq!(file.inner.meta_read().desc.size as usize, block_size * 2);
     }
 
     #[ktest]
@@ -4566,11 +4685,9 @@ mod test {
         let mut payload_reader = VmReader::from(payload.as_slice()).to_fallible();
         file.write_at(write_off, &mut payload_reader).unwrap();
 
-        let inner = file.inner.read();
-        assert_eq!(inner.meta.desc.size as usize, write_off + payload.len());
-        assert_eq!(inner.get_block(0).unwrap(), None);
-        assert_eq!(inner.get_block(1).unwrap(), None);
-        drop(inner);
+        assert_eq!(file.inner.meta_read().desc.size as usize, write_off + payload.len());
+        assert_eq!(file.inner.get_block(0).unwrap(), None);
+        assert_eq!(file.inner.get_block(1).unwrap(), None);
 
         let mut out = vec![0u8; payload.len()];
         let mut out_writer = VmWriter::from(out.as_mut_slice()).to_fallible();
@@ -4605,12 +4722,10 @@ mod test {
             .unwrap_err();
         assert_eq!(err.error(), Errno::ENOSPC);
 
-        let inner = file.inner.read();
-        assert_eq!(inner.meta.desc.size as usize, block_size);
-        assert!(inner.get_block(0).unwrap().is_some());
-        assert_eq!(inner.get_block(1).unwrap(), None);
+        assert_eq!(file.inner.meta_read().desc.size as usize, block_size);
+        assert!(file.inner.get_block(0).unwrap().is_some());
+        assert_eq!(file.inner.get_block(1).unwrap(), None);
         assert_eq!(f.ext2.super_block().free_blocks_count(), free_before_fail);
-        drop(inner);
 
         let mut readback = vec![0u8; block_size];
         let mut readback_writer = VmWriter::from(readback.as_mut_slice()).to_fallible();
@@ -4729,10 +4844,10 @@ mod test {
         let block_size = f.ext2.block_size();
         let target = block_size * 3 + 123;
         file.resize(target).unwrap();
-        let inner = file.inner.read();
-        assert_eq!(inner.meta.desc.size as usize, target);
-        assert_eq!(inner.mapping.desc.blocks, 0);
-        assert!(inner.mapping.desc.block_ptrs.iter().all(|ptr| *ptr == 0));
+        assert_eq!(file.inner.meta_read().desc.size as usize, target);
+        let mapping = file.inner.mapping_read();
+        assert_eq!(mapping.desc.blocks, 0);
+        assert!(mapping.desc.block_ptrs.iter().all(|ptr| *ptr == 0));
     }
 
     #[ktest]
@@ -4861,10 +4976,10 @@ mod test {
         );
         assert_eq!(eof, [0x5au8; 32]);
 
-        let inner = file.inner.read();
-        assert_eq!(inner.meta.desc.size as usize, block_size + keep_in_tail);
+        assert_eq!(file.inner.meta_read().desc.size as usize, block_size + keep_in_tail);
+        let mapping = file.inner.mapping_read();
         assert_eq!(
-            inner.mapping.desc.blocks,
+            mapping.desc.blocks,
             sectors_per_block.saturating_mul(2)
         );
     }
@@ -4919,12 +5034,12 @@ mod test {
         let block_size = f.ext2.block_size();
 
         let inode_empty = make_live_file_inode(&f.ext2, 60, 0, 0, FileFlags::empty(), [0; 15]);
-        assert_eq!(inode_empty.inner.read().page_cache.pages().size(), 0);
+        assert_eq!(inode_empty.inner.page_cache().pages().size(), 0);
 
         let inode_non_empty =
             make_live_file_inode(&f.ext2, 61, block_size + 1, 0, FileFlags::empty(), [0; 15]);
         assert_eq!(
-            inode_non_empty.inner.read().page_cache.pages().size(),
+            inode_non_empty.inner.page_cache().pages().size(),
             (block_size + 1).align_up(BLOCK_SIZE)
         );
     }
@@ -4990,10 +5105,10 @@ mod test {
 
         file.resize(block_size * 2 + 7).unwrap();
 
-        let inner = file.inner.read();
-        assert_eq!(inner.meta.desc.size as usize, block_size * 2 + 7);
-        assert_eq!(inner.mapping.desc.blocks, 0);
-        assert!(inner.mapping.desc.block_ptrs.iter().all(|ptr| *ptr == 0));
+        assert_eq!(file.inner.meta_read().desc.size as usize, block_size * 2 + 7);
+        let mapping = file.inner.mapping_read();
+        assert_eq!(mapping.desc.blocks, 0);
+        assert!(mapping.desc.block_ptrs.iter().all(|ptr| *ptr == 0));
     }
 
     #[ktest]
@@ -5007,17 +5122,18 @@ mod test {
         let block_size = f.ext2.block_size();
         let file = make_live_file_inode(&f.ext2, 66, block_size, 0, FileFlags::empty(), [0; 15]);
 
-        {
-            let inner = file.inner.read();
-            inner.page_cache.resize(block_size).unwrap();
+        file.inner.page_cache().resize(block_size).unwrap();
 
-            let one_byte = [0x5au8];
-            let mut reader = VmReader::from(one_byte.as_slice()).to_fallible();
-            inner.page_cache.pages().write(0, &mut reader).unwrap();
+        let one_byte = [0x5au8];
+        let mut reader = VmReader::from(one_byte.as_slice()).to_fallible();
+        file.inner.page_cache().pages().write(0, &mut reader).unwrap();
 
-            let err = inner.page_cache.evict_range(0..block_size).unwrap_err();
-            assert_eq!(err.error(), Errno::EIO);
-        }
+        let err = file
+            .inner
+            .page_cache()
+            .evict_range(0..block_size)
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EIO);
     }
 
     #[ktest]
@@ -5056,7 +5172,7 @@ mod test {
         assert_eq!(read, value.len());
         assert_eq!(got.as_slice(), value);
 
-        assert_ne!(file.inner.read().meta.desc.file_acl, 0);
+        assert_ne!(file.inner.meta_read().desc.file_acl, 0);
     }
 
     #[ktest]
@@ -5082,10 +5198,10 @@ mod test {
             XattrSetFlags::CREATE_OR_REPLACE,
         )
         .unwrap();
-        assert_ne!(file.inner.read().meta.desc.file_acl, 0);
+        assert_ne!(file.inner.meta_read().desc.file_acl, 0);
 
         VfsInodeTrait::remove_xattr(file.as_ref(), make_name()).unwrap();
-        assert_eq!(file.inner.read().meta.desc.file_acl, 0);
+        assert_eq!(file.inner.meta_read().desc.file_acl, 0);
 
         let err = VfsInodeTrait::remove_xattr(file.as_ref(), make_name()).unwrap_err();
         assert_eq!(err.error(), Errno::ENODATA);

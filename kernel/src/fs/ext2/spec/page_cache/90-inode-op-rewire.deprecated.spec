@@ -1,4 +1,12 @@
 [PROMPT]
+DEPRECATED: Phase 4 has been split into the following specs (use these instead):
+
+- 14-phase4-1-metadata-xattr-dir-read.spec
+- 15-phase4-2-io-and-symlink.spec
+- 16-phase4-3-resize-fallocate.spec
+- 17-phase4-4-dir-mutations.spec
+- 18-phase4-5-rename-and-set-link.spec
+
 Phase 4 (rewire operations): update `Inode` high-level operations to use split
 meta/mapping locks and remove the upread/upgrade choreography that previously
 existed to avoid PageCacheBackend callback self-deadlock.

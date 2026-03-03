@@ -4,6 +4,10 @@ Phase 3 (lock split): refactor Ext2 inode mutable state from a single
 meta and mapping lock domains. Ensure PageCache backend callbacks never acquire
 meta, eliminating the callback self-deadlock root cause.
 
+This phase is a *structural* refactor. It is expected that the tree may not
+compile until Phase 4 rewires all inode operations to the new lock layout.
+Do not attempt to preserve the old upread/upgrade choreography.
+
 Provide modifications to `kernel/src/fs/ext2/inode.rs`.
 Output Rust code only. No unsafe.
 All functions must be methods in `impl` blocks.
@@ -43,12 +47,22 @@ pub trait PageCacheBackend: Sync + Send {
 [GUARANTEE]
 
 ```rust
+/// The Ext2 inode public handle.
+///
+/// NOTE: `inner` is no longer wrapped by a monolithic `RwMutex`.
+#[derive(Debug)]
+pub struct Inode {
+    // ...
+    inner: InodeInner,
+    // ...
+}
+
 /// Split-lock inode state container.
 #[derive(Debug)]
 pub(super) struct InodeInner {
-    pub(super) meta: RwMutex<InodeMeta>,
-    pub(super) mapping: RwMutex<InodeMapping>,
-    pub(super) page_cache: PageCache,
+    meta: RwMutex<InodeMeta>,
+    mapping: RwMutex<InodeMapping>,
+    page_cache: PageCache,
 }
 
 impl InodeInner {
@@ -105,6 +119,17 @@ impl PageCacheBackend for Inode {
 - `persist_inode_locked` assembles `RawInode` from meta+mapping split descriptors
   (see spec 9) and writes it via `Ext2::write_inode_desc`.
 - On success, clears both dirty flags.
+- `persist_inode_locked` is the single persistence primitive for inode table
+  writes. Any convenience wrapper must delegate to it (no other direct
+  `write_inode_desc` call sites).
+
+## API cleanup
+
+- Remove `commit_dir_metadata` (directory metadata commit helper).
+  - Directory timestamp/flag updates must be expressed as explicit `meta` domain
+    mutations, then persisted via `persist_inode_locked`.
+  - Rationale: a dedicated "commit" helper tends to re-introduce mixed lock
+    domains and hidden PageCache interactions.
 
 [DIFF]
 

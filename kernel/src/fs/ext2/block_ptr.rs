@@ -2,6 +2,8 @@
 
 use core::mem::size_of;
 
+use device_id::{decode_device_numbers, encode_device_numbers};
+
 use super::{fs::Ext2, inode::RawInode, prelude::*};
 
 ///TODO: Refactor this with a more rusty approach (e.g. enum).
@@ -64,6 +66,45 @@ impl InodeMappingDesc {
     pub(super) fn from_parts(blocks: u32, block_ptrs: [u32; 15]) -> Self {
         Self { blocks, block_ptrs }
     }
+
+    /// Decodes Linux ext2 old/new special-file device encoding from `i_block`.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:1493-1500
+    /// Linux: /root/linux/include/linux/kdev_t.h:34-37,46-51
+    pub(super) fn decode_device_id(&self) -> u64 {
+        let (major, minor) = if self.block_ptrs[0] != 0 {
+            let val = self.block_ptrs[0];
+            // SPEC: old_decode_dev((major << 8) | minor) with 8-bit major/minor.
+            (((val >> 8) & 0xFF), (val & 0xFF))
+        } else {
+            let dev = self.block_ptrs[1];
+            // SPEC: new_decode_dev bit layout in Linux kdev_t.h.
+            (
+                ((dev & 0xFFF00) >> 8),
+                ((dev & 0xFF) | ((dev >> 12) & 0xFFF00)),
+            )
+        };
+
+        encode_device_numbers(major, minor)
+    }
+
+    /// Encodes an Asterinas u64 device ID into Linux ext2 `i_block` layout.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:1589-1599
+    /// Linux: /root/linux/include/linux/kdev_t.h:24-32,39-44
+    pub(super) fn encode_device_id(&mut self, device_id: u64) {
+        let (major, minor) = decode_device_numbers(device_id);
+
+        // SPEC: old_valid_dev => MAJOR/MINOR must both fit in 8 bits.
+        if major < 256 && minor < 256 {
+            self.block_ptrs[0] = (major << 8) | minor;
+            self.block_ptrs[1] = 0;
+        } else {
+            self.block_ptrs[0] = 0;
+            self.block_ptrs[1] = (minor & 0xFF) | (major << 8) | ((minor & !0xFF) << 12);
+            self.block_ptrs[2] = 0;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -84,6 +125,10 @@ impl InodeMapping {
 
     pub(super) fn set_blocks_512(&mut self, blocks: u32) {
         self.desc.blocks = blocks;
+    }
+
+    pub(super) fn get_desc(&self) -> &InodeMappingDesc {
+        &self.desc
     }
 
     /// Translates a logical block number into a path of block pointer offsets.
