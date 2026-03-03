@@ -6,7 +6,7 @@ use device_id::{decode_device_numbers, encode_device_numbers};
 use ostd::{const_assert, mm::io_util::HasVmReaderWriter, sync::RwMutexUpgradeableGuard};
 
 use super::{
-    block_ptr::{BlockPath, InodeMapping, InodeMappingDesc},
+    block_ptr::{InodeMapping, InodeMappingDesc},
     fs::{Ext2, ROOT_INO},
     prelude::*,
     utils::now,
@@ -1868,7 +1868,7 @@ impl PageCacheBackend for Inode {
 }
 
 #[derive(Debug)]
-pub struct InodeInner {
+struct InodeInner {
     meta: RwMutex<InodeMeta>,
     mapping: RwMutex<InodeMapping>,
     weak_self: Weak<Inode>,
@@ -1906,7 +1906,7 @@ struct DirEntryTarget {
 }
 
 impl InodeInner {
-    pub fn new(desc: Dirty<InodeDesc>, weak_self: Weak<Inode>, fs: Weak<Ext2>) -> Self {
+    fn new(desc: Dirty<InodeDesc>, weak_self: Weak<Inode>, fs: Weak<Ext2>) -> Self {
         let num_page_bytes = (desc.size as usize).align_up(BLOCK_SIZE);
         let meta = RwMutex::new(InodeMeta::new(desc.meta_desc()));
         let mapping = RwMutex::new(InodeMapping::new(desc.mapping_desc()));
@@ -1929,31 +1929,31 @@ impl InodeInner {
         }
     }
 
-    pub(super) fn meta_read(&self) -> RwMutexReadGuard<'_, InodeMeta> {
+    fn meta_read(&self) -> RwMutexReadGuard<'_, InodeMeta> {
         self.meta.read()
     }
 
-    pub(super) fn meta_write(&self) -> RwMutexWriteGuard<'_, InodeMeta> {
+    fn meta_write(&self) -> RwMutexWriteGuard<'_, InodeMeta> {
         self.meta.write()
     }
 
-    pub(super) fn meta_upread(&self) -> RwMutexUpgradeableGuard<'_, InodeMeta> {
+    fn meta_upread(&self) -> RwMutexUpgradeableGuard<'_, InodeMeta> {
         self.meta.upread()
     }
 
-    pub(super) fn mapping_upread(&self) -> RwMutexUpgradeableGuard<'_, InodeMapping> {
+    fn mapping_upread(&self) -> RwMutexUpgradeableGuard<'_, InodeMapping> {
         self.mapping.upread()
     }
 
-    pub(super) fn mapping_read(&self) -> RwMutexReadGuard<'_, InodeMapping> {
+    fn mapping_read(&self) -> RwMutexReadGuard<'_, InodeMapping> {
         self.mapping.read()
     }
 
-    pub(super) fn mapping_write(&self) -> RwMutexWriteGuard<'_, InodeMapping> {
+    fn mapping_write(&self) -> RwMutexWriteGuard<'_, InodeMapping> {
         self.mapping.write()
     }
 
-    pub(super) fn page_cache(&self) -> &PageCache {
+    fn page_cache(&self) -> &PageCache {
         &self.page_cache
     }
 
@@ -1967,7 +1967,7 @@ impl InodeInner {
     ///
     /// # Lock
     /// The caller must hold both `meta.write()` and `mapping.write()`.
-    pub(super) fn persist_inode_locked(
+    fn persist_inode_locked(
         meta: &mut InodeMeta,
         mapping: &mut InodeMapping,
         ino: u32,
@@ -1982,47 +1982,10 @@ impl InodeInner {
         Ok(())
     }
 
-    // fn is_fast_symlink(&self, block_size: usize) -> bool {
-    //     let ea_blocks = if self.meta.file_acl() != 0 {
-    //         (block_size / SECTOR_SIZE) as u32
-    //     } else {
-    //         0
-    //     };
-    //     self.meta.inode_type() == InodeType::SymLink
-    //         && self.mapping.desc.blocks.checked_sub(ea_blocks) == Some(0)
-    // }
-
-    // fn decode_device_id(&self) -> u64 {
-    //     let (major, minor) = if self.mapping.desc.block_ptrs[0] != 0 {
-    //         let val = self.mapping.desc.block_ptrs[0];
-    //         (((val >> 8) & 0xFF), (val & 0xFF))
-    //     } else {
-    //         let dev = self.mapping.desc.block_ptrs[1];
-    //         (
-    //             ((dev & 0xFFF00) >> 8),
-    //             ((dev & 0xFF) | ((dev >> 12) & 0xFFF00)),
-    //         )
-    //     };
-    //     encode_device_numbers(major, minor)
-    // }
-
-    // fn encode_device_id(&mut self, device_id: u64) {
-    //     let (major, minor) = decode_device_numbers(device_id);
-    //     if major < 256 && minor < 256 {
-    //         self.mapping.desc.block_ptrs[0] = (major << 8) | minor;
-    //         self.mapping.desc.block_ptrs[1] = 0;
-    //     } else {
-    //         self.mapping.desc.block_ptrs[0] = 0;
-    //         self.mapping.desc.block_ptrs[1] =
-    //             (minor & 0xFF) | (major << 8) | ((minor & !0xFF) << 12);
-    //         self.mapping.desc.block_ptrs[2] = 0;
-    //     }
-    // }
-
     /// Reads file data directly from data blocks into `writer`.
     ///
     /// Linux: /root/linux/fs/ext2/file.c:168 (ext2_dio_read_iter)
-    pub(super) fn read_direct_at(
+    fn read_direct_at(
         &self,
         mapping: &InodeMapping,
         fs: &Ext2,
@@ -2094,7 +2057,7 @@ impl InodeInner {
     /// Writes file data directly to already-allocated data blocks.
     ///
     /// Linux: /root/linux/fs/ext2/file.c:214 (ext2_dio_write_iter)
-    pub(super) fn write_direct_at(
+    fn write_direct_at(
         &self,
         mapping: &InodeMapping,
         fs: &Ext2,
@@ -2172,7 +2135,7 @@ impl InodeInner {
     /// Checks whether this directory contains only `.` and `..` as live entries.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:659 (ext2_empty_dir)
-    pub(super) fn empty_dir(&self, meta: &InodeMeta, fs: &Ext2, self_ino: u32) -> bool {
+    fn empty_dir(&self, meta: &InodeMeta, fs: &Ext2, self_ino: u32) -> bool {
         if meta.inode_type() != InodeType::Dir {
             return false;
         }
@@ -2236,7 +2199,7 @@ impl InodeInner {
     /// Finds a directory entry by name and returns its inode number.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:342 (ext2_find_entry)
-    pub(super) fn find_entry(&self, meta: &InodeMeta, fs: &Ext2, name: &str) -> Result<u32> {
+    fn find_entry(&self, meta: &InodeMeta, fs: &Ext2, name: &str) -> Result<u32> {
         if meta.inode_type() != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
@@ -2288,7 +2251,7 @@ impl InodeInner {
     /// Reads directory entries starting at byte offset and feeds visitor.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:257 (ext2_readdir)
-    pub(super) fn readdir_at(
+    fn readdir_at(
         &self,
         meta: &InodeMeta,
         fs: &Ext2,
@@ -2378,25 +2341,7 @@ impl InodeInner {
         Ok(advanced)
     }
 
-    /// Translates a logical block number into a path of block pointer offsets.
-    ///
-    /// Linux: /root/linux/fs/ext2/inode.c:163 (ext2_block_to_path)
-    pub(super) fn block_to_path(&self, iblock: u32) -> Result<BlockPath> {
-        let fs = self.fs_arc()?;
-        let mapping = self.mapping_read();
-        mapping.block_to_path(&fs, iblock)
-    }
-
-    /// Maps a logical block to a physical block (read-only path).
-    ///
-    /// Linux: /root/linux/fs/ext2/inode.c:783 (ext2_get_block)
-    pub(super) fn get_block(&self, iblock: u32) -> Result<Option<Bid>> {
-        let fs = self.fs_arc()?;
-        let mapping = self.mapping_read();
-        mapping.get_block(&fs, iblock)
-    }
-
-    pub(super) fn prepare_continuous_blocks(
+    fn prepare_continuous_blocks(
         &self,
         meta: &mut InodeMeta,
         fs: &Ext2,
@@ -2448,7 +2393,7 @@ impl InodeInner {
         Ok(())
     }
 
-    pub(super) fn write_failed_cleanup(
+    fn write_failed_cleanup(
         &self,
         meta: &mut InodeMeta,
         fs: &Ext2,
@@ -2484,7 +2429,7 @@ impl InodeInner {
     /// Resolves a logical block to physical, allocating a missing branch if requested.
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:624 (ext2_get_blocks, create path)
-    pub(super) fn get_or_alloc_block(&self, iblock: u32, create: bool) -> Result<Option<Bid>> {
+    fn get_or_alloc_block(&self, iblock: u32, create: bool) -> Result<Option<Bid>> {
         let fs = self.fs_arc()?;
         let mut meta = self.meta_write();
         let mut mapping = self.mapping_write();
@@ -2499,12 +2444,7 @@ impl InodeInner {
     /// Phase 1: scan directory blocks for reusable slot or duplicate.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link scan loop)
-    pub(super) fn scan_dir_for_slot(
-        &self,
-        meta: &InodeMeta,
-        fs: &Ext2,
-        name: &str,
-    ) -> Result<DirScanResult> {
+    fn scan_dir_for_slot(&self, meta: &InodeMeta, fs: &Ext2, name: &str) -> Result<DirScanResult> {
         if meta.inode_type() != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
@@ -2571,7 +2511,7 @@ impl InodeInner {
     /// Phase 2: grow directory by one data block.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link growth path)
-    pub(super) fn grow_dir_block(&self, meta: &mut InodeMeta, fs: &Ext2) -> Result<DirSlotInfo> {
+    fn grow_dir_block(&self, meta: &mut InodeMeta, fs: &Ext2) -> Result<DirSlotInfo> {
         let block_size = fs.block_size();
         let old_size = meta.file_size();
         let data_blocks = old_size.div_ceil(block_size);
@@ -2609,7 +2549,7 @@ impl InodeInner {
     /// Phase 3: write a new entry into a selected slot via PageCache.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link commit)
-    pub(super) fn write_dir_entry(
+    fn write_dir_entry(
         &self,
         _meta: &InodeMeta,
         fs: &Ext2,
@@ -2657,12 +2597,7 @@ impl InodeInner {
     /// Locate a target entry by name for delete/set_link operations.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:342 (ext2_find_entry)
-    pub(super) fn find_entry_target(
-        &self,
-        meta: &InodeMeta,
-        fs: &Ext2,
-        name: &str,
-    ) -> Result<DirEntryTarget> {
+    fn find_entry_target(&self, meta: &InodeMeta, fs: &Ext2, name: &str) -> Result<DirEntryTarget> {
         let max_inumber = fs.super_block().total_inodes();
         let block_size = fs.block_size();
         let size = meta.file_size();
@@ -2701,7 +2636,7 @@ impl InodeInner {
     /// Delete a located entry by zeroing inode and merging rec_len.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:560 (ext2_delete_entry)
-    pub(super) fn delete_entry_in_cache(
+    fn delete_entry_in_cache(
         &self,
         meta: &InodeMeta,
         fs: &Ext2,
@@ -2734,7 +2669,7 @@ impl InodeInner {
     /// Rewrite a located entry's inode/type via PageCache.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:450 (ext2_set_link)
-    pub(super) fn set_link_in_cache(
+    fn set_link_in_cache(
         &self,
         _meta: &InodeMeta,
         fs: &Ext2,
@@ -2901,11 +2836,7 @@ impl InodeInner {
         Ok(())
     }
 
-    pub(super) fn release_dir_data_blocks_for_cleanup(
-        &self,
-        meta: &mut InodeMeta,
-        fs: &Ext2,
-    ) -> Result<()> {
+    fn release_dir_data_blocks_for_cleanup(&self, meta: &mut InodeMeta, fs: &Ext2) -> Result<()> {
         // DIFF from Linux:
         // Linux mkdir-failure/rmdir cleanup reaches block release through
         // discard_new_inode()/iput() -> ext2_evict_inode() -> ext2_truncate_blocks().
@@ -2932,7 +2863,7 @@ impl InodeInner {
         Ok(())
     }
 
-    pub(super) fn sync_data_pages(&self, meta: &InodeMeta) -> Result<()> {
+    fn sync_data_pages(&self, meta: &InodeMeta) -> Result<()> {
         // SPEC: file_write_and_wait_range on an empty file is a no-op.
         // Linux: /root/linux/mm/filemap.c:782-783.
         let file_size = meta.file_size();
