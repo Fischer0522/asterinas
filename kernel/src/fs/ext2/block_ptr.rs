@@ -131,6 +131,10 @@ impl InodeMapping {
         &self.desc
     }
 
+    pub(super) fn encode_device_id(&mut self, device_id: u64) {
+        self.desc.encode_device_id(device_id);
+    }
+
     /// Translates a logical block number into a path of block pointer offsets.
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:163 (ext2_block_to_path)
@@ -900,7 +904,7 @@ mod test {
     use crate::{
         fs::{
             ext2::{
-                inode::{FileFlags, InodeMetaDesc},
+                inode::{FileFlags, InodeDesc},
                 testkit::{
                     self, ErrorBioDisk, Ext2FixtureBuilder, RawInodeBuilder, write_indirect_ptr,
                 },
@@ -944,52 +948,6 @@ mod test {
         };
         let mut inode_bitmap = group.inode_bitmap_mut();
         **inode_bitmap = IdBitmap::from_buf(inode_bitmap_buf.into_boxed_slice(), inode_len);
-    }
-
-    #[ktest]
-    fn mapping_desc_and_raw_from_parts_roundtrip() {
-        let mut raw = make_raw_inode(0o100644);
-        raw.size_lo = 0xAABB_CCDD;
-        raw.size_high = 0x1122_3344;
-        raw.uid = 0x1357;
-        raw.uid_high = 0x2468;
-        raw.gid = 0x2222;
-        raw.gid_high = 0x3333;
-        raw.links_count = 9;
-        raw.blocks = 77;
-        raw.flags = FileFlags::APPEND_ONLY.bits() | FileFlags::NO_DUMP.bits();
-        raw.block[0] = 1234;
-        raw.block[1] = 5678;
-        raw.file_acl = 42;
-        raw.generation = 99;
-        raw.atime = 11;
-        raw.ctime = 22;
-        raw.mtime = 33;
-        raw.dtime = 44;
-
-        let mapping = InodeMappingDesc::from_raw(&raw);
-        assert_eq!(mapping.blocks, raw.blocks);
-        assert_eq!(mapping.block_ptrs, raw.block);
-
-        let meta = InodeMetaDesc::try_from_raw(&raw).unwrap();
-        let roundtrip = RawInode::from_parts(&meta, &mapping);
-        assert_eq!(roundtrip.mode, raw.mode);
-        assert_eq!(roundtrip.uid, raw.uid);
-        assert_eq!(roundtrip.uid_high, raw.uid_high);
-        assert_eq!(roundtrip.gid, raw.gid);
-        assert_eq!(roundtrip.gid_high, raw.gid_high);
-        assert_eq!(roundtrip.size_lo, raw.size_lo);
-        assert_eq!(roundtrip.size_high, raw.size_high);
-        assert_eq!(roundtrip.atime, raw.atime);
-        assert_eq!(roundtrip.ctime, raw.ctime);
-        assert_eq!(roundtrip.mtime, raw.mtime);
-        assert_eq!(roundtrip.dtime, raw.dtime);
-        assert_eq!(roundtrip.links_count, raw.links_count);
-        assert_eq!(roundtrip.blocks, raw.blocks);
-        assert_eq!(roundtrip.flags, raw.flags);
-        assert_eq!(roundtrip.block, raw.block);
-        assert_eq!(roundtrip.file_acl, raw.file_acl);
-        assert_eq!(roundtrip.generation, raw.generation);
     }
 
     #[ktest]
