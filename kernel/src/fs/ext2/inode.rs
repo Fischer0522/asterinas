@@ -647,42 +647,6 @@ impl Inode {
         fs.read_inode(ino)
     }
 
-    /// Adds a new directory entry.
-    ///
-    /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link)
-    pub(super) fn add_entry(
-        &self,
-        name: &str,
-        ino: u32,
-        file_type: DirEntryFileType,
-    ) -> Result<()> {
-        let fs = self.fs_arc()?;
-        if self.type_ != InodeType::Dir {
-            return_errno!(Errno::ENOTDIR);
-        }
-
-        let name_bytes = name.as_bytes();
-        if name_bytes.is_empty() || name_bytes.len() > u8::MAX as usize {
-            return_errno!(Errno::EINVAL);
-        }
-
-        let max_inumber = fs.super_block().total_inodes();
-        if ino == 0 || ino > max_inumber {
-            return_errno!(Errno::EINVAL);
-        }
-
-        let mut inner = self.inner.write();
-        let slot = match inner.scan_dir_for_slot(&fs, name)? {
-            DirScanResult::Slot(slot) => slot,
-            DirScanResult::NeedGrowth => inner.grow_dir_block(&fs)?,
-        };
-
-        inner.write_dir_entry(&fs, &slot, name, ino, file_type as u8)?;
-        inner.update_dir_timestamps_and_flags()?;
-        inner.persist(self.ino, self.type_, &fs)?;
-        Ok(())
-    }
-
     pub(super) fn readdir_at(
         &self,
         offset: usize,
@@ -697,35 +661,24 @@ impl Inode {
         inner.readdir_at(&fs, offset, visitor)
     }
 
-    /// Deletes a directory entry by name.
-    ///
-    /// Linux: /root/linux/fs/ext2/dir.c:560 (ext2_delete_entry)
-    pub(super) fn delete_entry(&self, name: &str) -> Result<()> {
-        if self.type_ != InodeType::Dir {
-            return_errno!(Errno::ENOTDIR);
-        }
+    // /// Deletes a directory entry by name.
+    // ///
+    // /// Linux: /root/linux/fs/ext2/dir.c:560 (ext2_delete_entry)
+    // pub(super) fn delete_entry(&self, name: &str) -> Result<()> {
+    //     if self.type_ != InodeType::Dir {
+    //         return_errno!(Errno::ENOTDIR);
+    //     }
 
-        let name_bytes = name.as_bytes();
-        if name_bytes.is_empty() || name_bytes.len() > u8::MAX as usize {
-            return_errno!(Errno::EINVAL);
-        }
+    //     let name_bytes = name.as_bytes();
+    //     if name_bytes.is_empty() || name_bytes.len() > u8::MAX as usize {
+    //         return_errno!(Errno::EINVAL);
+    //     }
 
-        let fs = self.fs_arc()?;
-        let mut inner = self.inner.write();
-        let target = inner.find_entry_target(&fs, name).map_err(|err| {
-            if err.error() == Errno::ENOENT {
-                Error::with_message(Errno::EIO, "dir entry not found for delete")
-            } else {
-                err
-            }
-        })?;
-        inner.delete_entry_in_cache(&fs, &target)?;
-        inner.update_dir_timestamps_and_flags()?;
-        inner.persist(self.ino, self.type_, &fs)?;
-        Ok(())
-    }
+    //     let fs = self.fs_arc()?;
+    //     let mut inner = self.inner.write();
+    //     inner.delete_entry(self.ino, self.type_, &fs, name)
+    // }
 
-    // TODO: abstract it into inner
     /// Initializes a directory with `.` and `..`.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:617 (ext2_make_empty)
@@ -740,105 +693,9 @@ impl Inode {
             return_errno_with_message!(Errno::EINVAL, "parent inode number out of range");
         }
 
-        let block_size = fs.block_size();
         let mut inner = self.inner.write();
-        let old_size = inner.file_size();
-        let (old_mapping_desc, new_mapping_desc, new_bid) = {
-            let mapping_backend = Arc::clone(inner.backend());
-            let mut mapping = mapping_backend.mapping.write();
-            if mapping.desc.block_ptrs[0] != 0 {
-                return_errno_with_message!(Errno::EIO, "dir block pointer already occupied");
-            }
-            let old_mapping_desc = *mapping.get_desc();
-            let bid = mapping
-                .get_or_alloc_block(&fs, 0, true)?
-                .ok_or_else(|| {
-                    Error::with_message(Errno::ENOSPC, "failed to allocate first dir block")
-                })?
-                .to_raw() as u32;
-            let new_mapping_desc = *mapping.get_desc();
-            (old_mapping_desc, new_mapping_desc, bid)
-        };
-        inner.sync_desc_mapping_from_snapshot(new_mapping_desc);
-        inner.set_file_size(block_size);
-
-        if let Err(err) = inner.resize_page_cache_and_update_npages(block_size) {
-            inner.page_cache().discard_range(0..block_size);
-            inner.set_file_size(old_size);
-            let mapping_desc = {
-                let mapping_backend = Arc::clone(inner.backend());
-                let mut mapping = mapping_backend.mapping.write();
-                mapping.desc.block_ptrs = old_mapping_desc.block_ptrs;
-                mapping.desc.blocks = old_mapping_desc.blocks;
-                let _ = fs.free_blocks(new_bid, 1);
-                *mapping.get_desc()
-            };
-            inner.sync_desc_mapping_from_snapshot(mapping_desc);
-            return Err(err);
-        }
-
-        let mut buf = vec![0u8; block_size];
-        InodeInner::write_dir_entry_bytes(
-            &mut buf,
-            0,
-            self.ino,
-            DirEntry::dir_rec_len(1),
-            b".",
-            DirEntryFileType::Dir as u8,
-        )?;
-        let dot_len = DirEntry::dir_rec_len(1) as usize;
-        InodeInner::write_dir_entry_bytes(
-            &mut buf,
-            dot_len,
-            parent_ino,
-            (block_size - dot_len) as u16,
-            b"..",
-            DirEntryFileType::Dir as u8,
-        )?;
-
-        if let Err(err) = inner.page_cache().pages().write_bytes(0, &buf) {
-            inner.page_cache().discard_range(0..block_size);
-            if let Err(resize_err) = inner.resize_page_cache_and_update_npages(old_size) {
-                error!(
-                    "ext2: make_empty rollback resize failed: old_size={}, err={:?}",
-                    old_size, resize_err
-                );
-            }
-            inner.set_file_size(old_size);
-            let mapping_desc = {
-                let mapping_backend = Arc::clone(inner.backend());
-                let mut mapping = mapping_backend.mapping.write();
-                mapping.desc.block_ptrs = old_mapping_desc.block_ptrs;
-                mapping.desc.blocks = old_mapping_desc.blocks;
-                let _ = fs.free_blocks(new_bid, 1);
-                *mapping.get_desc()
-            };
-            inner.sync_desc_mapping_from_snapshot(mapping_desc);
-            return Err(err.into());
-        }
-
-        let persist_result = inner.persist(self.ino, self.type_, &fs);
-        if let Err(err) = persist_result {
-            inner.page_cache().discard_range(0..block_size);
-            if let Err(resize_err) = inner.resize_page_cache_and_update_npages(old_size) {
-                error!(
-                    "ext2: make_empty rollback resize failed: old_size={}, err={:?}",
-                    old_size, resize_err
-                );
-            }
-            inner.set_file_size(old_size);
-            let mapping_desc = {
-                let mapping_backend = Arc::clone(inner.backend());
-                let mut mapping = mapping_backend.mapping.write();
-                mapping.desc.block_ptrs = old_mapping_desc.block_ptrs;
-                mapping.desc.blocks = old_mapping_desc.blocks;
-                let _ = fs.free_blocks(new_bid, 1);
-                *mapping.get_desc()
-            };
-            inner.sync_desc_mapping_from_snapshot(mapping_desc);
-            return Err(err);
-        }
-
+        inner.make_empty(self.ino, parent_ino, &fs)?;
+        inner.persist(self.ino, self.type_, &fs)?;
         Ok(())
     }
 
@@ -866,19 +723,14 @@ impl Inode {
         let child = fs.read_inode(child_ino)?;
 
         {
-            let child_inner = child.inner.read();
+            let mut child_inner = child.inner.write();
             if child_inner.inode_type() != InodeType::Dir {
                 return_errno!(Errno::ENOTDIR);
             }
             if !child_inner.empty_dir(&fs, child.ino()) {
                 return_errno!(Errno::ENOTEMPTY);
             }
-        }
 
-        self.delete_entry(name)?;
-
-        {
-            let mut child_inner = child.inner.write();
             child_inner.set_file_size(0);
             child_inner.sub_links_count_saturating(2);
             child_inner.set_dtime(now());
@@ -887,6 +739,7 @@ impl Inode {
         }
 
         let mut parent_inner = self.inner.write();
+        parent_inner.delete_entry(self.ino,self.type_,&fs,name)?;
         parent_inner.sub_links_count_saturating(1);
         // SPEC: parent link-count change in rmdir is a directory mutation; refresh
         // ctime/mtime the same way as add/delete entry paths.
@@ -951,8 +804,7 @@ impl Inode {
         parent_inner.update_dir_timestamps_and_flags()?;
         if let Err(err) = parent_inner.persist(self.ino, self.type_, &fs) {
             parent_inner.sub_links_count_saturating(1);
-            drop(parent_inner);
-            let _ = self.delete_entry(name);
+            let _ = parent_inner.delete_entry(self.ino,self.type_,&fs,name);
             {
                 let mut child_inner = child.inner.write();
                 let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
@@ -1138,8 +990,8 @@ impl Inode {
             let child = fs.create_inode(self.ino, type_, perm)?;
             let child_ino = child.ino();
             let dir_ft = Self::inode_type_to_dir_file_type(type_);
-
-            if let Err(err) = self.add_entry(name, child_ino, dir_ft) {
+            let mut inner = self.inner.write();
+            if let Err(err) = inner.add_entry(self.ino,self.type_, &fs,name, child_ino, dir_ft) {
                 // SPEC: rollback — ext2_add_nondir failure path:
                 // decrement link count and discard inode.
                 let _ = fs.free_inode(child_ino, false);
@@ -1222,9 +1074,8 @@ impl Inode {
         }
 
         let fs = self.fs_arc()?;
-        let parent_inner = self.inner.read();
+        let parent_inner = self.inner.upread();
         let child_ino = parent_inner.find_entry(&fs, name)?;
-        drop(parent_inner);
         let child = fs.read_inode(child_ino)?;
 
         // SPEC: unlink rejects directories — use rmdir instead.
@@ -1232,8 +1083,8 @@ impl Inode {
             return_errno!(Errno::EISDIR);
         }
 
-        // Delete the directory entry first.
-        self.delete_entry(name)?;
+        let mut parent_inner = parent_inner.upgrade();
+        parent_inner.delete_entry(self.ino,self.type_,&fs,name)?;
 
         // Linux: inode_set_ctime_to_ts(inode, inode_get_ctime(dir))
         // then inode_dec_link_count.
@@ -1932,6 +1783,89 @@ impl InodeInner {
         fs.write_inode_desc(ino, &raw)?;
         self.clear_dirty();
         Ok(())
+    }
+
+    /// Initializes an empty directory with `.` and `..` entries.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:617 (ext2_make_empty)
+    fn make_empty(&mut self, ino: u32, parent_ino: u32, fs: &Ext2) -> Result<()> {
+        let block_size = fs.block_size();
+        let old_size = self.file_size();
+        let (old_mapping_desc, new_mapping_desc, new_bid) = {
+            let mapping_backend = Arc::clone(self.backend());
+            let mut mapping = mapping_backend.mapping.write();
+            if mapping.desc.block_ptrs[0] != 0 {
+                return_errno_with_message!(Errno::EIO, "dir block pointer already occupied");
+            }
+            let old_mapping_desc = *mapping.get_desc();
+            let bid = mapping
+                .get_or_alloc_block(fs, 0, true)?
+                .ok_or_else(|| {
+                    Error::with_message(Errno::ENOSPC, "failed to allocate first dir block")
+                })?
+                .to_raw() as u32;
+            let new_mapping_desc = *mapping.get_desc();
+            (old_mapping_desc, new_mapping_desc, bid)
+        };
+        self.sync_desc_mapping_from_snapshot(new_mapping_desc);
+        self.set_file_size(block_size);
+
+        if let Err(err) = self.resize_page_cache_and_update_npages(block_size) {
+            self.rollback_make_empty(old_size, old_mapping_desc, new_bid, fs);
+            return Err(err);
+        }
+
+        let mut buf = vec![0u8; block_size];
+        Self::write_dir_entry_bytes(
+            &mut buf,
+            0,
+            ino,
+            DirEntry::dir_rec_len(1),
+            b".",
+            DirEntryFileType::Dir as u8,
+        )?;
+        let dot_len = DirEntry::dir_rec_len(1) as usize;
+        Self::write_dir_entry_bytes(
+            &mut buf,
+            dot_len,
+            parent_ino,
+            (block_size - dot_len) as u16,
+            b"..",
+            DirEntryFileType::Dir as u8,
+        )?;
+
+        if let Err(err) = self.page_cache().pages().write_bytes(0, &buf) {
+            self.page_cache().discard_range(0..block_size);
+            if let Err(resize_err) = self.resize_page_cache_and_update_npages(old_size) {
+                error!(
+                    "ext2: make_empty rollback resize failed: old_size={}, err={:?}",
+                    old_size, resize_err
+                );
+            }
+            self.rollback_make_empty(old_size, old_mapping_desc, new_bid, fs);
+            return Err(err.into());
+        }
+
+        Ok(())
+    }
+
+    fn rollback_make_empty(
+        &mut self,
+        old_size: usize,
+        old_mapping_desc: InodeMappingDesc,
+        new_bid: u32,
+        fs: &Ext2,
+    ) {
+        self.page_cache().discard_range(0..fs.block_size());
+        self.set_file_size(old_size);
+        let mapping_backend = Arc::clone(self.backend());
+        let mut mapping = mapping_backend.mapping.write();
+        mapping.desc.block_ptrs = old_mapping_desc.block_ptrs;
+        mapping.desc.blocks = old_mapping_desc.blocks;
+        let _ = fs.free_blocks(new_bid, 1);
+        let mapping_desc = *mapping.get_desc();
+        drop(mapping);
+        self.sync_desc_mapping_from_snapshot(mapping_desc);
     }
 
     /// Reads file data directly from data blocks into `writer`.
@@ -2727,6 +2661,51 @@ impl InodeInner {
         self.page_cache
             .pages()
             .write_bytes(block_base, &block_buf)?;
+        Ok(())
+    }
+
+    /// Add a directory entry.
+    ///
+    /// Linux: /root/linux/fs/ext2/namei.c:various (ext2_add_link)
+    fn add_entry(
+        &mut self,
+        ino: u32,
+        type_: InodeType,
+        fs: &Ext2,
+        name: &str,
+        new_ino: u32,
+        file_type: DirEntryFileType,
+    ) -> Result<()> {
+        let slot = match self.scan_dir_for_slot(fs, name)? {
+            DirScanResult::Slot(slot) => slot,
+            DirScanResult::NeedGrowth => self.grow_dir_block(fs)?,
+        };
+        self.write_dir_entry(fs, &slot, name, new_ino, file_type as u8)?;
+        self.update_dir_timestamps_and_flags()?;
+        self.persist(ino, type_, fs)?;
+        Ok(())
+    }
+
+    /// Delete a directory entry by name.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:560 (ext2_delete_entry)
+    fn delete_entry(
+        &mut self,
+        ino: u32,
+        type_: InodeType,
+        fs: &Ext2,
+        name: &str,
+    ) -> Result<()> {
+        let target = self.find_entry_target(fs, name).map_err(|err| {
+            if err.error() == Errno::ENOENT {
+                Error::with_message(Errno::EIO, "dir entry not found for delete")
+            } else {
+                err
+            }
+        })?;
+        self.delete_entry_in_cache(fs, &target)?;
+        self.update_dir_timestamps_and_flags()?;
+        self.persist(ino, type_, fs)?;
         Ok(())
     }
 
@@ -3938,12 +3917,18 @@ mod test {
             .unwrap();
 
         assert_eq!(lookup_ino(&root, "bar").unwrap(), bar.ino());
-        root.add_entry("foo", 11, DirEntryFileType::File).unwrap();
+
+        let foo = root
+            .create("foo", InodeType::File, FilePerm::from_bits_truncate(0o644))
+            .unwrap();
+        assert_eq!(lookup_ino(&root, "foo").unwrap(), foo.ino());
+
         let dup = root
-            .add_entry("foo", 12, DirEntryFileType::File)
+            .create("foo", InodeType::File, FilePerm::from_bits_truncate(0o644))
             .unwrap_err();
         assert_eq!(dup.error(), Errno::EEXIST);
-        root.delete_entry("foo").unwrap();
+
+        root.unlink("foo").unwrap();
 
         assert_eq!(lookup_ino(&root, ".").unwrap(), ROOT_INO);
         assert_eq!(lookup_ino(&root, "bar").unwrap(), bar.ino());
@@ -3998,13 +3983,13 @@ mod test {
         let file_inode = make_live_file_inode(ext2, 50, 0, 0, FileFlags::empty(), [0u32; 15]);
         assert_eq!(
             file_inode
-                .add_entry("foo", 2, DirEntryFileType::File)
+                .create("foo", InodeType::File, FilePerm::from_bits_truncate(0o644))
                 .unwrap_err()
                 .error(),
             Errno::ENOTDIR
         );
         assert_eq!(
-            file_inode.delete_entry("foo").unwrap_err().error(),
+            file_inode.unlink("foo").unwrap_err().error(),
             Errno::ENOTDIR
         );
 
@@ -4013,13 +3998,13 @@ mod test {
         let dir_inode = make_live_dir_inode(ext2, 2, 0, 8, FileFlags::empty(), dir_ptrs);
         assert_eq!(
             dir_inode
-                .add_entry("", 2, DirEntryFileType::File)
+                .create("", InodeType::File, FilePerm::from_bits_truncate(0o644))
                 .unwrap_err()
                 .error(),
             Errno::EINVAL
         );
         assert_eq!(
-            dir_inode.delete_entry("").unwrap_err().error(),
+            dir_inode.unlink("").unwrap_err().error(),
             Errno::EINVAL
         );
     }
