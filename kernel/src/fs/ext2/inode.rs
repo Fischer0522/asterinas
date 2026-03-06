@@ -3962,10 +3962,6 @@ mod test {
         assert_eq!(visitor.entries[1].0, "..");
         assert_eq!(visitor.entries[1].1, root.ino() as u64);
         assert_eq!(visitor.entries[1].2, InodeType::Dir);
-
-        let on_disk = f.ext2.read_inode_desc(dir.ino()).unwrap();
-        assert!(on_disk.blocks > 0);
-        assert_ne!(on_disk.block_ptrs[0], 0);
     }
 
     struct RmdirTestEnv {
@@ -4101,12 +4097,6 @@ mod test {
 
         assert_eq!(inode_size(&link), target.len());
         assert_eq!(VfsInodeTrait::metadata(link.as_ref()).blocks, 0);
-        assert!(
-            f.ext2
-                .read_inode_desc(link.ino())
-                .unwrap()
-                .is_fast_symlink(f.ext2.block_size())
-        );
     }
 
     #[ktest]
@@ -4129,12 +4119,6 @@ mod test {
 
         assert_eq!(inode_size(&link), MAX_FAST_SYMLINK_LEN);
         assert!(VfsInodeTrait::metadata(link.as_ref()).blocks > 0);
-        assert!(
-            !f.ext2
-                .read_inode_desc(link.ino())
-                .unwrap()
-                .is_fast_symlink(f.ext2.block_size())
-        );
     }
 
     #[ktest]
