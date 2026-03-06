@@ -78,7 +78,7 @@ pub struct BlockGroup {
     /// Cached geometry: inode size in bytes.
     inode_size: usize,
     /// Inode table page cache backend.
-    inode_table_backend: Arc<InodeTableBackend>,
+    _inode_table_backend: Arc<InodeTableBackend>,
     /// Inode table page cache.
     inode_table_cache: PageCache,
     /// Per-group inode cache keyed by group-local inode index.
@@ -214,7 +214,7 @@ impl BlockGroup {
             itb_per_group,
             inodes_per_group,
             inode_size,
-            inode_table_backend: backend,
+            _inode_table_backend: backend,
             inode_table_cache,
             inode_cache: RwMutex::new(BTreeMap::new()),
         })
@@ -304,10 +304,17 @@ impl BlockGroup {
         })
     }
 
-    /// Syncs cached inodes and evicts unreferenced entries.
+    /// Syncs per-group inode state and bitmap metadata.
     ///
     /// Linux trigger analogue: /root/linux/fs/inode.c:1910 (iput_final)
-    pub(super) fn sync_all_inodes(&self) -> Result<EvictResult> {
+    pub(super) fn sync_all(&self, group_descs: &USegment) -> Result<EvictResult> {
+        let evicted = self.sync_inodes()?;
+        self.sync_metadata(group_descs)?;
+        Ok(evicted)
+    }
+
+    /// Syncs cached inodes and evicts unreferenced entries.
+    fn sync_inodes(&self) -> Result<EvictResult> {
         let mut evicted = EvictResult {
             freed_inodes: 0,
             freed_dirs: 0,
@@ -333,8 +340,16 @@ impl BlockGroup {
         for inode in &remaining_inodes {
             inode.sync_all()?;
         }
-
+        
+        //Phase 4: sync inode table page cache.
+        self.sync_inode_table()?;
         Ok(evicted)
+    }
+
+    fn sync_inode_table(&self) -> Result<()> {
+        let size = self.inodes_per_group as usize * self.inode_size;
+        let range = 0..size;
+        self.inode_table_cache.evict_range(range)
     }
 
     pub fn block_bitmap(&self) -> RwMutexReadGuard<'_, Dirty<IdBitmap>> {
@@ -439,7 +454,12 @@ impl BlockGroup {
         self.block_bitmap.read().is_dirty() || self.inode_bitmap.read().is_dirty()
     }
 
-    pub(super) fn sync_metadata(&self, group_descs: &USegment) -> Result<()> {
+    fn sync_metadata(&self, group_descs: &USegment) -> Result<()> {
+        self.sync_bitmaps()?;
+        self.sync_group_desc(group_descs)
+    }
+
+    fn sync_group_desc(&self, group_descs: &USegment) -> Result<()> {
         if !self.desc.read().is_dirty() {
             return Ok(());
         }
@@ -456,7 +476,7 @@ impl BlockGroup {
         Ok(())
     }
 
-    pub fn sync_bitmaps(&self) -> Result<()> {
+    fn sync_bitmaps(&self) -> Result<()> {
         let (block_bitmap_bid, inode_bitmap_bid) = {
             // SPEC: read descriptor block addresses before bitmap locks to keep lock ordering.
             let desc = self.desc.read();

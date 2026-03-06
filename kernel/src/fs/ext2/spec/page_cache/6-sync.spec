@@ -135,9 +135,7 @@ impl Inode {
     /// Asterinas: uses Dirty<InodeDesc>::is_dirty() as conservative approximation
     /// of I_DIRTY_DATASYNC — always persists metadata if desc was modified.
     ///
-    /// # Lock
-    /// Acquires inner read lock. evict_range and persist_inode_and_sync
-    /// are both safe under read lock.
+    /// The caller is responsible for the final device-cache flush.
     pub(super) fn sync_data(&self) -> Result<()>;
 
     /// Syncs file data and inode metadata to disk.
@@ -145,27 +143,30 @@ impl Inode {
     /// Linux: ext2_fsync (fs/ext2/file.c:155) calls generic_buffers_fsync
     /// which does: file_write_and_wait_range → sync_inode_metadata →
     /// blkdev_issue_flush.
-    /// Asterinas: sync_data (evict dirty pages) + persist_inode_and_sync
-    /// (write inode descriptor) + block_device.sync (flush).
-    ///
-    /// # Lock
-    /// Acquires inner read lock for sync_data, then read lock again
-    /// for persist_inode_and_sync. No lock held across both — safe.
+    /// Asterinas: flushes dirty data pages, persists inode metadata, and lets
+    /// the VFS / filesystem caller perform the final block-device flush.
     pub(super) fn sync_all(&self) -> Result<()>;
+
+    /// Persists inode metadata without flushing the device write cache.
+    pub(super) fn sync_metadata(&self) -> Result<()>;
 }
 ```
 
 ```rust
 impl Ext2 {
-    /// Syncs all cached inodes: writes back dirty pages and inode metadata.
+    /// Syncs all cached inodes and block-group-local metadata.
     ///
     /// Linux: writeback framework iterates dirty inodes via sb->s_inodes
     /// and calls __ext2_write_inode + writeback dirty pages.
-    /// Asterinas: iterates the inode cache, calls sync_all on each.
+    /// Asterinas: iterates block groups, lets each group sync its cached
+    /// inodes and group-local metadata, then syncs filesystem metadata.
     ///
     /// Follows ext2_old pattern (block_group.rs:266) and exFAT pattern
     /// (fs.rs:411) which iterate cached inodes and call sync_all.
-    pub fn sync_all_inodes(&self) -> Result<()>;
+    pub fn sync_all(&self) -> Result<()>;
+
+    /// Syncs filesystem-global metadata: superblock and descriptor table.
+    pub fn sync_metadata(&self) -> Result<()>;
 }
 ```
 
@@ -236,19 +237,19 @@ Pre:
 Post (success):
 - Obtains `fs` via `self.fs_arc()`.
 - Acquires inner read lock.
-- Calls `inner.sync_data()` to write back dirty pages.
-- If `inner.desc.is_dirty()`: calls `inner.persist_inode_and_sync(&fs)`
+- Calls `inner.sync_data()` / `inner.sync_data_pages()` to write back dirty pages.
+- If `inner.desc.is_dirty()`: persists inode metadata
   to persist inode metadata (i_size, block pointers, timestamps).
   - This ensures that after a file-extending write + fdatasync, the new
     i_size and block mappings are persisted. Without this, a crash would
     lose the size change and the data would appear truncated.
-- Releases read lock.
-- Calls `fs.block_device().sync()` to flush device write cache.
-  - Linux: `blkdev_issue_flush` at end of `generic_buffers_fsync`.
+- Releases the lock.
+- Final device flush is performed by the VFS wrapper (`impl VfsInode`) after
+  `Inode::sync_data()` returns successfully.
 - Returns `Ok(())`.
 
 Post (failure):
-- `Err(EIO)` if page writeback or device flush fails.
+- `Err(EIO)` if page writeback or metadata persistence fails.
 
 ## Inode::sync_all
 
@@ -265,14 +266,10 @@ Pre:
 - None (public API).
 
 Post (success):
-- Obtains `fs` via `self.fs_arc()`.
-- Step 1: Acquires inner read lock, calls `inner.sync_data()`.
-  Releases read lock.
-- Step 2: Acquires inner read lock, calls `inner.persist_inode_and_sync(&fs)`.
-  This writes the raw inode descriptor to the inode table page cache
-  and syncs filesystem metadata (superblock, group descriptors).
-  Releases read lock.
-- Step 3: Calls `fs.block_device().sync()` to flush device cache.
+- Step 1: Acquires inner read lock and flushes dirty data pages.
+- Step 2: Persists inode metadata via `Inode::sync_metadata()`.
+- Final device flush is performed by the VFS wrapper (`impl VfsInode`) after
+  `Inode::sync_all()` returns successfully.
 - Returns `Ok(())`.
 
 Post (failure):
@@ -281,40 +278,39 @@ Post (failure):
   `generic_buffers_fsync` continues after partial failures.
 
 Lock protocol:
-- Read lock acquired and released twice (once for data, once for metadata).
-- No lock held across both operations — avoids holding lock during
-  potentially long I/O.
-- persist_inode_and_sync under read lock is safe: it only reads desc
-  fields and calls fs.write_inode_desc (which writes to the block group's
-  inode table page cache, a separate lock domain).
+- Read lock for data writeback, then write lock for metadata persistence.
+- No lock held across the outer device flush.
 
-## Ext2::sync_all_inodes
+## Ext2::sync_all
 
-Filesystem-level inode sync for `sync(2)` / `syncfs(2)`.
+Filesystem-level sync orchestration for `sync(2)` / `syncfs(2)`.
 
 Linux equivalent: The writeback framework iterates `sb->s_inodes` (all
 inodes on the superblock's inode list) and calls `__ext2_write_inode`
 plus page writeback for each dirty inode.
 
 Asterinas: Since there is no global writeback framework, the filesystem
-must iterate its own cached inodes. This follows the pattern established
-by ext2_old (`sync_all_inodes` in block_group.rs:266) and exFAT
-(`sync` in fs.rs:411).
+must explicitly iterate block groups and sync cached inodes itself.
 
 Pre:
 - Called from `FileSystem::sync()`.
 
 Post (success):
 - Iterates all `BlockGroup`s in `self.block_groups`.
-- For each group, calls `group.sync_all_inodes()` which:
+- For each group, calls `group.sync_all(group_descs)` which:
   1. Evicts unreferenced inodes (`Arc::strong_count == 1`) from the
      per-group `BTreeMap<u32, Arc<Inode>>` cache.
   2. For evicted inodes with `nlink == 0`: runs `truncate_blocks(0)` +
      `free_inode` (bitmap clear) — equivalent to Linux `ext2_evict_inode`.
   3. For evicted inodes with `nlink > 0`: calls `sync_all()` before drop.
   4. Calls `sync_all()` on all remaining cached inodes.
+  5. Syncs group-local metadata by flushing `inode_bitmap`, `block_bitmap`,
+     and writing the dirty group descriptor into Ext2's
+     `group_descriptors_segment`.
 - Aggregates `EvictResult` (freed inode/dir counts) across groups.
 - If any inodes were freed, updates superblock `free_inodes_count`.
+- Calls `self.sync_metadata()` to persist filesystem-global metadata:
+  superblock and the descriptor table segment (primary + backup copies).
 - Returns `Ok(())`.
 
 Post (failure):
@@ -333,15 +329,12 @@ Pre:
 - Called from `sys_sync` / `sys_syncfs`.
 
 Post (success):
-- Calls `self.sync_all_inodes()` to write back dirty inode data.
-  - Linux: writeback framework handles this before ext2_sync_fs is called.
-  - Asterinas: must do it explicitly since there is no writeback framework.
-- Calls `self.sync_metadata()` to write superblock, group descriptors,
-  and bitmaps.
-  - Linux: `ext2_sync_super` writes superblock.
-  - Asterinas: `sync_metadata` writes superblock + group descriptors +
-    bitmaps (more comprehensive than Linux's ext2_sync_fs alone, but
-    Linux's writeback framework handles the rest separately).
+- Calls `self.sync_all()`.
+  - This walks `Ext2 -> BlockGroup -> Inode`.
+  - Each block group syncs cached inodes plus group-local metadata
+    (bitmaps + group descriptor write into `group_descriptors_segment`).
+  - `Ext2::sync_all()` then calls `self.sync_metadata()` to persist the
+    superblock and the descriptor-table segment to disk.
 - Calls `self.block_device().sync()` to flush device cache.
   - Linux: `sync_blockdev` called by VFS after ext2_sync_fs.
 - Returns `Ok(())`.
@@ -355,10 +348,9 @@ Post (failure):
 |------------------------|---------------|-----------------------|-------------------|-------|
 | InodeInner::sync_data  | read          | evict_range           | no Pager callback | YES   |
 | Inode::sync_data       | read          | evict + persist(cond) | writes to BG cache| YES   |
-| Inode::sync_data       | NONE          | device.sync           | none              | YES   |
 | Inode::sync_all step1  | read          | evict_range           | no Pager callback | YES   |
-| Inode::sync_all step2  | read          | persist_inode_and_sync| writes to BG cache| YES   |
-| Inode::sync_all step3  | NONE          | device.sync           | none              | YES   |
+| Inode::sync_all step2  | write         | persist metadata      | writes to BG cache| YES   |
+| VFS inode/fs wrapper   | NONE          | device.sync           | none              | YES   |
 | Ext2::sync             | NONE          | delegates to above    | none              | YES   |
 
 evict_range safety: evict_range locks PageCacheManager::pages (Mutex) and

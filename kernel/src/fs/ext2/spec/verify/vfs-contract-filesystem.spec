@@ -43,15 +43,17 @@ REQUIRE:
     FS.block_device is accessible
 
 ENSURE (Ok):
-    -- Phase 1: sync_all_inodes()
-    --   ∀ inode ∈ FS.inode_cache:
-    --     dirty pages flushed to block device
+    -- Phase 1: sync_all()
+    --   ∀ block_group ∈ FS.block_groups:
+    --     cached inodes synced/evicted
     --     inode descriptor persisted to inode table
-    --     xattr block flushed if dirty
+    --     block bitmap persisted if dirty
+    --     inode bitmap persisted if dirty
+    --     dirty group descriptor written into descriptor-table segment
 
     -- Phase 2: sync_metadata()
     --   superblock persisted to disk (if dirty)
-    --   block group descriptors persisted to disk (if dirty)
+    --   descriptor-table segment persisted to disk copies (if dirty)
 
     -- Phase 3: block_device.sync()
     --   device-level flush/barrier issued

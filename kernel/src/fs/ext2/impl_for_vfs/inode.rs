@@ -2,6 +2,8 @@
 
 use core::time::Duration;
 
+use aster_block::bio::BioStatus;
+
 use crate::{
     fs::{
         ext2::{FilePerm, Inode},
@@ -189,11 +191,21 @@ impl VfsInode for Inode {
     }
 
     fn sync_all(&self) -> Result<()> {
-        Inode::sync_all(self)
+        // Linux: /root/linux/fs/ext2/file.c:155 (ext2_fsync)
+        Inode::sync_all(self)?;
+        if Inode::fs_arc(self)?.block_device().sync()? != BioStatus::Complete {
+            return_errno_with_message!(Errno::EIO, "failed to flush block device");
+        }
+        Ok(())
     }
 
     fn sync_data(&self) -> Result<()> {
-        Inode::sync_data(self)
+        // Linux: /root/linux/fs/buffer.c:602 (generic_buffers_fsync_noflush)
+        Inode::sync_data(self)?;
+        if Inode::fs_arc(self)?.block_device().sync()? != BioStatus::Complete {
+            return_errno_with_message!(Errno::EIO, "failed to flush block device");
+        }
+        Ok(())
     }
 
     fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {

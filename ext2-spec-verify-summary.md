@@ -19,13 +19,9 @@
 ## 3. 已确认 VIOLATION（逐条）
 
 ### V1. MSG-FS-02 `sync()` 覆盖不全
-- 问题：`sync_all_inodes()` 主要遍历 block-group cache，`root_inode` 路径可能漏刷。
-- 证据：
-  - `kernel/src/fs/ext2/impl_for_vfs/fs.rs:17`
-  - `kernel/src/fs/ext2/fs.rs:86`
-  - `kernel/src/fs/ext2/block_group.rs:317`
-- 可能漏洞：`sync` 返回成功但部分状态未落盘，形成崩溃一致性缺口。
-- 结果：断电后目录/元数据回退，可能触发 fsck 修复或数据丢失感知不一致。
+- 旧结论已过时：当前实现已改为 `Ext2::sync_all()` 统一组织 `Ext2 -> BlockGroup -> Inode`，并在 `BlockGroup::sync_all()` 中覆盖组内 inode 与 metadata，同步结束后由 VFS wrapper 做一次最终 device flush。
+- 先前关于 `root_inode` 可能漏刷的判断也已过时：root inode 通过 `read_inode(ROOT_INO)` 懒加载后会进入 per-group `inode_cache`，因此参与正常的 group sync 遍历。
+- 当前该项应视为“已修正 / 已对齐文档”，而非现存 violation。
 
 ### V2. MSG-META-02 `resize()` 语义偏差
 - 问题：类型约束、扩容行为、失败回滚与 spec 不一致。

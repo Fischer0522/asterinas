@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use aster_block::bio::BioStatus;
+
 use crate::{
     fs::{
         ext2::{Ext2, MAGIC_NUM},
@@ -16,9 +18,10 @@ impl FileSystem for Ext2 {
 
     fn sync(&self) -> Result<()> {
         // Linux: /root/linux/fs/ext2/super.c:1308 (ext2_sync_fs)
-        self.sync_all_inodes()?;
-        self.sync_metadata()?;
-        self.block_device().sync()?;
+        self.sync_all()?;
+        if self.block_device().sync()? != BioStatus::Complete {
+            return_errno_with_message!(Errno::EIO, "failed to flush block device");
+        }
         Ok(())
     }
 

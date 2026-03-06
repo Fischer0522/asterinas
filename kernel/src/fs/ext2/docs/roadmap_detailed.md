@@ -503,13 +503,13 @@ Goal: finalize boundary checks, feature gating, and consistency rules.
 
 ### Module 9.4: Consistency & Sync
 - Methods:
-  - `Ext2::sync_metadata`, `Inode::sync_metadata`.
+  - `Ext2::sync_all`, `Ext2::sync_metadata`, `BlockGroup::sync_all`, `Inode::sync_metadata`.
 - Linux refs:
   - `/root/linux/fs/ext2/super.c` (superblock writeback).
 - Asterinas adjustments:
-  - use PageCache and `BlockDevice::sync`.
+  - use PageCache, per-group metadata sync, and one final `BlockDevice::sync` at the VFS boundary.
 - Spec: `phase-09-sync.spec`.
-- Status: ✅ implemented (`Ext2::sync_metadata` in fs.rs:637, `Inode::sync_all` in inode.rs:1047, `BlockGroup::sync_bitmaps` in block_group.rs:459; commit efcf1018).
+- Status: ✅ implemented (`Ext2::sync_all` orchestrates group sync + fs metadata sync, `BlockGroup::sync_metadata` covers bitmaps + descriptor-segment update, and outer VFS sync performs the final device flush).
 
 ---
 

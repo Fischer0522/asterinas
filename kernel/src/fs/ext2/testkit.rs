@@ -3,7 +3,11 @@
 #![cfg(ktest)]
 
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::{fmt, mem::size_of};
+use core::{
+    fmt,
+    mem::size_of,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use aster_block::{
     BLOCK_SIZE, BlockDevice, BlockDeviceMeta, SECTOR_SIZE,
@@ -36,6 +40,8 @@ use crate::{
 
 pub(super) struct Ext2MemoryDisk {
     segment: Segment<()>,
+    flush_count: AtomicUsize,
+    fail_flush: AtomicBool,
 }
 
 impl Ext2MemoryDisk {
@@ -45,7 +51,11 @@ impl Ext2MemoryDisk {
             .zeroed(true)
             .alloc_segment(npages)
             .unwrap();
-        Self { segment }
+        Self {
+            segment,
+            flush_count: AtomicUsize::new(0),
+            fail_flush: AtomicBool::new(false),
+        }
     }
 
     pub(super) fn segment(&self) -> &Segment<()> {
@@ -63,6 +73,14 @@ impl Ext2MemoryDisk {
             self.segment.write_val(offset, desc).unwrap();
         }
     }
+
+    pub(super) fn flush_count(&self) -> usize {
+        self.flush_count.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn set_flush_error(&self, should_fail: bool) {
+        self.fail_flush.store(should_fail, Ordering::Relaxed);
+    }
 }
 
 impl fmt::Debug for Ext2MemoryDisk {
@@ -75,6 +93,17 @@ impl fmt::Debug for Ext2MemoryDisk {
 
 impl BlockDevice for Ext2MemoryDisk {
     fn enqueue(&self, bio: SubmittedBio) -> core::result::Result<(), BioEnqueueError> {
+        if bio.type_() == BioType::Flush {
+            self.flush_count.fetch_add(1, Ordering::Relaxed);
+            let status = if self.fail_flush.load(Ordering::Relaxed) {
+                BioStatus::IoError
+            } else {
+                BioStatus::Complete
+            };
+            bio.complete(status);
+            return Ok(());
+        }
+
         let mut cur_device_ofs = bio.sid_range().start.to_raw() as usize * SECTOR_SIZE;
 
         for seg in bio.segments() {
@@ -963,8 +992,9 @@ impl Ext2FixtureBuilder {
         let (raw_sb, sb, descs, disk, layout) = self.prepare()?;
         self.write_bitmaps(&sb, &descs, &disk, &layout);
 
-        // Ext2::open reads ROOT_INO during mount, so fixtures that request
-        // root initialization must place a valid root inode on disk first.
+        // Ext2::open does not read ROOT_INO during mount, but fixtures that
+        // request root initialization must still place a valid root inode on
+        // disk so later root lookups succeed.
         let root_bid = layout.first_data.saturating_add(1);
         if self.init_root {
             let root_raw = make_root_raw_inode(root_bid, sb.block_size());

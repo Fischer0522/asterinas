@@ -632,7 +632,6 @@ impl Inode {
         inner.readdir_at(&fs, offset, visitor)
     }
 
-
     /// Initializes a directory with `.` and `..`.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:617 (ext2_make_empty)
@@ -736,13 +735,9 @@ impl Inode {
             return Err(err);
         }
 
-        if let Err(err) = parent_inner.write_dir_entry(
-            &fs,
-            &slot,
-            name,
-            child_ino,
-            DirEntryFileType::Dir as u8,
-        ) {
+        if let Err(err) =
+            parent_inner.write_dir_entry(&fs, &slot, name, child_ino, DirEntryFileType::Dir as u8)
+        {
             {
                 let mut child_inner = child.inner.write();
                 let _ = child_inner.release_dir_data_blocks_for_cleanup(&fs);
@@ -798,9 +793,7 @@ impl Inode {
     }
 
     pub(super) fn sync_all(&self) -> Result<()> {
-        let fs = self.fs_arc()?;
-
-        // SPEC: fsync step 1 flushes dirty data pages first.
+        // SPEC: fsync step 1 flushes dirty data pages before metadata writeback.
         // Linux: /root/linux/fs/buffer.c:646 (generic_buffers_fsync)
         // -> /root/linux/mm/filemap.c:777 (file_write_and_wait_range).
         {
@@ -808,14 +801,19 @@ impl Inode {
             inner.sync_data_pages()?;
         }
 
-        // SPEC: fsync step 2 persists inode metadata after data writeback.
+        // SPEC: fsync step 2 persists inode metadata. The caller is
+        // responsible for the final device-cache flush.
         // Linux: /root/linux/fs/buffer.c:619 (sync_inode_metadata).
+        self.sync_metadata()
+    }
+
+    /// Persists inode metadata without flushing the device write cache.
+    ///
+    /// Linux: /root/linux/fs/buffer.c:619 (sync_inode_metadata)
+    pub(super) fn sync_metadata(&self) -> Result<()> {
+        let fs = self.fs_arc()?;
         let mut inner = self.inner.write();
         inner.persist(self.ino, self.type_, &fs)?;
-
-        // SPEC: fsync step 3 flushes device write cache.
-        // Linux: /root/linux/fs/buffer.c:654 (blkdev_issue_flush).
-        fs.block_device().sync()?;
         Ok(())
     }
 
@@ -854,26 +852,22 @@ impl Inode {
     pub(super) fn sync_data(&self) -> Result<()> {
         let fs = self.fs_arc()?;
 
+        // SPEC: fdatasync writes back dirty data pages first. The caller is
+        // responsible for the final device-cache flush.
+        // Linux: /root/linux/fs/buffer.c:609 (file_write_and_wait_range).
         {
-            // SPEC: fdatasync always writes back dirty data pages first.
-            // Linux: /root/linux/fs/buffer.c:609 (file_write_and_wait_range).
             let inner = self.inner.read();
             inner.sync_data_pages()?;
-
-            // SPEC: Linux writes metadata when I_DIRTY_DATASYNC is set.
-            // Linux: /root/linux/fs/buffer.c:616-619.
-            // Asterinas uses desc.is_dirty() as a conservative approximation
-            // so fdatasync never misses i_size/block-mapping persistence.
-            drop(inner);
-            let mut inner = self.inner.write();
-            if inner.is_dirty() {
-                inner.persist(self.ino, self.type_, &fs)?;
-            }
         }
 
-        // SPEC: fdatasync ends with device cache flush.
-        // Linux: /root/linux/fs/buffer.c:654 (blkdev_issue_flush).
-        fs.block_device().sync()?;
+        // SPEC: Linux writes metadata when I_DIRTY_DATASYNC is set.
+        // Linux: /root/linux/fs/buffer.c:616-619.
+        // Asterinas uses desc.is_dirty() as a conservative approximation
+        // so fdatasync never misses i_size/block-mapping persistence.
+        let mut inner = self.inner.write();
+        if inner.is_dirty() {
+            inner.persist(self.ino, self.type_, &fs)?;
+        }
         Ok(())
     }
 
@@ -1178,9 +1172,7 @@ impl Inode {
         }
 
         let target_inner = guards.inner(ctx.target_dir.ino)?;
-        let rechecked_existing_ino = target_inner
-            .find_entry(ctx.fs, ctx.new_name)
-            .ok();
+        let rechecked_existing_ino = target_inner.find_entry(ctx.fs, ctx.new_name).ok();
         if rechecked_existing_ino != ctx.existing_ino {
             // Destination state changed after snapshot; caller should retry.
             return Ok(false);
@@ -1863,12 +1855,7 @@ impl InodeInner {
     /// Writes file data directly to already-allocated data blocks.
     ///
     /// Linux: /root/linux/fs/ext2/file.c:214 (ext2_dio_write_iter)
-    fn write_direct_at(
-        &self,
-        fs: &Ext2,
-        offset: usize,
-        reader: &mut VmReader,
-    ) -> Result<()> {
+    fn write_direct_at(&self, fs: &Ext2, offset: usize, reader: &mut VmReader) -> Result<()> {
         let block_size = fs.block_size();
         let write_len = reader.remain();
         // end is already checked in `Inode::write_direct_at`.
@@ -2215,8 +2202,7 @@ impl InodeInner {
         }
 
         let mut target = vec![0u8; link_size];
-        self
-            .page_cache()
+        self.page_cache()
             .pages()
             .read_bytes(0, &mut target)
             .map_err(|_| {
@@ -2344,11 +2330,7 @@ impl InodeInner {
     /// Phase 1: scan directory blocks for reusable slot or duplicate.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link scan loop)
-    fn scan_dir_for_slot(
-        &self,
-        fs: &Ext2,
-        name: &str,
-    ) -> Result<DirScanResult> {
+    fn scan_dir_for_slot(&self, fs: &Ext2, name: &str) -> Result<DirScanResult> {
         if self.inode_type() != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
@@ -2508,11 +2490,7 @@ impl InodeInner {
     /// Locate a target entry by name for delete/set_link operations.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:342 (ext2_find_entry)
-    fn find_entry_target(
-        &self,
-        fs: &Ext2,
-        name: &str,
-    ) -> Result<DirEntryTarget> {
+    fn find_entry_target(&self, fs: &Ext2, name: &str) -> Result<DirEntryTarget> {
         let max_inumber = fs.super_block().total_inodes();
         let block_size = fs.block_size();
         let size = self.file_size();
@@ -2551,11 +2529,7 @@ impl InodeInner {
     /// Delete a located entry by zeroing inode and merging rec_len.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:560 (ext2_delete_entry)
-    fn delete_entry_in_page_cache(
-        &self,
-        fs: &Ext2,
-        target: &DirEntryTarget,
-    ) -> Result<()> {
+    fn delete_entry_in_page_cache(&self, fs: &Ext2, target: &DirEntryTarget) -> Result<()> {
         let block_size = fs.block_size();
         let block_base = (target.dir_offset / block_size).saturating_mul(block_size);
         let entry_offset = target.dir_offset.saturating_sub(block_base);
@@ -2612,12 +2586,7 @@ impl InodeInner {
     /// Add a directory entry.
     ///
     /// Linux: /root/linux/fs/ext2/namei.c:various (ext2_add_link)
-    fn add_entry(
-        &mut self,
-        name: &str,
-        new_ino: u32,
-        file_type: DirEntryFileType,
-    ) -> Result<()> {
+    fn add_entry(&mut self, name: &str, new_ino: u32, file_type: DirEntryFileType) -> Result<()> {
         let fs = self.fs_arc()?;
         let slot = match self.scan_dir_for_slot(&fs, name)? {
             DirScanResult::Slot(slot) => slot,
@@ -2631,10 +2600,7 @@ impl InodeInner {
     /// Delete a directory entry by name.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:560 (ext2_delete_entry)
-    fn delete_entry(
-        &mut self,
-        name: &str,
-    ) -> Result<()> {
+    fn delete_entry(&mut self, name: &str) -> Result<()> {
         let fs = self.fs_arc()?;
         let target = self.find_entry_target(&fs, name).map_err(|err| {
             if err.error() == Errno::ENOENT {
@@ -2874,9 +2840,7 @@ fn write_lock_two_inodes<'a>(
 
 /// Acquires `inner.write()` locks on an arbitrary number of inodes in ascending ino order.
 /// Returns guards in the same order as the input slice.
-fn write_lock_multiple_inodes<'a>(
-    inodes: &[&'a Inode],
-) -> Vec<RwMutexWriteGuard<'a, InodeInner>> {
+fn write_lock_multiple_inodes<'a>(inodes: &[&'a Inode]) -> Vec<RwMutexWriteGuard<'a, InodeInner>> {
     use alloc::rc::Rc;
     use core::cell::RefCell;
 
@@ -3308,6 +3272,24 @@ mod test {
     }
 
     #[ktest]
+    fn vfs_inode_sync_all_flushes_device_once() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let file = root
+            .create(
+                "sync_me",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644),
+            )
+            .unwrap();
+
+        VfsInodeTrait::sync_all(file.as_ref()).unwrap();
+        assert_eq!(f.disk.flush_count(), 1);
+    }
+
+    #[ktest]
     fn namei_create_ok() {
         clocks::init_for_ktest();
 
@@ -3410,7 +3392,7 @@ mod test {
         let free_blocks_before_sync = f.ext2.super_block().free_blocks_count();
         root.unlink("old").unwrap();
         drop(old);
-        f.ext2.sync_all_inodes().unwrap();
+        f.ext2.sync_all().unwrap();
         assert_eq!(
             f.ext2.read_inode(old_ino).unwrap_err().error(),
             Errno::ENOENT
@@ -3598,7 +3580,7 @@ mod test {
         assert_eq!(lookup_ino(&root, "old").unwrap_err().error(), Errno::ENOENT);
         drop(replaced);
         drop(new);
-        f.ext2.sync_all_inodes().unwrap();
+        f.ext2.sync_all().unwrap();
         assert_eq!(
             f.ext2.read_inode(replaced_ino).unwrap_err().error(),
             Errno::ENOENT
@@ -3608,7 +3590,7 @@ mod test {
             Errno::ENOENT
         );
         drop(empty_dst);
-        f.ext2.sync_all_inodes().unwrap();
+        f.ext2.sync_all().unwrap();
         assert_eq!(
             f.ext2.read_inode(empty_dst_ino).unwrap_err().error(),
             Errno::ENOENT
@@ -3933,10 +3915,7 @@ mod test {
                 .error(),
             Errno::EINVAL
         );
-        assert_eq!(
-            dir_inode.unlink("").unwrap_err().error(),
-            Errno::EINVAL
-        );
+        assert_eq!(dir_inode.unlink("").unwrap_err().error(), Errno::EINVAL);
     }
 
     #[ktest]

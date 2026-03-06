@@ -275,7 +275,7 @@ PROTOCOL sync_all {
         4. LOCK    inner = upread.upgrade()
         5. PERSIST inner.persist_inode_and_sync(&fs)?
            // Serializes InodeDesc -> RawInode, writes to inode-table page cache
-           // Calls sync_metadata: recomputes sb free counts, writes sb + gdescs
+           // Final fs / device flush is handled by outer sync entry points
 
         6. UNLOCK  inner (implicit drop)
 
@@ -322,9 +322,9 @@ PROTOCOL sync_all {
                 (only marks desc as clean via clear_dirty)
                 => FS'.inodes[ino] = FS.inodes[ino], FS'.data[ino] = FS.data[ino]
         POST.sb:
-                persist_inode_and_sync calls sync_metadata which recomputes
-                free_blocks and free_inodes from group descriptors
-                => FS'.sb counters = actual counts
+                inode-local sync does not itself flush filesystem-global
+                metadata; that is handled by fs-level sync or outer wrappers
+                => inode-local durability holds after outer flush
         FRAME:  only self.inner accessed; no other inodes modified
         POST_ERR:
                 EIO on fs_arc, sync_data, persist, or device sync
@@ -365,7 +365,7 @@ PROTOCOL sync_data {
 
         5. UNLOCK  inner (implicit drop)
 
-        // Step 3: Flush device write cache
+        // Step 3: Flush device write cache (handled by outer VFS wrapper)
         6. EFFECT  fs.block_device().sync()?
 
         7. RETURN  Ok(())

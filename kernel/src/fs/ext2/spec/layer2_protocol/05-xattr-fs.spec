@@ -375,25 +375,25 @@ PROTOCOL fs_sync {
     CODE: kernel/src/fs/ext2/impl_for_vfs/fs.rs:17-23
 
     LOCKS:
-        Phase 1: per-inode READ/WRITE locks (during sync_all_inodes)
+        Phase 1: per-inode READ/WRITE locks (during sync_all)
         Phase 2: SB_WRITE, per-group locks (during sync_metadata)
         Phase 3: none (device sync)
 
     STEPS:
         // Phase 1: Sync all cached inodes
-        1. CALL  self.sync_all_inodes()?
+        1. CALL  self.sync_all()?
            // Iterates all block group inode caches.
            // For each cached inode: acquires inner lock, persists descriptor,
-           // flushes page cache, evicts freed inodes.
+           // flushes page cache, evicts freed inodes, syncs bitmaps, and
+           // writes dirty group descriptors into the descriptor-table segment.
 
-        // Phase 2: Sync filesystem metadata
+        // Phase 2: Sync filesystem-global metadata
         2. CALL  self.sync_metadata()?
-           // 2a. Syncs each group's descriptor and bitmaps to device.
-           // 2b. Recomputes sb.free_blocks from group descriptors.
-           // 2c. Recomputes sb.free_inodes from group descriptors.
-           // 2d. Writes group descriptor table to device.
-           // 2e. Writes primary superblock to device.
-           // 2f. Writes backup superblocks to device.
+           // 2a. Recomputes sb.free_blocks from group descriptors.
+           // 2b. Recomputes sb.free_inodes from group descriptors.
+           // 2c. Writes descriptor-table segment to device copies.
+           // 2d. Writes primary superblock to device.
+           // 2e. Writes backup superblocks to device.
 
         // Phase 3: Flush device write cache
         3. CALL  self.block_device().sync()?
@@ -401,7 +401,7 @@ PROTOCOL fs_sync {
         4. RETURN Ok(())
 
     CRASH_WINDOWS:
-        W1: During step 1 (sync_all_inodes).
+        W1: During step 1 (sync_all).
             Some inodes persisted to device, others not.
             Recovery: unpersisted inodes revert to FS.durable state.
         W2: During step 2a-2c (sync_metadata group writes).

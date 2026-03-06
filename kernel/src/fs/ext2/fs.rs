@@ -699,7 +699,7 @@ impl Ext2 {
         let sb_dirty = self.super_block.read().is_dirty();
         let mut any_group_dirty = false;
         for group in &self.block_groups {
-            if group.is_desc_dirty() || group.is_bitmap_dirty() {
+            if group.is_desc_dirty() {
                 any_group_dirty = true;
                 break;
             }
@@ -715,12 +715,6 @@ impl Ext2 {
         };
         if groups_count == 0 || self.block_groups.len() < groups_count {
             return_errno_with_message!(Errno::EIO, "inconsistent block group count");
-        }
-
-        for group in &self.block_groups {
-            group.sync_metadata(&self.group_descriptors_segment)?;
-            // SPEC: bitmap caches are persistent in-memory copies; flush if dirty.
-            group.sync_bitmaps()?;
         }
 
         let desc_bytes = groups_count * size_of::<RawGroupDesc>();
@@ -791,15 +785,15 @@ impl Ext2 {
         Ok(())
     }
 
-    /// Syncs cached inodes in all block groups and applies freed-inode counters.
-    pub fn sync_all_inodes(&self) -> Result<()> {
+    /// Syncs cached inodes and block-group-local metadata in all groups.
+    pub fn sync_all(&self) -> Result<()> {
         let mut total = EvictResult {
             freed_inodes: 0,
             freed_dirs: 0,
         };
 
         for group in &self.block_groups {
-            let result = group.sync_all_inodes()?;
+            let result = group.sync_all(&self.group_descriptors_segment)?;
             total.freed_inodes += result.freed_inodes;
             total.freed_dirs += result.freed_dirs;
         }
@@ -811,7 +805,7 @@ impl Ext2 {
             }
         }
 
-        Ok(())
+        self.sync_metadata()
     }
 }
 
@@ -836,9 +830,12 @@ mod test {
 
     use super::*;
     use crate::{
-        fs::ext2::testkit::{
-            self, ErrorBioDisk, Ext2FixtureBuilder, Ext2MemoryDisk, RawInodeBuilder,
-            build_group_desc_segment, make_valid_group_desc, make_valid_super_block,
+        fs::{
+            ext2::testkit::{
+                self, ErrorBioDisk, Ext2FixtureBuilder, Ext2MemoryDisk, RawInodeBuilder,
+                build_group_desc_segment, make_valid_group_desc, make_valid_super_block,
+            },
+            utils::FileSystem as FileSystemTrait,
         },
         time::clocks,
     };
@@ -848,6 +845,49 @@ mod test {
             .links_count(links_count)
             .dtime(dtime)
             .build()
+    }
+
+    #[ktest]
+    fn filesystem_sync_flushes_once_and_persists_root_updates() {
+        clocks::init_for_ktest();
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+
+        root.create(
+            "persisted",
+            InodeType::File,
+            FilePerm::from_bits_truncate(0o644),
+        )
+        .unwrap();
+
+        FileSystemTrait::sync(f.ext2.as_ref()).unwrap();
+        assert_eq!(f.disk.flush_count(), 1);
+
+        let reopened = Ext2::open(f.disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let reopened_root = reopened.read_inode(ROOT_INO).unwrap();
+        assert_eq!(
+            reopened_root.lookup("persisted").unwrap().inode_type(),
+            InodeType::File
+        );
+    }
+
+    #[ktest]
+    fn filesystem_sync_propagates_flush_error() {
+        clocks::init_for_ktest();
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+
+        root.create(
+            "flush_err",
+            InodeType::File,
+            FilePerm::from_bits_truncate(0o644),
+        )
+        .unwrap();
+
+        f.disk.set_flush_error(true);
+        let err = FileSystemTrait::sync(f.ext2.as_ref()).unwrap_err();
+        assert_eq!(err.error(), Errno::EIO);
+        assert_eq!(f.disk.flush_count(), 1);
     }
 
     #[ktest]
@@ -871,7 +911,7 @@ mod test {
         ext2.block_groups()[0].inc_free_inodes(1);
         assert!(ext2.block_groups()[0].is_desc_dirty());
 
-        ext2.sync_metadata().unwrap();
+        ext2.sync_all().unwrap();
 
         assert!(!ext2.super_block().is_dirty());
         assert!(!ext2.block_groups()[0].is_desc_dirty());
@@ -1369,7 +1409,7 @@ mod test {
 
         drop(cached);
         drop(child);
-        f.ext2.sync_all_inodes().unwrap();
+        f.ext2.sync_all().unwrap();
 
         let inode_bitmap = f.block_groups()[0].inode_bitmap();
         assert!(inode_bitmap.is_allocated((child_ino - 1) as u16));

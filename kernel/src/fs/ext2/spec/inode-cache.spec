@@ -171,11 +171,12 @@ impl BlockGroup {
 }
 ```
 
-## BlockGroup: sync_all_inodes
+## BlockGroup: sync_all
 
 ```rust
 impl BlockGroup {
-    /// Syncs and evicts unreferenced inodes from this group's cache.
+    /// Syncs and evicts unreferenced inodes from this group's cache, then
+    /// flushes group-local metadata.
     ///
     /// Linux: iput_final (fs/inode.c:1910) evicts when i_count reaches 0.
     /// Asterinas: deferred to sync time — evicts inodes with Arc::strong_count == 1.
@@ -183,7 +184,7 @@ impl BlockGroup {
     ///
     /// # Returns
     /// Aggregated `EvictResult` for superblock counter updates.
-    pub(super) fn sync_all_inodes(&self) -> Result<EvictResult>;
+    pub(super) fn sync_all(&self, group_descs: &USegment) -> Result<EvictResult>;
 }
 ```
 
@@ -214,15 +215,15 @@ impl Ext2 {
 }
 ```
 
-## Ext2: sync_all_inodes (updated)
+## Ext2: sync_all (updated)
 
 ```rust
 impl Ext2 {
-    /// Syncs all cached inodes across all block groups.
+    /// Syncs all cached inodes and group-local metadata across all block groups.
     ///
-    /// Iterates each BlockGroup, calls sync_all_inodes, aggregates
-    /// freed inode counts and updates superblock.
-    pub fn sync_all_inodes(&self) -> Result<()>;
+    /// Iterates each BlockGroup, calls sync_all, aggregates freed inode counts,
+    /// updates superblock, then syncs filesystem-global metadata.
+    pub fn sync_all(&self) -> Result<()>;
 }
 ```
 
@@ -312,12 +313,12 @@ Post (nlink == 0, file deleted — mirrors ext2_evict_inode):
 Post (failure):
 - `Err(EIO)` from sync or truncate. Inode remains in cache for retry.
 
-## BlockGroup::sync_all_inodes
+## BlockGroup::sync_all
 
 Syncs cached inodes and evicts unreferenced ones.
 
 Pre:
-- Called from `Ext2::sync_all_inodes()`.
+- Called from `Ext2::sync_all()`.
 
 Post:
 - Phase 1: Identify evictable inodes.
@@ -338,6 +339,10 @@ Post:
 
 - Returns aggregated `EvictResult`.
 
+- Phase 4: Sync group-local metadata.
+  - Flushes `inode_bitmap` and `block_bitmap` if dirty.
+  - Writes dirty `GroupDesc` into Ext2's `group_descriptors_segment`.
+
 Lock protocol:
 - Write lock on `inode_cache` only during extract_if (Phase 1).
 - No lock held during I/O (evict/sync in Phase 2 and 3).
@@ -356,7 +361,7 @@ Post:
 - Calls `self.block_groups[group_idx].lookup_inode(inode_idx, ino, self.self_ref.clone())`.
 - Returns the result.
 
-## Ext2::sync_all_inodes (updated)
+## Ext2::sync_all (updated)
 
 Iterates all groups, syncs and evicts.
 
@@ -365,11 +370,13 @@ Pre:
 
 Post:
 - For each `BlockGroup` in `self.block_groups`:
-  - Calls `group.sync_all_inodes()`.
+  - Calls `group.sync_all(group_descs)`.
   - Accumulates `EvictResult`.
 - If total `freed_inodes > 0`:
   - Acquires superblock write lock.
   - Increments `free_inodes_count` by `freed_inodes`.
+- Calls `self.sync_metadata()` to persist the descriptor-table segment and
+  superblock to disk.
 - Returns `Ok(())`.
 
 ## Inode::unlink (modification)
