@@ -112,6 +112,10 @@ impl Ext2 {
         self.blocks_per_group
     }
 
+    pub(super) fn block_group(&self, idx: usize) -> &BlockGroup {
+        &self.block_groups[idx]
+    }
+
     /// Returns a read guard of the superblock.
     pub fn super_block(&self) -> RwMutexReadGuard<'_, Dirty<SuperBlock>> {
         self.super_block.read()
@@ -811,11 +815,6 @@ impl Ext2 {
 
 #[cfg(ktest)]
 impl Ext2 {
-    /// Returns a reference to the block groups (test only).
-    pub(super) fn block_groups(&self) -> &[BlockGroup] {
-        &self.block_groups
-    }
-
     /// Returns a write guard of the superblock (test only).
     pub(super) fn super_block_write(&self) -> RwMutexWriteGuard<'_, Dirty<SuperBlock>> {
         self.super_block.write()
@@ -907,14 +906,14 @@ mod test {
             sb_guard.free_inodes_count()
         };
 
-        ext2.block_groups()[0].inc_free_blocks(3);
-        ext2.block_groups()[0].inc_free_inodes(1);
-        assert!(ext2.block_groups()[0].is_desc_dirty());
+        ext2.block_group(0).inc_free_blocks(3);
+        ext2.block_group(0).inc_free_inodes(1);
+        assert!(ext2.block_group(0).is_desc_dirty());
 
         ext2.sync_all().unwrap();
 
         assert!(!ext2.super_block().is_dirty());
-        assert!(!ext2.block_groups()[0].is_desc_dirty());
+        assert!(!ext2.block_group(0).is_desc_dirty());
 
         let groups_count = sb.block_groups_count() as usize;
         let desc_bytes = groups_count * size_of::<RawGroupDesc>();
@@ -971,7 +970,7 @@ mod test {
             .unwrap();
 
         let before_sb_free = f.ext2.super_block().free_blocks_count();
-        let before_group_free = f.block_groups()[0].free_blocks_count();
+        let before_group_free = f.block_group(0).free_blocks_count();
 
         let goal = Bid::new(f.sb.group_first_block_no(0) as u64);
         let range = f.ext2.alloc_blocks(8, goal).unwrap();
@@ -987,7 +986,7 @@ mod test {
         }
 
         assert_eq!(
-            f.block_groups()[0].free_blocks_count(),
+            f.block_group(0).free_blocks_count(),
             before_group_free - alloc_len as u16
         );
         assert_eq!(
@@ -996,7 +995,7 @@ mod test {
         );
 
         f.ext2.free_blocks(range.start, alloc_len).unwrap();
-        assert_eq!(f.block_groups()[0].free_blocks_count(), before_group_free);
+        assert_eq!(f.block_group(0).free_blocks_count(), before_group_free);
         assert_eq!(f.ext2.super_block().free_blocks_count(), before_sb_free);
     }
 
@@ -1052,7 +1051,7 @@ mod test {
             Errno::EIO
         );
 
-        let inode_bitmap_bid = f_free.block_groups()[0].inode_bitmap_bid().to_raw() as u32;
+        let inode_bitmap_bid = f_free.block_group(0).inode_bitmap_bid().to_raw() as u32;
         assert_eq!(
             f_free
                 .ext2
@@ -1076,7 +1075,7 @@ mod test {
 
         // Fixture builder only customizes group 0 free-block counter.
         // Make group 1 allocatable as well so goal-based start is observable.
-        f.block_groups()[1].inc_free_blocks(16);
+        f.block_group(1).inc_free_blocks(16);
         {
             let mut sb = f.ext2.super_block.write();
             sb.inc_free_blocks(16);
@@ -1099,30 +1098,27 @@ mod test {
             .unwrap();
 
         let before_sb_free = f.ext2.super_block().free_inodes_count();
-        let before_group_free = f.block_groups()[0].free_inodes_count();
-        let before_used_dirs = f.block_groups()[0].used_dirs_count();
+        let before_group_free = f.block_group(0).free_inodes_count();
+        let before_used_dirs = f.block_group(0).used_dirs_count();
 
         let ino = f.ext2.alloc_inode(ROOT_INO, InodeType::Dir).unwrap();
         assert!(ino >= f.sb.first_ino() && ino <= f.sb.total_inodes());
 
         let bit = ((ino - 1) % f.sb.inodes_per_group()) as u16;
-        let bitmap = f.block_groups()[0].inode_bitmap();
+        let bitmap = f.block_group(0).inode_bitmap();
         assert!(bitmap.is_allocated(bit));
         drop(bitmap);
         assert_eq!(f.ext2.super_block().free_inodes_count(), before_sb_free - 1);
-        assert_eq!(
-            f.block_groups()[0].free_inodes_count(),
-            before_group_free - 1
-        );
-        assert_eq!(f.block_groups()[0].used_dirs_count(), before_used_dirs + 1);
+        assert_eq!(f.block_group(0).free_inodes_count(), before_group_free - 1);
+        assert_eq!(f.block_group(0).used_dirs_count(), before_used_dirs + 1);
 
         // Free path now takes caller-provided inode type; no inode-table read is needed.
         let raw_dir = make_raw_inode(0o040755, 1, 0);
         f.ext2.write_inode_desc(ino, &raw_dir).unwrap();
         f.ext2.free_inode(ino, true).unwrap();
         assert_eq!(f.ext2.super_block().free_inodes_count(), before_sb_free);
-        assert_eq!(f.block_groups()[0].free_inodes_count(), before_group_free);
-        assert_eq!(f.block_groups()[0].used_dirs_count(), before_used_dirs);
+        assert_eq!(f.block_group(0).free_inodes_count(), before_group_free);
+        assert_eq!(f.block_group(0).used_dirs_count(), before_used_dirs);
     }
 
     #[ktest]
@@ -1185,10 +1181,10 @@ mod test {
         f_free.ext2.write_inode_desc(target_ino, &raw_file).unwrap();
 
         let before_sb = f_free.ext2.super_block().free_inodes_count();
-        let before_group = f_free.block_groups()[0].free_inodes_count();
+        let before_group = f_free.block_group(0).free_inodes_count();
         f_free.ext2.free_inode(target_ino, false).unwrap();
         assert_eq!(f_free.ext2.super_block().free_inodes_count(), before_sb);
-        assert_eq!(f_free.block_groups()[0].free_inodes_count(), before_group);
+        assert_eq!(f_free.block_group(0).free_inodes_count(), before_group);
     }
 
     #[ktest]
@@ -1411,7 +1407,7 @@ mod test {
         drop(child);
         f.ext2.sync_all().unwrap();
 
-        let inode_bitmap = f.block_groups()[0].inode_bitmap();
+        let inode_bitmap = f.block_group(0).inode_bitmap();
         assert!(inode_bitmap.is_allocated((child_ino - 1) as u16));
         drop(inode_bitmap);
 
@@ -1425,7 +1421,7 @@ mod test {
             .with_metadata_block_bitmap()
             .build()
             .unwrap();
-        let group = &f.block_groups()[0];
+        let group = f.block_group(0);
         let first = f.sb.group_first_block_no(0);
 
         let bitmap = group.block_bitmap();
@@ -1441,7 +1437,7 @@ mod test {
     #[ktest]
     fn load_block_bitmap_missing_itable_bits_returns_err() {
         let f = Ext2FixtureBuilder::new(2, 128).build().unwrap();
-        let group = &f.block_groups()[0];
+        let group = f.block_group(0);
         let first = f.sb.group_first_block_no(0);
 
         // Write a bitmap with only block_bitmap and inode_bitmap bits set,
@@ -1476,7 +1472,7 @@ mod test {
             .with_reserved_inode_bitmap()
             .build()
             .unwrap();
-        let group = &f.block_groups()[0];
+        let group = f.block_group(0);
 
         // Mutate on-disk bitmap after mount. Cache must remain unchanged.
         let mut bitmap_block = [0u8; BLOCK_SIZE];

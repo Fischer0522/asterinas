@@ -142,6 +142,10 @@ impl Inode {
         })
     }
 
+    pub fn is_dirty(&self) -> bool {
+        self.inner.read().is_dirty()
+    }
+
     pub(super) fn ino(&self) -> u32 {
         self.ino
     }
@@ -792,7 +796,7 @@ impl Inode {
         }
     }
 
-    pub(super) fn sync_all(&self) -> Result<()> {
+    pub(super) fn sync_all(&self, sync_inode_table: bool) -> Result<()> {
         // SPEC: fsync step 1 flushes dirty data pages before metadata writeback.
         // Linux: /root/linux/fs/buffer.c:646 (generic_buffers_fsync)
         // -> /root/linux/mm/filemap.c:777 (file_write_and_wait_range).
@@ -804,16 +808,23 @@ impl Inode {
         // SPEC: fsync step 2 persists inode metadata. The caller is
         // responsible for the final device-cache flush.
         // Linux: /root/linux/fs/buffer.c:619 (sync_inode_metadata).
-        self.sync_metadata()
+        self.sync_metadata(sync_inode_table)?;
+
+        Ok(())
     }
 
     /// Persists inode metadata without flushing the device write cache.
     ///
     /// Linux: /root/linux/fs/buffer.c:619 (sync_inode_metadata)
-    pub(super) fn sync_metadata(&self) -> Result<()> {
+    pub(super) fn sync_metadata(&self, sync_inode_table: bool) -> Result<()> {
         let fs = self.fs_arc()?;
         let mut inner = self.inner.write();
         inner.persist(self.ino, self.type_, &fs)?;
+
+        if sync_inode_table {
+            let block_group = fs.block_group(self.block_group_idx);
+            block_group.sync_inode_table()?;
+        }
         Ok(())
     }
 
@@ -825,7 +836,7 @@ impl Inode {
     /// Linux: /root/linux/fs/ext2/inode.c:72 (ext2_evict_inode)
     pub(super) fn prepare_for_evict(&self) -> Result<bool> {
         if self.inner.read().desc.links_count > 0 {
-            self.sync_all()?;
+            self.sync_all(false)?;
             return Ok(false);
         }
 

@@ -192,7 +192,7 @@ impl VfsInode for Inode {
 
     fn sync_all(&self) -> Result<()> {
         // Linux: /root/linux/fs/ext2/file.c:155 (ext2_fsync)
-        Inode::sync_all(self)?;
+        Inode::sync_all(self, true)?;
         if Inode::fs_arc(self)?.block_device().sync()? != BioStatus::Complete {
             return_errno_with_message!(Errno::EIO, "failed to flush block device");
         }
@@ -202,6 +202,11 @@ impl VfsInode for Inode {
     fn sync_data(&self) -> Result<()> {
         // Linux: /root/linux/fs/buffer.c:602 (generic_buffers_fsync_noflush)
         Inode::sync_data(self)?;
+
+        if self.is_dirty() {
+            Inode::sync_metadata(self, true)?;
+        }
+
         if Inode::fs_arc(self)?.block_device().sync()? != BioStatus::Complete {
             return_errno_with_message!(Errno::EIO, "failed to flush block device");
         }

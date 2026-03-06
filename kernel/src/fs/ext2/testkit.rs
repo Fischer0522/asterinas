@@ -716,8 +716,8 @@ impl Ext2Fixture {
         self.ext2.read_inode(ROOT_INO)
     }
 
-    pub(super) fn block_groups(&self) -> &[super::block_group::BlockGroup] {
-        self.ext2.block_groups()
+    pub(super) fn block_group(&self, idx: usize) -> &super::block_group::BlockGroup {
+        self.ext2.block_group(idx)
     }
 
     pub(super) fn read_inode_bitmap(&self, group_idx: usize) -> Result<[u8; BLOCK_SIZE]> {

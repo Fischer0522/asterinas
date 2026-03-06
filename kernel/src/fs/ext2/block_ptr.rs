@@ -923,7 +923,7 @@ mod test {
     }
 
     fn reload_group0_cached_bitmaps_from_disk(f: &testkit::Ext2Fixture) {
-        let group = &f.block_groups()[0];
+        let group = f.block_group(0);
 
         let mut block_bitmap_buf = vec![0u8; BLOCK_SIZE];
         f.disk
@@ -1253,7 +1253,7 @@ mod test {
         // All three isolated free blocks should be consumed.
         let block_size = ext2.block_size();
         assert_eq!(ext2.super_block().free_blocks_count(), 0);
-        assert_eq!(f.block_groups()[0].free_blocks_count(), 0);
+        assert_eq!(f.block_group(0).free_blocks_count(), 0);
         assert_eq!(mapping.desc.blocks, ((block_size / SECTOR_SIZE) as u32) * 3);
     }
 

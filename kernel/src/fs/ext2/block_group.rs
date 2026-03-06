@@ -338,15 +338,15 @@ impl BlockGroup {
         // Phase 3: sync still-referenced cached inodes.
         let remaining_inodes: Vec<Arc<Inode>> = self.inode_cache.read().values().cloned().collect();
         for inode in &remaining_inodes {
-            inode.sync_all()?;
+            inode.sync_all(false)?;
         }
-        
+
         //Phase 4: sync inode table page cache.
         self.sync_inode_table()?;
         Ok(evicted)
     }
 
-    fn sync_inode_table(&self) -> Result<()> {
+    pub(super) fn sync_inode_table(&self) -> Result<()> {
         let size = self.inodes_per_group as usize * self.inode_size;
         let range = 0..size;
         self.inode_table_cache.evict_range(range)
@@ -869,7 +869,7 @@ mod test {
             .with_root()
             .build()
             .unwrap();
-        let group = &fixture.block_groups()[1];
+        let group = fixture.block_group(1);
 
         assert_eq!(group.idx(), 1);
         assert_eq!(
@@ -898,7 +898,7 @@ mod test {
             .with_free_inodes(64, 64)
             .build()
             .unwrap();
-        let group = &fixture.block_groups()[0];
+        let group = fixture.block_group(0);
         assert_eq!(group.free_blocks_count(), 20);
         assert!(!group.is_desc_dirty());
 
