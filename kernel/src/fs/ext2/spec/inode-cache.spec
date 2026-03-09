@@ -379,6 +379,11 @@ Post:
   superblock to disk.
 - Returns `Ok(())`.
 
+Invariant:
+- `sync_all()` does not maintain any extra deleted-inode weak tracking set.
+- Deleted inodes already removed from the main block-group cache are not
+  revisited by an additional filesystem-global scan during sync.
+
 ## Inode::unlink (modification)
 
 Current (fs/ext2/inode.rs:3204-3211):
@@ -394,25 +399,29 @@ if child_inner.desc.links_count == 0 {
 New:
 ```rust
 if child_inner.desc.links_count == 0 {
-    child_inner.desc.dtime = now();
-    child_inner.is_freed = true;
+    child.transition_to_deletion_pending()?;
+    fs.remove_inode_cache(child_ino);
+    // Optional fast reclaim if only the current local reference remains.
 }
 child_inner.persist_inode_and_sync(&fs)?;
 ```
 
-Rationale: Defer resource reclamation to eviction time (BlockGroup::evict_inode).
-This fixes the data block leak: current code calls free_inode (bitmap only)
-without truncate_blocks. Eviction path does both.
+Rationale: Once `nlink == 0`, the inode is no longer lookup-reachable and must
+leave the main inode cache immediately. Final reclaim may happen immediately,
+during normal cache-driven sync eviction if still cached, or via `Drop`
+fallback if references escape above the filesystem layer.
 
 ## Inode::rmdir (modification)
 
-Similar change: remove immediate `fs.free_inode()` call, set `is_freed = true`.
-Eviction handles truncate + bitmap free.
+Similar change: when `nlink` reaches zero, transition to `DeletionPending`
+and remove the inode from the main cache. No extra deleted-inode tracking set
+is introduced.
 
 ## Inode::rename (modification for overwrite case)
 
 When rename overwrites an existing inode and its nlink reaches 0:
-same pattern — set `is_freed = true`, defer reclamation to eviction.
+same pattern — move it to `DeletionPending`, remove it from the main cache,
+and let fast reclaim / Drop finalization finish the lifecycle.
 
 ## Inode::create (cache insertion point)
 
@@ -448,16 +457,15 @@ Linux: VFS provides global inode cache via iget_locked / iput / evict_inode.
 
 Linux: iput_final (fs/inode.c:1910) triggers eviction immediately when
   i_count reaches 0 (either LRU or direct evict depending on drop_inode).
-  → Asterinas: Eviction is deferred to sync time. Unreferenced inodes
-  (Arc::strong_count == 1) are evicted during sync_all_inodes.
-  Reason: No shrinker/LRU infrastructure in Asterinas yet. Acceptable for
-  current usage patterns. TODO: integrate with memory pressure callbacks
-  when Asterinas supports periodic writeback/shrinker.
+  → Asterinas: For deleted inodes, zero-link transition removes them from the
+  main cache immediately. Fast reclaim may happen at delete time, while `Drop`
+  serves as the fallback finalizer if references escape above the filesystem.
+  Normal sync continues to operate only on the ordinary block-group cache.
 
 Linux: ext2_evict_inode (fs/ext2/inode.c:72) is called by VFS evict()
   when inode refcount drops to 0.
-  → Asterinas: BlockGroup::evict_inode performs equivalent logic
-  (truncate_blocks + free_inode) during sync-time eviction pass.
+  → Asterinas: a unified reclaim helper is shared by delete-time fast reclaim
+  and Drop finalization.
   Reason: Same logical intent, different trigger point.
 
 Linux: ext2_new_inode inserts into VFS inode cache immediately via

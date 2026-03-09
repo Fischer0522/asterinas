@@ -342,8 +342,11 @@ Linux: `ext2_rename` updates entries in folio/pagecache chunks via `ext2_set_lin
   Reason: No folio-backed ext2 mutation path in this phase.
 
 Linux: unlink final inode reclamation is deferred to inode eviction/orphan lifecycle.
-  → Asterinas: May reclaim inode allocation when link count reaches zero in unlink path.
-  Reason: Phase 11 orphan/evict pipeline is not integrated yet; this phase avoids leaked inode allocations.
+  → Asterinas: Zero-link transition removes the inode from the main cache
+  immediately, may perform fast reclaim if only the transient local reference
+  remains, and otherwise leaves final reclaim to the eventual fallback path.
+  Reason: This phase models deleted inodes as runtime-only `DeletionPending`
+  objects without a filesystem-global weak tracking set.
 
 ## Refine Prompt
 [RELY]
