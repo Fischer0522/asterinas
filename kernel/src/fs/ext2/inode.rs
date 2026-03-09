@@ -701,7 +701,6 @@ impl Inode {
             child_inner.set_file_size(0);
             child_inner.sub_links_count_saturating(2);
             child_inner.set_dtime(now());
-            child_inner.set_freed(true);
         }
 
         let mut parent_inner = self.inner.write();
@@ -811,12 +810,20 @@ impl Inode {
         // SPEC: fsync step 1 flushes dirty data pages before metadata writeback.
         // Linux: /root/linux/fs/buffer.c:646 (generic_buffers_fsync)
         // -> /root/linux/mm/filemap.c:777 (file_write_and_wait_range).
+        let mapping_backend = {
+            let inner = self.inner.read();
+            Arc::clone(inner.backend())
+        };
         {
             let inner = self.inner.read();
             inner.sync_data_pages()?;
         }
 
-        // SPEC: fsync step 2 persists inode metadata. The caller is
+        // SPEC: fsync step 2 flushes inode-local indirect metadata before
+        // persisting inode-table state.
+        mapping_backend.mapping.write().sync_indirect_blocks()?;
+
+        // SPEC: fsync step 3 persists inode metadata. The caller is
         // responsible for the final device-cache flush.
         // Linux: /root/linux/fs/buffer.c:619 (sync_inode_metadata).
         self.sync_metadata(sync_inode_table)?;
@@ -860,7 +867,6 @@ impl Inode {
         let mapping_backend = Arc::clone(inner.backend());
         let mut mapping = mapping_backend.mapping.write();
         inner.set_dtime(now());
-        inner.set_freed(true);
         inner.set_file_size(0);
         inner.set_file_acl(0);
         mapping.truncate_blocks(&fs, 0)?;
@@ -873,6 +879,10 @@ impl Inode {
 
     pub(super) fn sync_data(&self) -> Result<()> {
         let fs = self.fs_arc()?;
+        let mapping_backend = {
+            let inner = self.inner.read();
+            Arc::clone(inner.backend())
+        };
 
         // SPEC: fdatasync writes back dirty data pages first. The caller is
         // responsible for the final device-cache flush.
@@ -881,6 +891,10 @@ impl Inode {
             let inner = self.inner.read();
             inner.sync_data_pages()?;
         }
+
+        // fdatasync must also persist dirty indirect metadata needed to reach
+        // newly written data blocks before the final device flush.
+        mapping_backend.mapping.write().sync_indirect_blocks()?;
 
         // SPEC: Linux writes metadata when I_DIRTY_DATASYNC is set.
         // Linux: /root/linux/fs/buffer.c:616-619.
@@ -1048,7 +1062,6 @@ impl Inode {
         // Defer ext2_evict_inode-style reclamation to cache eviction.
         if child_inner.links_count() == 0 {
             child_inner.set_dtime(now());
-            child_inner.set_freed(true);
         }
 
         Ok(())
@@ -1302,7 +1315,6 @@ impl Inode {
             existing_inner.sub_links_count_saturating(1);
             if existing_inner.links_count() == 0 {
                 existing_inner.set_dtime(now());
-                existing_inner.set_freed(true);
             }
         }
 
@@ -1482,7 +1494,6 @@ struct InodeInner {
     /// Dedicated backend used by pager callbacks.
     backend: Arc<InodeBackend>,
     fs: Weak<Ext2>,
-    is_freed: bool,
 }
 
 /// Scan result for directory slot search.
@@ -1519,7 +1530,10 @@ impl InodeInner {
         let num_page_bytes = (desc.size as usize).align_up(BLOCK_SIZE);
         let num_pages = num_page_bytes / BLOCK_SIZE;
         let backend = InodeBackend::new(
-            InodeMapping::new(InodeMappingDesc::from_parts(desc.blocks, desc.block_ptrs)),
+            InodeMapping::new_with_fs(
+                InodeMappingDesc::from_parts(desc.blocks, desc.block_ptrs),
+                fs.clone(),
+            ),
             fs.clone(),
             num_pages,
         );
@@ -1538,7 +1552,6 @@ impl InodeInner {
             page_cache,
             backend,
             fs,
-            is_freed: false,
         }
     }
 
@@ -1685,14 +1698,6 @@ impl InodeInner {
         self.desc.file_acl = file_acl;
     }
 
-    fn is_freed(&self) -> bool {
-        self.is_freed
-    }
-
-    fn set_freed(&mut self, is_freed: bool) {
-        self.is_freed = is_freed;
-    }
-
     fn fs_arc(&self) -> Result<Arc<Ext2>> {
         self.fs
             .upgrade()
@@ -1815,7 +1820,7 @@ impl InodeInner {
     ) -> Result<()> {
         let block_size = fs.block_size();
         let mut current_offset = offset;
-        let mapping = self.backend.mapping.read();
+        let mut mapping = self.backend.mapping.write();
         while current_offset < end {
             let iblock = u32::try_from(current_offset / block_size)
                 .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
@@ -1883,7 +1888,7 @@ impl InodeInner {
         // end is already checked in `Inode::write_direct_at`.
         let end = offset + write_len;
         let mut current_offset = offset;
-        let mapping = self.backend.mapping.read();
+        let mut mapping = self.backend.mapping.write();
 
         while current_offset < end {
             let iblock = u32::try_from(current_offset / block_size)
@@ -3221,8 +3226,8 @@ mod test {
             ext2::{
                 fs::ROOT_INO,
                 testkit::{
-                    self, encode_dir_entry, CollectDirentVisitor, ErrorBioDisk, Ext2FixtureBuilder,
-                    RawInodeBuilder, StopAfterVisitor,
+                    self, CollectDirentVisitor, ErrorBioDisk, Ext2FixtureBuilder, RawInodeBuilder,
+                    StopAfterVisitor, encode_dir_entry,
                 },
             },
             utils::{
@@ -4632,9 +4637,11 @@ mod test {
         assert_eq!(file.read_at(0, &mut out_writer).unwrap(), block_size);
 
         assert_eq!(&out[..punch_off], &payload[..punch_off]);
-        assert!(out[punch_off..punch_off + punch_len]
-            .iter()
-            .all(|byte| *byte == 0));
+        assert!(
+            out[punch_off..punch_off + punch_len]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
         assert_eq!(
             &out[punch_off + punch_len..],
             &payload[punch_off + punch_len..]

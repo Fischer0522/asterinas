@@ -51,10 +51,12 @@ mod dir;
 mod fs;
 mod fs_type;
 mod impl_for_vfs;
+mod indirect_block_manager;
 mod inode;
 mod prelude;
 mod super_block;
-#[cfg(ktest)]
-mod testkit;
 mod utils;
 mod xattr;
+
+#[cfg(ktest)]
+mod testkit;
