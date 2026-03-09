@@ -218,28 +218,39 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        let mut inner = self.inner.write();
-        // Linux: /root/linux/fs/ext2/inode.c:48-55 (ext2_inode_is_fast_symlink).
-        // Keep resize invalid for existing fast symlinks (inline payload), but
-        // allow empty newly-created symlink inodes to grow into slow symlinks.
-        if inner.desc.is_fast_symlink(block_size) && inner.file_size() != 0 {
-            return_errno!(Errno::EINVAL);
-        }
+        let old_size = {
+            let inner = self.inner.read();
+            // Linux: /root/linux/fs/ext2/inode.c:48-55 (ext2_inode_is_fast_symlink).
+            // Keep resize invalid for existing fast symlinks (inline payload), but
+            // allow empty newly-created symlink inodes to grow into slow symlinks.
+            if inner.desc.is_fast_symlink(block_size) && inner.file_size() != 0 {
+                return_errno!(Errno::EINVAL);
+            }
 
-        if inner
-            .desc
-            .flags
-            .intersects(FileFlags::APPEND_ONLY | FileFlags::IMMUTABLE)
-        {
-            return_errno!(Errno::EPERM);
-        }
+            if inner
+                .desc
+                .flags
+                .intersects(FileFlags::APPEND_ONLY | FileFlags::IMMUTABLE)
+            {
+                return_errno!(Errno::EPERM);
+            }
 
-        let old_size = inner.file_size();
+            inner.file_size()
+        };
 
         if new_size == old_size {
             return Ok(());
         }
 
+        if new_size < old_size && new_size % block_size != 0 {
+            let zero_to = new_size.align_up(block_size);
+            self.inner
+                .read()
+                .page_cache()
+                .fill_zeros(new_size..zero_to)?;
+        }
+
+        let mut inner = self.inner.write();
         if new_size < old_size {
             inner.shrink(new_size)
         } else {
@@ -2055,17 +2066,20 @@ impl InodeInner {
     fn shrink(&mut self, new_size: usize) -> Result<()> {
         let fs = self.fs_arc()?;
         let block_size = fs.block_size();
-        let old_size = self.desc.size;
-        if new_size % block_size != 0 {
-            let zero_to = new_size.align_up(block_size);
-            self.page_cache.fill_zeros(new_size..zero_to)?;
+        let old_size = self.desc.size as usize;
+        let old_size_aligned = old_size.align_up(block_size);
+        let new_size_aligned = new_size.align_up(block_size);
+
+        if new_size_aligned < old_size_aligned {
+            self.page_cache
+                .discard_range(new_size_aligned..old_size_aligned);
         }
-        self.resize_page_cache_and_update_npages(new_size)?;
+        self.resize_page_cache_and_update_npages(new_size_aligned)?;
 
         let backend = self.backend.clone();
         let mut mapping = backend.mapping.write();
         if let Err(err) = mapping.truncate_blocks(&fs, new_size) {
-            self.resize_page_cache_and_update_npages(old_size as usize)?;
+            self.resize_page_cache_and_update_npages(old_size_aligned)?;
             return Err(err);
         }
         let snapshot = *mapping.get_desc();
@@ -3207,8 +3221,8 @@ mod test {
             ext2::{
                 fs::ROOT_INO,
                 testkit::{
-                    self, CollectDirentVisitor, ErrorBioDisk, Ext2FixtureBuilder, RawInodeBuilder,
-                    StopAfterVisitor, encode_dir_entry,
+                    self, encode_dir_entry, CollectDirentVisitor, ErrorBioDisk, Ext2FixtureBuilder,
+                    RawInodeBuilder, StopAfterVisitor,
                 },
             },
             utils::{
@@ -4536,6 +4550,32 @@ mod test {
     }
 
     #[ktest]
+    fn file_sparse_shrink_discards_dirty_truncated_pages() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let file = root
+            .create(
+                "sparse_shrink",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644),
+            )
+            .unwrap();
+        let block_size = f.ext2.block_size();
+        let sparse_size = block_size * 3;
+
+        VfsInodeTrait::resize(file.as_ref(), sparse_size).unwrap();
+        let vmo = VfsInodeTrait::page_cache(file.as_ref()).unwrap();
+        let dirty = [0x5au8; 32];
+        vmo.write_bytes(block_size * 2, &dirty).unwrap();
+
+        VfsInodeTrait::resize(file.as_ref(), block_size).unwrap();
+        assert_eq!(inode_size(&file), block_size);
+        assert_eq!(vmo.size(), block_size.align_up(BLOCK_SIZE));
+    }
+
+    #[ktest]
     fn falloc_alloc_extends_size() {
         clocks::init_for_ktest();
 
@@ -4592,11 +4632,9 @@ mod test {
         assert_eq!(file.read_at(0, &mut out_writer).unwrap(), block_size);
 
         assert_eq!(&out[..punch_off], &payload[..punch_off]);
-        assert!(
-            out[punch_off..punch_off + punch_len]
-                .iter()
-                .all(|byte| *byte == 0)
-        );
+        assert!(out[punch_off..punch_off + punch_len]
+            .iter()
+            .all(|byte| *byte == 0));
         assert_eq!(
             &out[punch_off + punch_len..],
             &payload[punch_off + punch_len..]
