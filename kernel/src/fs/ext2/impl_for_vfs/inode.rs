@@ -3,8 +3,10 @@
 use core::time::Duration;
 
 use aster_block::bio::BioStatus;
+use device_id::DeviceId;
 
 use crate::{
+    device,
     fs::{
         ext2::{FilePerm, Inode},
         inode_handle::FileIo,
@@ -127,7 +129,27 @@ impl VfsInode for Inode {
         _access_mode: AccessMode,
         _status_flags: StatusFlags,
     ) -> Option<Result<Box<dyn FileIo>>> {
-        None
+        match self.inode_type() {
+            inode_type @ (InodeType::BlockDevice | InodeType::CharDevice) => {
+                let device_id = self.device_id();
+                let Some(device_id) = DeviceId::from_encoded_u64(device_id) else {
+                    return Some(Err(Error::with_message(
+                        Errno::ENODEV,
+                        "the device ID is invalid",
+                    )));
+                };
+                let device_type = inode_type.device_type().unwrap();
+                let Some(device) = device::lookup(device_type, device_id) else {
+                    return Some(Err(Error::with_message(
+                        Errno::ENODEV,
+                        "the required device ID does not exist",
+                    )));
+                };
+
+                Some(device.open())
+            }
+            _ => None,
+        }
     }
 
     fn create(&self, name: &str, type_: InodeType, mode: InodeMode) -> Result<Arc<dyn VfsInode>> {

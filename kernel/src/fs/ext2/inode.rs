@@ -914,14 +914,17 @@ impl Inode {
 
         let fs = self.fs_arc()?;
         let mut inner = self.inner.write();
+        // inner.page_cache.discard_range(0..inner.file_size());
+        inner.resize_page_cache_and_update_npages(0)?;
         let mapping_backend = Arc::clone(inner.backend());
-        let mut mapping = mapping_backend.mapping.write();
         inner.set_dtime(now());
         inner.set_file_size(0);
         inner.set_file_acl(0);
-        mapping.truncate_blocks(&fs, 0)?;
-        inner.sync_desc_mapping_from_snapshot(*mapping.get_desc());
-        drop(mapping);
+        if inner.desc.blocks > 0 {
+            let mut mapping = mapping_backend.mapping.write();
+            mapping.truncate_blocks(&fs, 0)?;
+            inner.sync_desc_mapping_from_snapshot(*mapping.get_desc());
+        }
         inner.persist(self.ino, self.type_, &fs)?;
 
         Ok(true)
@@ -3259,7 +3262,7 @@ impl TryFrom<&RawInode> for InodeDesc {
         }
 
         let type_ = InodeType::from_raw_mode(mode)?;
-        let perm = FilePerm::from_bits_truncate(mode);
+        let perm = FilePerm::from_bits_truncate(mode & 0o7777);
         let uid = (raw.uid as u32) | ((raw.uid_high as u32) << 16);
         let gid = (raw.gid as u32) | ((raw.gid_high as u32) << 16);
         let atime = Duration::from_secs(raw.atime as u64);
@@ -3300,7 +3303,7 @@ impl TryFrom<&RawInode> for InodeDesc {
 
 impl From<&InodeDesc> for RawInode {
     fn from(desc: &InodeDesc) -> Self {
-        let mode = desc.perm.0;
+        let mode = (desc.type_ as u16) | (desc.perm.0 & 0o7777);
         let uid = desc.uid as u16;
         let gid = desc.gid as u16;
         let uid_high = (desc.uid >> 16) as u16;
@@ -3404,8 +3407,8 @@ mod test {
                 },
             },
             utils::{
-                Inode as VfsInodeTrait, InodeIo, StatusFlags, XattrName, XattrNamespace,
-                XattrSetFlags,
+                Inode as VfsInodeTrait, InodeIo, InodeMode, MknodType, StatusFlags, XattrName,
+                XattrNamespace, XattrSetFlags,
             },
         },
         prelude::*,
@@ -3853,6 +3856,48 @@ mod test {
         raw_dir.size_high = u32::MAX;
         let dir_desc = InodeDesc::try_from(&raw_dir).unwrap();
         assert_eq!(dir_desc.size, 7);
+    }
+
+    #[ktest]
+    fn unlink_special_inode_does_not_free_encoded_rdev_block() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let free_blocks_before = f.ext2.super_block().free_blocks_count();
+
+        let special = VfsInodeTrait::mknod(
+            root.as_ref(),
+            "null",
+            InodeMode::from_bits_truncate(0o666),
+            MknodType::CharDevice(encode_device_numbers(1, 3)),
+        )
+        .unwrap();
+        let special_ino = special.ino();
+
+        root.unlink("null").unwrap();
+        drop(special);
+        f.ext2.sync_all().unwrap();
+
+        assert_eq!(f.ext2.super_block().free_blocks_count(), free_blocks_before);
+        assert_eq!(f.ext2.read_inode(special_ino as u32).unwrap_err().error(), Errno::ENOENT);
+    }
+
+    #[ktest]
+    fn raw_inode_roundtrip_preserves_special_inode_type_on_mode_update() {
+        let mut raw = make_raw_inode(0o020600);
+        raw.block[0] = 0x0103;
+
+        let mut desc = InodeDesc::try_from(&raw).unwrap();
+        assert_eq!(desc.type_, InodeType::CharDevice);
+        assert_eq!(desc.perm.bits(), 0o600);
+        assert_eq!(desc.decode_device_id(), encode_device_numbers(1, 3));
+
+        desc.perm = FilePerm::from_bits_truncate(0o666);
+        let updated_raw = RawInode::from(&desc);
+        assert_eq!(updated_raw.mode, 0o020666);
+        assert_eq!(updated_raw.block[0], 0x0103);
+        assert_eq!(updated_raw.block[1], 0);
     }
 
     #[ktest]
