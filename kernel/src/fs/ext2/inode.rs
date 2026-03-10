@@ -607,6 +607,27 @@ impl Inode {
         let mut inner = self.inner.write();
         let old_size = inner.file_size();
 
+        if inner.should_fallback_direct_write(&fs, offset, end, block_size)? {
+            if let Err(err) = inner.prepare_continuous_blocks(&fs, offset, end, block_size, false) {
+                inner.write_failed_cleanup(&fs, old_size, end, block_size);
+                return Err(err);
+            }
+
+            if let Err(err) = inner.page_cache().pages().write(offset, reader) {
+                inner.write_failed_cleanup(&fs, old_size, end, block_size);
+                return Err(err.into());
+            }
+
+            let current = now();
+            inner.touch_mtime_ctime(current);
+            drop(inner);
+
+            self.sync_data()?;
+            return Ok(write_len);
+        }
+
+        inner.zero_direct_write_eof_tail(&fs, old_size, offset, block_size)?;
+
         if let Err(err) = inner.prepare_continuous_blocks(&fs, offset, end, block_size, true) {
             inner.write_failed_cleanup(&fs, old_size, end, block_size);
             return Err(err);
@@ -2300,6 +2321,77 @@ impl InodeInner {
             }
         }
 
+        Ok(())
+    }
+
+    /// Returns whether a direct write touching current i_size must fall back to buffered I/O.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:823-854 (`ext2_iomap_begin`)
+    fn should_fallback_direct_write(
+        &self,
+        fs: &Ext2,
+        offset: usize,
+        end: usize,
+        block_size: usize,
+    ) -> Result<bool> {
+        if block_size == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+        }
+
+        let scan_end = end.min(self.file_size());
+        if offset >= scan_end {
+            return Ok(false);
+        }
+
+        let start_block = offset / block_size;
+        let end_block = scan_end.div_ceil(block_size);
+        let mapping_backend = Arc::clone(self.backend());
+        let mapping = mapping_backend.mapping.read();
+
+        for iblock in start_block..end_block {
+            let iblock = u32::try_from(iblock)
+                .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
+            if mapping.get_block(fs, iblock)?.is_none() {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Zeroes the hidden stale-data window in the old EOF block before direct EOF extension.
+    ///
+    /// Linux: /root/linux/fs/direct-io.c:852-875 (`dio_zero_block`)
+    fn zero_direct_write_eof_tail(
+        &self,
+        fs: &Ext2,
+        old_size: usize,
+        offset: usize,
+        block_size: usize,
+    ) -> Result<()> {
+        if block_size == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+        }
+        if offset <= old_size || old_size.is_multiple_of(block_size) {
+            return Ok(());
+        }
+
+        let zero_end = offset.min(old_size.align_up(block_size));
+        if zero_end <= old_size {
+            return Ok(());
+        }
+
+        let eof_iblock = u32::try_from(old_size / block_size)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
+        let mapping_backend = Arc::clone(self.backend());
+        let mapping = mapping_backend.mapping.read();
+        let Some(_bid) = mapping.get_block(fs, eof_iblock)? else {
+            return Ok(());
+        };
+        drop(mapping);
+
+        self.page_cache().fill_zeros(old_size..zero_end)?;
+        self.sync_data_pages()?;
         Ok(())
     }
 
@@ -4168,6 +4260,122 @@ mod test {
     }
 
     #[ktest]
+    fn file_direct_write_sparse_hole_fallback_ok() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .build()
+            .unwrap();
+        let block_size = f.ext2.block_size();
+        let file =
+            make_live_file_inode(&f.ext2, 72, block_size * 3, 0, FileFlags::empty(), [0; 15]);
+        let payload = vec![0x6bu8; block_size];
+
+        let mut payload_reader = VmReader::from(payload.as_slice()).to_fallible();
+        assert_eq!(
+            InodeIo::write_at(
+                file.as_ref(),
+                block_size,
+                &mut payload_reader,
+                StatusFlags::O_DIRECT
+            )
+            .unwrap(),
+            block_size
+        );
+
+        let mut out = vec![0u8; block_size];
+        let mut out_writer = VmWriter::from(out.as_mut_slice()).to_fallible();
+        assert_eq!(
+            InodeIo::read_at(
+                file.as_ref(),
+                block_size,
+                &mut out_writer,
+                StatusFlags::O_DIRECT
+            )
+            .unwrap(),
+            block_size
+        );
+        assert_eq!(out, payload);
+
+        let mut untouched_hole = vec![0xa5u8; block_size];
+        let mut hole_writer = VmWriter::from(untouched_hole.as_mut_slice()).to_fallible();
+        assert_eq!(
+            InodeIo::read_at(file.as_ref(), 0, &mut hole_writer, StatusFlags::O_DIRECT).unwrap(),
+            block_size
+        );
+        assert!(untouched_hole.iter().all(|byte| *byte == 0));
+    }
+
+    #[ktest]
+    fn file_direct_write_extend_eof_zero_tail_ok() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .build()
+            .unwrap();
+        let block_size = f.ext2.block_size();
+        let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
+        let old_size = 100usize;
+        let data_bid = 80u32;
+
+        let mut on_disk_block = vec![0xaau8; block_size];
+        on_disk_block[..old_size].fill(0x11);
+        f.disk
+            .segment()
+            .write_bytes(Bid::new(data_bid as u64).to_offset(), &on_disk_block)
+            .unwrap();
+
+        let mut ptrs = [0u32; 15];
+        ptrs[0] = data_bid;
+        let file = make_live_file_inode(
+            &f.ext2,
+            73,
+            old_size,
+            sectors_per_block,
+            FileFlags::empty(),
+            ptrs,
+        );
+        let payload = vec![0x5cu8; block_size];
+
+        let mut payload_reader = VmReader::from(payload.as_slice()).to_fallible();
+        assert_eq!(
+            InodeIo::write_at(
+                file.as_ref(),
+                block_size,
+                &mut payload_reader,
+                StatusFlags::O_DIRECT
+            )
+            .unwrap(),
+            block_size
+        );
+
+        let mut first_block = vec![0u8; block_size];
+        let mut first_writer = VmWriter::from(first_block.as_mut_slice()).to_fallible();
+        assert_eq!(
+            InodeIo::read_at(file.as_ref(), 0, &mut first_writer, StatusFlags::empty()).unwrap(),
+            block_size
+        );
+        assert!(first_block[..old_size].iter().all(|byte| *byte == 0x11));
+        assert!(first_block[old_size..].iter().all(|byte| *byte == 0));
+
+        let mut second_block = vec![0u8; block_size];
+        let mut second_writer = VmWriter::from(second_block.as_mut_slice()).to_fallible();
+        assert_eq!(
+            InodeIo::read_at(
+                file.as_ref(),
+                block_size,
+                &mut second_writer,
+                StatusFlags::O_DIRECT
+            )
+            .unwrap(),
+            block_size
+        );
+        assert_eq!(second_block, payload);
+    }
+
+    #[ktest]
     fn symlink_fast_ok() {
         clocks::init_for_ktest();
 
@@ -4493,6 +4701,27 @@ mod test {
         let mut empty = [];
         let mut empty_writer = VmWriter::from(empty.as_mut_slice()).to_fallible();
         assert_eq!(file.read_at(0, &mut empty_writer).unwrap(), 0);
+    }
+
+    #[ktest]
+    fn file_read_direct_sparse_ok() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .build()
+            .unwrap();
+        let block_size = f.ext2.block_size();
+        let file =
+            make_live_file_inode(&f.ext2, 74, block_size * 2, 0, FileFlags::empty(), [0; 15]);
+
+        let mut buf = vec![0xa5u8; block_size];
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        assert_eq!(
+            InodeIo::read_at(file.as_ref(), 0, &mut writer, StatusFlags::O_DIRECT).unwrap(),
+            block_size
+        );
+        assert!(buf.iter().all(|byte| *byte == 0));
     }
 
     #[ktest]
