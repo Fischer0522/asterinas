@@ -914,7 +914,7 @@ impl Inode {
 
         let fs = self.fs_arc()?;
         let mut inner = self.inner.write();
-        // inner.page_cache.discard_range(0..inner.file_size());
+        inner.page_cache.discard_range(0..inner.file_size());
         inner.resize_page_cache_and_update_npages(0)?;
         let mapping_backend = Arc::clone(inner.backend());
         inner.set_dtime(now());
