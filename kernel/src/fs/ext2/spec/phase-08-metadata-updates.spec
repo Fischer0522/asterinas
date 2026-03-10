@@ -164,18 +164,19 @@ behavior here.
 - Old ext2 ref: `ext2_old/inode.rs:806-819`.
 
 ### Post (fallocate: FallocMode::Allocate):
-- Extends the file if `offset + len > file_size`.
-- Algorithm:
-  1. Computes `new_size = offset + len`.
-  2. If `new_size > self.file_size()`: calls `self.resize(new_size)`.
-  3. Returns `Ok(())`.
-- Old ext2 ref: `ext2_old/inode.rs:822-828`.
+- Allocates real data blocks covering `[offset, offset + len)`.
+- Newly allocated data blocks are zero-initialized before they become
+  observable through mapped reads.
+- If `offset + len > file_size`, updates `file_size = offset + len`
+  after allocation and zeroing succeed.
+- On allocator exhaustion, returns `Err(ENOSPC)`.
 
 ### Post (fallocate: FallocMode::AllocateKeepSize):
-- Preallocates space without changing file size. Since ext2 has no
-  preallocation metadata, this is a no-op.
-- Returns `Ok(())`.
-- Old ext2 ref: `ext2_old/inode.rs:829`.
+- Allocates real data blocks covering `[offset, offset + len)` without
+  changing `file_size`.
+- Newly allocated data blocks are zero-initialized on disk so that future
+  reads after a later size extension observe zeros instead of stale contents.
+- On allocator exhaustion, returns `Err(ENOSPC)`.
 
 ### Post (fallocate: unsupported modes):
 - `ZeroRange`, `ZeroRangeKeepSize`, `CollapseRange`, `InsertRange`,
@@ -207,9 +208,11 @@ Linux: `ext2_setattr` (inode.c:1647) is a single function that handles all
 
 Linux: ext2 has NO fallocate support (`ext2_file_operations` does not set
   `.fallocate`).
-  → Asterinas: Provides compatibility fallocate for `Allocate` (extend file),
-  `AllocateKeepSize` (no-op), and `PunchHoleKeepSize` (zero range). This
-  matches the old Asterinas ext2 behavior and improves POSIX compatibility.
+  → Asterinas: Provides compatibility fallocate for `Allocate`,
+  `AllocateKeepSize`, and `PunchHoleKeepSize`. Unlike the old compatibility
+  behavior, allocation modes now consume real ext2 blocks and zero newly
+  allocated blocks before exposure so reads remain zero-filled and ENOSPC is
+  reported when free blocks run out.
 
 Linux: Time updates in `setattr_copy` are in-memory only; writeback happens
   via `mark_inode_dirty` → periodic writeback or explicit fsync.

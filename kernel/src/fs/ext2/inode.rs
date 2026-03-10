@@ -787,16 +787,45 @@ impl Inode {
                     .min(file_size);
                 inner.page_cache().fill_zeros(offset..end)
             }
-            FallocMode::Allocate => {
-                let new_size = offset.checked_add(len).ok_or_else(|| {
+            FallocMode::Allocate | FallocMode::AllocateKeepSize => {
+                if len == 0 {
+                    return Ok(());
+                }
+
+                let fs = self.fs_arc()?;
+                let block_size = fs.block_size();
+                if block_size == 0 {
+                    return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+                }
+
+                let end = offset.checked_add(len).ok_or_else(|| {
                     Error::with_message(Errno::EINVAL, "fallocate range overflow")
                 })?;
-                if new_size > self.file_size() {
-                    self.resize(new_size)?;
+                let mut inner = self.inner.write();
+                let old_size = inner.file_size();
+
+                let new_blocks = match inner.allocate_range_blocks(&fs, offset, end, block_size) {
+                    Ok(new_blocks) => new_blocks,
+                    Err(err) => {
+                        inner.write_failed_cleanup(&fs, old_size, end, block_size);
+                        return Err(err);
+                    }
+                };
+
+                if let Err(err) = inner.zero_new_blocks(&fs, &new_blocks, block_size) {
+                    inner.write_failed_cleanup(&fs, old_size, end, block_size);
+                    return Err(err);
                 }
+
+                if mode == FallocMode::Allocate && end > old_size {
+                    if let Err(err) = inner.expand(end) {
+                        inner.write_failed_cleanup(&fs, old_size, end, block_size);
+                        return Err(err);
+                    }
+                }
+
                 Ok(())
             }
-            FallocMode::AllocateKeepSize => Ok(()),
             _ => {
                 return_errno_with_message!(
                     Errno::EOPNOTSUPP,
@@ -2255,34 +2284,8 @@ impl InodeInner {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
         }
 
-        let start_block = offset / block_size;
-        let end_block = end.div_ceil(block_size);
         let old_size = self.file_size();
-        let mut allocated = false;
-
-        let mapping_desc = {
-            let mapping_backend = Arc::clone(self.backend());
-            let mut mapping = mapping_backend.mapping.write();
-            for iblock in start_block..end_block {
-                let iblock = u32::try_from(iblock).map_err(|_| {
-                    Error::with_message(Errno::EINVAL, "logical block number overflow")
-                })?;
-                let old_blocks = mapping.blocks_512();
-                if mapping.get_or_alloc_block(fs, iblock, true)?.is_none() {
-                    return_errno_with_message!(
-                        Errno::EIO,
-                        "missing block mapping after allocation"
-                    );
-                }
-                allocated |= mapping.blocks_512() != old_blocks;
-            }
-            *mapping.get_desc()
-        };
-        self.sync_desc_mapping_from_snapshot(mapping_desc);
-
-        if allocated {
-            self.set_ctime(now());
-        }
+        self.allocate_range_blocks(fs, offset, end, block_size)?;
 
         if end > old_size {
             self.resize_page_cache_and_update_npages(end.align_up(block_size))?;
@@ -2297,6 +2300,84 @@ impl InodeInner {
             }
         }
 
+        Ok(())
+    }
+
+    /// Allocates missing data blocks that cover the requested file byte range.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:624 (`ext2_get_blocks`)
+    fn allocate_range_blocks(
+        &mut self,
+        fs: &Ext2,
+        offset: usize,
+        end: usize,
+        block_size: usize,
+    ) -> Result<Vec<Bid>> {
+        if block_size == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+        }
+        if end <= offset {
+            return Ok(Vec::new());
+        }
+
+        let start_block = offset / block_size;
+        let end_block = end.div_ceil(block_size);
+
+        let (mapping_desc, new_blocks, alloc_result) = {
+            let mapping_backend = self.backend().clone();
+            let mut mapping = mapping_backend.mapping.write();
+            let mut new_blocks = Vec::new();
+            let alloc_result = (|| -> Result<()> {
+                for iblock in start_block..end_block {
+                    let iblock = u32::try_from(iblock).map_err(|_| {
+                        Error::with_message(Errno::EINVAL, "logical block number overflow")
+                    })?;
+                    if mapping.get_block(fs, iblock)?.is_some() {
+                        continue;
+                    }
+                    let bid = mapping
+                        .get_or_alloc_block(fs, iblock, true)?
+                        .ok_or_else(|| {
+                            Error::with_message(
+                                Errno::EIO,
+                                "missing block mapping after allocation",
+                            )
+                        })?;
+                    new_blocks.push(bid);
+                }
+                Ok(())
+            })();
+            (*mapping.get_desc(), new_blocks, alloc_result)
+        };
+        self.sync_desc_mapping_from_snapshot(mapping_desc);
+
+        if !new_blocks.is_empty() {
+            self.set_ctime(now());
+        }
+
+        alloc_result?;
+        Ok(new_blocks)
+    }
+
+    /// Zeroes newly allocated data blocks before exposing them via mapped reads.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:742-757 (`ext2_get_blocks`, DAX zeroout path)
+    fn zero_new_blocks(&self, fs: &Ext2, blocks: &[Bid], block_size: usize) -> Result<()> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        if block_size == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+        }
+
+        let zero_block = vec![0u8; block_size];
+        for &bid in blocks {
+            fs.block_device()
+                .write_bytes(bid.to_offset(), &zero_block)
+                .map_err(|_| {
+                    Error::with_message(Errno::EIO, "failed to zero newly allocated data block")
+                })?;
+        }
         Ok(())
     }
 
@@ -4591,14 +4672,23 @@ mod test {
         let file = make_live_file_inode(&f.ext2, 67, 0, 0, FileFlags::empty(), [0; 15]);
         let block_size = f.ext2.block_size();
         let new_size = block_size + 210;
+        let free_before = f.ext2.super_block().free_blocks_count();
 
         file.fallocate(FallocMode::Allocate, block_size + 10, 200)
             .unwrap();
         assert_eq!(file.file_size(), new_size);
+
+        let free_after = f.ext2.super_block().free_blocks_count();
+        assert_eq!(free_before.saturating_sub(free_after), 1);
+
+        let mut out = vec![0x5au8; 210];
+        let mut out_writer = VmWriter::from(out.as_mut_slice()).to_fallible();
+        assert_eq!(file.read_at(block_size, &mut out_writer).unwrap(), 210);
+        assert!(out.iter().all(|byte| *byte == 0));
     }
 
     #[ktest]
-    fn falloc_keep_size_noop() {
+    fn falloc_keep_size_allocates_blocks_without_changing_size() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)
@@ -4606,10 +4696,46 @@ mod test {
             .build()
             .unwrap();
         let file = make_live_file_inode(&f.ext2, 68, 123, 0, FileFlags::empty(), [0; 15]);
+        let block_size = f.ext2.block_size();
+        let free_before = f.ext2.super_block().free_blocks_count();
 
-        file.fallocate(FallocMode::AllocateKeepSize, 4096, 512)
+        file.fallocate(FallocMode::AllocateKeepSize, block_size, 512)
             .unwrap();
         assert_eq!(file.file_size(), 123);
+
+        let free_after = f.ext2.super_block().free_blocks_count();
+        assert_eq!(free_before.saturating_sub(free_after), 1);
+
+        file.resize(block_size + 512).unwrap();
+
+        let mut out = vec![0x5au8; 512];
+        let mut out_writer = VmWriter::from(out.as_mut_slice()).to_fallible();
+        assert_eq!(file.read_at(block_size, &mut out_writer).unwrap(), 512);
+        assert!(out.iter().all(|byte| *byte == 0));
+    }
+
+    #[ktest]
+    fn falloc_allocate_returns_enospc_after_consuming_blocks() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(2, 2)
+            .build()
+            .unwrap();
+        let file = make_live_file_inode(&f.ext2, 69, 0, 0, FileFlags::empty(), [0; 15]);
+        let block_size = f.ext2.block_size();
+
+        file.fallocate(FallocMode::Allocate, 0, block_size * 2)
+            .unwrap();
+        assert_eq!(f.ext2.super_block().free_blocks_count(), 0);
+        assert_eq!(file.file_size(), block_size * 2);
+
+        let err = file
+            .fallocate(FallocMode::Allocate, block_size * 2, block_size)
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::ENOSPC);
+        assert_eq!(f.ext2.super_block().free_blocks_count(), 0);
+        assert_eq!(file.file_size(), block_size * 2);
     }
 
     #[ktest]
@@ -4620,7 +4746,7 @@ mod test {
             .with_free_blocks(64, 64)
             .build()
             .unwrap();
-        let file = make_live_file_inode(&f.ext2, 69, 0, 0, FileFlags::empty(), [0; 15]);
+        let file = make_live_file_inode(&f.ext2, 70, 0, 0, FileFlags::empty(), [0; 15]);
         let block_size = f.ext2.block_size();
 
         let payload = vec![0xabu8; block_size];
@@ -4657,7 +4783,7 @@ mod test {
             .with_free_blocks(64, 64)
             .build()
             .unwrap();
-        let file = make_live_file_inode(&f.ext2, 70, 0, 0, FileFlags::empty(), [0; 15]);
+        let file = make_live_file_inode(&f.ext2, 71, 0, 0, FileFlags::empty(), [0; 15]);
 
         for mode in [
             FallocMode::ZeroRange,
