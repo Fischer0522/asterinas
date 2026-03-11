@@ -9,7 +9,7 @@ use device_id::{decode_device_numbers, encode_device_numbers};
 use ostd::{const_assert, mm::io_util::HasVmReaderWriter};
 
 use super::{
-    block_ptr::{Ext2Bid, InodeMapping, InodeMappingDesc},
+    block_ptr::{Ext2Bid, InodeBlockMap, BlockMapDesc},
     fs::{Ext2, ROOT_INO},
     prelude::*,
     utils::now,
@@ -1494,7 +1494,7 @@ impl Inode {
 #[derive(Debug)]
 pub(super) struct InodeBackend {
     /// Serializes backend traversal vs foreground mapping mutations.
-    mapping: RwMutex<InodeMapping>,
+    mapping: RwMutex<InodeBlockMap>,
     /// Cached `npages` bound for PageCache.
     npages: AtomicUsize,
     /// Filesystem handle for indirect I/O and BIO submission.
@@ -1502,7 +1502,7 @@ pub(super) struct InodeBackend {
 }
 
 impl InodeBackend {
-    pub(super) fn new(mapping: InodeMapping, fs: Weak<Ext2>, npages: usize) -> Arc<Self> {
+    pub(super) fn new(mapping: InodeBlockMap, fs: Weak<Ext2>, npages: usize) -> Arc<Self> {
         Arc::new(Self {
             mapping: RwMutex::new(mapping),
             npages: AtomicUsize::new(npages),
@@ -1627,8 +1627,8 @@ impl InodeInner {
         let num_page_bytes = (desc.size as usize).align_up(BLOCK_SIZE);
         let num_pages = num_page_bytes / BLOCK_SIZE;
         let backend = InodeBackend::new(
-            InodeMapping::new_with_fs(
-                InodeMappingDesc::from_parts(desc.blocks, desc.block_ptrs),
+            InodeBlockMap::new(
+                BlockMapDesc::from_parts(desc.blocks, desc.block_ptrs),
                 fs.clone(),
             ),
             fs.clone(),
@@ -1660,7 +1660,7 @@ impl InodeInner {
         &self.backend
     }
 
-    fn sync_desc_mapping_from_snapshot(&mut self, mapping_desc: InodeMappingDesc) {
+    fn sync_desc_mapping_from_snapshot(&mut self, mapping_desc: BlockMapDesc) {
         self.desc.blocks = mapping_desc.blocks;
         self.desc.block_ptrs = mapping_desc.block_ptrs;
     }
@@ -1885,7 +1885,7 @@ impl InodeInner {
     fn rollback_make_empty(
         &mut self,
         old_size: usize,
-        old_mapping_desc: InodeMappingDesc,
+        old_mapping_desc: BlockMapDesc,
         new_bid: u32,
         fs: &Ext2,
     ) {
@@ -3311,7 +3311,7 @@ impl TryFrom<&RawInode> for InodeDesc {
 
         let flags = FileFlags::from_bits(raw.flags)
             .ok_or_else(|| Error::with_message(Errno::EIO, "invalid inode flags"))?;
-        let mapping = InodeMappingDesc::from_raw(raw);
+        let mapping = BlockMapDesc::from_raw(raw);
 
         Ok(InodeDesc {
             type_,

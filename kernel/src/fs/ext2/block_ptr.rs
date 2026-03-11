@@ -58,12 +58,12 @@ struct BranchResult {
 
 // In-memory inode mapping (raw on-disk view only i_blocks/i_block[]).
 #[derive(Clone, Copy, Debug)]
-pub(super) struct InodeMappingDesc {
+pub(super) struct BlockMapDesc {
     pub(super) blocks: u32,
     pub(super) block_ptrs: [u32; 15],
 }
 
-impl InodeMappingDesc {
+impl BlockMapDesc {
     pub(super) fn from_raw(raw: &RawInode) -> Self {
         Self {
             blocks: raw.blocks,
@@ -116,17 +116,13 @@ impl InodeMappingDesc {
 }
 
 #[derive(Debug)]
-pub(super) struct InodeMapping {
-    pub(super) desc: Dirty<InodeMappingDesc>,
+pub(super) struct InodeBlockMap {
+    pub(super) desc: Dirty<BlockMapDesc>,
     pub(super) indirect_blocks: Mutex<IndirectBlockManager>,
 }
 
-impl InodeMapping {
-    pub(super) fn new(desc: InodeMappingDesc) -> Self {
-        Self::new_with_fs(desc, Weak::new())
-    }
-
-    pub(super) fn new_with_fs(desc: InodeMappingDesc, fs: Weak<Ext2>) -> Self {
+impl InodeBlockMap {
+    pub(super) fn new(desc: BlockMapDesc, fs: Weak<Ext2>) -> Self {
         Self {
             desc: Dirty::new(desc),
             indirect_blocks: Mutex::new(IndirectBlockManager::new(fs)),
@@ -141,7 +137,7 @@ impl InodeMapping {
         self.desc.blocks = blocks;
     }
 
-    pub(super) fn get_desc(&self) -> &InodeMappingDesc {
+    pub(super) fn get_desc(&self) -> &BlockMapDesc {
         &self.desc
     }
 
@@ -845,9 +841,9 @@ mod test {
         RawInodeBuilder::new(mode).build()
     }
 
-    fn make_mapping(block_ptrs: [u32; 15], blocks: u32, fs: &Arc<Ext2>) -> InodeMapping {
-        InodeMapping::new_with_fs(
-            InodeMappingDesc::from_parts(blocks, block_ptrs),
+    fn make_mapping(block_ptrs: [u32; 15], blocks: u32, fs: &Arc<Ext2>) -> InodeBlockMap {
+        InodeBlockMap::new(
+            BlockMapDesc::from_parts(blocks, block_ptrs),
             Arc::downgrade(fs),
         )
     }

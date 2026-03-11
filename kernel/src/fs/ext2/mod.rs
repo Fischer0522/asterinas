@@ -47,6 +47,7 @@ pub(super) fn init() {
 }
 mod block_group;
 mod block_ptr;
+mod io_range_mapper;
 mod dir;
 mod fs;
 mod fs_type;
