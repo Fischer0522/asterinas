@@ -569,13 +569,7 @@ impl Xattr {
         let block_buf = Self::alloc_block_buffer(block_size)?;
 
         let bio_segment = BioSegment::new_from_segment(block_buf.clone(), BioDirection::FromDevice);
-        match fs
-            .block_device()
-            .read_blocks(self.bid.to_bid(), bio_segment)?
-        {
-            BioStatus::Complete => {}
-            status => return Err(Error::from(status)),
-        }
+        fs.read_blocks(self.bid, bio_segment)?;
 
         Self::validate_block(&block_buf, block_size)?;
         self.block_buf = Some(block_buf);
@@ -800,16 +794,9 @@ impl Xattr {
 
         let fs = self.fs_arc()?;
         let bio_segment = BioSegment::new_from_segment(block_buf, BioDirection::ToDevice);
-        match fs
-            .block_device()
-            .write_blocks(self.bid.to_bid(), bio_segment)?
-        {
-            BioStatus::Complete => {
-                self.dirty = false;
-                Ok(())
-            }
-            status => Err(Error::from(status)),
-        }
+        fs.write_blocks(self.bid, bio_segment)?;
+        self.dirty = false;
+        Ok(())
     }
 
     /// Lazily loads the xattr block from disk into `block_buf`.

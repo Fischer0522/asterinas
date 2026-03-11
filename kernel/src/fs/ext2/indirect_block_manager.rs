@@ -119,13 +119,8 @@ impl IndirectBlockManager {
             Segment::<()>::from(block.frame().clone()).into(),
             BioDirection::FromDevice,
         );
-        let status = fs
-            .block_device()
-            .read_blocks(bid.to_bid(), bio_segment)
+        fs.read_blocks(bid, bio_segment)
             .map_err(|_| Error::with_message(Errno::EIO, "failed to submit indirect block read"))?;
-        if status != BioStatus::Complete {
-            return_errno_with_message!(Errno::EIO, "failed to read indirect block");
-        }
         block.mark_clean();
         Ok(block)
     }
@@ -139,15 +134,9 @@ impl IndirectBlockManager {
             Segment::<()>::from(block.frame().clone()).into(),
             BioDirection::ToDevice,
         );
-        let status = fs
-            .block_device()
-            .write_blocks(block.bid().to_bid(), bio_segment)
-            .map_err(|_| {
-                Error::with_message(Errno::EIO, "failed to submit indirect block writeback")
-            })?;
-        if status != BioStatus::Complete {
-            return_errno_with_message!(Errno::EIO, "failed to write back indirect block");
-        }
+        fs.write_blocks(block.bid(), bio_segment).map_err(|_| {
+            Error::with_message(Errno::EIO, "failed to submit indirect block writeback")
+        })?;
 
         block.mark_clean();
         Ok(())

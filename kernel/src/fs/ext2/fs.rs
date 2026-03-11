@@ -826,14 +826,23 @@ impl Ext2 {
 
     pub(super) fn write_blocks_async(
         &self,
-        _bid: Ext2Bid,
-        _bio_segment: BioSegment,
+        bid: Ext2Bid,
+        bio_segment: BioSegment,
     ) -> Result<BioWaiter> {
-        todo!()
+        let waiter = self
+            .block_device
+            .write_blocks_async(bid.to_bid(), bio_segment)?;
+        Ok(waiter)
     }
 
-    pub(super) fn write_blocks(&self, _bid: Ext2Bid, _bio_segment: BioSegment) -> Result<()> {
-        todo!()
+    pub(super) fn write_blocks(&self, bid: Ext2Bid, bio_segment: BioSegment) -> Result<()> {
+        let bio_status = self.block_device.write_blocks(bid.to_bid(), bio_segment)?;
+        match bio_status {
+            BioStatus::Complete => Ok(()),
+            _ => {
+                return_errno_with_message!(Errno::EIO, "failed to write blocks to block device")
+            }
+        }
     }
 
     /// Syncs cached inodes and block-group-local metadata in all groups.

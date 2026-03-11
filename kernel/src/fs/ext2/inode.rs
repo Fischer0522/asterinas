@@ -21,7 +21,7 @@ use crate::{
             xattr::Xattr,
         },
         utils::{
-            Extension, FallocMode, InodeMode, Metadata, XattrName, XattrNamespace, XattrSetFlags
+            Extension, FallocMode, InodeMode, Metadata, XattrName, XattrNamespace, XattrSetFlags,
         },
     },
     process::{Gid, Uid},
@@ -1549,7 +1549,7 @@ impl PageCacheBackend for InodeBackend {
                     Segment::from(frame.clone()).into(),
                     BioDirection::FromDevice,
                 );
-                Ok(fs.block_device().read_blocks_async(bid.to_bid(), bio_segment)?)
+                Ok(fs.read_blocks_async(bid, bio_segment)?)
             }
             None => {
                 // Sparse hole: return a zero-filled page without issuing BIO.
@@ -1574,7 +1574,7 @@ impl PageCacheBackend for InodeBackend {
             Segment::from(frame.clone()).into(),
             BioDirection::ToDevice,
         );
-        Ok(fs.block_device().write_blocks_async(bid.to_bid(), bio_segment)?)
+        Ok(fs.write_blocks_async(bid, bio_segment)?)
     }
 
     fn npages(&self) -> usize {
@@ -1990,18 +1990,9 @@ impl InodeInner {
             let mut block_buf = vec![0u8; block_size];
             if offset_in_block != 0 || bytes_this_block < block_size {
                 let read_segment = BioSegment::alloc(1, BioDirection::FromDevice);
-                let read_status = fs
-                    .block_device()
-                    .read_blocks(bid.to_bid(), read_segment.clone())
-                    .map_err(|_| {
-                        Error::with_message(Errno::EIO, "failed to read block for partial write")
-                    })?;
-                if read_status != BioStatus::Complete {
-                    return_errno_with_message!(
-                        Errno::EIO,
-                        "failed to read block for partial write"
-                    );
-                }
+                fs.read_blocks(bid, read_segment.clone()).map_err(|_| {
+                    Error::with_message(Errno::EIO, "failed to read block for partial write")
+                })?;
 
                 let mut segment_reader = read_segment.reader().map_err(|_| {
                     Error::with_message(Errno::EIO, "failed to access bio read segment")
@@ -2026,13 +2017,8 @@ impl InodeInner {
                 segment_writer.write_fallible(&mut block_reader)?;
             }
 
-            let write_status = fs
-                .block_device()
-                .write_blocks(bid.to_bid(), write_segment)
+            fs.write_blocks(bid, write_segment)
                 .map_err(|_| Error::with_message(Errno::EIO, "failed to write data block"))?;
-            if write_status != BioStatus::Complete {
-                return_errno_with_message!(Errno::EIO, "failed to write data block");
-            }
 
             current_offset += bytes_this_block;
         }
@@ -2502,11 +2488,17 @@ impl InodeInner {
 
         let zero_block = vec![0u8; block_size];
         for &bid in blocks {
-            fs.block_device()
-                .write_bytes(bid.to_offset(), &zero_block)
-                .map_err(|_| {
-                    Error::with_message(Errno::EIO, "failed to zero newly allocated data block")
+            let bio_segment = BioSegment::alloc(1, BioDirection::ToDevice);
+            {
+                let mut segment_writer = bio_segment.writer().map_err(|_| {
+                    Error::with_message(Errno::EIO, "failed to access zero-write bio segment")
                 })?;
+                let mut zero_reader = VmReader::from(zero_block.as_slice()).to_fallible();
+                segment_writer.write_fallible(&mut zero_reader)?;
+            }
+            fs.write_blocks(bid, bio_segment).map_err(|_| {
+                Error::with_message(Errno::EIO, "failed to zero newly allocated data block")
+            })?;
         }
         Ok(())
     }
@@ -3039,13 +3031,12 @@ impl InodeInner {
     }
 
     fn finalize_zero_link_transition(&mut self, ino: u32, fs: &Ext2) -> Result<()> {
-
         if self.links_count() != 0 {
-                return Ok(());
+            return Ok(());
         }
         self.persist(ino, fs)?;
         let _ = fs.remove_inode_cache(ino);
-        Ok(()) 
+        Ok(())
     }
 }
 
@@ -3972,7 +3963,10 @@ mod test {
         f.ext2.sync_all().unwrap();
 
         assert_eq!(f.ext2.super_block().free_blocks_count(), free_blocks_before);
-        assert_eq!(f.ext2.read_inode(special_ino as u32).unwrap_err().error(), Errno::ENOENT);
+        assert_eq!(
+            f.ext2.read_inode(special_ino as u32).unwrap_err().error(),
+            Errno::ENOENT
+        );
     }
 
     #[ktest]
