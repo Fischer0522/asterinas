@@ -21,7 +21,7 @@ use crate::{
             xattr::Xattr,
         },
         utils::{
-            Extension, FallocMode, InodeMode, Metadata, XattrName, XattrNamespace, XattrSetFlags,
+            Extension, FallocMode, InodeMode, Metadata, XattrName, XattrNamespace, XattrSetFlags
         },
     },
     process::{Gid, Uid},
@@ -152,6 +152,10 @@ impl Inode {
 
     pub(super) fn block_group_idx(&self) -> usize {
         self.block_group_idx
+    }
+
+    pub(super) fn links_count(&self) -> u16 {
+        self.inner.read().links_count()
     }
 
     pub(super) fn fs_arc(&self) -> Result<Arc<Ext2>> {
@@ -709,8 +713,7 @@ impl Inode {
         let child_ino = parent_inner.find_entry(&fs, name)?;
         drop(parent_inner);
         let child = fs.read_inode(child_ino)?;
-
-        {
+        let child_reached_zero_link = {
             let mut child_inner = child.inner.write();
             if child_inner.inode_type() != InodeType::Dir {
                 return_errno!(Errno::ENOTDIR);
@@ -719,10 +722,10 @@ impl Inode {
                 return_errno!(Errno::ENOTEMPTY);
             }
 
-            child_inner.set_file_size(0);
+            child_inner.set_ctime(now());
             child_inner.sub_links_count_saturating(2);
-            child_inner.set_dtime(now());
-        }
+            child_inner.links_count() == 0
+        };
 
         let mut parent_inner = self.inner.write();
         parent_inner.delete_entry(name)?;
@@ -731,6 +734,11 @@ impl Inode {
         // ctime/mtime the same way as add/delete entry paths.
         // Linux: /root/linux/fs/ext2/namei.c:312 (inode_dec_link_count(dir)).
         parent_inner.update_dir_timestamps_and_flags()?;
+        drop(parent_inner);
+
+        if child_reached_zero_link {
+            child.finalize_zero_link_transition(&fs)?;
+        }
         Ok(())
     }
 
@@ -887,7 +895,7 @@ impl Inode {
     pub(super) fn sync_metadata(&self, sync_inode_table: bool) -> Result<()> {
         let fs = self.fs_arc()?;
         let mut inner = self.inner.write();
-        inner.persist(self.ino, self.type_, &fs)?;
+        inner.persist(self.ino, &fs)?;
 
         if sync_inode_table {
             let block_group = fs.block_group(self.block_group_idx);
@@ -896,15 +904,30 @@ impl Inode {
         Ok(())
     }
 
-    /// Prepares this inode for eviction.
+    /// Persists a zero-link inode into the inode-table page cache and removes it from the live cache.
     ///
-    /// Returns `Ok(true)` if inode had `nlink == 0` and was truncated/persisted;
-    /// returns `Ok(false)` if inode is still linked and only regular sync is needed.
+    /// Linux delete-path counterpart: /root/linux/fs/libfs.c:375 (inode_dec_link_count)
+    pub(super) fn finalize_zero_link_transition(&self, fs: &Arc<Ext2>) -> Result<()> {
+        let mut inner = self.inner.write();
+        inner.finalize_zero_link_transition(self.ino, fs)
+    }
+
+    /// Attempts Linux-style final reclaim for a deleted inode.
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:72 (ext2_evict_inode)
-    pub(super) fn prepare_for_evict(&self) -> Result<bool> {
-        if self.inner.read().desc.links_count > 0 {
-            self.sync_all(false)?;
+    pub(super) fn try_reclaim_deleted_inode(&self, fs: &Ext2) -> Result<bool> {
+        if self.links_count() != 0 {
+            return Ok(false);
+        }
+
+        let group = fs.block_group(self.block_group_idx);
+        let inode_idx = {
+            let inodes_per_group = fs.super_block().inodes_per_group();
+            (self.ino - 1) % inodes_per_group
+        };
+        let inode_bit = u16::try_from(inode_idx)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "inode index out of range"))?;
+        if !group.inode_bitmap().is_allocated(inode_bit) {
             return Ok(false);
         }
 
@@ -914,6 +937,7 @@ impl Inode {
 
         let fs = self.fs_arc()?;
         let mut inner = self.inner.write();
+        // TODO: fix the page cache
         inner.page_cache.discard_range(0..inner.file_size());
         inner.resize_page_cache_and_update_npages(0)?;
         let mapping_backend = Arc::clone(inner.backend());
@@ -925,8 +949,9 @@ impl Inode {
             mapping.truncate_blocks(&fs, 0)?;
             inner.sync_desc_mapping_from_snapshot(*mapping.get_desc());
         }
-        inner.persist(self.ino, self.type_, &fs)?;
+        inner.persist(self.ino, &fs)?;
 
+        fs.free_inode(self.ino, self.type_ == InodeType::Dir)?;
         Ok(true)
     }
 
@@ -955,7 +980,7 @@ impl Inode {
         // so fdatasync never misses i_size/block-mapping persistence.
         let mut inner = self.inner.write();
         if inner.is_dirty() {
-            inner.persist(self.ino, self.type_, &fs)?;
+            inner.persist(self.ino, &fs)?;
         }
         Ok(())
     }
@@ -1111,10 +1136,10 @@ impl Inode {
         let mut child_inner = child.inner.write();
         child_inner.set_ctime(now());
         child_inner.sub_links_count_saturating(1);
+        let child_reached_zero_link = child_inner.links_count() == 0;
 
-        // Defer ext2_evict_inode-style reclamation to cache eviction.
-        if child_inner.links_count() == 0 {
-            child_inner.set_dtime(now());
+        if child_reached_zero_link {
+            child_inner.finalize_zero_link_transition(child.ino, &fs)?;
         }
 
         Ok(())
@@ -1187,6 +1212,13 @@ impl Inode {
         // Phase 4: apply rename mutations and persist metadata.
         self.validate_rename_overwrite(&ctx, &guards)?;
         self.apply_rename_with_locks(&ctx, &mut guards)?;
+        drop(guards);
+
+        if let Some(existing) = ctx.existing_inode.as_ref() {
+            if existing.links_count() == 0 {
+                existing.finalize_zero_link_transition(fs)?;
+            }
+        }
         Ok(true)
     }
 
@@ -1366,9 +1398,6 @@ impl Inode {
                 existing_inner.sub_links_count_saturating(1);
             }
             existing_inner.sub_links_count_saturating(1);
-            if existing_inner.links_count() == 0 {
-                existing_inner.set_dtime(now());
-            }
         }
 
         let old_inner = guards.inner_mut(ctx.old_inode.ino())?;
@@ -1489,6 +1518,21 @@ impl InodeBackend {
         self.fs
             .upgrade()
             .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))
+    }
+}
+
+impl Drop for Inode {
+    fn drop(&mut self) {
+        let Some(fs) = self.fs.upgrade() else {
+            return;
+        };
+
+        if let Err(err) = self.try_reclaim_deleted_inode(fs.as_ref()) {
+            debug!(
+                "ext2: failed to reclaim deleted inode {} during drop: {:?}",
+                self.ino, err
+            );
+        }
     }
 }
 
@@ -1770,8 +1814,7 @@ impl InodeInner {
     ///
     /// # Lock
     /// The caller must hold `inner.write()`.
-    fn persist(&mut self, ino: u32, type_: InodeType, fs: &Ext2) -> Result<()> {
-        debug_assert_eq!(self.inode_type(), type_);
+    fn persist(&mut self, ino: u32, fs: &Ext2) -> Result<()> {
         let raw = RawInode::from(&*self.desc);
         fs.write_inode_desc(ino, &raw)?;
         self.clear_dirty();
@@ -3002,6 +3045,16 @@ impl InodeInner {
         // completion, and keeps pages cached as UpToDate.
         self.page_cache.evict_range(0..file_size)
     }
+
+    fn finalize_zero_link_transition(&mut self, ino: u32, fs: &Ext2) -> Result<()> {
+
+        if self.links_count() != 0 {
+                return Ok(());
+        }
+        self.persist(ino, fs)?;
+        let _ = fs.remove_inode_cache(ino);
+        Ok(()) 
+    }
 }
 
 /// Acquires `inner.read()` locks on two inodes in ascending ino order.
@@ -3255,12 +3308,11 @@ impl InodeDesc {
 impl TryFrom<&RawInode> for InodeDesc {
     type Error = Error;
     fn try_from(raw: &RawInode) -> Result<Self> {
-        let mode = raw.mode;
-
-        if raw.links_count == 0 && (mode == 0 || raw.dtime != 0) {
+        if raw.links_count == 0 {
             return_errno_with_message!(Errno::ESTALE, "inode has been deleted");
         }
 
+        let mode = raw.mode;
         let type_ = InodeType::from_raw_mode(mode)?;
         let perm = FilePerm::from_bits_truncate(mode & 0o7777);
         let uid = (raw.uid as u32) | ((raw.uid_high as u32) << 16);
@@ -3431,6 +3483,22 @@ mod test {
         VfsInodeTrait::metadata(inode.as_ref()).nlinks
     }
 
+    fn read_raw_inode_from_disk(f: &testkit::Ext2Fixture, ino: u32) -> RawInode {
+        let inodes_per_group = f.sb.inodes_per_group();
+        let group_idx = ((ino - 1) / inodes_per_group) as usize;
+        let index_in_group = (ino - 1) % inodes_per_group;
+        let inode_size = f.sb.inode_size();
+        let block_size = f.sb.block_size();
+        let offset_bytes = (index_in_group as usize) * inode_size;
+        let block_index = offset_bytes / block_size;
+        let offset_in_block = offset_bytes % block_size;
+        let table_block = f.descs[group_idx].inode_table + block_index as u32;
+        f.disk
+            .segment()
+            .read_val(Bid::new(table_block as u64).to_offset() + offset_in_block)
+            .unwrap()
+    }
+
     fn make_live_dir_inode(
         ext2: &Arc<Ext2>,
         ino: u32,
@@ -3597,12 +3665,36 @@ mod test {
 
         let free_blocks_before_sync = f.ext2.super_block().free_blocks_count();
         root.unlink("old").unwrap();
+        assert_eq!(
+            f.ext2.read_inode(old_ino).unwrap_err().error(),
+            Errno::ESTALE
+        );
+        assert!(
+            f.block_group(0)
+                .inode_bitmap()
+                .is_allocated((old_ino - 1) as u16)
+        );
+        f.ext2.sync_all().unwrap();
+        let raw_before_drop = read_raw_inode_from_disk(&f, old_ino);
+        assert_eq!(raw_before_drop.links_count, 0);
+        assert_eq!(raw_before_drop.dtime, 0);
+        assert_ne!(raw_before_drop.blocks, 0);
+
         drop(old);
         f.ext2.sync_all().unwrap();
         assert_eq!(
             f.ext2.read_inode(old_ino).unwrap_err().error(),
             Errno::ENOENT
         );
+        assert!(
+            !f.block_group(0)
+                .inode_bitmap()
+                .is_allocated((old_ino - 1) as u16)
+        );
+        let raw_after_drop = read_raw_inode_from_disk(&f, old_ino);
+        assert_eq!(raw_after_drop.links_count, 0);
+        assert_eq!(raw_after_drop.blocks, 0);
+        assert_eq!(raw_after_drop.block[0], 0);
         assert_eq!(
             f.ext2.super_block().free_blocks_count(),
             free_blocks_before_sync.saturating_add(1)
@@ -3784,6 +3876,14 @@ mod test {
         root.rename("old", &root, "new").unwrap();
         assert_eq!(lookup_ino(&root, "new").unwrap(), old_ino);
         assert_eq!(lookup_ino(&root, "old").unwrap_err().error(), Errno::ENOENT);
+        assert_eq!(
+            f.ext2.read_inode(replaced_ino).unwrap_err().error(),
+            Errno::ESTALE
+        );
+        assert_eq!(
+            f.ext2.read_inode(replaced_ino_cross).unwrap_err().error(),
+            Errno::ESTALE
+        );
         drop(replaced);
         drop(new);
         f.ext2.sync_all().unwrap();
@@ -3907,6 +4007,11 @@ mod test {
         deleted_inode.dtime = 1;
         let deleted_err = InodeDesc::try_from(&deleted_inode).unwrap_err();
         assert_eq!(deleted_err.error(), Errno::ESTALE);
+
+        let mut zero_link_live_inode = make_raw_inode(0o100644);
+        zero_link_live_inode.links_count = 0;
+        let zero_link_err = InodeDesc::try_from(&zero_link_live_inode).unwrap_err();
+        assert_eq!(zero_link_err.error(), Errno::ESTALE);
 
         let mut invalid_flags_inode = make_raw_inode(0o100644);
         invalid_flags_inode.flags = 1 << 30;
@@ -4220,18 +4325,28 @@ mod test {
     fn dir_rmdir_ok() {
         clocks::init_for_ktest();
 
-        let env = prepare_rmdir_env(false);
-        let parent = &env.parent;
-        let child = &env.child;
+        let RmdirTestEnv { f, parent, child } = prepare_rmdir_env(false);
+        let child_ino = child.ino();
 
         parent.rmdir("sub").unwrap();
-        assert_eq!(inode_nlinks(parent), 2);
+        assert_eq!(inode_nlinks(&parent), 2);
         assert_eq!(
-            lookup_ino(parent, "sub").unwrap_err().error(),
+            lookup_ino(&parent, "sub").unwrap_err().error(),
             Errno::ENOENT
         );
-        assert_eq!(inode_size(child), 0);
-        assert_eq!(inode_nlinks(child), 0);
+        assert_eq!(inode_size(&child), f.ext2.block_size());
+        assert_eq!(inode_nlinks(&child), 0);
+        assert_eq!(
+            f.ext2.read_inode(child_ino).unwrap_err().error(),
+            Errno::ESTALE
+        );
+
+        drop(child);
+        f.ext2.sync_all().unwrap();
+        assert_eq!(
+            f.ext2.read_inode(child_ino).unwrap_err().error(),
+            Errno::ENOENT
+        );
     }
 
     #[ktest]

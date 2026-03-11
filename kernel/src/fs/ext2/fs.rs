@@ -6,7 +6,7 @@ use core::{
 };
 
 use super::{
-    block_group::{BlockGroup, EvictResult, RawGroupDesc},
+    block_group::{BlockGroup, RawGroupDesc},
     inode::{FilePerm, Inode, InodeDesc, RawInode},
     prelude::*,
     super_block::{RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
@@ -167,6 +167,20 @@ impl Ext2 {
         if let Some(group) = self.block_groups.get(group_idx) {
             group.insert_cache(inode_idx, inode);
         }
+    }
+
+    /// Removes one inode from the live block-group cache.
+    ///
+    /// Linux analogue: /root/linux/fs/inode.c:1910 (iput_final)
+    pub(super) fn remove_inode_cache(&self, ino: u32) -> Option<Arc<Inode>> {
+        if ino == 0 {
+            return None;
+        }
+        let group_idx = ((ino - 1) / self.inodes_per_group) as usize;
+        let inode_idx = (ino - 1) % self.inodes_per_group;
+        self.block_groups
+            .get(group_idx)
+            .and_then(|group| group.remove_inode_cache(inode_idx))
     }
 
     /// Returns the inode table block ID for the given group.
@@ -791,22 +805,8 @@ impl Ext2 {
 
     /// Syncs cached inodes and block-group-local metadata in all groups.
     pub fn sync_all(&self) -> Result<()> {
-        let mut total = EvictResult {
-            freed_inodes: 0,
-            freed_dirs: 0,
-        };
-
         for group in &self.block_groups {
-            let result = group.sync_all(&self.group_descriptors_segment)?;
-            total.freed_inodes += result.freed_inodes;
-            total.freed_dirs += result.freed_dirs;
-        }
-
-        if total.freed_inodes > 0 {
-            let mut sb = self.super_block.write();
-            for _ in 0..total.freed_inodes {
-                sb.inc_free_inodes();
-            }
+            let _ = group.sync_all(&self.group_descriptors_segment)?;
         }
 
         self.sync_metadata()

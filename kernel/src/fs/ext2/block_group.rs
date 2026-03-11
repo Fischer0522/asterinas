@@ -88,12 +88,6 @@ pub struct BlockGroup {
     inode_cache: RwMutex<BTreeMap<u32, Arc<Inode>>>,
 }
 
-/// Aggregated inode-eviction counters for superblock updates.
-pub(super) struct EvictResult {
-    pub freed_inodes: u32,
-    pub freed_dirs: u32,
-}
-
 impl fmt::Debug for BlockGroup {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BlockGroup")
@@ -270,56 +264,24 @@ impl BlockGroup {
         self.inode_cache.write().insert(inode_idx, inode);
     }
 
-    /// Evicts one inode and performs Linux-equivalent deleted-inode cleanup.
+    /// Removes one inode from the per-group live cache.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:72 (ext2_evict_inode)
-    fn evict_inode(&self, inode: &Arc<Inode>) -> Result<EvictResult> {
-        if !inode.prepare_for_evict()? {
-            return Ok(EvictResult {
-                freed_inodes: 0,
-                freed_dirs: 0,
-            });
-        }
-
-        let inode_idx = (inode.ino() - 1) % self.inodes_per_group;
-        let inode_bit = u16::try_from(inode_idx)
-            .map_err(|_| Error::with_message(Errno::EINVAL, "inode index out of range"))?;
-        let was_allocated = self.free_inode(inode_bit)?;
-        if !was_allocated {
-            return Ok(EvictResult {
-                freed_inodes: 0,
-                freed_dirs: 0,
-            });
-        }
-
-        self.inc_free_inodes(1);
-        let freed_dirs = u32::from(inode.inode_type().is_directory());
-        if freed_dirs > 0 {
-            self.dec_used_dirs();
-        }
-
-        Ok(EvictResult {
-            freed_inodes: 1,
-            freed_dirs,
-        })
+    /// Linux analogue: /root/linux/fs/inode.c:1910 (iput_final)
+    pub(super) fn remove_inode_cache(&self, inode_idx: u32) -> Option<Arc<Inode>> {
+        self.inode_cache.write().remove(&inode_idx)
     }
 
     /// Syncs per-group inode state and bitmap metadata.
     ///
     /// Linux trigger analogue: /root/linux/fs/inode.c:1910 (iput_final)
-    pub(super) fn sync_all(&self, group_descs: &USegment) -> Result<EvictResult> {
-        let evicted = self.sync_inodes()?;
+    pub(super) fn sync_all(&self, group_descs: &USegment) -> Result<()> {
+        self.sync_inodes()?;
         self.sync_metadata(group_descs)?;
-        Ok(evicted)
+        Ok(())
     }
 
     /// Syncs cached inodes and evicts unreferenced entries.
-    fn sync_inodes(&self) -> Result<EvictResult> {
-        let mut evicted = EvictResult {
-            freed_inodes: 0,
-            freed_dirs: 0,
-        };
-
+    fn sync_inodes(&self) -> Result<()> {
         // Phase 1: remove unreferenced inodes from cache.
         let unused_inodes: Vec<Arc<Inode>> = self
             .inode_cache
@@ -328,11 +290,9 @@ impl BlockGroup {
             .map(|(_, inode)| inode)
             .collect();
 
-        // Phase 2: evict removed inodes (without holding cache lock).
+        // Phase 2: sync removed live inodes without holding the cache lock.
         for inode in &unused_inodes {
-            let result = self.evict_inode(inode)?;
-            evicted.freed_inodes = evicted.freed_inodes.saturating_add(result.freed_inodes);
-            evicted.freed_dirs = evicted.freed_dirs.saturating_add(result.freed_dirs);
+            inode.sync_all(false)?;
         }
 
         // Phase 3: sync still-referenced cached inodes.
@@ -343,7 +303,7 @@ impl BlockGroup {
 
         //Phase 4: sync inode table page cache.
         self.sync_inode_table()?;
-        Ok(evicted)
+        Ok(())
     }
 
     pub(super) fn sync_inode_table(&self) -> Result<()> {
