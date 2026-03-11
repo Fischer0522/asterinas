@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::{mem::size_of, ops::Add};
+use core::mem::size_of;
 
 use device_id::{decode_device_numbers, encode_device_numbers};
 use ostd::sync::Mutex;
@@ -12,61 +12,7 @@ use super::{
     prelude::*,
 };
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Pod)]
-pub(super) struct Ext2Bid(u32);
-
-impl Ext2Bid {
-    pub(super) const fn new(raw: u32) -> Self {
-        Self(raw)
-    }
-
-    pub(super) const fn from_raw(raw: u32) -> Self {
-        Self(raw)
-    }
-
-    pub(super) const fn to_raw(self) -> u32 {
-        self.0
-    }
-
-    pub(super) const fn to_bid(self) -> Bid {
-        Bid::new(self.0 as u64)
-    }
-
-    pub(super) fn to_offset(self) -> usize {
-        self.to_bid().to_offset()
-    }
-
-    pub(super) const fn is_zero(self) -> bool {
-        self.0 == 0
-    }
-}
-
-impl From<u32> for Ext2Bid {
-    fn from(raw: u32) -> Self {
-        Self::new(raw)
-    }
-}
-
-impl From<Ext2Bid> for u32 {
-    fn from(bid: Ext2Bid) -> Self {
-        bid.to_raw()
-    }
-}
-
-impl From<Ext2Bid> for Bid {
-    fn from(bid: Ext2Bid) -> Self {
-        bid.to_bid()
-    }
-}
-
-impl Add<u32> for Ext2Bid {
-    type Output = Self;
-
-    fn add(self, rhs: u32) -> Self::Output {
-        Self(self.0 + rhs)
-    }
-}
+pub(super) type Ext2Bid = u32;
 
 ///TODO: Refactor this with a more rusty approach (e.g. enum).
 /// Block path offsets for direct/indirect traversal.
@@ -288,7 +234,7 @@ impl InodeMapping {
 
         let mut chain = Vec::with_capacity(path.depth);
         chain.push(IndirectEntry {
-            key: Ext2Bid::from_raw(top_key),
+            key: top_key,
             bh: None,
         });
         if top_key == 0 {
@@ -316,7 +262,7 @@ impl InodeMapping {
                 key: next_key,
                 bh: Some(parent_key),
             });
-            if next_key.is_zero() {
+            if next_key == 0 {
                 // SPEC: include the zero-key entry and report break level.
                 return Ok(BranchResult {
                     partial_level: level,
@@ -340,7 +286,7 @@ impl InodeMapping {
     /// Linux: /root/linux/fs/ext2/inode.c:1096 (ext2_free_data)
     /// Linux: /root/linux/fs/ext2/inode.c:1136 (ext2_free_branches)
     pub(super) fn free_branches(&mut self, fs: &Ext2, block_nr: Ext2Bid, depth: u32) {
-        if block_nr.is_zero() {
+        if block_nr == 0 {
             return;
         }
 
@@ -355,12 +301,11 @@ impl InodeMapping {
         }
 
         if depth == 0 {
-            if let Err(err) = fs.free_blocks(block_nr.to_raw(), 1) {
+            if let Err(err) = fs.free_blocks(block_nr, 1) {
                 // SPEC: best-effort free path logs errors and proceeds.
                 error!(
                     "ext2: free_branches: failed to free data block {}: {:?}",
-                    block_nr.to_raw(),
-                    err
+                    block_nr, err
                 );
                 return;
             }
@@ -386,8 +331,7 @@ impl InodeMapping {
                         // Linux ext2_free_branches logs read failure and skips that branch.
                         error!(
                             "ext2: free_branches: failed to read indirect block {} (depth {})",
-                            block_nr.to_raw(),
-                            depth
+                            block_nr, depth
                         );
                         return;
                     }
@@ -396,7 +340,7 @@ impl InodeMapping {
                 let mut child_blocks = Vec::new();
                 for idx in 0..ptrs_per_block {
                     match block.read_bid(idx) {
-                        Ok(nr) if nr.is_zero() => continue,
+                        Ok(0) => continue,
                         Ok(nr) => child_blocks.push(nr),
                         Err(_) => break,
                     }
@@ -411,11 +355,10 @@ impl InodeMapping {
             self.free_branches(fs, nr, depth - 1);
         }
 
-        if let Err(err) = fs.free_blocks(block_nr.to_raw(), 1) {
+        if let Err(err) = fs.free_blocks(block_nr, 1) {
             error!(
                 "ext2: free_branches: failed to free indirect block {}: {:?}",
-                block_nr.to_raw(),
-                err
+                block_nr, err
             );
             return;
         }
@@ -440,7 +383,7 @@ impl InodeMapping {
         ) {
             let mut indirect_blocks = indirect_blocks.lock();
             for bid in blocks.iter().copied().take(indirect_count) {
-                indirect_blocks.remove(Ext2Bid::from_raw(bid));
+                indirect_blocks.remove(bid);
             }
             for bid in blocks {
                 let _ = fs.free_blocks(*bid, 1);
@@ -483,9 +426,7 @@ impl InodeMapping {
         let mut alloc_goal = branch
             .chain
             .last()
-            .map_or(Ext2Bid::from_raw(self.desc.block_ptrs[0]), |entry| {
-                entry.key
-            })
+            .map_or(self.desc.block_ptrs[0], |entry| entry.key)
             .max(fs.super_block().first_data_block());
 
         while (new_blocks.len() as u32) < total {
@@ -516,7 +457,7 @@ impl InodeMapping {
 
             new_blocks.extend(allocated);
             if let Some(last) = new_blocks.last() {
-                alloc_goal = Ext2Bid::from_raw(last.saturating_add(1));
+                alloc_goal = last.saturating_add(1);
             }
         }
 
@@ -552,15 +493,15 @@ impl InodeMapping {
                     }
                 };
 
-                let new_bid = Ext2Bid::from_raw(new_blocks[i]);
-                let next_bid = Ext2Bid::from_raw(next_block);
+                let new_bid = new_blocks[i];
+                let next_bid = next_block;
                 let mut block = IndirectBlock::alloc_new(new_bid)?;
                 block.write_bid(path.offsets[level] as usize, next_bid)?;
                 self.indirect_blocks.lock().insert_new(new_bid, block)?;
             }
 
             // Splice the chain head into the existing branch.
-            let splice_ptr = Ext2Bid::from_raw(new_blocks[0]);
+            let splice_ptr = new_blocks[0];
             if branch.partial_level == 0 {
                 let slot = path.offsets[0] as usize;
                 if slot >= self.desc.block_ptrs.len() {
@@ -572,7 +513,7 @@ impl InodeMapping {
                         "block pointer changed during allocation"
                     );
                 }
-                self.desc.block_ptrs[slot] = splice_ptr.to_raw();
+                self.desc.block_ptrs[slot] = splice_ptr;
             } else {
                 let parent_bid = branch
                     .chain
@@ -584,7 +525,7 @@ impl InodeMapping {
                 let mut indirect_blocks = self.indirect_blocks.lock();
                 let parent_block = indirect_blocks.find_mut(parent_bid)?;
                 let slot = path.offsets[branch.partial_level] as usize;
-                if !parent_block.read_bid(slot)?.is_zero() {
+                if parent_block.read_bid(slot)? != 0 {
                     return_errno_with_message!(
                         Errno::EIO,
                         "block pointer changed during allocation"
@@ -609,7 +550,7 @@ impl InodeMapping {
         // SPEC: ext2_splice_branch-style inode accounting and ctime update.
         self.desc.blocks = new_block_count;
 
-        Ok(Ext2Bid::from_raw(data_block))
+        Ok(data_block)
     }
 
     /// Resolves a logical block to physical block (read-only).
@@ -631,7 +572,7 @@ impl InodeMapping {
             .get(path.depth - 1)
             .ok_or_else(|| Error::with_message(Errno::EIO, "incomplete branch result"))?
             .key;
-        if bid.is_zero() {
+        if bid == 0 {
             return Ok(None);
         }
         Ok(Some(bid))
@@ -767,7 +708,7 @@ impl InodeMapping {
                     let keep_entries = path.offsets[partial] as usize;
                     let mut all_zero = true;
                     for idx in 0..keep_entries {
-                        if !block.read_bid(idx)?.is_zero() {
+                        if block.read_bid(idx)? != 0 {
                             all_zero = false;
                             break;
                         }
@@ -791,7 +732,7 @@ impl InodeMapping {
                 if slot >= self.desc.block_ptrs.len() {
                     return_errno_with_message!(Errno::EIO, "inode block pointer slot out of range");
                 }
-                detached_nr = Ext2Bid::from_raw(self.desc.block_ptrs[slot]);
+                detached_nr = self.desc.block_ptrs[slot];
                 self.desc.block_ptrs[slot] = 0;
             } else {
                 let parent_bid = branch
@@ -805,11 +746,11 @@ impl InodeMapping {
                 let mut indirect_blocks = self.indirect_blocks.lock();
                 let parent_block = indirect_blocks.find_mut(parent_bid)?;
                 detached_nr = parent_block.read_bid(slot)?;
-                parent_block.write_bid(slot, Ext2Bid::new(0))?;
+                parent_block.write_bid(slot, 0)?;
             }
 
             // Recursively free the detached subtree.
-            if !detached_nr.is_zero() {
+            if detached_nr != 0 {
                 // SPEC: free detached subtree root.
                 let subtree_depth = (path.depth - 1 - partial) as u32;
                 self.free_branches(fs, detached_nr, subtree_depth);
@@ -836,10 +777,10 @@ impl InodeMapping {
                     let mut child_blocks = Vec::new();
                     for idx in start_idx..ptrs_per_block {
                         let nr = block.read_bid(idx)?;
-                        if nr.is_zero() {
+                        if nr == 0 {
                             continue;
                         }
-                        block.write_bid(idx, Ext2Bid::new(0))?;
+                        block.write_bid(idx, 0)?;
                         child_blocks.push(nr);
                     }
                     child_blocks
@@ -856,24 +797,24 @@ impl InodeMapping {
         // If in single indirect, free double and triple indirect trees, etc.
         if path.offsets[0] < 12 {
             // Truncation in direct blocks: free single, double, triple indirect.
-            let nr = Ext2Bid::from_raw(self.desc.block_ptrs[12]);
-            if !nr.is_zero() {
+            let nr = self.desc.block_ptrs[12];
+            if nr != 0 {
                 self.desc.block_ptrs[12] = 0;
                 self.free_branches(fs, nr, 1);
             }
         }
         if path.offsets[0] <= 12 {
             // Truncation in direct or single indirect: free double, triple indirect.
-            let nr = Ext2Bid::from_raw(self.desc.block_ptrs[13]);
-            if !nr.is_zero() {
+            let nr = self.desc.block_ptrs[13];
+            if nr != 0 {
                 self.desc.block_ptrs[13] = 0;
                 self.free_branches(fs, nr, 2);
             }
         }
         if path.offsets[0] <= 13 {
             // Truncation in direct, single, or double indirect: free triple indirect.
-            let nr = Ext2Bid::from_raw(self.desc.block_ptrs[14]);
-            if !nr.is_zero() {
+            let nr = self.desc.block_ptrs[14];
+            if nr != 0 {
                 self.desc.block_ptrs[14] = 0;
                 self.free_branches(fs, nr, 3);
             }
@@ -917,7 +858,10 @@ mod test {
         let mut block_bitmap_buf = vec![0u8; BLOCK_SIZE];
         f.disk
             .segment()
-            .read_bytes(group.block_bitmap_bid().to_offset(), &mut block_bitmap_buf)
+            .read_bytes(
+                Bid::new(group.block_bitmap_bid() as u64).to_offset(),
+                &mut block_bitmap_buf,
+            )
             .unwrap();
         let block_len = {
             let bitmap = group.block_bitmap();
@@ -929,7 +873,10 @@ mod test {
         let mut inode_bitmap_buf = vec![0u8; BLOCK_SIZE];
         f.disk
             .segment()
-            .read_bytes(group.inode_bitmap_bid().to_offset(), &mut inode_bitmap_buf)
+            .read_bytes(
+                Bid::new(group.inode_bitmap_bid() as u64).to_offset(),
+                &mut inode_bitmap_buf,
+            )
             .unwrap();
         let inode_len = {
             let bitmap = group.inode_bitmap();
@@ -1034,19 +981,19 @@ mod test {
         assert_eq!(triple_path.offsets[3], 4);
 
         // Verify block lookup resolves direct/indirect/double/triple chains.
-        assert_eq!(mapping.get_block(ext2, 0).unwrap(), Some(Ext2Bid::new(11)));
+        assert_eq!(mapping.get_block(ext2, 0).unwrap(), Some(11));
         assert_eq!(mapping.get_block(ext2, 1).unwrap(), None);
         assert_eq!(
             mapping.get_block(ext2, 12 + indirect_index).unwrap(),
-            Some(Ext2Bid::new(mapped_bid))
+            Some(mapped_bid)
         );
         assert_eq!(
             mapping.get_block(ext2, double_iblock).unwrap(),
-            Some(Ext2Bid::new(double_data_bid))
+            Some(double_data_bid)
         );
         assert_eq!(
             mapping.get_block(ext2, triple_iblock).unwrap(),
-            Some(Ext2Bid::new(triple_data_bid))
+            Some(triple_data_bid)
         );
     }
 
@@ -1076,7 +1023,7 @@ mod test {
 
         // Inject a deterministic read failure on the indirect block read path.
         let io_base = Ext2FixtureBuilder::new(2, 256).build().unwrap();
-        let io_fail_offset = Ext2Bid::new(40).to_offset();
+        let io_fail_offset = Bid::new(40).to_offset();
         let io_disk = Arc::new(ErrorBioDisk::with_read_error_at(
             io_base.disk.clone(),
             BioStatus::IoError,
@@ -1148,7 +1095,7 @@ mod test {
         let allocated = mapping.get_or_alloc_block(ext2, 0, true).unwrap().unwrap();
         let free_after = ext2.super_block().free_blocks_count();
 
-        assert_eq!(mapping.desc.block_ptrs[0], allocated.to_raw() as u32);
+        assert_eq!(mapping.desc.block_ptrs[0], allocated);
         assert_eq!(mapping.get_block(ext2, 0).unwrap(), Some(allocated));
         assert_eq!(mapping.desc.blocks, sectors_per_block);
         assert_eq!(free_before.saturating_sub(free_after), 1);
@@ -1337,8 +1284,8 @@ mod test {
         mapping
             .get_or_alloc_block(ext2, first_triple_iblock, true)
             .unwrap();
-        let root = Ext2Bid::new(mapping.desc.block_ptrs[14]);
-        assert_ne!(root, Ext2Bid::new(0));
+        let root = mapping.desc.block_ptrs[14];
+        assert_ne!(root, 0);
         assert_eq!(mapping.desc.blocks, sectors_per_block.saturating_mul(4));
 
         let free_before = ext2.super_block().free_blocks_count();

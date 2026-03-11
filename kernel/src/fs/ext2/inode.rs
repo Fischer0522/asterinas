@@ -1834,12 +1834,9 @@ impl InodeInner {
                 return_errno_with_message!(Errno::EIO, "dir block pointer already occupied");
             }
             let old_mapping_desc = *mapping.get_desc();
-            let bid = mapping
-                .get_or_alloc_block(fs, 0, true)?
-                .ok_or_else(|| {
-                    Error::with_message(Errno::ENOSPC, "failed to allocate first dir block")
-                })?
-                .to_raw() as u32;
+            let bid = mapping.get_or_alloc_block(fs, 0, true)?.ok_or_else(|| {
+                Error::with_message(Errno::ENOSPC, "failed to allocate first dir block")
+            })?;
             let new_mapping_desc = *mapping.get_desc();
             (old_mapping_desc, new_mapping_desc, bid)
         };
@@ -3478,7 +3475,7 @@ mod test {
         let table_block = f.descs[group_idx].inode_table + block_index as u32;
         f.disk
             .segment()
-            .read_val(Ext2Bid::from_raw(table_block).to_offset() + offset_in_block)
+            .read_val(Bid::new(table_block as u64).to_offset() + offset_in_block)
             .unwrap()
     }
 
@@ -4105,7 +4102,7 @@ mod test {
         encode_dir_entry(&mut one_block, 12, 0, (block_size - 12) as u16, b"", 0);
         let data_bid = 81u32;
         disk.segment()
-            .write_bytes(Ext2Bid::from_raw(data_bid).to_offset(), &one_block)
+            .write_bytes(Bid::new(data_bid as u64).to_offset(), &one_block)
             .unwrap();
 
         let mut ptrs = [0u32; 15];
@@ -4139,7 +4136,7 @@ mod test {
         bad_block[8] = b'.';
         let bad_bid = 82u32;
         disk.segment()
-            .write_bytes(Ext2Bid::from_raw(bad_bid).to_offset(), &bad_block)
+            .write_bytes(Bid::new(bad_bid as u64).to_offset(), &bad_block)
             .unwrap();
 
         let mut bad_ptrs = [0u32; 15];
@@ -4470,7 +4467,7 @@ mod test {
         on_disk_block[..old_size].fill(0x11);
         f.disk
             .segment()
-            .write_bytes(Ext2Bid::from_raw(data_bid).to_offset(), &on_disk_block)
+            .write_bytes(Bid::new(data_bid as u64).to_offset(), &on_disk_block)
             .unwrap();
 
         let mut ptrs = [0u32; 15];
@@ -4888,7 +4885,7 @@ mod test {
 
         let base = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let fail_bid = 40u32;
-        let fail_offset = Ext2Bid::from_raw(fail_bid).to_offset();
+        let fail_offset = Bid::new(fail_bid as u64).to_offset();
         let io_disk = Arc::new(ErrorBioDisk::with_read_error_at(
             base.disk.clone(),
             BioStatus::IoError,

@@ -29,7 +29,7 @@ struct InodeTableBackend {
 
 impl PageCacheBackend for InodeTableBackend {
     fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
-        let bid = self.inode_table_bid.to_bid() + idx as u64;
+        let bid = Bid::new(self.inode_table_bid as u64) + idx as u64;
         let bio_segment = BioSegment::new_from_segment(
             Segment::from(frame.clone()).into(),
             BioDirection::FromDevice,
@@ -38,7 +38,7 @@ impl PageCacheBackend for InodeTableBackend {
     }
 
     fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
-        let bid = self.inode_table_bid.to_bid() + idx as u64;
+        let bid = Bid::new(self.inode_table_bid as u64) + idx as u64;
         let bio_segment = BioSegment::new_from_segment(
             Segment::from(frame.clone()).into(),
             BioDirection::ToDevice,
@@ -129,9 +129,9 @@ pub(super) struct GroupDesc {
 impl From<RawGroupDesc> for GroupDesc {
     fn from(raw: RawGroupDesc) -> Self {
         Self {
-            block_bitmap: Ext2Bid::from_raw(raw.block_bitmap),
-            inode_bitmap: Ext2Bid::from_raw(raw.inode_bitmap),
-            inode_table: Ext2Bid::from_raw(raw.inode_table),
+            block_bitmap: raw.block_bitmap,
+            inode_bitmap: raw.inode_bitmap,
+            inode_table: raw.inode_table,
             free_blocks_count: raw.free_blocks_count,
             free_inodes_count: raw.free_inodes_count,
             used_dirs_count: raw.used_dirs_count,
@@ -142,9 +142,9 @@ impl From<RawGroupDesc> for GroupDesc {
 impl From<GroupDesc> for RawGroupDesc {
     fn from(desc: GroupDesc) -> Self {
         Self {
-            block_bitmap: desc.block_bitmap.to_raw(),
-            inode_bitmap: desc.inode_bitmap.to_raw(),
-            inode_table: desc.inode_table.to_raw(),
+            block_bitmap: desc.block_bitmap,
+            inode_bitmap: desc.inode_bitmap,
+            inode_table: desc.inode_table,
             free_blocks_count: desc.free_blocks_count,
             free_inodes_count: desc.free_inodes_count,
             used_dirs_count: desc.used_dirs_count,
@@ -449,7 +449,10 @@ impl BlockGroup {
             if block_bitmap.is_dirty() {
                 if self
                     .block_device
-                    .write_bytes(block_bitmap_bid.to_offset(), block_bitmap.as_bytes())
+                    .write_bytes(
+                        Bid::new(block_bitmap_bid as u64).to_offset(),
+                        block_bitmap.as_bytes(),
+                    )
                     .is_err()
                 {
                     // SPEC: keep dirty bit set on writeback failure for retry.
@@ -464,7 +467,10 @@ impl BlockGroup {
             if inode_bitmap.is_dirty() {
                 if self
                     .block_device
-                    .write_bytes(inode_bitmap_bid.to_offset(), inode_bitmap.as_bytes())
+                    .write_bytes(
+                        Bid::new(inode_bitmap_bid as u64).to_offset(),
+                        inode_bitmap.as_bytes(),
+                    )
                     .is_err()
                 {
                     // SPEC: keep dirty bit set on writeback failure for retry.
@@ -491,7 +497,7 @@ impl BlockGroup {
 
         let mut buf = vec![0u8; BLOCK_SIZE];
         if block_device
-            .read_bytes(bitmap_bid.to_offset(), &mut buf)
+            .read_bytes(Bid::new(bitmap_bid as u64).to_offset(), &mut buf)
             .is_err()
         {
             return_errno_with_message!(Errno::EIO, "failed to read block bitmap");
@@ -512,9 +518,9 @@ impl BlockGroup {
                                   desc: &GroupDesc,
                                   bitmap: &IdBitmap|
          -> Result<()> {
-            let block_bitmap = desc.block_bitmap.to_raw() as u32;
-            let inode_bitmap = desc.inode_bitmap.to_raw() as u32;
-            let inode_table = desc.inode_table.to_raw() as u32;
+            let block_bitmap = desc.block_bitmap;
+            let inode_bitmap = desc.inode_bitmap;
+            let inode_table = desc.inode_table;
 
             let mut offset = block_bitmap.wrapping_sub(first_block);
             if block_bitmap < first_block || offset > max_bit {
@@ -578,7 +584,7 @@ impl BlockGroup {
 
         let mut buf = vec![0u8; BLOCK_SIZE];
         if block_device
-            .read_bytes(bitmap_bid.to_offset(), &mut buf)
+            .read_bytes(Bid::new(bitmap_bid as u64).to_offset(), &mut buf)
             .is_err()
         {
             return_errno_with_message!(Errno::EIO, "failed to read inode bitmap");
@@ -779,9 +785,9 @@ impl BlockGroup {
         };
 
         let desc = self.desc.read();
-        let block_bitmap = desc.block_bitmap.to_raw() as u32;
-        let inode_bitmap = desc.inode_bitmap.to_raw() as u32;
-        let inode_table = desc.inode_table.to_raw() as u32;
+        let block_bitmap = desc.block_bitmap;
+        let inode_bitmap = desc.inode_bitmap;
+        let inode_table = desc.inode_table;
         drop(desc);
 
         if Self::ranges_overlap(start, end, block_bitmap, 1) {
@@ -833,18 +839,9 @@ mod test {
         let group = fixture.block_group(1);
 
         assert_eq!(group.idx(), 1);
-        assert_eq!(
-            group.block_bitmap_bid().to_raw() as u32,
-            descs[1].block_bitmap
-        );
-        assert_eq!(
-            group.inode_bitmap_bid().to_raw() as u32,
-            descs[1].inode_bitmap
-        );
-        assert_eq!(
-            group.inode_table_bid().to_raw() as u32,
-            descs[1].inode_table
-        );
+        assert_eq!(group.block_bitmap_bid(), descs[1].block_bitmap);
+        assert_eq!(group.inode_bitmap_bid(), descs[1].inode_bitmap);
+        assert_eq!(group.inode_table_bid(), descs[1].inode_table);
         assert_eq!(group.free_blocks_count(), descs[1].free_blocks_count);
         assert_eq!(group.free_inodes_count(), descs[1].free_inodes_count);
         assert_eq!(group.used_dirs_count(), descs[1].used_dirs_count);

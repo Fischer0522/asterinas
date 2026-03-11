@@ -162,7 +162,7 @@ impl IndirectBlock {
     pub(super) fn alloc_uninit() -> Result<Self> {
         Ok(Self {
             block: FrameAllocOptions::new().zeroed(false).alloc_frame()?,
-            bid: Ext2Bid::new(0),
+            bid: 0,
             dirty: false,
         })
     }

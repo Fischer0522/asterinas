@@ -232,7 +232,7 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             reserved_blocks_count: sb.reserved_blocks_count,
             free_blocks_count: sb.free_blocks_count,
             free_inodes_count: sb.free_inodes_count,
-            first_data_block: Ext2Bid::from_raw(sb.first_data_block),
+            first_data_block: sb.first_data_block,
             block_size,
             frag_size,
             blocks_per_group: sb.blocks_per_group,
@@ -354,7 +354,7 @@ impl SuperBlock {
     ///
     /// Linux: /root/linux/fs/ext2/ext2.h:798 (ext2_group_first_block_no)
     pub(super) fn group_first_block_no(&self, group_idx: usize) -> u32 {
-        (group_idx as u32) * self.blocks_per_group + self.first_data_block().to_raw()
+        (group_idx as u32) * self.blocks_per_group + self.first_data_block()
     }
 
     /// Returns the last block number of a block group.
@@ -377,7 +377,7 @@ impl SuperBlock {
             return false;
         }
 
-        let first_data_block = self.first_data_block().to_raw();
+        let first_data_block = self.first_data_block();
         let blocks_count = self.total_blocks();
 
         let Some(end_blk) = start_blk.checked_add(count - 1) else {
@@ -553,12 +553,12 @@ impl SuperBlock {
     pub(super) fn bid(&self, block_group_idx: usize) -> Ext2Bid {
         if block_group_idx == 0 {
             let bid = (SUPER_BLOCK_OFFSET / self.block_size) as u32;
-            return Ext2Bid::from_raw(bid);
+            return bid;
         }
 
         assert!(self.is_backup_group(block_group_idx));
         let super_block_bid = block_group_idx * (self.blocks_per_group as usize);
-        Ext2Bid::from_raw(super_block_bid as u32)
+        super_block_bid as u32
     }
 
     /// Returns the starting block id of the block group descriptor table
@@ -748,7 +748,7 @@ impl From<&SuperBlock> for RawSuperBlock {
             reserved_blocks_count: sb.reserved_blocks_count,
             free_blocks_count: sb.free_blocks_count,
             free_inodes_count: sb.free_inodes_count,
-            first_data_block: sb.first_data_block.to_raw() as u32,
+            first_data_block: sb.first_data_block,
             log_block_size: (sb.block_size / SUPER_BLOCK_SIZE).trailing_zeros(),
             log_frag_size: (sb.frag_size / SUPER_BLOCK_SIZE).trailing_zeros(),
             blocks_per_group: sb.blocks_per_group,

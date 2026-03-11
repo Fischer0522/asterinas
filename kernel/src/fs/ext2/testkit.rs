@@ -12,6 +12,7 @@ use core::{
 use aster_block::{
     BLOCK_SIZE, BlockDevice, BlockDeviceMeta, SECTOR_SIZE,
     bio::{BioEnqueueError, BioStatus, BioType, SubmittedBio},
+    id::Bid,
 };
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::{
@@ -22,7 +23,6 @@ use ostd::{
 use super::{
     SuperBlock,
     block_group::RawGroupDesc,
-    block_ptr::Ext2Bid,
     fs::{Ext2, ROOT_INO},
     inode::{RawDirEntry, RawInode},
     super_block::{
@@ -67,7 +67,7 @@ impl Ext2MemoryDisk {
     }
 
     pub(super) fn write_group_desc_table(&self, sb: &SuperBlock, descs: &[RawGroupDesc]) {
-        let table_offset = sb.group_descriptors_bid(0).to_offset();
+        let table_offset = Bid::new(sb.group_descriptors_bid(0) as u64).to_offset();
         for (idx, desc) in descs.iter().enumerate() {
             let offset = table_offset + idx * size_of::<RawGroupDesc>();
             self.segment.write_val(offset, desc).unwrap();
@@ -453,7 +453,7 @@ impl DirentVisitor for StopAfterVisitor {
 
 /// Writes one u32 pointer into an indirect block slot.
 pub(super) fn write_indirect_ptr(disk: &Ext2MemoryDisk, bid: u32, index: u32, next: u32) {
-    let offset = Ext2Bid::from_raw(bid).to_offset() + (index as usize) * size_of::<u32>();
+    let offset = Bid::new(bid as u64).to_offset() + (index as usize) * size_of::<u32>();
     disk.segment().write_val(offset, &next).unwrap();
 }
 
@@ -475,7 +475,7 @@ pub(super) fn write_raw_inode_to_disk(
     let offset_in_block = offset_bytes % block_size;
 
     let table_block = descs[group_idx].inode_table + block_index as u32;
-    let table_bid = Ext2Bid::from_raw(table_block);
+    let table_bid = Bid::new(table_block as u64);
     disk.segment()
         .write_val(table_bid.to_offset() + offset_in_block, raw)
         .unwrap();
@@ -519,7 +519,7 @@ pub(super) fn write_block_bitmap(
     };
 
     // Required metadata/system blocks.
-    mark_block(sb.group_descriptors_bid(0).to_raw() as u32);
+    mark_block(sb.group_descriptors_bid(0));
     mark_block(desc.block_bitmap);
     mark_block(desc.inode_bitmap);
     for block in desc.inode_table..desc.inode_table.saturating_add(sb.itb_per_group()) {
@@ -532,7 +532,7 @@ pub(super) fn write_block_bitmap(
 
     disk.segment()
         .write_bytes(
-            Ext2Bid::from_raw(desc.block_bitmap).to_offset(),
+            Bid::new(desc.block_bitmap as u64).to_offset(),
             &bitmap_block,
         )
         .unwrap();
@@ -559,7 +559,7 @@ pub(super) fn write_inode_bitmap(
     }
 
     disk.segment()
-        .write_bytes(Ext2Bid::from_raw(desc.inode_bitmap).to_offset(), &bitmap)
+        .write_bytes(Bid::new(desc.inode_bitmap as u64).to_offset(), &bitmap)
         .unwrap();
 }
 
@@ -579,7 +579,7 @@ pub(super) struct Group0Layout {
 
 pub(super) fn group0_layout(sb: &SuperBlock) -> Group0Layout {
     let first = sb.group_first_block_no(0);
-    let group_desc_bid = sb.group_descriptors_bid(0).to_raw() as u32;
+    let group_desc_bid = sb.group_descriptors_bid(0);
 
     let mut next = first;
     if next == group_desc_bid {
@@ -695,7 +695,7 @@ pub(super) fn write_simple_root_dir_block(disk: &Ext2MemoryDisk, root_bid: u32, 
     block[21] = b'.';
 
     disk.segment()
-        .write_bytes(Ext2Bid::from_raw(root_bid).to_offset(), &block)
+        .write_bytes(Bid::new(root_bid as u64).to_offset(), &block)
         .unwrap();
 }
 
@@ -729,7 +729,7 @@ impl Ext2Fixture {
         self.disk
             .segment()
             .read_bytes(
-                Ext2Bid::from_raw(desc.inode_bitmap).to_offset(),
+                Bid::new(desc.inode_bitmap as u64).to_offset(),
                 &mut inode_bitmap,
             )
             .map_err(|_| Error::new(Errno::EIO))?;
@@ -905,7 +905,7 @@ impl Ext2FixtureBuilder {
 
             // Group descriptor table block(s) in group 0 must stay allocated.
             if group_idx == 0 {
-                let group_desc_bid = sb.group_descriptors_bid(0).to_raw() as u32;
+                let group_desc_bid = sb.group_descriptors_bid(0);
                 if group_desc_bid >= first && group_desc_bid <= last {
                     set_bit_lsb0(&mut bitmap_block, (group_desc_bid - first) as usize);
                 }
@@ -917,7 +917,7 @@ impl Ext2FixtureBuilder {
             }
             disk.segment()
                 .write_bytes(
-                    Ext2Bid::from_raw(desc.block_bitmap).to_offset(),
+                    Bid::new(desc.block_bitmap as u64).to_offset(),
                     &bitmap_block,
                 )
                 .unwrap();
@@ -944,7 +944,7 @@ impl Ext2FixtureBuilder {
             }
             disk.segment()
                 .write_bytes(
-                    Ext2Bid::from_raw(descs[0].block_bitmap).to_offset(),
+                    Bid::new(descs[0].block_bitmap as u64).to_offset(),
                     &bitmap_block,
                 )
                 .unwrap();
@@ -960,7 +960,7 @@ impl Ext2FixtureBuilder {
             }
             disk.segment()
                 .write_bytes(
-                    Ext2Bid::from_raw(descs[0].block_bitmap).to_offset(),
+                    Bid::new(descs[0].block_bitmap as u64).to_offset(),
                     &bitmap_block,
                 )
                 .unwrap();
@@ -972,10 +972,7 @@ impl Ext2FixtureBuilder {
                 set_bit_lsb0(&mut bitmap, bit);
             }
             disk.segment()
-                .write_bytes(
-                    Ext2Bid::from_raw(descs[0].inode_bitmap).to_offset(),
-                    &bitmap,
-                )
+                .write_bytes(Bid::new(descs[0].inode_bitmap as u64).to_offset(), &bitmap)
                 .unwrap();
         }
 
@@ -985,10 +982,7 @@ impl Ext2FixtureBuilder {
                 set_bit_lsb0(&mut bitmap, bit);
             }
             disk.segment()
-                .write_bytes(
-                    Ext2Bid::from_raw(descs[0].inode_bitmap).to_offset(),
-                    &bitmap,
-                )
+                .write_bytes(Bid::new(descs[0].inode_bitmap as u64).to_offset(), &bitmap)
                 .unwrap();
         }
     }

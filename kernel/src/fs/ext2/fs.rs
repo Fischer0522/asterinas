@@ -275,7 +275,7 @@ impl Ext2 {
             .alloc_segment(npages)?;
         let bio_segment =
             BioSegment::new_from_segment(segment.clone().into(), BioDirection::FromDevice);
-        match block_device.read_blocks(sb.group_descriptors_bid(0).to_bid(), bio_segment)? {
+        match block_device.read_blocks(Bid::new(sb.group_descriptors_bid(0) as u64), bio_segment)? {
             BioStatus::Complete => {}
             err_status => {
                 ostd::early_println!(
@@ -439,8 +439,8 @@ impl Ext2 {
         }
 
         // Linux: /root/linux/fs/ext2/balloc.c:1260 (goal-based group start).
-        let goal_raw = goal.to_raw();
-        let first_data_raw = first_data_block.to_raw();
+        let goal_raw = goal;
+        let first_data_raw = first_data_block;
         let goal_group = if goal_raw > first_data_raw {
             ((goal_raw - first_data_raw) / blocks_per_group) as usize
         } else {
@@ -491,7 +491,7 @@ impl Ext2 {
             return_errno_with_message!(Errno::EIO, "freeing invalid data block range");
         }
         let blocks_per_group = sb.blocks_per_group();
-        let first_data_block = sb.first_data_block().to_raw();
+        let first_data_block = sb.first_data_block();
         drop(sb);
 
         let mut current = start;
@@ -763,7 +763,10 @@ impl Ext2 {
         sb_guard.set_wtime(now());
         if self
             .block_device
-            .write_bytes(sb_guard.group_descriptors_bid(0).to_offset(), &desc_buf)
+            .write_bytes(
+                Bid::new(sb_guard.group_descriptors_bid(0) as u64).to_offset(),
+                &desc_buf,
+            )
             .is_err()
         {
             return_errno_with_message!(Errno::EIO, "failed to write group descriptor table");
@@ -785,14 +788,20 @@ impl Ext2 {
             raw_sb.block_group_idx = idx as u16;
             if self
                 .block_device
-                .write_bytes(sb_guard.bid(idx).to_offset(), raw_sb.as_bytes())
+                .write_bytes(
+                    Bid::new(sb_guard.bid(idx) as u64).to_offset(),
+                    raw_sb.as_bytes(),
+                )
                 .is_err()
             {
                 return_errno_with_message!(Errno::EIO, "failed to write backup superblock");
             }
             if self
                 .block_device
-                .write_bytes(sb_guard.group_descriptors_bid(idx).to_offset(), &desc_buf)
+                .write_bytes(
+                    Bid::new(sb_guard.group_descriptors_bid(idx) as u64).to_offset(),
+                    &desc_buf,
+                )
                 .is_err()
             {
                 return_errno_with_message!(Errno::EIO, "failed to write backup group descriptors");
@@ -810,12 +819,14 @@ impl Ext2 {
     ) -> Result<BioWaiter> {
         let waiter = self
             .block_device
-            .read_blocks_async(bid.to_bid(), bio_segment)?;
+            .read_blocks_async(Bid::new(bid as u64), bio_segment)?;
         Ok(waiter)
     }
 
     pub(super) fn read_blocks(&self, bid: Ext2Bid, bio_segment: BioSegment) -> Result<()> {
-        let bio_status = self.block_device.read_blocks(bid.to_bid(), bio_segment)?;
+        let bio_status = self
+            .block_device
+            .read_blocks(Bid::new(bid as u64), bio_segment)?;
         match bio_status {
             BioStatus::Complete => Ok(()),
             _ => {
@@ -831,12 +842,14 @@ impl Ext2 {
     ) -> Result<BioWaiter> {
         let waiter = self
             .block_device
-            .write_blocks_async(bid.to_bid(), bio_segment)?;
+            .write_blocks_async(Bid::new(bid as u64), bio_segment)?;
         Ok(waiter)
     }
 
     pub(super) fn write_blocks(&self, bid: Ext2Bid, bio_segment: BioSegment) -> Result<()> {
-        let bio_status = self.block_device.write_blocks(bid.to_bid(), bio_segment)?;
+        let bio_status = self
+            .block_device
+            .write_blocks(Bid::new(bid as u64), bio_segment)?;
         match bio_status {
             BioStatus::Complete => Ok(()),
             _ => {
@@ -959,7 +972,7 @@ mod test {
 
         let groups_count = sb.block_groups_count() as usize;
         let desc_bytes = groups_count * size_of::<RawGroupDesc>();
-        let primary_desc_offset = sb.group_descriptors_bid(0).to_offset();
+        let primary_desc_offset = Bid::new(sb.group_descriptors_bid(0) as u64).to_offset();
 
         let mut primary_desc = vec![0u8; desc_bytes];
         disk.segment()
@@ -984,7 +997,7 @@ mod test {
 
             let backup_sb = disk
                 .segment()
-                .read_val::<RawSuperBlock>(sb.bid(idx).to_offset())
+                .read_val::<RawSuperBlock>(Bid::new(sb.bid(idx) as u64).to_offset())
                 .unwrap();
             assert_eq!(backup_sb.block_group_idx, idx as u16);
 
@@ -996,7 +1009,10 @@ mod test {
 
             let mut backup_desc = vec![0u8; desc_bytes];
             disk.segment()
-                .read_bytes(sb.group_descriptors_bid(idx).to_offset(), &mut backup_desc)
+                .read_bytes(
+                    Bid::new(sb.group_descriptors_bid(idx) as u64).to_offset(),
+                    &mut backup_desc,
+                )
                 .unwrap();
             assert_eq!(backup_desc, primary_desc);
         }
@@ -1014,7 +1030,7 @@ mod test {
         let before_sb_free = f.ext2.super_block().free_blocks_count();
         let before_group_free = f.block_group(0).free_blocks_count();
 
-        let goal = Ext2Bid::from_raw(f.sb.group_first_block_no(0));
+        let goal = f.sb.group_first_block_no(0);
         let range = f.ext2.alloc_blocks(8, goal).unwrap();
         let alloc_len = range.end - range.start;
         assert!(alloc_len >= 1 && alloc_len <= 8);
@@ -1022,7 +1038,7 @@ mod test {
         {
             let sb = f.ext2.super_block();
             assert!(sb.data_block_valid(range.start, alloc_len));
-            let first_data = sb.first_data_block().to_raw();
+            let first_data = sb.first_data_block();
             let start_group = (range.start - first_data) / sb.blocks_per_group();
             let end_group = (range.end - 1 - first_data) / sb.blocks_per_group();
             assert_eq!(start_group, end_group);
@@ -1094,7 +1110,7 @@ mod test {
             Errno::EIO
         );
 
-        let inode_bitmap_bid = f_free.block_group(0).inode_bitmap_bid().to_raw() as u32;
+        let inode_bitmap_bid = f_free.block_group(0).inode_bitmap_bid();
         assert_eq!(
             f_free
                 .ext2
@@ -1124,11 +1140,10 @@ mod test {
             sb.inc_free_blocks(16);
         }
 
-        let goal = Ext2Bid::from_raw(f.sb.group_first_block_no(1) + 16);
+        let goal = f.sb.group_first_block_no(1) + 16;
         let range = f.ext2.alloc_blocks(4, goal).unwrap();
 
-        let start_group =
-            (range.start - f.sb.first_data_block().to_raw()) / f.sb.blocks_per_group();
+        let start_group = (range.start - f.sb.first_data_block()) / f.sb.blocks_per_group();
         assert_eq!(start_group, 1);
     }
 
@@ -1368,7 +1383,7 @@ mod test {
         f.ext2.write_inode_desc(ROOT_INO, &raw).unwrap();
 
         let bid = f.ext2.inode_table_block(1, 3).unwrap();
-        let base = Ext2Bid::from_raw(f.descs[1].inode_table);
+        let base = f.descs[1].inode_table;
         assert_eq!(bid, base + 3);
 
         let desc = f.ext2.read_inode_desc(ROOT_INO).unwrap();
@@ -1394,7 +1409,7 @@ mod test {
         // I/O error from block device: fail group-1 inode-table reads so mount
         // (which reads ROOT_INO from group 0) still succeeds.
         let f_base = Ext2FixtureBuilder::new(2, 128).build().unwrap();
-        let inode_table_offset = Ext2Bid::from_raw(f_base.descs[1].inode_table).to_offset();
+        let inode_table_offset = Bid::new(f_base.descs[1].inode_table as u64).to_offset();
         let io_disk = ErrorBioDisk::with_read_error_at(
             f_base.disk.clone(),
             BioStatus::IoError,
@@ -1497,7 +1512,10 @@ mod test {
         );
         f.disk
             .segment()
-            .write_bytes(group.block_bitmap_bid().to_offset(), &bitmap_block)
+            .write_bytes(
+                Bid::new(group.block_bitmap_bid() as u64).to_offset(),
+                &bitmap_block,
+            )
             .unwrap();
 
         // Cached bitmap is loaded during mount; direct disk mutation should not affect cache.
@@ -1523,7 +1541,10 @@ mod test {
         testkit::set_bit_lsb0(&mut bitmap_block, 31);
         f.disk
             .segment()
-            .write_bytes(group.inode_bitmap_bid().to_offset(), &bitmap_block)
+            .write_bytes(
+                Bid::new(group.inode_bitmap_bid() as u64).to_offset(),
+                &bitmap_block,
+            )
             .unwrap();
 
         let bitmap = group.inode_bitmap();
