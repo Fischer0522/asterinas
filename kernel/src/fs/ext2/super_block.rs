@@ -4,7 +4,7 @@ use core::mem::size_of;
 
 use ostd::const_assert;
 
-use super::prelude::*;
+use super::{block_ptr::Ext2Bid, prelude::*};
 use crate::time::UnixTime;
 
 /// The magic number of Ext2.
@@ -31,7 +31,7 @@ pub struct SuperBlock {
     /// Total number of free inodes.
     free_inodes_count: u32,
     /// First data block.
-    first_data_block: Bid,
+    first_data_block: Ext2Bid,
     /// Block size.
     block_size: usize,
     /// Fragment size.
@@ -232,7 +232,7 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             reserved_blocks_count: sb.reserved_blocks_count,
             free_blocks_count: sb.free_blocks_count,
             free_inodes_count: sb.free_inodes_count,
-            first_data_block: Bid::new(sb.first_data_block as _),
+            first_data_block: Ext2Bid::from_raw(sb.first_data_block),
             block_size,
             frag_size,
             blocks_per_group: sb.blocks_per_group,
@@ -354,7 +354,7 @@ impl SuperBlock {
     ///
     /// Linux: /root/linux/fs/ext2/ext2.h:798 (ext2_group_first_block_no)
     pub(super) fn group_first_block_no(&self, group_idx: usize) -> u32 {
-        (group_idx as u32) * self.blocks_per_group + self.first_data_block()
+        (group_idx as u32) * self.blocks_per_group + self.first_data_block().to_raw()
     }
 
     /// Returns the last block number of a block group.
@@ -377,7 +377,7 @@ impl SuperBlock {
             return false;
         }
 
-        let first_data_block = self.first_data_block();
+        let first_data_block = self.first_data_block().to_raw();
         let blocks_count = self.total_blocks();
 
         let Some(end_blk) = start_blk.checked_add(count - 1) else {
@@ -401,8 +401,8 @@ impl SuperBlock {
     }
 
     /// Returns the first data block number.
-    pub fn first_data_block(&self) -> u32 {
-        self.first_data_block.to_raw() as u32
+    pub(super) fn first_data_block(&self) -> Ext2Bid {
+        self.first_data_block
     }
 
     /// Returns the number of inodes in each block group.
@@ -550,15 +550,15 @@ impl SuperBlock {
     ///
     /// If `block_group_idx` is neither 0 nor a backup block group index,
     /// then the method panics.
-    pub(super) fn bid(&self, block_group_idx: usize) -> Bid {
+    pub(super) fn bid(&self, block_group_idx: usize) -> Ext2Bid {
         if block_group_idx == 0 {
-            let bid = (SUPER_BLOCK_OFFSET / self.block_size) as u64;
-            return Bid::new(bid);
+            let bid = (SUPER_BLOCK_OFFSET / self.block_size) as u32;
+            return Ext2Bid::from_raw(bid);
         }
 
         assert!(self.is_backup_group(block_group_idx));
         let super_block_bid = block_group_idx * (self.blocks_per_group as usize);
-        Bid::new(super_block_bid as u64)
+        Ext2Bid::from_raw(super_block_bid as u32)
     }
 
     /// Returns the starting block id of the block group descriptor table
@@ -568,9 +568,9 @@ impl SuperBlock {
     ///
     /// If `block_group_idx` is neither 0 nor a backup block group index,
     /// then the method panics.
-    pub(super) fn group_descriptors_bid(&self, block_group_idx: usize) -> Bid {
+    pub(super) fn group_descriptors_bid(&self, block_group_idx: usize) -> Ext2Bid {
         let super_block_bid = self.bid(block_group_idx);
-        super_block_bid + (SUPER_BLOCK_SIZE.div_ceil(self.block_size) as u64)
+        super_block_bid + (SUPER_BLOCK_SIZE.div_ceil(self.block_size) as u32)
     }
 }
 

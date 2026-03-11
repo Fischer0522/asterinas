@@ -9,7 +9,7 @@ use super::{block_ptr::Ext2Bid, fs::Ext2, prelude::*};
 /// Inode-local cache for indirect metadata blocks.
 #[derive(Debug)]
 pub(super) struct IndirectBlockManager {
-    cache: LruCache<Bid, IndirectBlock>,
+    cache: LruCache<Ext2Bid, IndirectBlock>,
     capacity: usize,
     fs: Weak<Ext2>,
 }
@@ -30,28 +30,26 @@ impl IndirectBlockManager {
 
     /// Linux: /root/linux/fs/ext2/inode.c:234 (ext2_get_branch)
     pub(super) fn find(&mut self, bid: Ext2Bid) -> Result<&IndirectBlock> {
-        let cache_bid = Bid::new(bid as u64);
-        if self.cache.get(&cache_bid).is_none() {
+        if self.cache.get(&bid).is_none() {
             self.try_shink()?;
             let block = self.load_block(bid)?;
-            self.cache.put(cache_bid, block);
+            self.cache.put(bid, block);
         }
 
-        self.cache.get(&cache_bid).ok_or_else(|| {
+        self.cache.get(&bid).ok_or_else(|| {
             Error::with_message(Errno::EIO, "failed to retain resident indirect block")
         })
     }
 
     /// Linux: /root/linux/fs/ext2/inode.c:234 (ext2_get_branch)
     pub(super) fn find_mut(&mut self, bid: Ext2Bid) -> Result<&mut IndirectBlock> {
-        let cache_bid = Bid::new(bid as u64);
-        if self.cache.get(&cache_bid).is_none() {
+        if self.cache.get(&bid).is_none() {
             self.try_shink()?;
             let block = self.load_block(bid)?;
-            self.cache.put(cache_bid, block);
+            self.cache.put(bid, block);
         }
 
-        self.cache.get_mut(&cache_bid).ok_or_else(|| {
+        self.cache.get_mut(&bid).ok_or_else(|| {
             Error::with_message(Errno::EIO, "failed to retain resident indirect block")
         })
     }
@@ -63,19 +61,19 @@ impl IndirectBlockManager {
         }
 
         self.try_shink()?;
-        self.cache.put(Bid::new(bid as u64), block);
+        self.cache.put(bid, block);
         Ok(())
     }
 
     /// Linux: /root/linux/fs/ext2/inode.c:1136 (ext2_free_branches)
     pub(super) fn remove(&mut self, bid: Ext2Bid) -> Option<IndirectBlock> {
-        self.cache.pop(&Bid::new(bid as u64))
+        self.cache.pop(&bid)
     }
 
     /// Linux: /root/linux/fs/ext2/super.c:1308 (ext2_sync_fs)
     pub(super) fn sync(&mut self) -> Result<()> {
         let fs = self.fs_arc()?;
-        let dirty_bids: Vec<Bid> = self
+        let dirty_bids: Vec<Ext2Bid> = self
             .cache
             .iter()
             .filter_map(|(bid, block)| block.is_dirty().then_some(*bid))
@@ -123,7 +121,7 @@ impl IndirectBlockManager {
         );
         let status = fs
             .block_device()
-            .read_blocks(Bid::new(bid as u64), bio_segment)
+            .read_blocks(bid.to_bid(), bio_segment)
             .map_err(|_| Error::with_message(Errno::EIO, "failed to submit indirect block read"))?;
         if status != BioStatus::Complete {
             return_errno_with_message!(Errno::EIO, "failed to read indirect block");
@@ -143,7 +141,7 @@ impl IndirectBlockManager {
         );
         let status = fs
             .block_device()
-            .write_blocks(Bid::new(block.bid() as u64), bio_segment)
+            .write_blocks(block.bid().to_bid(), bio_segment)
             .map_err(|_| {
                 Error::with_message(Errno::EIO, "failed to submit indirect block writeback")
             })?;
@@ -175,7 +173,7 @@ impl IndirectBlock {
     pub(super) fn alloc_uninit() -> Result<Self> {
         Ok(Self {
             block: FrameAllocOptions::new().zeroed(false).alloc_frame()?,
-            bid: 0,
+            bid: Ext2Bid::new(0),
             dirty: false,
         })
     }

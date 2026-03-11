@@ -5,6 +5,7 @@ use core::{fmt, mem::size_of};
 use ostd::const_assert;
 
 use super::{
+    block_ptr::Ext2Bid,
     fs::Ext2,
     inode::{Inode, InodeDesc, RawInode},
     prelude::*,
@@ -19,7 +20,7 @@ use crate::fs::utils::IdBitmap;
 /// Asterinas equivalent: `PageCacheBackend` implementation.
 struct InodeTableBackend {
     /// Physical block ID of `bg_inode_table`.
-    inode_table_bid: Bid,
+    inode_table_bid: Ext2Bid,
     /// Total inode table size in bytes (`inodes_per_group * inode_size`).
     raw_inodes_size: usize,
     /// Block device handle for I/O (replaces `Weak<Ext2>`).
@@ -28,7 +29,7 @@ struct InodeTableBackend {
 
 impl PageCacheBackend for InodeTableBackend {
     fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
-        let bid = self.inode_table_bid + idx as u64;
+        let bid = self.inode_table_bid.to_bid() + idx as u64;
         let bio_segment = BioSegment::new_from_segment(
             Segment::from(frame.clone()).into(),
             BioDirection::FromDevice,
@@ -37,7 +38,7 @@ impl PageCacheBackend for InodeTableBackend {
     }
 
     fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
-        let bid = self.inode_table_bid + idx as u64;
+        let bid = self.inode_table_bid.to_bid() + idx as u64;
         let bio_segment = BioSegment::new_from_segment(
             Segment::from(frame.clone()).into(),
             BioDirection::ToDevice,
@@ -117,9 +118,9 @@ const_assert!(size_of::<RawGroupDesc>() == 32);
 /// In-memory block group descriptor.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct GroupDesc {
-    pub block_bitmap: Bid,
-    pub inode_bitmap: Bid,
-    pub inode_table: Bid,
+    pub block_bitmap: Ext2Bid,
+    pub inode_bitmap: Ext2Bid,
+    pub inode_table: Ext2Bid,
     pub free_blocks_count: u16,
     pub free_inodes_count: u16,
     pub used_dirs_count: u16,
@@ -128,9 +129,9 @@ pub(super) struct GroupDesc {
 impl From<RawGroupDesc> for GroupDesc {
     fn from(raw: RawGroupDesc) -> Self {
         Self {
-            block_bitmap: Bid::new(raw.block_bitmap as u64),
-            inode_bitmap: Bid::new(raw.inode_bitmap as u64),
-            inode_table: Bid::new(raw.inode_table as u64),
+            block_bitmap: Ext2Bid::from_raw(raw.block_bitmap),
+            inode_bitmap: Ext2Bid::from_raw(raw.inode_bitmap),
+            inode_table: Ext2Bid::from_raw(raw.inode_table),
             free_blocks_count: raw.free_blocks_count,
             free_inodes_count: raw.free_inodes_count,
             used_dirs_count: raw.used_dirs_count,
@@ -141,9 +142,9 @@ impl From<RawGroupDesc> for GroupDesc {
 impl From<GroupDesc> for RawGroupDesc {
     fn from(desc: GroupDesc) -> Self {
         Self {
-            block_bitmap: desc.block_bitmap.to_raw() as u32,
-            inode_bitmap: desc.inode_bitmap.to_raw() as u32,
-            inode_table: desc.inode_table.to_raw() as u32,
+            block_bitmap: desc.block_bitmap.to_raw(),
+            inode_bitmap: desc.inode_bitmap.to_raw(),
+            inode_table: desc.inode_table.to_raw(),
             free_blocks_count: desc.free_blocks_count,
             free_inodes_count: desc.free_inodes_count,
             used_dirs_count: desc.used_dirs_count,
@@ -332,15 +333,15 @@ impl BlockGroup {
         self.idx
     }
 
-    pub fn block_bitmap_bid(&self) -> Bid {
+    pub fn block_bitmap_bid(&self) -> Ext2Bid {
         self.desc.read().block_bitmap
     }
 
-    pub fn inode_bitmap_bid(&self) -> Bid {
+    pub fn inode_bitmap_bid(&self) -> Ext2Bid {
         self.desc.read().inode_bitmap
     }
 
-    pub fn inode_table_bid(&self) -> Bid {
+    pub fn inode_table_bid(&self) -> Ext2Bid {
         self.desc.read().inode_table
     }
 

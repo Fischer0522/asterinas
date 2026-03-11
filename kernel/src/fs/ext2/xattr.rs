@@ -2,7 +2,7 @@
 
 use core::{cmp::Ordering, mem::size_of};
 
-use super::{fs::Ext2, prelude::*};
+use super::{block_ptr::Ext2Bid, fs::Ext2, prelude::*};
 use crate::fs::{
     ext2::Inode,
     utils::{XattrName, XattrNamespace, XattrSetFlags},
@@ -126,7 +126,7 @@ struct XattrEntryData {
 #[derive(Debug)]
 pub(super) struct Xattr {
     block_buf: Option<USegment>,
-    bid: u32,
+    bid: Ext2Bid,
     dirty: bool,
     inode: Weak<Inode>,
     fs: Weak<Ext2>,
@@ -137,7 +137,7 @@ impl Xattr {
     pub(super) fn new(bid: u32, inode: Weak<Inode>, fs: Weak<Ext2>) -> Self {
         Self {
             block_buf: None,
-            bid,
+            bid: Ext2Bid::from_raw(bid),
             dirty: false,
             inode,
             fs,
@@ -146,7 +146,7 @@ impl Xattr {
 
     /// Returns the current xattr block number. Caller uses this to update `InodeDesc.file_acl`.
     pub(super) fn bid(&self) -> u32 {
-        self.bid
+        self.bid.to_raw()
     }
 
     fn fs_arc(&self) -> Result<Arc<Ext2>> {
@@ -537,7 +537,7 @@ impl Xattr {
     }
 
     fn alloc_bid_if_needed(&mut self) -> Result<()> {
-        if self.bid != 0 {
+        if !self.bid.is_zero() {
             return Ok(());
         }
 
@@ -545,21 +545,22 @@ impl Xattr {
         let inode = self.inode_arc()?;
         let goal = {
             let sb = fs.super_block();
-            Bid::new(
-                sb.first_data_block() as u64
-                    + inode.block_group_idx() as u64 * sb.blocks_per_group() as u64,
+            Ext2Bid::from_raw(
+                sb.first_data_block()
+                    .to_raw()
+                    .saturating_add(inode.block_group_idx() as u32 * sb.blocks_per_group()),
             )
         };
         let range = fs.alloc_blocks(1, goal)?;
         if range.start >= range.end {
             return_errno_with_message!(Errno::EIO, "xattr block allocation returned empty range");
         }
-        self.bid = range.start;
+        self.bid = Ext2Bid::from_raw(range.start);
         Ok(())
     }
 
     fn ensure_loaded(&mut self) -> Result<()> {
-        if self.block_buf.is_some() || self.bid == 0 {
+        if self.block_buf.is_some() || self.bid.is_zero() {
             return Ok(());
         }
 
@@ -567,9 +568,11 @@ impl Xattr {
         let block_size = fs.block_size();
         let block_buf = Self::alloc_block_buffer(block_size)?;
 
-        let bid = Bid::new(self.bid as u64);
         let bio_segment = BioSegment::new_from_segment(block_buf.clone(), BioDirection::FromDevice);
-        match fs.block_device().read_blocks(bid, bio_segment)? {
+        match fs
+            .block_device()
+            .read_blocks(self.bid.to_bid(), bio_segment)?
+        {
             BioStatus::Complete => {}
             status => return Err(Error::from(status)),
         }
@@ -596,7 +599,7 @@ impl Xattr {
         }
 
         self.ensure_loaded()?;
-        let mut entries = if self.bid == 0 {
+        let mut entries = if self.bid.is_zero() {
             Vec::new()
         } else {
             self.read_loaded_entries(block_size)?
@@ -644,7 +647,7 @@ impl Xattr {
         let (target_index, target_name) = Self::parse_target_name(name)?;
 
         self.ensure_loaded()?;
-        if self.bid == 0 {
+        if self.bid.is_zero() {
             return_errno_with_message!(Errno::ENODATA, "the target xattr does not exist");
         }
 
@@ -681,7 +684,7 @@ impl Xattr {
         list_writer: &mut VmWriter,
     ) -> Result<usize> {
         self.ensure_loaded()?;
-        if self.bid == 0 {
+        if self.bid.is_zero() {
             return Ok(0);
         }
 
@@ -732,7 +735,7 @@ impl Xattr {
         let (target_index, target_name) = Self::parse_target_name(name)?;
 
         self.ensure_loaded()?;
-        if self.bid == 0 {
+        if self.bid.is_zero() {
             return_errno_with_message!(Errno::ENODATA, "the target xattr does not exist");
         }
 
@@ -746,8 +749,8 @@ impl Xattr {
 
         if entries.is_empty() {
             let fs = self.fs_arc()?;
-            fs.free_blocks(self.bid, 1)?;
-            self.bid = 0;
+            fs.free_blocks(self.bid.to_raw(), 1)?;
+            self.bid = Ext2Bid::new(0);
             self.block_buf = None;
             self.dirty = false;
             return Ok(());
@@ -763,15 +766,15 @@ impl Xattr {
     ///
     /// Linux: /root/linux/fs/ext2/xattr.c:816-861 (ext2_xattr_delete_inode)
     pub(super) fn delete_xattr_block(&mut self) -> Result<()> {
-        if self.bid == 0 {
+        if self.bid.is_zero() {
             self.block_buf = None;
             self.dirty = false;
             return Ok(());
         }
 
         let fs = self.fs_arc()?;
-        fs.free_blocks(self.bid, 1)?;
-        self.bid = 0;
+        fs.free_blocks(self.bid.to_raw(), 1)?;
+        self.bid = Ext2Bid::new(0);
         self.block_buf = None;
         self.dirty = false;
         Ok(())
@@ -782,7 +785,7 @@ impl Xattr {
         if !self.dirty {
             return Ok(());
         }
-        if self.bid == 0 {
+        if self.bid.is_zero() {
             self.dirty = false;
             return Ok(());
         }
@@ -796,9 +799,11 @@ impl Xattr {
         };
 
         let fs = self.fs_arc()?;
-        let bid = Bid::new(self.bid as u64);
         let bio_segment = BioSegment::new_from_segment(block_buf, BioDirection::ToDevice);
-        match fs.block_device().write_blocks(bid, bio_segment)? {
+        match fs
+            .block_device()
+            .write_blocks(self.bid.to_bid(), bio_segment)?
+        {
             BioStatus::Complete => {
                 self.dirty = false;
                 Ok(())

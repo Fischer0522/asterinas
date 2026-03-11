@@ -13,7 +13,7 @@ use super::{
     utils::{Dirty, now},
 };
 use crate::{
-    fs::utils::FsEventSubscriberStats,
+    fs::{ext2::block_ptr::Ext2Bid, utils::FsEventSubscriberStats},
     process::{Gid, credentials::capabilities::CapSet, posix_thread::AsPosixThread},
     thread::Thread,
 };
@@ -190,12 +190,12 @@ impl Ext2 {
         &self,
         group_idx: usize,
         table_block_index: u32,
-    ) -> Result<Bid> {
+    ) -> Result<Ext2Bid> {
         let group = self
             .block_groups
             .get(group_idx)
             .ok_or_else(|| Error::with_message(Errno::EIO, "block group index out of range"))?;
-        Ok(group.inode_table_bid() + table_block_index as u64)
+        Ok(group.inode_table_bid() + table_block_index)
     }
 
     /// Reads an inode descriptor from the group's PageCache.
@@ -275,7 +275,7 @@ impl Ext2 {
             .alloc_segment(npages)?;
         let bio_segment =
             BioSegment::new_from_segment(segment.clone().into(), BioDirection::FromDevice);
-        match block_device.read_blocks(sb.group_descriptors_bid(0), bio_segment)? {
+        match block_device.read_blocks(sb.group_descriptors_bid(0).to_bid(), bio_segment)? {
             BioStatus::Complete => {}
             err_status => {
                 ostd::early_println!(
@@ -398,7 +398,7 @@ impl Ext2 {
     /// Thin orchestrator: starts from goal group (Linux ext2_new_blocks behavior),
     /// iterates groups cyclically, delegates to `BlockGroup::alloc_blocks`, and
     /// updates superblock counter on success.
-    pub(super) fn alloc_blocks(&self, count: u32, goal: Bid) -> Result<Range<u32>> {
+    pub(super) fn alloc_blocks(&self, count: u32, goal: Ext2Bid) -> Result<Range<u32>> {
         if count == 0 {
             return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
         }
@@ -440,9 +440,9 @@ impl Ext2 {
 
         // Linux: /root/linux/fs/ext2/balloc.c:1260 (goal-based group start).
         let goal_raw = goal.to_raw();
-        let first_data_raw = first_data_block as u64;
+        let first_data_raw = first_data_block.to_raw();
         let goal_group = if goal_raw > first_data_raw {
-            ((goal_raw - first_data_raw) / blocks_per_group as u64) as usize
+            ((goal_raw - first_data_raw) / blocks_per_group) as usize
         } else {
             0
         }
@@ -491,7 +491,7 @@ impl Ext2 {
             return_errno_with_message!(Errno::EIO, "freeing invalid data block range");
         }
         let blocks_per_group = sb.blocks_per_group();
-        let first_data_block = sb.first_data_block();
+        let first_data_block = sb.first_data_block().to_raw();
         drop(sb);
 
         let mut current = start;
@@ -803,6 +803,39 @@ impl Ext2 {
         Ok(())
     }
 
+    pub(super) fn read_blocks_async(
+        &self,
+        bid: Ext2Bid,
+        bio_segment: BioSegment,
+    ) -> Result<BioWaiter> {
+        let waiter = self
+            .block_device
+            .read_blocks_async(bid.to_bid(), bio_segment)?;
+        Ok(waiter)
+    }
+
+    pub(super) fn read_blocks(&self, bid: Ext2Bid, bio_segment: BioSegment) -> Result<()> {
+        let bio_status = self.block_device.read_blocks(bid.to_bid(), bio_segment)?;
+        match bio_status {
+            BioStatus::Complete => Ok(()),
+            _ => {
+                return_errno_with_message!(Errno::EIO, "failed to read blocks from block device")
+            }
+        }
+    }
+
+    pub(super) fn write_blocks_async(
+        &self,
+        _bid: Ext2Bid,
+        _bio_segment: BioSegment,
+    ) -> Result<BioWaiter> {
+        todo!()
+    }
+
+    pub(super) fn write_blocks(&self, _bid: Ext2Bid, _bio_segment: BioSegment) -> Result<()> {
+        todo!()
+    }
+
     /// Syncs cached inodes and block-group-local metadata in all groups.
     pub fn sync_all(&self) -> Result<()> {
         for group in &self.block_groups {
@@ -972,7 +1005,7 @@ mod test {
         let before_sb_free = f.ext2.super_block().free_blocks_count();
         let before_group_free = f.block_group(0).free_blocks_count();
 
-        let goal = Bid::new(f.sb.group_first_block_no(0) as u64);
+        let goal = Ext2Bid::from_raw(f.sb.group_first_block_no(0));
         let range = f.ext2.alloc_blocks(8, goal).unwrap();
         let alloc_len = range.end - range.start;
         assert!(alloc_len >= 1 && alloc_len <= 8);
@@ -980,8 +1013,9 @@ mod test {
         {
             let sb = f.ext2.super_block();
             assert!(sb.data_block_valid(range.start, alloc_len));
-            let start_group = (range.start - sb.first_data_block()) / sb.blocks_per_group();
-            let end_group = (range.end - 1 - sb.first_data_block()) / sb.blocks_per_group();
+            let first_data = sb.first_data_block().to_raw();
+            let start_group = (range.start - first_data) / sb.blocks_per_group();
+            let end_group = (range.end - 1 - first_data) / sb.blocks_per_group();
             assert_eq!(start_group, end_group);
         }
 
@@ -1010,7 +1044,7 @@ mod test {
         assert_eq!(
             f_nospc
                 .ext2
-                .alloc_blocks(1, Bid::new(f_nospc.sb.first_data_block() as u64))
+                .alloc_blocks(1, f_nospc.sb.first_data_block())
                 .unwrap_err()
                 .error(),
             Errno::ENOSPC
@@ -1018,7 +1052,7 @@ mod test {
         assert_eq!(
             f_nospc
                 .ext2
-                .alloc_blocks(0, Bid::new(f_nospc.sb.first_data_block() as u64))
+                .alloc_blocks(0, f_nospc.sb.first_data_block())
                 .unwrap_err()
                 .error(),
             Errno::EINVAL
@@ -1033,7 +1067,7 @@ mod test {
         assert_eq!(
             f_corrupt
                 .ext2
-                .alloc_blocks(1, Bid::new(f_corrupt.sb.first_data_block() as u64))
+                .alloc_blocks(1, f_corrupt.sb.first_data_block())
                 .unwrap_err()
                 .error(),
             Errno::EIO
@@ -1081,10 +1115,11 @@ mod test {
             sb.inc_free_blocks(16);
         }
 
-        let goal = Bid::new((f.sb.group_first_block_no(1) + 16) as u64);
+        let goal = Ext2Bid::from_raw(f.sb.group_first_block_no(1) + 16);
         let range = f.ext2.alloc_blocks(4, goal).unwrap();
 
-        let start_group = (range.start - f.sb.first_data_block()) / f.sb.blocks_per_group();
+        let start_group =
+            (range.start - f.sb.first_data_block().to_raw()) / f.sb.blocks_per_group();
         assert_eq!(start_group, 1);
     }
 
@@ -1324,7 +1359,7 @@ mod test {
         f.ext2.write_inode_desc(ROOT_INO, &raw).unwrap();
 
         let bid = f.ext2.inode_table_block(1, 3).unwrap();
-        let base = Bid::new(f.descs[1].inode_table as u64);
+        let base = Ext2Bid::from_raw(f.descs[1].inode_table);
         assert_eq!(bid, base + 3);
 
         let desc = f.ext2.read_inode_desc(ROOT_INO).unwrap();
@@ -1350,7 +1385,7 @@ mod test {
         // I/O error from block device: fail group-1 inode-table reads so mount
         // (which reads ROOT_INO from group 0) still succeeds.
         let f_base = Ext2FixtureBuilder::new(2, 128).build().unwrap();
-        let inode_table_offset = Bid::new(f_base.descs[1].inode_table as u64).to_offset();
+        let inode_table_offset = Ext2Bid::from_raw(f_base.descs[1].inode_table).to_offset();
         let io_disk = ErrorBioDisk::with_read_error_at(
             f_base.disk.clone(),
             BioStatus::IoError,

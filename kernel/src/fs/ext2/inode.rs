@@ -9,7 +9,7 @@ use device_id::{decode_device_numbers, encode_device_numbers};
 use ostd::{const_assert, mm::io_util::HasVmReaderWriter};
 
 use super::{
-    block_ptr::{InodeMapping, InodeMappingDesc},
+    block_ptr::{Ext2Bid, InodeMapping, InodeMappingDesc},
     fs::{Ext2, ROOT_INO},
     prelude::*,
     utils::now,
@@ -1549,7 +1549,7 @@ impl PageCacheBackend for InodeBackend {
                     Segment::from(frame.clone()).into(),
                     BioDirection::FromDevice,
                 );
-                Ok(fs.block_device().read_blocks_async(bid, bio_segment)?)
+                Ok(fs.block_device().read_blocks_async(bid.to_bid(), bio_segment)?)
             }
             None => {
                 // Sparse hole: return a zero-filled page without issuing BIO.
@@ -1574,7 +1574,7 @@ impl PageCacheBackend for InodeBackend {
             Segment::from(frame.clone()).into(),
             BioDirection::ToDevice,
         );
-        Ok(fs.block_device().write_blocks_async(bid, bio_segment)?)
+        Ok(fs.block_device().write_blocks_async(bid.to_bid(), bio_segment)?)
     }
 
     fn npages(&self) -> usize {
@@ -1916,7 +1916,7 @@ impl InodeInner {
     ) -> Result<()> {
         let block_size = fs.block_size();
         let mut current_offset = offset;
-        let mut mapping = self.backend.mapping.write();
+        let mapping = self.backend.mapping.read();
         while current_offset < end {
             let iblock = u32::try_from(current_offset / block_size)
                 .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
@@ -1926,15 +1926,7 @@ impl InodeInner {
             match mapping.get_block(fs, iblock)? {
                 Some(bid) => {
                     let bio_segment = BioSegment::alloc(1, BioDirection::FromDevice);
-                    let status = fs
-                        .block_device()
-                        .read_blocks(bid, bio_segment.clone())
-                        .map_err(|_| {
-                            Error::with_message(Errno::EIO, "failed to read data block")
-                        })?;
-                    if status != BioStatus::Complete {
-                        return_errno_with_message!(Errno::EIO, "failed to read data block");
-                    }
+                    fs.read_blocks(bid, bio_segment.clone())?;
 
                     if offset_in_block == 0 && bytes_this_block == block_size {
                         let mut segment_reader = bio_segment.reader().map_err(|_| {
@@ -1984,7 +1976,7 @@ impl InodeInner {
         // end is already checked in `Inode::write_direct_at`.
         let end = offset + write_len;
         let mut current_offset = offset;
-        let mut mapping = self.backend.mapping.write();
+        let mapping = self.backend.mapping.read();
 
         while current_offset < end {
             let iblock = u32::try_from(current_offset / block_size)
@@ -2000,7 +1992,7 @@ impl InodeInner {
                 let read_segment = BioSegment::alloc(1, BioDirection::FromDevice);
                 let read_status = fs
                     .block_device()
-                    .read_blocks(bid, read_segment.clone())
+                    .read_blocks(bid.to_bid(), read_segment.clone())
                     .map_err(|_| {
                         Error::with_message(Errno::EIO, "failed to read block for partial write")
                     })?;
@@ -2036,7 +2028,7 @@ impl InodeInner {
 
             let write_status = fs
                 .block_device()
-                .write_blocks(bid, write_segment)
+                .write_blocks(bid.to_bid(), write_segment)
                 .map_err(|_| Error::with_message(Errno::EIO, "failed to write data block"))?;
             if write_status != BioStatus::Complete {
                 return_errno_with_message!(Errno::EIO, "failed to write data block");
@@ -2450,7 +2442,7 @@ impl InodeInner {
         offset: usize,
         end: usize,
         block_size: usize,
-    ) -> Result<Vec<Bid>> {
+    ) -> Result<Vec<Ext2Bid>> {
         if block_size == 0 {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
         }
@@ -2500,7 +2492,7 @@ impl InodeInner {
     /// Zeroes newly allocated data blocks before exposing them via mapped reads.
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:742-757 (`ext2_get_blocks`, DAX zeroout path)
-    fn zero_new_blocks(&self, fs: &Ext2, blocks: &[Bid], block_size: usize) -> Result<()> {
+    fn zero_new_blocks(&self, fs: &Ext2, blocks: &[Ext2Bid], block_size: usize) -> Result<()> {
         if blocks.is_empty() {
             return Ok(());
         }
@@ -2560,7 +2552,7 @@ impl InodeInner {
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:624 (ext2_get_blocks, create path)
     /// TODO: refactor this into a fast path
-    fn get_or_alloc_block(&mut self, iblock: u32, create: bool) -> Result<Option<Bid>> {
+    fn get_or_alloc_block(&mut self, iblock: u32, create: bool) -> Result<Option<Ext2Bid>> {
         let fs = self.fs_arc()?;
         let mapping_backend = Arc::clone(self.backend());
         let mut mapping = mapping_backend.mapping.write();
@@ -3495,7 +3487,7 @@ mod test {
         let table_block = f.descs[group_idx].inode_table + block_index as u32;
         f.disk
             .segment()
-            .read_val(Bid::new(table_block as u64).to_offset() + offset_in_block)
+            .read_val(Ext2Bid::from_raw(table_block).to_offset() + offset_in_block)
             .unwrap()
     }
 
@@ -4119,7 +4111,7 @@ mod test {
         encode_dir_entry(&mut one_block, 12, 0, (block_size - 12) as u16, b"", 0);
         let data_bid = 81u32;
         disk.segment()
-            .write_bytes(Bid::new(data_bid as u64).to_offset(), &one_block)
+            .write_bytes(Ext2Bid::from_raw(data_bid).to_offset(), &one_block)
             .unwrap();
 
         let mut ptrs = [0u32; 15];
@@ -4153,7 +4145,7 @@ mod test {
         bad_block[8] = b'.';
         let bad_bid = 82u32;
         disk.segment()
-            .write_bytes(Bid::new(bad_bid as u64).to_offset(), &bad_block)
+            .write_bytes(Ext2Bid::from_raw(bad_bid).to_offset(), &bad_block)
             .unwrap();
 
         let mut bad_ptrs = [0u32; 15];
@@ -4484,7 +4476,7 @@ mod test {
         on_disk_block[..old_size].fill(0x11);
         f.disk
             .segment()
-            .write_bytes(Bid::new(data_bid as u64).to_offset(), &on_disk_block)
+            .write_bytes(Ext2Bid::from_raw(data_bid).to_offset(), &on_disk_block)
             .unwrap();
 
         let mut ptrs = [0u32; 15];
@@ -4902,7 +4894,7 @@ mod test {
 
         let base = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let fail_bid = 40u32;
-        let fail_offset = Bid::new(fail_bid as u64).to_offset();
+        let fail_offset = Ext2Bid::from_raw(fail_bid).to_offset();
         let io_disk = Arc::new(ErrorBioDisk::with_read_error_at(
             base.disk.clone(),
             BioStatus::IoError,

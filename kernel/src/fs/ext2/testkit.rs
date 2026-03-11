@@ -12,7 +12,6 @@ use core::{
 use aster_block::{
     BLOCK_SIZE, BlockDevice, BlockDeviceMeta, SECTOR_SIZE,
     bio::{BioEnqueueError, BioStatus, BioType, SubmittedBio},
-    id::Bid,
 };
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::{
@@ -23,6 +22,7 @@ use ostd::{
 use super::{
     SuperBlock,
     block_group::RawGroupDesc,
+    block_ptr::Ext2Bid,
     fs::{Ext2, ROOT_INO},
     inode::{RawDirEntry, RawInode},
     super_block::{
@@ -453,7 +453,7 @@ impl DirentVisitor for StopAfterVisitor {
 
 /// Writes one u32 pointer into an indirect block slot.
 pub(super) fn write_indirect_ptr(disk: &Ext2MemoryDisk, bid: u32, index: u32, next: u32) {
-    let offset = Bid::new(bid as u64).to_offset() + (index as usize) * size_of::<u32>();
+    let offset = Ext2Bid::from_raw(bid).to_offset() + (index as usize) * size_of::<u32>();
     disk.segment().write_val(offset, &next).unwrap();
 }
 
@@ -475,7 +475,7 @@ pub(super) fn write_raw_inode_to_disk(
     let offset_in_block = offset_bytes % block_size;
 
     let table_block = descs[group_idx].inode_table + block_index as u32;
-    let table_bid = Bid::new(table_block as u64);
+    let table_bid = Ext2Bid::from_raw(table_block);
     disk.segment()
         .write_val(table_bid.to_offset() + offset_in_block, raw)
         .unwrap();
@@ -532,7 +532,7 @@ pub(super) fn write_block_bitmap(
 
     disk.segment()
         .write_bytes(
-            Bid::new(desc.block_bitmap as u64).to_offset(),
+            Ext2Bid::from_raw(desc.block_bitmap).to_offset(),
             &bitmap_block,
         )
         .unwrap();
@@ -559,7 +559,7 @@ pub(super) fn write_inode_bitmap(
     }
 
     disk.segment()
-        .write_bytes(Bid::new(desc.inode_bitmap as u64).to_offset(), &bitmap)
+        .write_bytes(Ext2Bid::from_raw(desc.inode_bitmap).to_offset(), &bitmap)
         .unwrap();
 }
 
@@ -695,7 +695,7 @@ pub(super) fn write_simple_root_dir_block(disk: &Ext2MemoryDisk, root_bid: u32, 
     block[21] = b'.';
 
     disk.segment()
-        .write_bytes(Bid::new(root_bid as u64).to_offset(), &block)
+        .write_bytes(Ext2Bid::from_raw(root_bid).to_offset(), &block)
         .unwrap();
 }
 
@@ -729,7 +729,7 @@ impl Ext2Fixture {
         self.disk
             .segment()
             .read_bytes(
-                Bid::new(desc.inode_bitmap as u64).to_offset(),
+                Ext2Bid::from_raw(desc.inode_bitmap).to_offset(),
                 &mut inode_bitmap,
             )
             .map_err(|_| Error::new(Errno::EIO))?;
@@ -917,7 +917,7 @@ impl Ext2FixtureBuilder {
             }
             disk.segment()
                 .write_bytes(
-                    Bid::new(desc.block_bitmap as u64).to_offset(),
+                    Ext2Bid::from_raw(desc.block_bitmap).to_offset(),
                     &bitmap_block,
                 )
                 .unwrap();
@@ -944,7 +944,7 @@ impl Ext2FixtureBuilder {
             }
             disk.segment()
                 .write_bytes(
-                    Bid::new(descs[0].block_bitmap as u64).to_offset(),
+                    Ext2Bid::from_raw(descs[0].block_bitmap).to_offset(),
                     &bitmap_block,
                 )
                 .unwrap();
@@ -960,7 +960,7 @@ impl Ext2FixtureBuilder {
             }
             disk.segment()
                 .write_bytes(
-                    Bid::new(descs[0].block_bitmap as u64).to_offset(),
+                    Ext2Bid::from_raw(descs[0].block_bitmap).to_offset(),
                     &bitmap_block,
                 )
                 .unwrap();
@@ -972,7 +972,10 @@ impl Ext2FixtureBuilder {
                 set_bit_lsb0(&mut bitmap, bit);
             }
             disk.segment()
-                .write_bytes(Bid::new(descs[0].inode_bitmap as u64).to_offset(), &bitmap)
+                .write_bytes(
+                    Ext2Bid::from_raw(descs[0].inode_bitmap).to_offset(),
+                    &bitmap,
+                )
                 .unwrap();
         }
 
@@ -982,7 +985,10 @@ impl Ext2FixtureBuilder {
                 set_bit_lsb0(&mut bitmap, bit);
             }
             disk.segment()
-                .write_bytes(Bid::new(descs[0].inode_bitmap as u64).to_offset(), &bitmap)
+                .write_bytes(
+                    Ext2Bid::from_raw(descs[0].inode_bitmap).to_offset(),
+                    &bitmap,
+                )
                 .unwrap();
         }
     }
