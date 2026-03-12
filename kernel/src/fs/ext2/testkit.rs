@@ -31,7 +31,7 @@ use super::{
 };
 use crate::{
     fs::utils::{DirentVisitor, InodeType},
-    prelude::{Errno, Error, Result, return_errno_with_message, *},
+    prelude::{Errno, Result, return_errno_with_message, *},
 };
 
 // ---------------------------------------------------------------------------
@@ -310,7 +310,7 @@ pub(super) struct RawInodeBuilder {
     links_count: u16,
     dtime: u32,
     size_lo: u32,
-    blocks: u32,
+    sector_count: u32,
     flags: u32,
     block: [u32; 15],
 }
@@ -322,7 +322,7 @@ impl RawInodeBuilder {
             links_count: 1,
             dtime: 0,
             size_lo: 0,
-            blocks: 0,
+            sector_count: 0,
             flags: 0,
             block: [0; 15],
         }
@@ -343,13 +343,8 @@ impl RawInodeBuilder {
         self
     }
 
-    pub(super) fn blocks(mut self, v: u32) -> Self {
-        self.blocks = v;
-        self
-    }
-
-    pub(super) fn flags(mut self, v: u32) -> Self {
-        self.flags = v;
+    pub(super) fn sector_count(mut self, v: u32) -> Self {
+        self.sector_count = v;
         self
     }
 
@@ -369,7 +364,7 @@ impl RawInodeBuilder {
             dtime: self.dtime,
             gid: 0,
             links_count: self.links_count,
-            blocks: self.blocks,
+            sector_count: self.sector_count,
             flags: self.flags,
             osd1: 0,
             block: self.block,
@@ -491,12 +486,6 @@ pub(super) fn set_bit_lsb0(buf: &mut [u8], bit: usize) {
     buf[byte] |= 1u8 << bit_in_byte;
 }
 
-pub(super) fn bit_is_set_lsb0(buf: &[u8], bit: usize) -> bool {
-    let byte = bit / 8;
-    let bit_in_byte = bit % 8;
-    (buf[byte] & (1u8 << bit_in_byte)) != 0
-}
-
 // ---------------------------------------------------------------------------
 // Bitmap write helpers
 // ---------------------------------------------------------------------------
@@ -569,7 +558,6 @@ pub(super) fn write_inode_bitmap(
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Group0Layout {
-    pub first: u32,
     pub group_desc_bid: u32,
     pub block_bitmap: u32,
     pub inode_bitmap: u32,
@@ -578,10 +566,9 @@ pub(super) struct Group0Layout {
 }
 
 pub(super) fn group0_layout(sb: &SuperBlock) -> Group0Layout {
-    let first = sb.group_first_block_no(0);
     let group_desc_bid = sb.group_descriptors_bid(0);
 
-    let mut next = first;
+    let mut next = sb.group_first_block_no(0);
     if next == group_desc_bid {
         next = next.saturating_add(1);
     }
@@ -599,7 +586,6 @@ pub(super) fn group0_layout(sb: &SuperBlock) -> Group0Layout {
     let first_data = inode_table.saturating_add(sb.itb_per_group());
 
     Group0Layout {
-        first,
         group_desc_bid,
         block_bitmap,
         inode_bitmap,
@@ -667,7 +653,7 @@ fn make_root_raw_inode(root_bid: u32, block_size: usize) -> RawInode {
     RawInodeBuilder::new(InodeType::Dir as u16 | 0o755)
         .links_count(2)
         .size_lo(block_size as u32)
-        .blocks((block_size / SECTOR_SIZE) as u32)
+        .sector_count((block_size / SECTOR_SIZE) as u32)
         .block_ptrs({
             let mut ptrs = [0u32; 15];
             ptrs[0] = root_bid;
@@ -708,33 +694,6 @@ pub(super) struct Ext2Fixture {
     pub ext2: Arc<Ext2>,
     pub sb: SuperBlock,
     pub descs: Vec<RawGroupDesc>,
-    pub root_bid: u32,
-}
-
-impl Ext2Fixture {
-    pub(super) fn root(&self) -> Result<Arc<super::inode::Inode>> {
-        self.ext2.read_inode(ROOT_INO)
-    }
-
-    pub(super) fn block_group(&self, idx: usize) -> &super::block_group::BlockGroup {
-        self.ext2.block_group(idx)
-    }
-
-    pub(super) fn read_inode_bitmap(&self, group_idx: usize) -> Result<[u8; BLOCK_SIZE]> {
-        let desc = self
-            .descs
-            .get(group_idx)
-            .ok_or_else(|| Error::new(Errno::EINVAL))?;
-        let mut inode_bitmap = [0u8; BLOCK_SIZE];
-        self.disk
-            .segment()
-            .read_bytes(
-                Bid::new(desc.inode_bitmap as u64).to_offset(),
-                &mut inode_bitmap,
-            )
-            .map_err(|_| Error::new(Errno::EIO))?;
-        Ok(inode_bitmap)
-    }
 }
 
 pub(super) struct Ext2FixtureBuilder {
@@ -989,7 +948,7 @@ impl Ext2FixtureBuilder {
 
     /// Builds a fixture that goes through `Ext2::open`.
     pub(super) fn build(self) -> Result<Ext2Fixture> {
-        let (raw_sb, sb, descs, disk, layout) = self.prepare()?;
+        let (_, sb, descs, disk, layout) = self.prepare()?;
         self.write_bitmaps(&sb, &descs, &disk, &layout);
 
         // Ext2::open does not read ROOT_INO during mount, but fixtures that
@@ -1011,7 +970,6 @@ impl Ext2FixtureBuilder {
             ext2,
             sb,
             descs,
-            root_bid,
         })
     }
 }

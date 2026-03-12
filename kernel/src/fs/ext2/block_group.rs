@@ -345,10 +345,6 @@ impl BlockGroup {
         self.desc.read().inode_table
     }
 
-    pub fn inode_table_cache(&self) -> &PageCache {
-        &self.inode_table_cache
-    }
-
     /// Returns the first filesystem-wide block number of this group.
     pub fn first_block(&self) -> u32 {
         self.first_block
@@ -409,10 +405,6 @@ impl BlockGroup {
 
     pub(super) fn is_desc_dirty(&self) -> bool {
         self.desc.read().is_dirty()
-    }
-
-    pub(super) fn is_bitmap_dirty(&self) -> bool {
-        self.block_bitmap.read().is_dirty() || self.inode_bitmap.read().is_dirty()
     }
 
     fn sync_metadata(&self, group_descs: &USegment) -> Result<()> {
@@ -632,6 +624,8 @@ impl BlockGroup {
             .min(group_size)
             .min(self.free_blocks_count() as u32)
             .min(sb_free_blocks) as u16;
+        // TODO: Add a helper function in IdBitmap to find the first free block, making this
+        //       loop more efficient.
         while req > 0 {
             let Some(range) = bitmap.alloc_consecutive(req) else {
                 for rejected_range in rejected.drain(..) {
@@ -846,7 +840,7 @@ mod test {
             .with_root()
             .build()
             .unwrap();
-        let group = fixture.block_group(1);
+        let group = fixture.ext2.block_group(1);
 
         assert_eq!(group.idx(), 1);
         assert_eq!(group.block_bitmap_bid(), descs[1].block_bitmap);
@@ -866,7 +860,7 @@ mod test {
             .with_free_inodes(64, 64)
             .build()
             .unwrap();
-        let group = fixture.block_group(0);
+        let group = fixture.ext2.block_group(0);
         assert_eq!(group.free_blocks_count(), 20);
         assert!(!group.is_desc_dirty());
 

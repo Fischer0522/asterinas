@@ -65,8 +65,10 @@ impl<'a> IoRangeMapper<'a> {
             self.mapping
                 .get_block_range(self.fs, start_iblock, max_blocks)?
         {
-            let logical_end =
-                start_iblock + device_block_range.end.saturating_sub(device_block_range.start);
+            let logical_end = start_iblock
+                + device_block_range
+                    .end
+                    .saturating_sub(device_block_range.start);
             self.range.start = logical_end;
             return Ok(Some(IoRange::Mapped(MappedRange {
                 logical_block_range: start_iblock..logical_end,
@@ -79,7 +81,11 @@ impl<'a> IoRangeMapper<'a> {
         while self.range.start < self.range.end {
             let iblock = self.range.start;
             let remaining = self.range.end - iblock;
-            if self.mapping.get_block_range(self.fs, iblock, remaining)?.is_some() {
+            if self
+                .mapping
+                .get_block_range(self.fs, iblock, remaining)?
+                .is_some()
+            {
                 break;
             }
             self.range.start += 1;

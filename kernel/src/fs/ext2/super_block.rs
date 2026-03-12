@@ -808,15 +808,11 @@ impl Default for Reserved {
 
 #[cfg(ktest)]
 mod test {
-    use core::time::Duration;
 
-    use ostd::{mm::VmIo, prelude::*};
+    use ostd::prelude::*;
 
     use super::*;
-    use crate::{
-        fs::ext2::testkit::{Ext2MemoryDisk, make_valid_raw_super_block},
-        time::clocks::{self, init_for_ktest},
-    };
+    use crate::fs::ext2::testkit::{Ext2MemoryDisk, make_valid_raw_super_block};
 
     #[ktest]
     fn try_from_valid_raw_ok() {

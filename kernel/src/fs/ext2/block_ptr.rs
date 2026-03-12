@@ -59,20 +59,23 @@ struct BranchResult {
 // In-memory inode mapping (raw on-disk view only i_blocks/i_block[]).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct BlockMapDesc {
-    pub(super) blocks: u32,
+    pub(super) sector_count: u32,
     pub(super) block_ptrs: [u32; 15],
 }
 
 impl BlockMapDesc {
     pub(super) fn from_raw(raw: &RawInode) -> Self {
         Self {
-            blocks: raw.blocks,
+            sector_count: raw.sector_count,
             block_ptrs: raw.block,
         }
     }
 
-    pub(super) fn from_parts(blocks: u32, block_ptrs: [u32; 15]) -> Self {
-        Self { blocks, block_ptrs }
+    pub(super) fn from_parts(sector_count: u32, block_ptrs: [u32; 15]) -> Self {
+        Self {
+            sector_count,
+            block_ptrs,
+        }
     }
 
     /// Decodes Linux ext2 old/new special-file device encoding from `i_block`.
@@ -129,20 +132,8 @@ impl InodeBlockMap {
         }
     }
 
-    pub(super) fn blocks_512(&self) -> u32 {
-        self.desc.blocks
-    }
-
-    pub(super) fn set_blocks_512(&mut self, blocks: u32) {
-        self.desc.blocks = blocks;
-    }
-
     pub(super) fn get_desc(&self) -> &BlockMapDesc {
         &self.desc
-    }
-
-    pub(super) fn encode_device_id(&mut self, device_id: u64) {
-        self.desc.encode_device_id(device_id);
     }
 
     /// Linux: /root/linux/fs/ext2/super.c:1308 (ext2_sync_fs)
@@ -520,7 +511,7 @@ impl InodeBlockMap {
                 );
                 return;
             }
-            self.desc.blocks = self.desc.blocks.saturating_sub(sectors_per_block);
+            self.desc.sector_count = self.desc.sector_count.saturating_sub(sectors_per_block);
             return;
         }
 
@@ -573,7 +564,7 @@ impl InodeBlockMap {
             );
             return;
         }
-        self.desc.blocks = self.desc.blocks.saturating_sub(sectors_per_block);
+        self.desc.sector_count = self.desc.sector_count.saturating_sub(sectors_per_block);
     }
 
     /// Linux: /root/linux/fs/ext2/inode.c:479 (ext2_alloc_branch)
@@ -635,7 +626,7 @@ impl InodeBlockMap {
             .ok_or_else(|| Error::with_message(Errno::EIO, "inode block accounting overflow"))?;
         let new_block_count = self
             .desc
-            .blocks
+            .sector_count
             .checked_add(added_sectors)
             .ok_or_else(|| Error::with_message(Errno::EIO, "inode block count overflow"))?;
 
@@ -655,17 +646,15 @@ impl InodeBlockMap {
                     block.clear();
                     let start_slot = path.offsets[level] as usize;
                     if i + 1 == metadata_blocks.len() {
-                        Self::write_data_range_to_indirect_block(&mut block, start_slot, &data_range)?;
+                        Self::write_data_range_to_indirect_block(
+                            &mut block,
+                            start_slot,
+                            &data_range,
+                        )?;
                     } else {
-                        let next_bid = metadata_blocks
-                            .get(i + 1)
-                            .copied()
-                            .ok_or_else(|| {
-                                Error::with_message(
-                                    Errno::EIO,
-                                    "allocated chain metadata mismatch",
-                                )
-                            })?;
+                        let next_bid = metadata_blocks.get(i + 1).copied().ok_or_else(|| {
+                            Error::with_message(Errno::EIO, "allocated chain metadata mismatch")
+                        })?;
                         block.write_bid(start_slot, next_bid)?;
                     }
                     indirect_blocks.insert_new(new_bid, block)?;
@@ -744,7 +733,7 @@ impl InodeBlockMap {
         }
 
         // SPEC: ext2_splice_branch-style inode accounting and ctime update.
-        self.desc.blocks = new_block_count;
+        self.desc.sector_count = new_block_count;
 
         Ok(data_range)
     }
@@ -775,7 +764,9 @@ impl InodeBlockMap {
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:783 (ext2_get_block)
     pub(super) fn get_block(&self, fs: &Ext2, iblock: u32) -> Result<Option<Ext2Bid>> {
-        Ok(self.get_block_range(fs, iblock, 1)?.map(|range| range.start))
+        Ok(self
+            .get_block_range(fs, iblock, 1)?
+            .map(|range| range.start))
     }
 
     /// Resolves a logical block to a contiguous physical block range, allocating if needed.
@@ -864,7 +855,7 @@ impl InodeBlockMap {
                 }
                 fs.free_blocks(ptr, 1)?;
                 self.desc.block_ptrs[idx] = 0;
-                self.desc.blocks = self.desc.blocks.saturating_sub(sectors_per_block);
+                self.desc.sector_count = self.desc.sector_count.saturating_sub(sectors_per_block);
             }
         } else {
             // === Case 2: Indirect blocks ===
@@ -1047,27 +1038,21 @@ mod test {
     use super::*;
     use crate::{
         fs::{
-            ext2::testkit::{
-                self, ErrorBioDisk, Ext2FixtureBuilder, RawInodeBuilder, write_indirect_ptr,
-            },
+            ext2::testkit::{self, ErrorBioDisk, Ext2FixtureBuilder, write_indirect_ptr},
             utils::IdBitmap,
         },
         prelude::*,
     };
 
-    fn make_raw_inode(mode: u16) -> RawInode {
-        RawInodeBuilder::new(mode).build()
-    }
-
-    fn make_mapping(block_ptrs: [u32; 15], blocks: u32, fs: &Arc<Ext2>) -> InodeBlockMap {
+    fn make_mapping(block_ptrs: [u32; 15], sector_count: u32, fs: &Arc<Ext2>) -> InodeBlockMap {
         InodeBlockMap::new(
-            BlockMapDesc::from_parts(blocks, block_ptrs),
+            BlockMapDesc::from_parts(sector_count, block_ptrs),
             Arc::downgrade(fs),
         )
     }
 
     fn reload_group0_cached_bitmaps_from_disk(f: &testkit::Ext2Fixture) {
-        let group = f.block_group(0);
+        let group = f.ext2.block_group(0);
 
         let mut block_bitmap_buf = vec![0u8; BLOCK_SIZE];
         f.disk
@@ -1133,7 +1118,7 @@ mod test {
         block_ptrs[12] = indirect_bid;
         block_ptrs[13] = double_l1_bid;
         block_ptrs[14] = triple_l1_bid;
-        let mut mapping = make_mapping(block_ptrs, 0, &f.ext2);
+        let mapping = make_mapping(block_ptrs, 0, &f.ext2);
 
         // Cover exact transition boundaries across all mapping levels.
         let direct_path = mapping.block_to_path(ext2, 0).unwrap();
@@ -1336,7 +1321,7 @@ mod test {
 
         assert_eq!(mapping.desc.block_ptrs[0], allocated);
         assert_eq!(mapping.get_block(ext2, 0).unwrap(), Some(allocated));
-        assert_eq!(mapping.desc.blocks, sectors_per_block);
+        assert_eq!(mapping.desc.sector_count, sectors_per_block);
         assert_eq!(free_before.saturating_sub(free_after), 1);
     }
 
@@ -1369,7 +1354,10 @@ mod test {
             mapping.get_or_alloc_block(ext2, 0, true).unwrap(),
             Some(allocated_range.start)
         );
-        assert_eq!(mapping.desc.blocks, sectors_per_block.saturating_mul(3));
+        assert_eq!(
+            mapping.desc.sector_count,
+            sectors_per_block.saturating_mul(3)
+        );
         assert_eq!(free_before.saturating_sub(free_after), 3);
     }
 
@@ -1389,7 +1377,10 @@ mod test {
 
         assert_ne!(mapping.desc.block_ptrs[12], 0);
         assert_eq!(mapping.get_block(ext2, 12).unwrap(), Some(allocated));
-        assert_eq!(mapping.desc.blocks, sectors_per_block.saturating_mul(2));
+        assert_eq!(
+            mapping.desc.sector_count,
+            sectors_per_block.saturating_mul(2)
+        );
         assert_eq!(free_before.saturating_sub(free_after), 2);
     }
 
@@ -1416,8 +1407,14 @@ mod test {
             mapping.get_block_range(ext2, 12, 4).unwrap(),
             Some(allocated_range.clone())
         );
-        assert_eq!(mapping.get_block(ext2, 12).unwrap(), Some(allocated_range.start));
-        assert_eq!(mapping.desc.blocks, sectors_per_block.saturating_mul(5));
+        assert_eq!(
+            mapping.get_block(ext2, 12).unwrap(),
+            Some(allocated_range.start)
+        );
+        assert_eq!(
+            mapping.desc.sector_count,
+            sectors_per_block.saturating_mul(5)
+        );
         assert_eq!(free_before.saturating_sub(free_after), 5);
     }
 
@@ -1434,7 +1431,7 @@ mod test {
         let err = mapping.get_or_alloc_block(ext2, 0, true).unwrap_err();
         assert_eq!(err.error(), Errno::ENOSPC);
         assert_eq!(mapping.desc.block_ptrs, [0u32; 15]);
-        assert_eq!(mapping.desc.blocks, 0);
+        assert_eq!(mapping.desc.sector_count, 0);
     }
 
     #[ktest]
@@ -1489,8 +1486,11 @@ mod test {
         // All three isolated free blocks should be consumed.
         let block_size = ext2.block_size();
         assert_eq!(ext2.super_block().free_blocks_count(), 0);
-        assert_eq!(f.block_group(0).free_blocks_count(), 0);
-        assert_eq!(mapping.desc.blocks, ((block_size / SECTOR_SIZE) as u32) * 3);
+        assert_eq!(f.ext2.block_group(0).free_blocks_count(), 0);
+        assert_eq!(
+            mapping.desc.sector_count,
+            ((block_size / SECTOR_SIZE) as u32) * 3
+        );
     }
 
     #[ktest]
@@ -1565,7 +1565,7 @@ mod test {
         assert_eq!(mapping.get_block(ext2, 12).unwrap(), None);
         assert_eq!(mapping.get_block(ext2, first_double_iblock).unwrap(), None);
         assert_eq!(mapping.get_block(ext2, first_triple_iblock).unwrap(), None);
-        assert_eq!(mapping.desc.blocks, 0);
+        assert_eq!(mapping.desc.sector_count, 0);
     }
 
     #[ktest]
@@ -1586,7 +1586,10 @@ mod test {
             .unwrap();
         let root = mapping.desc.block_ptrs[14];
         assert_ne!(root, 0);
-        assert_eq!(mapping.desc.blocks, sectors_per_block.saturating_mul(4));
+        assert_eq!(
+            mapping.desc.sector_count,
+            sectors_per_block.saturating_mul(4)
+        );
 
         let free_before = ext2.super_block().free_blocks_count();
         mapping.free_branches(ext2, root, 3);
@@ -1594,6 +1597,6 @@ mod test {
         let free_after = ext2.super_block().free_blocks_count();
 
         assert_eq!(free_after.saturating_sub(free_before), 4);
-        assert_eq!(mapping.desc.blocks, 0);
+        assert_eq!(mapping.desc.sector_count, 0);
     }
 }

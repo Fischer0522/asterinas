@@ -795,9 +795,4 @@ impl Xattr {
         self.dirty = false;
         Ok(())
     }
-
-    /// Lazily loads the xattr block from disk into `block_buf`.
-    pub(super) fn load_block(&mut self) -> Result<()> {
-        self.ensure_loaded()
-    }
 }

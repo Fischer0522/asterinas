@@ -280,12 +280,21 @@ impl Inode {
         } else {
             0
         };
+        let sectors_per_block = blk_size / SECTOR_SIZE;
+        debug_assert!(sectors_per_block > 0);
+        // Ext2 stores `i_blocks` in 512-byte sectors, while `Metadata.blocks`
+        // is reported in units of `blk_size` for the syscall layer.
+        let allocated_blocks = if sectors_per_block == 0 {
+            0
+        } else {
+            (mapping.desc.sector_count as usize) / sectors_per_block
+        };
         Metadata {
             dev,
             ino: self.ino as u64,
             size: inner.file_size(),
             blk_size,
-            blocks: mapping.desc.blocks as usize,
+            blocks: allocated_blocks,
             atime: inner.atime(),
             mtime: inner.mtime(),
             ctime: inner.ctime(),
@@ -532,7 +541,7 @@ impl Inode {
 
         let mut inner = self.inner.write();
         let old_size = inner.file_size();
-        if let Err(err) = inner.prepare_continuous_blocks(&fs, offset, end, block_size, false) {
+        if let Err(err) = inner.prepare_write_blocks(&fs, offset, end, block_size, false) {
             inner.write_failed_cleanup(&fs, old_size, end, block_size);
             return Err(err);
         }
@@ -612,14 +621,13 @@ impl Inode {
         let mut inner = self.inner.write();
         let old_size = inner.file_size();
 
-
         // If the new write will expand the file, we need to zero the tail of the last block of old size.
         // The block range between old_size % block_size + 1 and offset is still as hole, no need to zero.
         inner.zero_direct_write_eof_tail(&fs, old_size, offset, block_size)?;
 
         // Differ from Linux, Linux fallback to buffered io when encountered hole.
         // We pre allocate blocks for direct write, so there should be no hole.
-        if let Err(err) = inner.prepare_continuous_blocks(&fs, offset, end, block_size, true) {
+        if let Err(err) = inner.prepare_write_blocks(&fs, offset, end, block_size, true) {
             inner.write_failed_cleanup(&fs, old_size, end, block_size);
             return Err(err);
         }
@@ -931,7 +939,7 @@ impl Inode {
         inner.set_dtime(now());
         inner.set_file_size(0);
         inner.set_file_acl(0);
-        if inner.desc.blocks > 0 {
+        if inner.desc.sector_count > 0 {
             let mut mapping = mapping_backend.mapping.write();
             mapping.truncate_blocks(&fs, 0)?;
             inner.sync_desc_mapping_from_snapshot(*mapping.get_desc());
@@ -1615,7 +1623,7 @@ impl InodeInner {
         let num_pages = num_page_bytes / BLOCK_SIZE;
         let backend = InodeBackend::new(
             InodeBlockMap::new(
-                BlockMapDesc::from_parts(desc.blocks, desc.block_ptrs),
+                BlockMapDesc::from_parts(desc.sector_count, desc.block_ptrs),
                 fs.clone(),
             ),
             fs.clone(),
@@ -1648,7 +1656,7 @@ impl InodeInner {
     }
 
     fn sync_desc_mapping_from_snapshot(&mut self, mapping_desc: BlockMapDesc) {
-        self.desc.blocks = mapping_desc.blocks;
+        self.desc.sector_count = mapping_desc.sector_count;
         self.desc.block_ptrs = mapping_desc.block_ptrs;
     }
 
@@ -1748,10 +1756,6 @@ impl InodeInner {
 
     fn links_count(&self) -> u16 {
         self.desc.links_count
-    }
-
-    fn set_links_count(&mut self, nlinks: u16) {
-        self.desc.links_count = nlinks;
     }
 
     fn add_links_count_saturating(&mut self, delta: u16) {
@@ -1881,7 +1885,7 @@ impl InodeInner {
         let mapping_backend = Arc::clone(self.backend());
         let mut mapping = mapping_backend.mapping.write();
         mapping.desc.block_ptrs = old_mapping_desc.block_ptrs;
-        mapping.desc.blocks = old_mapping_desc.blocks;
+        mapping.desc.sector_count = old_mapping_desc.sector_count;
         let _ = fs.free_blocks(new_bid, 1);
         let mapping_desc = *mapping.get_desc();
         drop(mapping);
@@ -1909,16 +1913,17 @@ impl InodeInner {
         while let Some(range) = range_mapper.next()? {
             match range {
                 IoRange::Mapped(mapped_range) => {
-                    let nblocks = mapped_range.device_block_range.end - mapped_range.device_block_range.start;
+                    let nblocks =
+                        mapped_range.device_block_range.end - mapped_range.device_block_range.start;
                     let segment = BioSegment::alloc(nblocks as usize, BioDirection::FromDevice);
                     fs.read_blocks(mapped_range.device_block_range.start, segment.clone())?;
                     let mut segment_reader = segment.reader()?;
                     segment_reader.read_fallible(writer)?;
-                },
+                }
                 IoRange::Hole(range) => {
                     let n_bytes = (range.end as usize - range.start as usize) * block_size;
                     writer.fill_zeros(n_bytes)?;
-                },
+                }
             }
         }
         Ok(())
@@ -1930,7 +1935,7 @@ impl InodeInner {
     fn write_direct_at(&self, fs: &Ext2, offset: usize, reader: &mut VmReader) -> Result<()> {
         let block_size = fs.block_size();
         let write_len = reader.remain();
-        debug_assert_eq!(write_len % block_size,0);
+        debug_assert_eq!(write_len % block_size, 0);
         // end is already checked in `Inode::write_direct_at`.
         let end = offset + write_len;
         let mapping = self.backend.mapping.read();
@@ -1941,12 +1946,10 @@ impl InodeInner {
             fs,
         );
         while let Some(range) = range_mapper.next()? {
-
             match range {
                 IoRange::Mapped(m) => {
                     // Perform direct write for the continuous block range
-                    let nblocks =
-                        (m.device_block_range.end - m.device_block_range.start) as usize;
+                    let nblocks = (m.device_block_range.end - m.device_block_range.start) as usize;
                     let segment = BioSegment::alloc(nblocks, BioDirection::ToDevice);
                     segment.writer()?.write_fallible(reader)?;
                     fs.write_blocks(m.device_block_range.start, segment)?;
@@ -2210,7 +2213,7 @@ impl InodeInner {
             let fs = self.fs_arc()?;
             let block_size = fs.block_size();
             // slow path, write to page cache
-            self.prepare_continuous_blocks(&fs, 0, target_len, block_size, false)?;
+            self.prepare_write_blocks(&fs, 0, target_len, block_size, false)?;
             self.page_cache()
                 .pages()
                 .write_bytes(0, target.as_bytes())?;
@@ -2251,7 +2254,7 @@ impl InodeInner {
             .map_err(|_| Error::with_message(Errno::EIO, "symlink target is not valid UTF-8"))
     }
 
-    fn prepare_continuous_blocks(
+    fn prepare_write_blocks(
         &mut self,
         fs: &Ext2,
         offset: usize,
@@ -3109,7 +3112,7 @@ pub(super) struct InodeDesc {
     mtime: Duration,
     dtime: Duration,
     links_count: u16,
-    blocks: u32,
+    sector_count: u32,
     flags: FileFlags,
     file_acl: u32,
     generation: u32,
@@ -3131,7 +3134,7 @@ impl InodeDesc {
             0
         };
 
-        self.type_ == InodeType::SymLink && self.blocks.checked_sub(ea_blocks) == Some(0)
+        self.type_ == InodeType::SymLink && self.sector_count.checked_sub(ea_blocks) == Some(0)
     }
 
     /// Decodes Linux ext2 old/new special-file device encoding from `i_block`.
@@ -3213,7 +3216,7 @@ impl TryFrom<&RawInode> for InodeDesc {
             mtime,
             dtime: Duration::from_secs(raw.dtime as u64),
             links_count: raw.links_count,
-            blocks: mapping.blocks,
+            sector_count: mapping.sector_count,
             flags,
             file_acl: raw.file_acl,
             generation: raw.generation,
@@ -3246,7 +3249,7 @@ impl From<&InodeDesc> for RawInode {
             dtime: desc.dtime.as_secs() as u32,
             gid,
             links_count: desc.links_count,
-            blocks: desc.blocks,
+            sector_count: desc.sector_count,
             flags: desc.flags.bits(),
             osd1: 0,
             block: desc.block_ptrs,
@@ -3270,29 +3273,29 @@ impl From<&InodeDesc> for RawInode {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
 pub(super) struct RawInode {
-    pub mode: u16,        // i_mode
-    pub uid: u16,         // i_uid (low 16 bits)
-    pub size_lo: u32,     // i_size
-    pub atime: u32,       // i_atime
-    pub ctime: u32,       // i_ctime
-    pub mtime: u32,       // i_mtime
-    pub dtime: u32,       // i_dtime
-    pub gid: u16,         // i_gid (low 16 bits)
-    pub links_count: u16, // i_links_count
-    pub blocks: u32,      // i_blocks (512-byte sectors)
-    pub flags: u32,       // i_flags
-    pub osd1: u32,        // osd1.linux1.l_i_reserved1
-    pub block: [u32; 15], // i_block
-    pub generation: u32,  // i_generation
-    pub file_acl: u32,    // i_file_acl
-    pub size_high: u32,   // i_dir_acl (size high)
-    pub faddr: u32,       // i_faddr
-    pub frag: u8,         // osd2.linux2.l_i_frag
-    pub fsize: u8,        // osd2.linux2.l_i_fsize
-    pub pad1: u16,        // osd2.linux2.i_pad1
-    pub uid_high: u16,    // osd2.linux2.l_i_uid_high
-    pub gid_high: u16,    // osd2.linux2.l_i_gid_high
-    pub reserved2: u32,   // osd2.linux2.l_i_reserved2
+    pub mode: u16,         // i_mode
+    pub uid: u16,          // i_uid (low 16 bits)
+    pub size_lo: u32,      // i_size
+    pub atime: u32,        // i_atime
+    pub ctime: u32,        // i_ctime
+    pub mtime: u32,        // i_mtime
+    pub dtime: u32,        // i_dtime
+    pub gid: u16,          // i_gid (low 16 bits)
+    pub links_count: u16,  // i_links_count
+    pub sector_count: u32, // i_blocks (512-byte sectors)
+    pub flags: u32,        // i_flags
+    pub osd1: u32,         // osd1.linux1.l_i_reserved1
+    pub block: [u32; 15],  // i_block
+    pub generation: u32,   // i_generation
+    pub file_acl: u32,     // i_file_acl
+    pub size_high: u32,    // i_dir_acl (size high)
+    pub faddr: u32,        // i_faddr
+    pub frag: u8,          // osd2.linux2.l_i_frag
+    pub fsize: u8,         // osd2.linux2.l_i_fsize
+    pub pad1: u16,         // osd2.linux2.i_pad1
+    pub uid_high: u16,     // osd2.linux2.l_i_uid_high
+    pub gid_high: u16,     // osd2.linux2.l_i_gid_high
+    pub reserved2: u32,    // osd2.linux2.l_i_reserved2
 }
 
 const_assert!(size_of::<RawInode>() == 128);
@@ -3372,13 +3375,13 @@ mod test {
         ext2: &Arc<Ext2>,
         ino: u32,
         size: usize,
-        blocks: u32,
+        sector_count: u32,
         flags: FileFlags,
         block_ptrs: [u32; 15],
     ) -> Arc<Inode> {
         let mut raw = make_raw_inode(0o040755);
         raw.size_lo = size as u32;
-        raw.blocks = blocks;
+        raw.sector_count = sector_count;
         raw.flags = flags.bits();
         raw.block = block_ptrs;
         let desc = InodeDesc::try_from(&raw).unwrap();
@@ -3395,13 +3398,13 @@ mod test {
         ext2: &Arc<Ext2>,
         ino: u32,
         size: usize,
-        blocks: u32,
+        sector_count: u32,
         flags: FileFlags,
         block_ptrs: [u32; 15],
     ) -> Arc<Inode> {
         let mut raw = make_raw_inode(0o100644);
         raw.size_lo = size as u32;
-        raw.blocks = blocks;
+        raw.sector_count = sector_count;
         raw.flags = flags.bits();
         raw.block = block_ptrs;
         let desc = InodeDesc::try_from(&raw).unwrap();
@@ -3539,7 +3542,8 @@ mod test {
             Errno::ESTALE
         );
         assert!(
-            f.block_group(0)
+            f.ext2
+                .block_group(0)
                 .inode_bitmap()
                 .is_allocated((old_ino - 1) as u16)
         );
@@ -3547,7 +3551,7 @@ mod test {
         let raw_before_drop = read_raw_inode_from_disk(&f, old_ino);
         assert_eq!(raw_before_drop.links_count, 0);
         assert_eq!(raw_before_drop.dtime, 0);
-        assert_ne!(raw_before_drop.blocks, 0);
+        assert_ne!(raw_before_drop.sector_count, 0);
 
         drop(old);
         f.ext2.sync_all().unwrap();
@@ -3556,13 +3560,14 @@ mod test {
             Errno::ENOENT
         );
         assert!(
-            !f.block_group(0)
+            !f.ext2
+                .block_group(0)
                 .inode_bitmap()
                 .is_allocated((old_ino - 1) as u16)
         );
         let raw_after_drop = read_raw_inode_from_disk(&f, old_ino);
         assert_eq!(raw_after_drop.links_count, 0);
-        assert_eq!(raw_after_drop.blocks, 0);
+        assert_eq!(raw_after_drop.sector_count, 0);
         assert_eq!(raw_after_drop.block[0], 0);
         assert_eq!(
             f.ext2.super_block().free_blocks_count(),
@@ -3806,7 +3811,7 @@ mod test {
         raw.uid_high = 0x5678;
         raw.gid = 0x4321;
         raw.gid_high = 0x8765;
-        raw.blocks = 99;
+        raw.sector_count = 99;
         raw.block[0] = 42;
         raw.dtime = 123;
 
@@ -3814,7 +3819,7 @@ mod test {
         assert_eq!(desc.size, 0x5566_7788_1122_3344);
         assert_eq!(desc.uid, 0x5678_1234);
         assert_eq!(desc.gid, 0x8765_4321);
-        assert_eq!(desc.blocks, 99);
+        assert_eq!(desc.sector_count, 99);
         assert_eq!(desc.block_ptrs[0], 42);
 
         let dtime: Duration = desc.dtime.into();
@@ -4288,7 +4293,7 @@ mod test {
 
         let on_disk = f.ext2.read_inode_desc(file.ino()).unwrap();
         assert_eq!(on_disk.size, 0);
-        assert_eq!(on_disk.blocks, 0);
+        assert_eq!(on_disk.sector_count, 0);
     }
 
     #[ktest]
