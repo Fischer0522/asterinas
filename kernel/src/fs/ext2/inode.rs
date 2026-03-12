@@ -9,7 +9,7 @@ use device_id::{decode_device_numbers, encode_device_numbers};
 use ostd::{const_assert, mm::io_util::HasVmReaderWriter};
 
 use super::{
-    block_ptr::{Ext2Bid, InodeBlockMap, BlockMapDesc},
+    block_ptr::{BlockMapDesc, Ext2Bid, InodeBlockMap},
     fs::{Ext2, ROOT_INO},
     prelude::*,
     utils::now,
@@ -18,6 +18,7 @@ use crate::{
     fs::{
         ext2::{
             dir::{DirEntry, DirEntryIter},
+            io_range_mapper::{IoRange, IoRangeMapper},
             xattr::Xattr,
         },
         utils::{
@@ -611,27 +612,13 @@ impl Inode {
         let mut inner = self.inner.write();
         let old_size = inner.file_size();
 
-        if inner.should_fallback_direct_write(&fs, offset, end, block_size)? {
-            if let Err(err) = inner.prepare_continuous_blocks(&fs, offset, end, block_size, false) {
-                inner.write_failed_cleanup(&fs, old_size, end, block_size);
-                return Err(err);
-            }
 
-            if let Err(err) = inner.page_cache().pages().write(offset, reader) {
-                inner.write_failed_cleanup(&fs, old_size, end, block_size);
-                return Err(err.into());
-            }
-
-            let current = now();
-            inner.touch_mtime_ctime(current);
-            drop(inner);
-
-            self.sync_data()?;
-            return Ok(write_len);
-        }
-
+        // If the new write will expand the file, we need to zero the tail of the last block of old size.
+        // The block range between old_size % block_size + 1 and offset is still as hole, no need to zero.
         inner.zero_direct_write_eof_tail(&fs, old_size, offset, block_size)?;
 
+        // Differ from Linux, Linux fallback to buffered io when encountered hole.
+        // We pre allocate blocks for direct write, so there should be no hole.
         if let Err(err) = inner.prepare_continuous_blocks(&fs, offset, end, block_size, true) {
             inner.write_failed_cleanup(&fs, old_size, end, block_size);
             return Err(err);
@@ -1912,55 +1899,28 @@ impl InodeInner {
         writer: &mut VmWriter,
     ) -> Result<()> {
         let block_size = fs.block_size();
-        let mut current_offset = offset;
         let mapping = self.backend.mapping.read();
-        while current_offset < end {
-            let iblock = u32::try_from(current_offset / block_size)
-                .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
-            let offset_in_block = current_offset % block_size;
-            let bytes_this_block = (block_size - offset_in_block).min(end - current_offset);
 
-            match mapping.get_block(fs, iblock)? {
-                Some(bid) => {
-                    let bio_segment = BioSegment::alloc(1, BioDirection::FromDevice);
-                    fs.read_blocks(bid, bio_segment.clone())?;
-
-                    if offset_in_block == 0 && bytes_this_block == block_size {
-                        let mut segment_reader = bio_segment.reader().map_err(|_| {
-                            Error::with_message(Errno::EIO, "failed to access bio read segment")
-                        })?;
-                        segment_reader.read_fallible(writer)?;
-                    } else {
-                        let mut block_buf = vec![0u8; block_size];
-                        {
-                            let mut segment_reader = bio_segment.reader().map_err(|_| {
-                                Error::with_message(Errno::EIO, "failed to access bio read segment")
-                            })?;
-                            let mut block_writer =
-                                VmWriter::from(block_buf.as_mut_slice()).to_fallible();
-                            segment_reader.read_fallible(&mut block_writer)?;
-                        }
-
-                        let copy_end =
-                            offset_in_block
-                                .checked_add(bytes_this_block)
-                                .ok_or_else(|| {
-                                    Error::with_message(Errno::EINVAL, "read block slice overflow")
-                                })?;
-                        let mut block_reader =
-                            VmReader::from(&block_buf[offset_in_block..copy_end]).to_fallible();
-                        writer.write_fallible(&mut block_reader)?;
-                    }
-                }
-                None => {
-                    // Sparse hole: return zero-filled bytes without issuing BIO.
-                    writer.fill_zeros(bytes_this_block)?;
-                }
+        let mut range_mapper = IoRangeMapper::new(
+            (offset / block_size) as u32..(end.div_ceil(block_size)) as u32,
+            mapping,
+            fs,
+        );
+        while let Some(range) = range_mapper.next()? {
+            match range {
+                IoRange::Mapped(mapped_range) => {
+                    let nblocks = mapped_range.device_block_range.end - mapped_range.device_block_range.start;
+                    let segment = BioSegment::alloc(nblocks as usize, BioDirection::FromDevice);
+                    fs.read_blocks(mapped_range.device_block_range.start, segment.clone())?;
+                    let mut segment_reader = segment.reader()?;
+                    segment_reader.read_fallible(writer)?;
+                },
+                IoRange::Hole(range) => {
+                    let n_bytes = (range.end as usize - range.start as usize) * block_size;
+                    writer.fill_zeros(n_bytes)?;
+                },
             }
-
-            current_offset += bytes_this_block;
         }
-
         Ok(())
     }
 
@@ -1970,56 +1930,33 @@ impl InodeInner {
     fn write_direct_at(&self, fs: &Ext2, offset: usize, reader: &mut VmReader) -> Result<()> {
         let block_size = fs.block_size();
         let write_len = reader.remain();
+        debug_assert_eq!(write_len % block_size,0);
         // end is already checked in `Inode::write_direct_at`.
         let end = offset + write_len;
-        let mut current_offset = offset;
         let mapping = self.backend.mapping.read();
 
-        while current_offset < end {
-            let iblock = u32::try_from(current_offset / block_size)
-                .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
-            let offset_in_block = current_offset % block_size;
-            let bytes_this_block = (block_size - offset_in_block).min(end - current_offset);
-            let bid = mapping.get_block(fs, iblock)?.ok_or_else(|| {
-                Error::with_message(Errno::EIO, "missing block mapping for direct write")
-            })?;
+        let mut range_mapper = IoRangeMapper::new(
+            (offset / block_size) as u32..(end.div_ceil(block_size)) as u32,
+            mapping,
+            fs,
+        );
+        while let Some(range) = range_mapper.next()? {
 
-            let mut block_buf = vec![0u8; block_size];
-            if offset_in_block != 0 || bytes_this_block < block_size {
-                let read_segment = BioSegment::alloc(1, BioDirection::FromDevice);
-                fs.read_blocks(bid, read_segment.clone()).map_err(|_| {
-                    Error::with_message(Errno::EIO, "failed to read block for partial write")
-                })?;
-
-                let mut segment_reader = read_segment.reader().map_err(|_| {
-                    Error::with_message(Errno::EIO, "failed to access bio read segment")
-                })?;
-                let mut block_writer = VmWriter::from(block_buf.as_mut_slice()).to_fallible();
-                segment_reader.read_fallible(&mut block_writer)?;
+            match range {
+                IoRange::Mapped(m) => {
+                    // Perform direct write for the continuous block range
+                    let nblocks =
+                        (m.device_block_range.end - m.device_block_range.start) as usize;
+                    let segment = BioSegment::alloc(nblocks, BioDirection::ToDevice);
+                    segment.writer()?.write_fallible(reader)?;
+                    fs.write_blocks(m.device_block_range.start, segment)?;
+                }
+                IoRange::Hole(_) => {
+                    // The upper layer should have performed allocation for the write range.
+                    return_errno_with_message!(Errno::EIO, "unexpected hole in direct write path");
+                }
             }
-
-            let copy_end = offset_in_block
-                .checked_add(bytes_this_block)
-                .ok_or_else(|| Error::with_message(Errno::EINVAL, "write block slice overflow"))?;
-            let mut slice_writer =
-                VmWriter::from(&mut block_buf[offset_in_block..copy_end]).to_fallible();
-            slice_writer.write_fallible(reader)?;
-
-            let write_segment = BioSegment::alloc(1, BioDirection::ToDevice);
-            {
-                let mut segment_writer = write_segment.writer().map_err(|_| {
-                    Error::with_message(Errno::EIO, "failed to access bio write segment")
-                })?;
-                let mut block_reader = VmReader::from(block_buf.as_slice()).to_fallible();
-                segment_writer.write_fallible(&mut block_reader)?;
-            }
-
-            fs.write_blocks(bid, write_segment)
-                .map_err(|_| Error::with_message(Errno::EIO, "failed to write data block"))?;
-
-            current_offset += bytes_this_block;
         }
-
         Ok(())
     }
 
@@ -2345,41 +2282,6 @@ impl InodeInner {
         Ok(())
     }
 
-    /// Returns whether a direct write touching current i_size must fall back to buffered I/O.
-    ///
-    /// Linux: /root/linux/fs/ext2/inode.c:823-854 (`ext2_iomap_begin`)
-    fn should_fallback_direct_write(
-        &self,
-        fs: &Ext2,
-        offset: usize,
-        end: usize,
-        block_size: usize,
-    ) -> Result<bool> {
-        if block_size == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
-        }
-
-        let scan_end = end.min(self.file_size());
-        if offset >= scan_end {
-            return Ok(false);
-        }
-
-        let start_block = offset / block_size;
-        let end_block = scan_end.div_ceil(block_size);
-        let mapping_backend = Arc::clone(self.backend());
-        let mapping = mapping_backend.mapping.read();
-
-        for iblock in start_block..end_block {
-            let iblock = u32::try_from(iblock)
-                .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
-            if mapping.get_block(fs, iblock)?.is_none() {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
-    }
-
     /// Zeroes the hidden stale-data window in the old EOF block before direct EOF extension.
     ///
     /// Linux: /root/linux/fs/direct-io.c:852-875 (`dio_zero_block`)
@@ -2404,12 +2306,10 @@ impl InodeInner {
 
         let eof_iblock = u32::try_from(old_size / block_size)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
-        let mapping_backend = Arc::clone(self.backend());
-        let mapping = mapping_backend.mapping.read();
+        let mapping = self.backend.mapping.read();
         let Some(_bid) = mapping.get_block(fs, eof_iblock)? else {
             return Ok(());
         };
-        drop(mapping);
 
         self.page_cache().fill_zeros(old_size..zero_end)?;
         self.sync_data_pages()?;
@@ -2440,6 +2340,7 @@ impl InodeInner {
             let mapping_backend = self.backend().clone();
             let mut mapping = mapping_backend.mapping.write();
             let mut new_blocks = Vec::new();
+            // TODO: simplify this logic
             let alloc_result = (|| -> Result<()> {
                 for iblock in start_block..end_block {
                     let iblock = u32::try_from(iblock).map_err(|_| {
@@ -2541,21 +2442,21 @@ impl InodeInner {
     ///
     /// Linux: /root/linux/fs/ext2/inode.c:624 (ext2_get_blocks, create path)
     /// TODO: refactor this into a fast path
-    fn get_or_alloc_block(&mut self, iblock: u32, create: bool) -> Result<Option<Ext2Bid>> {
-        let fs = self.fs_arc()?;
-        let mapping_backend = Arc::clone(self.backend());
-        let mut mapping = mapping_backend.mapping.write();
-        let old_blocks = mapping.blocks_512();
-        let mapped = mapping.get_or_alloc_block(&fs, iblock, create)?;
-        let allocated = mapping.blocks_512() != old_blocks;
-        let mapping_desc = *mapping.get_desc();
-        drop(mapping);
-        if allocated {
-            self.set_ctime(now());
-        }
-        self.sync_desc_mapping_from_snapshot(mapping_desc);
-        Ok(mapped)
-    }
+    // fn get_or_alloc_block(&mut self, iblock: u32, create: bool) -> Result<Option<Ext2Bid>> {
+    //     let fs = self.fs_arc()?;
+    //     let mapping_backend = Arc::clone(self.backend());
+    //     let mut mapping = mapping_backend.mapping.write();
+    //     let old_blocks = mapping.blocks_512();
+    //     let mapped = mapping.get_or_alloc_block(&fs, iblock, create)?;
+    //     let allocated = mapping.blocks_512() != old_blocks;
+    //     let mapping_desc = *mapping.get_desc();
+    //     drop(mapping);
+    //     if allocated {
+    //         self.set_ctime(now());
+    //     }
+    //     self.sync_desc_mapping_from_snapshot(mapping_desc);
+    //     Ok(mapped)
+    // }
 
     /// Phase 1: scan directory blocks for reusable slot or duplicate.
     ///
@@ -4403,7 +4304,7 @@ mod test {
     }
 
     #[ktest]
-    fn file_direct_write_sparse_hole_fallback_ok() {
+    fn file_direct_write_sparse_hole_ok() {
         clocks::init_for_ktest();
 
         let f = Ext2FixtureBuilder::new(1, 256)

@@ -47,13 +47,13 @@ pub(super) fn init() {
 }
 mod block_group;
 mod block_ptr;
-mod io_range_mapper;
 mod dir;
 mod fs;
 mod fs_type;
 mod impl_for_vfs;
 mod indirect_block_manager;
 mod inode;
+mod io_range_mapper;
 mod prelude;
 mod super_block;
 mod utils;
