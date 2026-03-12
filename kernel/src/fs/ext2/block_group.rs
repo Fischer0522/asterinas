@@ -628,10 +628,16 @@ impl BlockGroup {
         }
 
         let mut rejected = Vec::new();
-        let mut req = count.min(group_size) as u16;
+        let mut req = count
+            .min(group_size)
+            .min(self.free_blocks_count() as u32)
+            .min(sb_free_blocks) as u16;
         while req > 0 {
             let Some(range) = bitmap.alloc_consecutive(req) else {
-                req /= 2;
+                for rejected_range in rejected.drain(..) {
+                    bitmap.free_consecutive(rejected_range);
+                }
+                req -= 1;
                 continue;
             };
             let alloc_len = range.len() as u32;
@@ -645,7 +651,11 @@ impl BlockGroup {
             }
             if self.free_blocks_count() < alloc_len as u16 || sb_free_blocks < alloc_len {
                 saw_corruption = true;
-                rejected.push(range);
+                bitmap.free_consecutive(range);
+                for rejected_range in rejected.drain(..) {
+                    bitmap.free_consecutive(rejected_range);
+                }
+                req -= 1;
                 continue;
             }
 

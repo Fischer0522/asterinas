@@ -2340,24 +2340,32 @@ impl InodeInner {
             let mapping_backend = self.backend().clone();
             let mut mapping = mapping_backend.mapping.write();
             let mut new_blocks = Vec::new();
-            // TODO: simplify this logic
             let alloc_result = (|| -> Result<()> {
-                for iblock in start_block..end_block {
-                    let iblock = u32::try_from(iblock).map_err(|_| {
+                let mut current_block = start_block;
+                while current_block < end_block {
+                    let iblock = u32::try_from(current_block).map_err(|_| {
                         Error::with_message(Errno::EINVAL, "logical block number overflow")
                     })?;
-                    if mapping.get_block(fs, iblock)?.is_some() {
+                    let remaining = u32::try_from(end_block - current_block).map_err(|_| {
+                        Error::with_message(Errno::EINVAL, "logical block range overflow")
+                    })?;
+
+                    if let Some(mapped_range) = mapping.get_block_range(fs, iblock, remaining)? {
+                        current_block +=
+                            mapped_range.end.saturating_sub(mapped_range.start) as usize;
                         continue;
                     }
-                    let bid = mapping
-                        .get_or_alloc_block(fs, iblock, true)?
+                    let allocated_range = mapping
+                        .get_or_alloc_block_range(fs, iblock, remaining, true)?
                         .ok_or_else(|| {
                             Error::with_message(
                                 Errno::EIO,
                                 "missing block mapping after allocation",
                             )
                         })?;
-                    new_blocks.push(bid);
+                    current_block +=
+                        allocated_range.end.saturating_sub(allocated_range.start) as usize;
+                    new_blocks.extend(allocated_range);
                 }
                 Ok(())
             })();
@@ -2437,26 +2445,6 @@ impl InodeInner {
 
         self.set_file_size(old_size);
     }
-
-    /// Resolves a logical block to physical, allocating a missing branch if requested.
-    ///
-    /// Linux: /root/linux/fs/ext2/inode.c:624 (ext2_get_blocks, create path)
-    /// TODO: refactor this into a fast path
-    // fn get_or_alloc_block(&mut self, iblock: u32, create: bool) -> Result<Option<Ext2Bid>> {
-    //     let fs = self.fs_arc()?;
-    //     let mapping_backend = Arc::clone(self.backend());
-    //     let mut mapping = mapping_backend.mapping.write();
-    //     let old_blocks = mapping.blocks_512();
-    //     let mapped = mapping.get_or_alloc_block(&fs, iblock, create)?;
-    //     let allocated = mapping.blocks_512() != old_blocks;
-    //     let mapping_desc = *mapping.get_desc();
-    //     drop(mapping);
-    //     if allocated {
-    //         self.set_ctime(now());
-    //     }
-    //     self.sync_desc_mapping_from_snapshot(mapping_desc);
-    //     Ok(mapped)
-    // }
 
     /// Phase 1: scan directory blocks for reusable slot or duplicate.
     ///

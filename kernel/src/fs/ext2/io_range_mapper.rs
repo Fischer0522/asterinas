@@ -55,65 +55,37 @@ impl<'a> IoRangeMapper<'a> {
     /// backed by contiguous physical device blocks.
     /// `IoRange::Hole` returns one maximal logical hole run.
     pub(super) fn next(&mut self) -> Result<Option<IoRange>> {
-        let mut current_logical_start = self.range.start;
-        let mut current_physical_range: Option<Range<Ext2Bid>> = None;
-        let mut is_hole = false;
+        if self.range.start >= self.range.end {
+            return Ok(None);
+        }
 
+        let start_iblock = self.range.start;
+        let max_blocks = self.range.end - self.range.start;
+        if let Some(device_block_range) =
+            self.mapping
+                .get_block_range(self.fs, start_iblock, max_blocks)?
+        {
+            let logical_end =
+                start_iblock + device_block_range.end.saturating_sub(device_block_range.start);
+            self.range.start = logical_end;
+            return Ok(Some(IoRange::Mapped(MappedRange {
+                logical_block_range: start_iblock..logical_end,
+                device_block_range,
+            })));
+        }
+
+        let hole_start = start_iblock;
+        self.range.start += 1;
         while self.range.start < self.range.end {
             let iblock = self.range.start;
-            match self.mapping.get_block(self.fs, iblock)? {
-                Some(bid) => {
-                    if is_hole {
-                        // Keep `self.range.start` on the first mapped block so the
-                        // next call can start a mapped run from that block.
-                        return Ok(Some(IoRange::Hole(current_logical_start..iblock)));
-                    }
-
-                    if let Some(device_range) = current_physical_range.as_mut() {
-                        if bid != device_range.end {
-                            // Stop before the first physically non-contiguous block.
-                            // The next call will resume from the same logical block
-                            // and start a new mapped run there.
-                            return Ok(Some(IoRange::Mapped(MappedRange {
-                                logical_block_range: current_logical_start..iblock,
-                                device_block_range: device_range.clone(),
-                            })));
-                        }
-                        device_range.end += 1;
-                    } else {
-                        current_logical_start = iblock;
-                        current_physical_range = Some(bid..bid + 1);
-                    }
-                }
-                None => {
-                    if let Some(device_physical_range) = current_physical_range.take() {
-                        // A hole terminates the current mapped run. Leave the hole's
-                        // logical block unconsumed so the next call can report the
-                        // hole run explicitly.
-                        return Ok(Some(IoRange::Mapped(MappedRange {
-                            logical_block_range: current_logical_start..iblock,
-                            device_block_range: device_physical_range,
-                        })));
-                    }
-                    if !is_hole {
-                        is_hole = true;
-                        current_logical_start = iblock;
-                    }
-                }
+            let remaining = self.range.end - iblock;
+            if self.mapping.get_block_range(self.fs, iblock, remaining)?.is_some() {
+                break;
             }
             self.range.start += 1;
         }
 
-        if is_hole {
-            Ok(Some(IoRange::Hole(current_logical_start..self.range.end)))
-        } else if let Some(device_range) = current_physical_range {
-            Ok(Some(IoRange::Mapped(MappedRange {
-                logical_block_range: current_logical_start..self.range.end,
-                device_block_range: device_range,
-            })))
-        } else {
-            Ok(None)
-        }
+        Ok(Some(IoRange::Hole(hole_start..self.range.start)))
     }
 }
 

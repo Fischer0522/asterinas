@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::mem::size_of;
+use core::{mem::size_of, ops::Range};
 
 use device_id::{decode_device_numbers, encode_device_numbers};
 use ostd::sync::Mutex;
@@ -273,10 +273,225 @@ impl InodeBlockMap {
         })
     }
 
+    fn max_blocks_in_run(path: &BlockPath, max_blocks: u32) -> u32 {
+        max_blocks.min(path.boundary.saturating_add(1))
+    }
+
+    fn mapped_range_from_branch(
+        &self,
+        path: &BlockPath,
+        branch: &BranchResult,
+        max_blocks: u32,
+    ) -> Result<Option<Range<Ext2Bid>>> {
+        if max_blocks == 0 {
+            return_errno_with_message!(Errno::EINVAL, "zero block range requested");
+        }
+        if branch.partial_level < path.depth {
+            return Ok(None);
+        }
+
+        let first_bid = branch
+            .chain
+            .get(path.depth - 1)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "incomplete branch result"))?
+            .key;
+        if first_bid == 0 {
+            return Ok(None);
+        }
+
+        let max_count = Self::max_blocks_in_run(path, max_blocks);
+        let mut count = 1u32;
+        let start_slot = path.offsets[path.depth - 1] as usize;
+
+        if path.depth == 1 {
+            while count < max_count {
+                let slot = start_slot
+                    .checked_add(count as usize)
+                    .ok_or_else(|| Error::with_message(Errno::EIO, "direct slot overflow"))?;
+                let Some(&next_bid) = self.desc.block_ptrs.get(slot) else {
+                    break;
+                };
+                if next_bid == 0 || next_bid != first_bid.saturating_add(count) {
+                    break;
+                }
+                count += 1;
+            }
+        } else {
+            let leaf_bid = branch
+                .chain
+                .get(path.depth - 1)
+                .and_then(|entry| entry.bh)
+                .ok_or_else(|| Error::with_message(Errno::EIO, "missing indirect leaf block"))?;
+            let mut indirect_blocks = self.indirect_blocks.lock();
+            let leaf_block = indirect_blocks.find(leaf_bid)?;
+            while count < max_count {
+                let slot = start_slot
+                    .checked_add(count as usize)
+                    .ok_or_else(|| Error::with_message(Errno::EIO, "indirect slot overflow"))?;
+                let next_bid = leaf_block.read_bid(slot)?;
+                if next_bid == 0 || next_bid != first_bid.saturating_add(count) {
+                    break;
+                }
+                count += 1;
+            }
+        }
+
+        Ok(Some(first_bid..first_bid.saturating_add(count)))
+    }
+
     /// Linux: /root/linux/fs/ext2/inode.c:361 (ext2_blks_to_allocate)
-    fn blks_to_allocate(&self, branch: &BranchResult, path: &BlockPath) -> (u32, u32) {
+    fn blks_to_allocate(
+        &self,
+        branch: &BranchResult,
+        path: &BlockPath,
+        max_blocks: u32,
+    ) -> Result<(u32, u32)> {
+        if max_blocks == 0 {
+            return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
+        }
+
         let indirect_blks = (path.depth - 1 - branch.partial_level) as u32;
-        (indirect_blks, 1)
+        let max_data_blks = Self::max_blocks_in_run(path, max_blocks);
+        if indirect_blks > 0 {
+            return Ok((indirect_blks, max_data_blks));
+        }
+
+        let start_slot = path.offsets[path.depth - 1] as usize;
+        let mut count = 1u32;
+        if path.depth == 1 {
+            while count < max_data_blks {
+                let slot = start_slot
+                    .checked_add(count as usize)
+                    .ok_or_else(|| Error::with_message(Errno::EIO, "direct slot overflow"))?;
+                let Some(&next_bid) = self.desc.block_ptrs.get(slot) else {
+                    break;
+                };
+                if next_bid != 0 {
+                    break;
+                }
+                count += 1;
+            }
+        } else {
+            let leaf_bid = branch
+                .chain
+                .get(path.depth - 1)
+                .and_then(|entry| entry.bh)
+                .ok_or_else(|| Error::with_message(Errno::EIO, "missing indirect leaf block"))?;
+            let mut indirect_blocks = self.indirect_blocks.lock();
+            let leaf_block = indirect_blocks.find(leaf_bid)?;
+            while count < max_data_blks {
+                let slot = start_slot
+                    .checked_add(count as usize)
+                    .ok_or_else(|| Error::with_message(Errno::EIO, "indirect slot overflow"))?;
+                if leaf_block.read_bid(slot)? != 0 {
+                    break;
+                }
+                count += 1;
+            }
+        }
+
+        Ok((0, count))
+    }
+
+    fn rollback_allocated(
+        fs: &Ext2,
+        indirect_blocks: &Mutex<IndirectBlockManager>,
+        metadata_blocks: &[Ext2Bid],
+        data_range: Option<&Range<Ext2Bid>>,
+    ) {
+        let mut indirect_blocks = indirect_blocks.lock();
+        for bid in metadata_blocks {
+            indirect_blocks.remove(*bid);
+            let _ = fs.free_blocks(*bid, 1);
+        }
+        if let Some(data_range) = data_range {
+            let data_count = data_range.end.saturating_sub(data_range.start);
+            if data_count > 0 {
+                let _ = fs.free_blocks(data_range.start, data_count);
+            }
+        }
+    }
+
+    fn allocate_metadata_blocks(
+        &self,
+        fs: &Ext2,
+        count: u32,
+        goal: Ext2Bid,
+    ) -> Result<Vec<Ext2Bid>> {
+        let mut metadata_blocks = Vec::with_capacity(count as usize);
+        let mut alloc_goal = goal.max(fs.super_block().first_data_block());
+
+        while (metadata_blocks.len() as u32) < count {
+            let remain = count - metadata_blocks.len() as u32;
+            let allocated = fs.alloc_blocks(remain, alloc_goal)?;
+            let alloc_len = allocated.end.saturating_sub(allocated.start);
+            if alloc_len == 0 || alloc_len > remain {
+                return_errno_with_message!(Errno::EIO, "invalid metadata allocation result");
+            }
+
+            metadata_blocks.extend(allocated.clone());
+            alloc_goal = allocated.end;
+        }
+
+        Ok(metadata_blocks)
+    }
+
+    fn write_data_range_to_direct_slots(
+        &mut self,
+        start_slot: usize,
+        data_range: &Range<Ext2Bid>,
+    ) -> Result<()> {
+        for (offset, _) in data_range.clone().enumerate() {
+            let slot = start_slot
+                .checked_add(offset)
+                .ok_or_else(|| Error::with_message(Errno::EIO, "direct slot overflow"))?;
+            let entry = self
+                .desc
+                .block_ptrs
+                .get(slot)
+                .ok_or_else(|| Error::with_message(Errno::EIO, "direct slot out of bounds"))?;
+            if *entry != 0 {
+                return_errno_with_message!(Errno::EIO, "block pointer changed during allocation");
+            }
+        }
+
+        for (offset, bid) in data_range.clone().enumerate() {
+            let slot = start_slot
+                .checked_add(offset)
+                .ok_or_else(|| Error::with_message(Errno::EIO, "direct slot overflow"))?;
+            let entry = self
+                .desc
+                .block_ptrs
+                .get_mut(slot)
+                .ok_or_else(|| Error::with_message(Errno::EIO, "direct slot out of bounds"))?;
+            *entry = bid;
+        }
+
+        Ok(())
+    }
+
+    fn write_data_range_to_indirect_block(
+        block: &mut IndirectBlock,
+        start_slot: usize,
+        data_range: &Range<Ext2Bid>,
+    ) -> Result<()> {
+        for (offset, _) in data_range.clone().enumerate() {
+            let slot = start_slot
+                .checked_add(offset)
+                .ok_or_else(|| Error::with_message(Errno::EIO, "indirect slot overflow"))?;
+            if block.read_bid(slot)? != 0 {
+                return_errno_with_message!(Errno::EIO, "block pointer changed during allocation");
+            }
+        }
+
+        for (offset, bid) in data_range.clone().enumerate() {
+            let slot = start_slot
+                .checked_add(offset)
+                .ok_or_else(|| Error::with_message(Errno::EIO, "indirect slot overflow"))?;
+            block.write_bid(slot, bid)?;
+        }
+
+        Ok(())
     }
 
     /// Linux: /root/linux/fs/ext2/inode.c:1096 (ext2_free_data)
@@ -370,34 +585,12 @@ impl InodeBlockMap {
         data_blks: u32,
         path: &BlockPath,
         branch: &BranchResult,
-    ) -> Result<Ext2Bid> {
-        fn rollback_allocated(
-            fs: &Ext2,
-            indirect_blocks: &Mutex<IndirectBlockManager>,
-            blocks: &[u32],
-            indirect_count: usize,
-        ) {
-            let mut indirect_blocks = indirect_blocks.lock();
-            for bid in blocks.iter().copied().take(indirect_count) {
-                indirect_blocks.remove(bid);
-            }
-            for bid in blocks {
-                let _ = fs.free_blocks(*bid, 1);
-            }
-        }
-
+    ) -> Result<Range<Ext2Bid>> {
         if data_blks == 0 {
             return_errno_with_message!(Errno::EIO, "invalid zero data allocation");
         }
         if branch.partial_level >= path.depth {
             return_errno_with_message!(Errno::EIO, "branch is already complete");
-        }
-
-        let total = indirect_blks
-            .checked_add(data_blks)
-            .ok_or_else(|| Error::with_message(Errno::EIO, "block allocation count overflow"))?;
-        if total == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid zero total allocation");
         }
 
         if fs.block_size() < size_of::<u32>() {
@@ -409,6 +602,34 @@ impl InodeBlockMap {
         if sectors_per_block == 0 {
             return_errno_with_message!(Errno::EIO, "invalid sector accounting for block size");
         }
+        let alloc_goal = branch
+            .chain
+            .last()
+            .map_or(self.desc.block_ptrs[0], |entry| entry.key)
+            .max(fs.super_block().first_data_block());
+        let metadata_blocks = self.allocate_metadata_blocks(fs, indirect_blks, alloc_goal)?;
+        let data_goal = metadata_blocks
+            .last()
+            .copied()
+            .map_or(alloc_goal, |last_metadata| last_metadata.saturating_add(1));
+        let data_range = match fs.alloc_blocks(data_blks, data_goal) {
+            Ok(range) => {
+                let alloc_len = range.end.saturating_sub(range.start);
+                if alloc_len == 0 || alloc_len > data_blks {
+                    Self::rollback_allocated(fs, &self.indirect_blocks, &metadata_blocks, None);
+                    return_errno_with_message!(Errno::EIO, "invalid data allocation result");
+                }
+                range
+            }
+            Err(err) => {
+                Self::rollback_allocated(fs, &self.indirect_blocks, &metadata_blocks, None);
+                return Err(err);
+            }
+        };
+
+        let total = (metadata_blocks.len() as u32)
+            .checked_add(data_range.end.saturating_sub(data_range.start))
+            .ok_or_else(|| Error::with_message(Errno::EIO, "block allocation count overflow"))?;
         let added_sectors = total
             .checked_mul(sectors_per_block)
             .ok_or_else(|| Error::with_message(Errno::EIO, "inode block accounting overflow"))?;
@@ -418,127 +639,106 @@ impl InodeBlockMap {
             .checked_add(added_sectors)
             .ok_or_else(|| Error::with_message(Errno::EIO, "inode block count overflow"))?;
 
-        let mut new_blocks = Vec::with_capacity(total as usize);
-        let mut alloc_goal = branch
-            .chain
-            .last()
-            .map_or(self.desc.block_ptrs[0], |entry| entry.key)
-            .max(fs.super_block().first_data_block());
-
-        while (new_blocks.len() as u32) < total {
-            let remain = total - new_blocks.len() as u32;
-            let allocated = match fs.alloc_blocks(remain, alloc_goal) {
-                Ok(allocated) => allocated,
-                Err(err) => {
-                    rollback_allocated(
-                        fs,
-                        &self.indirect_blocks,
-                        &new_blocks,
-                        indirect_blks as usize,
-                    );
-                    return Err(err);
-                }
-            };
-
-            let alloc_len = allocated.end - allocated.start;
-            if alloc_len == 0 || alloc_len > remain {
-                rollback_allocated(
-                    fs,
-                    &self.indirect_blocks,
-                    &new_blocks,
-                    indirect_blks as usize,
-                );
-                return_errno_with_message!(Errno::EIO, "invalid block allocation result");
-            }
-
-            new_blocks.extend(allocated);
-            if let Some(last) = new_blocks.last() {
-                alloc_goal = last.saturating_add(1);
-            }
-        }
-
-        // SPEC: data block is at index `indirect_blks` in allocation order.
-        let data_block = match new_blocks.get(indirect_blks as usize) {
-            Some(bid) => *bid,
-            None => {
-                rollback_allocated(
-                    fs,
-                    &self.indirect_blocks,
-                    &new_blocks,
-                    indirect_blks as usize,
-                );
-                return_errno_with_message!(Errno::EIO, "allocated chain missing data block");
-            }
-        };
-
         let chain_build_result = (|| -> Result<()> {
-            // Build the new chain fully in-memory before splicing it into the tree.
-            for i in 0..(indirect_blks as usize) {
-                let level = branch.partial_level + 1 + i;
-                if level >= path.depth {
-                    return_errno_with_message!(
-                        Errno::EIO,
-                        "invalid branch depth during allocation"
-                    );
-                }
-
-                let next_block = match new_blocks.get(i + 1) {
-                    Some(bid) => *bid,
-                    None => {
-                        return_errno_with_message!(Errno::EIO, "allocated chain metadata mismatch");
+            if !metadata_blocks.is_empty() {
+                let mut indirect_blocks = self.indirect_blocks.lock();
+                for (i, new_bid) in metadata_blocks.iter().copied().enumerate() {
+                    let level = branch.partial_level + 1 + i;
+                    if level >= path.depth {
+                        return_errno_with_message!(
+                            Errno::EIO,
+                            "invalid branch depth during allocation"
+                        );
                     }
-                };
 
-                let new_bid = new_blocks[i];
-                let next_bid = next_block;
-                let mut block = IndirectBlock::alloc_new(new_bid)?;
-                block.write_bid(path.offsets[level] as usize, next_bid)?;
-                self.indirect_blocks.lock().insert_new(new_bid, block)?;
+                    let mut block = IndirectBlock::alloc_new(new_bid)?;
+                    block.clear();
+                    let start_slot = path.offsets[level] as usize;
+                    if i + 1 == metadata_blocks.len() {
+                        Self::write_data_range_to_indirect_block(&mut block, start_slot, &data_range)?;
+                    } else {
+                        let next_bid = metadata_blocks
+                            .get(i + 1)
+                            .copied()
+                            .ok_or_else(|| {
+                                Error::with_message(
+                                    Errno::EIO,
+                                    "allocated chain metadata mismatch",
+                                )
+                            })?;
+                        block.write_bid(start_slot, next_bid)?;
+                    }
+                    indirect_blocks.insert_new(new_bid, block)?;
+                }
             }
 
-            // Splice the chain head into the existing branch.
-            let splice_ptr = new_blocks[0];
-            if branch.partial_level == 0 {
-                let slot = path.offsets[0] as usize;
-                if slot >= self.desc.block_ptrs.len() {
-                    return_errno_with_message!(Errno::EIO, "invalid inode block pointer slot");
+            if metadata_blocks.is_empty() {
+                if branch.partial_level == 0 {
+                    let slot = path.offsets[0] as usize;
+                    self.write_data_range_to_direct_slots(slot, &data_range)?;
+                } else {
+                    let parent_bid = branch
+                        .chain
+                        .get(branch.partial_level)
+                        .and_then(|entry| entry.bh)
+                        .ok_or_else(|| {
+                            Error::with_message(
+                                Errno::EIO,
+                                "missing parent indirect block for data splice",
+                            )
+                        })?;
+                    let slot = path.offsets[branch.partial_level] as usize;
+                    let mut indirect_blocks = self.indirect_blocks.lock();
+                    let parent_block = indirect_blocks.find_mut(parent_bid)?;
+                    Self::write_data_range_to_indirect_block(parent_block, slot, &data_range)?;
                 }
-                if self.desc.block_ptrs[slot] != 0 {
-                    return_errno_with_message!(
-                        Errno::EIO,
-                        "block pointer changed during allocation"
-                    );
-                }
-                self.desc.block_ptrs[slot] = splice_ptr;
             } else {
-                let parent_bid = branch
-                    .chain
-                    .get(branch.partial_level)
-                    .and_then(|entry| entry.bh)
-                    .ok_or_else(|| {
-                        Error::with_message(Errno::EIO, "missing parent indirect block for splice")
-                    })?;
-                let mut indirect_blocks = self.indirect_blocks.lock();
-                let parent_block = indirect_blocks.find_mut(parent_bid)?;
-                let slot = path.offsets[branch.partial_level] as usize;
-                if parent_block.read_bid(slot)? != 0 {
-                    return_errno_with_message!(
-                        Errno::EIO,
-                        "block pointer changed during allocation"
-                    );
+                let splice_ptr = metadata_blocks[0];
+                if branch.partial_level == 0 {
+                    let slot = path.offsets[0] as usize;
+                    if slot >= self.desc.block_ptrs.len() {
+                        return_errno_with_message!(Errno::EIO, "invalid inode block pointer slot");
+                    }
+                    if self.desc.block_ptrs[slot] != 0 {
+                        return_errno_with_message!(
+                            Errno::EIO,
+                            "block pointer changed during allocation"
+                        );
+                    }
+                    self.desc.block_ptrs[slot] = splice_ptr;
+                } else {
+                    let parent_bid = branch
+                        .chain
+                        .get(branch.partial_level)
+                        .and_then(|entry| entry.bh)
+                        .ok_or_else(|| {
+                            Error::with_message(
+                                Errno::EIO,
+                                "missing parent indirect block for splice",
+                            )
+                        })?;
+                    let mut indirect_blocks = self.indirect_blocks.lock();
+                    let parent_block = indirect_blocks.find_mut(parent_bid)?;
+                    let slot = path.offsets[branch.partial_level] as usize;
+                    if parent_block.read_bid(slot)? != 0 {
+                        return_errno_with_message!(
+                            Errno::EIO,
+                            "block pointer changed during allocation"
+                        );
+                    }
+                    parent_block.write_bid(slot, splice_ptr)?;
                 }
-                parent_block.write_bid(slot, splice_ptr)?;
             }
 
             Ok(())
         })();
 
         if let Err(err) = chain_build_result {
-            rollback_allocated(
+            Self::rollback_allocated(
                 fs,
                 &self.indirect_blocks,
-                &new_blocks,
-                indirect_blks as usize,
+                &metadata_blocks,
+                Some(&data_range),
             );
             return Err(err);
         }
@@ -546,32 +746,68 @@ impl InodeBlockMap {
         // SPEC: ext2_splice_branch-style inode accounting and ctime update.
         self.desc.blocks = new_block_count;
 
-        Ok(data_block)
+        Ok(data_range)
     }
 
-    /// Resolves a logical block to physical block (read-only).
+    /// Resolves a logical block to a contiguous physical block range.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:783 (ext2_get_block)
-    pub(super) fn get_block(&self, fs: &Ext2, iblock: u32) -> Result<Option<Ext2Bid>> {
+    /// Linux: /root/linux/fs/ext2/inode.c:624 (ext2_get_blocks, create = 0)
+    pub(super) fn get_block_range(
+        &self,
+        fs: &Ext2,
+        iblock: u32,
+        max_blocks: u32,
+    ) -> Result<Option<Range<Ext2Bid>>> {
+        if max_blocks == 0 {
+            return_errno_with_message!(Errno::EINVAL, "zero block range requested");
+        }
+
         let path = self.block_to_path(fs, iblock)?;
         if path.depth == 0 {
             return Ok(None);
         }
 
         let branch = self.get_branch(&path, fs)?;
-        if branch.partial_level < path.depth {
+        self.mapped_range_from_branch(&path, &branch, max_blocks)
+    }
+
+    /// Resolves a logical block to physical block (read-only).
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:783 (ext2_get_block)
+    pub(super) fn get_block(&self, fs: &Ext2, iblock: u32) -> Result<Option<Ext2Bid>> {
+        Ok(self.get_block_range(fs, iblock, 1)?.map(|range| range.start))
+    }
+
+    /// Resolves a logical block to a contiguous physical block range, allocating if needed.
+    ///
+    /// Linux: /root/linux/fs/ext2/inode.c:624 (ext2_get_blocks)
+    pub(super) fn get_or_alloc_block_range(
+        &mut self,
+        fs: &Ext2,
+        iblock: u32,
+        max_blocks: u32,
+        create: bool,
+    ) -> Result<Option<Range<Ext2Bid>>> {
+        if max_blocks == 0 {
+            return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
+        }
+
+        let path = self.block_to_path(fs, iblock)?;
+        if path.depth == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid block path depth");
+        }
+
+        let branch = self.get_branch(&path, fs)?;
+        if branch.partial_level == path.depth {
+            return self.mapped_range_from_branch(&path, &branch, max_blocks);
+        }
+        if !create {
             return Ok(None);
         }
 
-        let bid = branch
-            .chain
-            .get(path.depth - 1)
-            .ok_or_else(|| Error::with_message(Errno::EIO, "incomplete branch result"))?
-            .key;
-        if bid == 0 {
-            return Ok(None);
-        }
-        Ok(Some(bid))
+        let (indirect_blks, data_blks) = self.blks_to_allocate(&branch, &path, max_blocks)?;
+        let range = self.alloc_and_splice_branch(fs, indirect_blks, data_blks, &path, &branch)?;
+        Ok(Some(range))
     }
 
     /// Resolves a logical block to physical, optionally allocating missing branch.
@@ -583,27 +819,9 @@ impl InodeBlockMap {
         iblock: u32,
         create: bool,
     ) -> Result<Option<Ext2Bid>> {
-        let path = self.block_to_path(fs, iblock)?;
-        if path.depth == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid block path depth");
-        }
-
-        let branch = self.get_branch(&path, fs)?;
-        if branch.partial_level == path.depth {
-            let mapped = branch
-                .chain
-                .get(path.depth - 1)
-                .ok_or_else(|| Error::with_message(Errno::EIO, "incomplete branch result"))?
-                .key;
-            return Ok(Some(mapped));
-        }
-        if !create {
-            return Ok(None);
-        }
-
-        let (indirect_blks, data_blks) = self.blks_to_allocate(&branch, &path);
-        let bid = self.alloc_and_splice_branch(fs, indirect_blks, data_blks, &path, &branch)?;
-        Ok(Some(bid))
+        Ok(self
+            .get_or_alloc_block_range(fs, iblock, 1, create)?
+            .map(|range| range.start))
     }
 
     /// Truncates all blocks beyond `new_size`.
@@ -994,6 +1212,31 @@ mod test {
     }
 
     #[ktest]
+    fn block_mapping_get_block_range_returns_contiguous_runs() {
+        let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
+        let (disk, ext2) = (&f.disk, &f.ext2);
+
+        let indirect_bid = 40u32;
+        write_indirect_ptr(disk.as_ref(), indirect_bid, 0, 70);
+        write_indirect_ptr(disk.as_ref(), indirect_bid, 1, 71);
+        write_indirect_ptr(disk.as_ref(), indirect_bid, 2, 72);
+        write_indirect_ptr(disk.as_ref(), indirect_bid, 3, 90);
+
+        let mut block_ptrs = [0u32; 15];
+        block_ptrs[0] = 11;
+        block_ptrs[1] = 12;
+        block_ptrs[2] = 13;
+        block_ptrs[12] = indirect_bid;
+        let mapping = make_mapping(block_ptrs, 0, &f.ext2);
+
+        assert_eq!(mapping.get_block_range(ext2, 0, 4).unwrap(), Some(11..14));
+        assert_eq!(mapping.get_block(ext2, 0).unwrap(), Some(11));
+        assert_eq!(mapping.get_block_range(ext2, 12, 4).unwrap(), Some(70..73));
+        assert_eq!(mapping.get_block_range(ext2, 15, 4).unwrap(), Some(90..91));
+        assert_eq!(mapping.get_block_range(ext2, 3, 4).unwrap(), None);
+    }
+
+    #[ktest]
     fn block_mapping_invalid_depth_returns_err() {
         let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let (disk, ext2) = (&f.disk, &f.ext2);
@@ -1098,6 +1341,39 @@ mod test {
     }
 
     #[ktest]
+    fn block_alloc_direct_range_ok() {
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .build()
+            .unwrap();
+        let ext2 = &f.ext2;
+        let sectors_per_block = (ext2.block_size() / SECTOR_SIZE) as u32;
+
+        let mut mapping = make_mapping([0u32; 15], 0, &f.ext2);
+        let free_before = ext2.super_block().free_blocks_count();
+        let allocated_range = mapping
+            .get_or_alloc_block_range(ext2, 0, 3, true)
+            .unwrap()
+            .unwrap();
+        let free_after = ext2.super_block().free_blocks_count();
+
+        assert_eq!(allocated_range.end - allocated_range.start, 3);
+        assert_eq!(mapping.desc.block_ptrs[0], allocated_range.start);
+        assert_eq!(mapping.desc.block_ptrs[1], allocated_range.start + 1);
+        assert_eq!(mapping.desc.block_ptrs[2], allocated_range.start + 2);
+        assert_eq!(
+            mapping.get_block_range(ext2, 0, 3).unwrap(),
+            Some(allocated_range.clone())
+        );
+        assert_eq!(
+            mapping.get_or_alloc_block(ext2, 0, true).unwrap(),
+            Some(allocated_range.start)
+        );
+        assert_eq!(mapping.desc.blocks, sectors_per_block.saturating_mul(3));
+        assert_eq!(free_before.saturating_sub(free_after), 3);
+    }
+
+    #[ktest]
     fn block_alloc_indirect_path_ok() {
         let f = Ext2FixtureBuilder::new(1, 256)
             .with_free_blocks(64, 64)
@@ -1118,6 +1394,34 @@ mod test {
     }
 
     #[ktest]
+    fn block_alloc_indirect_range_ok() {
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .build()
+            .unwrap();
+        let ext2 = &f.ext2;
+        let sectors_per_block = (ext2.block_size() / SECTOR_SIZE) as u32;
+
+        let mut mapping = make_mapping([0u32; 15], 0, &f.ext2);
+        let free_before = ext2.super_block().free_blocks_count();
+        let allocated_range = mapping
+            .get_or_alloc_block_range(ext2, 12, 4, true)
+            .unwrap()
+            .unwrap();
+        let free_after = ext2.super_block().free_blocks_count();
+
+        assert_ne!(mapping.desc.block_ptrs[12], 0);
+        assert_eq!(allocated_range.end - allocated_range.start, 4);
+        assert_eq!(
+            mapping.get_block_range(ext2, 12, 4).unwrap(),
+            Some(allocated_range.clone())
+        );
+        assert_eq!(mapping.get_block(ext2, 12).unwrap(), Some(allocated_range.start));
+        assert_eq!(mapping.desc.blocks, sectors_per_block.saturating_mul(5));
+        assert_eq!(free_before.saturating_sub(free_after), 5);
+    }
+
+    #[ktest]
     fn block_alloc_enospc_preserves_inode_state() {
         let f = Ext2FixtureBuilder::new(1, 256)
             .with_free_blocks(0, 0)
@@ -1135,9 +1439,9 @@ mod test {
 
     #[ktest]
     fn block_alloc_fragmented_chain_ok() {
-        // Corner case: total free blocks are enough, but no contiguous run can satisfy
-        // the full request in one call. This forces get_or_alloc_block() to loop and
-        // accumulate allocations across multiple fs.alloc_blocks() calls.
+        // Corner case: the required metadata chain exists only as fragmented free
+        // blocks, so metadata allocation must be accumulated across multiple
+        // fs.alloc_blocks() calls before the single data block is attached.
         let f = Ext2FixtureBuilder::new(1, 256)
             .with_free_blocks(3, 3)
             .build()
