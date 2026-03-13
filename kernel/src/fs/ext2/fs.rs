@@ -13,7 +13,7 @@ use super::{
     utils::{Dirty, now},
 };
 use crate::{
-    fs::{ext2::block_ptr::Ext2Bid, utils::FsEventSubscriberStats},
+    fs::{ext2::inode_block_map::Ext2Bid, utils::FsEventSubscriberStats},
     process::{Gid, credentials::capabilities::CapSet, posix_thread::AsPosixThread},
     thread::Thread,
 };

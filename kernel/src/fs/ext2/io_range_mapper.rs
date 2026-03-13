@@ -7,7 +7,7 @@ use ostd::sync::RwMutexReadGuard;
 use super::prelude::*;
 use crate::fs::ext2::{
     Ext2,
-    block_ptr::{Ext2Bid, InodeBlockMap},
+    inode_block_map::{Ext2Bid, InodeBlockMap},
 };
 
 /// One contiguous mapped run translated from logical file blocks to device blocks.
@@ -101,7 +101,7 @@ mod test {
 
     use super::*;
     use crate::{
-        fs::ext2::{block_ptr::BlockMapDesc, testkit::Ext2FixtureBuilder},
+        fs::ext2::{inode_block_map::BlockMapDesc, testkit::Ext2FixtureBuilder},
         prelude::*,
         time::clocks,
     };

@@ -2,7 +2,7 @@
 
 use core::{cmp::Ordering, mem::size_of};
 
-use super::{block_ptr::Ext2Bid, fs::Ext2, prelude::*};
+use super::{inode_block_map::Ext2Bid, fs::Ext2, prelude::*};
 use crate::fs::{
     ext2::Inode,
     utils::{XattrName, XattrNamespace, XattrSetFlags},

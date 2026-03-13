@@ -46,7 +46,7 @@ pub(super) fn init() {
     super::registry::register(&Ext2Type).unwrap();
 }
 mod block_group;
-mod block_ptr;
+mod inode_block_map;
 mod dir;
 mod fs;
 mod fs_type;

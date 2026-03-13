@@ -4,7 +4,7 @@ use core::mem::size_of;
 
 use ostd::const_assert;
 
-use super::{block_ptr::Ext2Bid, prelude::*};
+use super::{inode_block_map::Ext2Bid, prelude::*};
 use crate::time::UnixTime;
 
 /// The magic number of Ext2.

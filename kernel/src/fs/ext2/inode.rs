@@ -9,7 +9,7 @@ use device_id::{decode_device_numbers, encode_device_numbers};
 use ostd::{const_assert, mm::io_util::HasVmReaderWriter};
 
 use super::{
-    block_ptr::{BlockMapDesc, Ext2Bid, InodeBlockMap},
+    inode_block_map::{BlockMapDesc, Ext2Bid, InodeBlockMap},
     fs::{Ext2, ROOT_INO},
     prelude::*,
     utils::now,
