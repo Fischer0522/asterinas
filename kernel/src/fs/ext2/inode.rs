@@ -670,7 +670,7 @@ impl Inode {
     /// Initializes a directory with `.` and `..`.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:617 (ext2_make_empty)
-    pub(super) fn make_empty(&self, parent_ino: u32) -> Result<()> {
+    fn make_empty(&self, parent_ino: u32) -> Result<()> {
         if self.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
@@ -686,14 +686,6 @@ impl Inode {
         Ok(())
     }
 
-    pub(super) fn empty_dir(&self) -> bool {
-        let Ok(fs) = self.fs_arc() else {
-            return false;
-        };
-        let inner = self.inner.read();
-        inner.empty_dir(&fs, self.ino)
-    }
-
     pub(super) fn rmdir(&self, name: &str) -> Result<()> {
         if self.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
@@ -704,12 +696,23 @@ impl Inode {
         }
 
         let fs = self.fs_arc()?;
-        let parent_inner = self.inner.read();
-        let child_ino = parent_inner.find_entry(&fs, name)?;
-        drop(parent_inner);
-        let child = fs.read_inode(child_ino)?;
-        let child_reached_zero_link = {
-            let mut child_inner = child.inner.write();
+        const RMDIR_RETRY_LIMIT: usize = 8;
+        for _ in 0..RMDIR_RETRY_LIMIT {
+            let child_ino = {
+                let parent_inner = self.inner.read();
+                parent_inner.find_entry(&fs, name)?
+            };
+            let child = fs.read_inode(child_ino)?;
+            let lock_targets = [self, child.as_ref()];
+            let mut guards = MultiInodeInnerGuards::lock(&lock_targets);
+
+            let parent_inner = guards.inner(self.ino())?;
+            let rechecked_child_ino = parent_inner.find_entry(&fs, name)?;
+            if rechecked_child_ino != child_ino {
+                continue;
+            }
+
+            let child_inner = guards.inner_mut(child.ino())?;
             if child_inner.inode_type() != InodeType::Dir {
                 return_errno!(Errno::ENOTDIR);
             }
@@ -719,22 +722,27 @@ impl Inode {
 
             child_inner.set_ctime(now());
             child_inner.sub_links_count_saturating(2);
-            child_inner.links_count() == 0
-        };
+            let child_reached_zero_link = child_inner.links_count() == 0;
 
-        let mut parent_inner = self.inner.write();
-        parent_inner.delete_entry(name)?;
-        parent_inner.sub_links_count_saturating(1);
-        // SPEC: parent link-count change in rmdir is a directory mutation; refresh
-        // ctime/mtime the same way as add/delete entry paths.
-        // Linux: /root/linux/fs/ext2/namei.c:312 (inode_dec_link_count(dir)).
-        parent_inner.update_dir_timestamps_and_flags()?;
-        drop(parent_inner);
+            let parent_inner = guards.inner_mut(self.ino())?;
+            parent_inner.delete_entry(name)?;
+            parent_inner.sub_links_count_saturating(1);
+            // Keep the emptiness check and unlink in one stable parent+child lock
+            // domain so a concurrent mkdir cannot revive the child after validation.
+            // Linux: /root/linux/fs/ext2/namei.c:302 (ext2_rmdir)
+            parent_inner.update_dir_timestamps_and_flags()?;
+            drop(guards);
 
-        if child_reached_zero_link {
-            child.finalize_zero_link_transition(&fs)?;
+            if child_reached_zero_link {
+                child.finalize_zero_link_transition(&fs)?;
+            }
+            return Ok(());
         }
-        Ok(())
+
+        return_errno_with_message!(
+            Errno::EAGAIN,
+            "rmdir retried due concurrent directory updates"
+        )
     }
 
     /// Creates a subdirectory under this directory.
@@ -1114,30 +1122,48 @@ impl Inode {
         }
 
         let fs = self.fs_arc()?;
-        let parent_inner = self.inner.upread();
-        let child_ino = parent_inner.find_entry(&fs, name)?;
-        let child = fs.read_inode(child_ino)?;
+        const UNLINK_RETRY_LIMIT: usize = 8;
+        for _ in 0..UNLINK_RETRY_LIMIT {
+            let child_ino = {
+                let parent_inner = self.inner.read();
+                parent_inner.find_entry(&fs, name)?
+            };
+            let child = fs.read_inode(child_ino)?;
+            let lock_targets = [self, child.as_ref()];
+            let mut guards = MultiInodeInnerGuards::lock(&lock_targets);
 
-        // SPEC: unlink rejects directories — use rmdir instead.
-        if child.type_ == InodeType::Dir {
-            return_errno!(Errno::EISDIR);
+            let parent_inner = guards.inner(self.ino())?;
+            let rechecked_child_ino = parent_inner.find_entry(&fs, name)?;
+            if rechecked_child_ino != child_ino {
+                continue;
+            }
+
+            let child_inner = guards.inner_mut(child.ino())?;
+            if child_inner.inode_type() == InodeType::Dir {
+                return_errno!(Errno::EISDIR);
+            }
+
+            let parent_inner = guards.inner_mut(self.ino())?;
+            parent_inner.delete_entry(name)?;
+
+            // Linux: inode_set_ctime_to_ts(inode, inode_get_ctime(dir))
+            // then inode_dec_link_count.
+            let child_inner = guards.inner_mut(child.ino())?;
+            child_inner.set_ctime(now());
+            child_inner.sub_links_count_saturating(1);
+            let child_reached_zero_link = child_inner.links_count() == 0;
+            drop(guards);
+
+            if child_reached_zero_link {
+                child.finalize_zero_link_transition(&fs)?;
+            }
+            return Ok(());
         }
 
-        let mut parent_inner = parent_inner.upgrade();
-        parent_inner.delete_entry(name)?;
-
-        // Linux: inode_set_ctime_to_ts(inode, inode_get_ctime(dir))
-        // then inode_dec_link_count.
-        let mut child_inner = child.inner.write();
-        child_inner.set_ctime(now());
-        child_inner.sub_links_count_saturating(1);
-        let child_reached_zero_link = child_inner.links_count() == 0;
-
-        if child_reached_zero_link {
-            child_inner.finalize_zero_link_transition(child.ino, &fs)?;
-        }
-
-        Ok(())
+        return_errno_with_message!(
+            Errno::EAGAIN,
+            "unlink retried due concurrent directory updates"
+        )
     }
 
     /// Renames or moves an entry from this directory to `target` directory.
@@ -1258,16 +1284,16 @@ impl Inode {
 
     fn rename_lock_targets<'a>(&'a self, ctx: &'a RenameContext<'a>) -> Vec<&'a Inode> {
         let mut targets = Vec::new();
-        Self::add_unique_rename_lock_target(&mut targets, ctx.source_dir);
-        Self::add_unique_rename_lock_target(&mut targets, ctx.target_dir);
-        Self::add_unique_rename_lock_target(&mut targets, ctx.old_inode.as_ref());
+        Self::add_unique_inode_lock_target(&mut targets, ctx.source_dir);
+        Self::add_unique_inode_lock_target(&mut targets, ctx.target_dir);
+        Self::add_unique_inode_lock_target(&mut targets, ctx.old_inode.as_ref());
         if let Some(existing) = ctx.existing_inode.as_ref() {
-            Self::add_unique_rename_lock_target(&mut targets, existing.as_ref());
+            Self::add_unique_inode_lock_target(&mut targets, existing.as_ref());
         }
         targets
     }
 
-    fn add_unique_rename_lock_target<'a>(targets: &mut Vec<&'a Inode>, inode: &'a Inode) {
+    fn add_unique_inode_lock_target<'a>(targets: &mut Vec<&'a Inode>, inode: &'a Inode) {
         if targets.iter().any(|target| target.ino == inode.ino) {
             return;
         }
@@ -3326,8 +3352,8 @@ mod test {
             ext2::{
                 fs::ROOT_INO,
                 testkit::{
-                    self, CollectDirentVisitor, ErrorBioDisk, Ext2FixtureBuilder, RawInodeBuilder,
-                    StopAfterVisitor, encode_dir_entry,
+                    self, encode_dir_entry, CollectDirentVisitor, ErrorBioDisk, Ext2FixtureBuilder,
+                    RawInodeBuilder, StopAfterVisitor,
                 },
             },
             utils::{
@@ -3541,12 +3567,11 @@ mod test {
             f.ext2.read_inode(old_ino).unwrap_err().error(),
             Errno::ESTALE
         );
-        assert!(
-            f.ext2
-                .block_group(0)
-                .inode_bitmap()
-                .is_allocated((old_ino - 1) as u16)
-        );
+        assert!(f
+            .ext2
+            .block_group(0)
+            .inode_bitmap()
+            .is_allocated((old_ino - 1) as u16));
         f.ext2.sync_all().unwrap();
         let raw_before_drop = read_raw_inode_from_disk(&f, old_ino);
         assert_eq!(raw_before_drop.links_count, 0);
@@ -3559,12 +3584,11 @@ mod test {
             f.ext2.read_inode(old_ino).unwrap_err().error(),
             Errno::ENOENT
         );
-        assert!(
-            !f.ext2
-                .block_group(0)
-                .inode_bitmap()
-                .is_allocated((old_ino - 1) as u16)
-        );
+        assert!(!f
+            .ext2
+            .block_group(0)
+            .inode_bitmap()
+            .is_allocated((old_ino - 1) as u16));
         let raw_after_drop = read_raw_inode_from_disk(&f, old_ino);
         assert_eq!(raw_after_drop.links_count, 0);
         assert_eq!(raw_after_drop.sector_count, 0);
@@ -4158,7 +4182,6 @@ mod test {
         let dir = root
             .create("empty", InodeType::Dir, FilePerm::from_bits_truncate(0o755))
             .unwrap();
-        assert!(dir.empty_dir());
         assert_eq!(inode_size(&dir), block_size);
 
         let mut visitor = CollectDirentVisitor::default();
@@ -5029,11 +5052,9 @@ mod test {
         assert_eq!(file.read_at(0, &mut out_writer).unwrap(), block_size);
 
         assert_eq!(&out[..punch_off], &payload[..punch_off]);
-        assert!(
-            out[punch_off..punch_off + punch_len]
-                .iter()
-                .all(|byte| *byte == 0)
-        );
+        assert!(out[punch_off..punch_off + punch_len]
+            .iter()
+            .all(|byte| *byte == 0));
         assert_eq!(
             &out[punch_off + punch_len..],
             &payload[punch_off + punch_len..]
