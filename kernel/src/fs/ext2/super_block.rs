@@ -4,7 +4,7 @@ use core::mem::size_of;
 
 use ostd::const_assert;
 
-use super::{inode_block_map::Ext2Bid, prelude::*};
+use super::{block_group::RawGroupDesc, inode_block_map::Ext2Bid, prelude::*};
 use crate::time::UnixTime;
 
 /// The magic number of Ext2.
@@ -425,6 +425,14 @@ impl SuperBlock {
         self.blocks_count.div_ceil(self.blocks_per_group)
     }
 
+    /// Returns the number of group descriptor blocks in each superblock copy.
+    ///
+    /// Linux: /root/linux/fs/ext2/balloc.c:1531 (ext2_bg_num_gdb)
+    pub(super) fn group_descriptor_blocks_count(&self) -> u32 {
+        let descriptor_bytes = (self.block_groups_count() as usize) * size_of::<RawGroupDesc>();
+        descriptor_bytes.div_ceil(self.block_size) as u32
+    }
+
     /// Returns the filesystem state.
     #[expect(dead_code)]
     pub fn state(&self) -> FsState {
@@ -541,6 +549,30 @@ impl SuperBlock {
         } else {
             true
         }
+    }
+
+    /// Returns whether the given group stores a superblock copy.
+    ///
+    /// Linux: /root/linux/fs/ext2/balloc.c:1514 (ext2_bg_has_super)
+    pub(super) fn has_super_block(&self, block_group_idx: usize) -> bool {
+        block_group_idx == 0 || self.is_backup_group(block_group_idx)
+    }
+
+    /// Computes the metadata overhead subtracted by Linux `ext2_statfs`.
+    ///
+    /// Linux: /root/linux/fs/ext2/super.c:1446 (ext2_statfs)
+    pub(super) fn statfs_overhead_blocks(&self) -> u32 {
+        let groups_count = self.block_groups_count() as usize;
+        let gdb_count = self.group_descriptor_blocks_count();
+        let mut overhead = self.first_data_block();
+
+        for group_idx in 0..groups_count {
+            if self.has_super_block(group_idx) {
+                overhead = overhead.saturating_add(1 + gdb_count);
+            }
+        }
+
+        overhead.saturating_add(self.block_groups_count() * (2 + self.itb_per_group))
     }
 
     /// Returns the starting block id of the super block

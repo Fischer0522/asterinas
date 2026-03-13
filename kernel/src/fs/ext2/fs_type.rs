@@ -26,14 +26,14 @@ impl FsType for Ext2Type {
     fn create(
         &self,
         _flags: FsFlags,
-        _args: Option<CString>,
+        args: Option<CString>,
         disk: Option<Arc<dyn BlockDevice>>,
     ) -> Result<Arc<dyn FileSystem>> {
         // Linux: /root/linux/fs/ext2/super.c:1703 (init_fs_context -> mount flow)
         let disk = disk.ok_or_else(|| {
             Error::with_message(Errno::EINVAL, "the ext2 filesystem requires a block device")
         })?;
-        Ext2::open(disk).map(|fs| fs as Arc<dyn FileSystem>)
+        Ext2::open(disk, args.as_deref()).map(|fs| fs as Arc<dyn FileSystem>)
     }
 
     fn sysnode(&self) -> Option<Arc<dyn SysNode>> {

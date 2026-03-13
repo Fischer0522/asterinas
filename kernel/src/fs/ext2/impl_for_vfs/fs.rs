@@ -33,10 +33,17 @@ impl FileSystem for Ext2 {
     fn sb(&self) -> SuperBlock {
         // Linux: /root/linux/fs/ext2/super.c:1446 (ext2_statfs)
         let ext2_sb = self.super_block();
+        let blocks = if self.uses_minix_df() {
+            ext2_sb.total_blocks()
+        } else {
+            ext2_sb
+                .total_blocks()
+                .saturating_sub(ext2_sb.statfs_overhead_blocks())
+        };
         SuperBlock {
             magic: MAGIC_NUM as u64,
             bsize: ext2_sb.block_size(),
-            blocks: ext2_sb.total_blocks() as usize,
+            blocks: blocks as usize,
             bfree: ext2_sb.free_blocks_count() as usize,
             bavail: ext2_sb
                 .free_blocks_count()

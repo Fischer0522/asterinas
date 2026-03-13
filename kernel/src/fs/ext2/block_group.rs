@@ -5,9 +5,9 @@ use core::{fmt, mem::size_of};
 use ostd::const_assert;
 
 use super::{
-    inode_block_map::Ext2Bid,
     fs::Ext2,
     inode::{Inode, InodeDesc, RawInode},
+    inode_block_map::Ext2Bid,
     prelude::*,
     super_block::SuperBlock,
 };

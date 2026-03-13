@@ -21,6 +21,45 @@ use crate::{
 /// The root inode number (Linux EXT2_ROOT_INO).
 pub const ROOT_INO: u32 = 2;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum StatfsMode {
+    #[default]
+    BsdDf,
+    MinixDf,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Ext2MountOptions {
+    statfs_mode: StatfsMode,
+}
+
+impl Ext2MountOptions {
+    /// Parses the subset of ext2 mount options that affects `statfs`.
+    ///
+    /// Linux: /root/linux/fs/ext2/super.c:494 (ext2_parse_param)
+    fn parse(data: Option<&CStr>) -> Self {
+        let mut options = Self::default();
+        let Some(data) = data else {
+            return options;
+        };
+
+        let data = data.to_string_lossy();
+        for token in data.split(',') {
+            match token.trim() {
+                "bsddf" => options.statfs_mode = StatfsMode::BsdDf,
+                "minixdf" => options.statfs_mode = StatfsMode::MinixDf,
+                _ => {}
+            }
+        }
+
+        options
+    }
+
+    fn uses_minix_df(self) -> bool {
+        matches!(self.statfs_mode, StatfsMode::MinixDf)
+    }
+}
+
 /// The Ext2 filesystem (core state holder).
 #[derive(Debug)]
 pub struct Ext2 {
@@ -36,6 +75,8 @@ pub struct Ext2 {
     block_size: usize,
     /// Group descriptor table segment.
     group_descriptors_segment: USegment,
+    /// Runtime mount options that affect statfs projection.
+    mount_options: Ext2MountOptions,
     /// FS event stats for VFS.
     fs_event_subscriber_stats: FsEventSubscriberStats,
     /// Per-filesystem inode generation counter.
@@ -45,8 +86,15 @@ pub struct Ext2 {
 }
 
 impl Ext2 {
-    /// Opens and loads an Ext2 filesystem from a block device (skeleton only).
-    pub fn open(device: Arc<dyn BlockDevice>) -> Result<Arc<Self>> {
+    /// Opens and loads an Ext2 filesystem from a block device.
+    pub fn open(device: Arc<dyn BlockDevice>,data: Option<&CStr>) -> Result<Arc<Self>> {
+        Self::open_with_mount_options(device, Ext2MountOptions::parse(data))
+    }
+
+    fn open_with_mount_options(
+        device: Arc<dyn BlockDevice>,
+        mount_options: Ext2MountOptions,
+    ) -> Result<Arc<Self>> {
         let super_block = {
             let raw_super_block = device.read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)?;
             SuperBlock::try_from(raw_super_block)?
@@ -71,6 +119,7 @@ impl Ext2 {
             inodes_per_group,
             block_size,
             group_descriptors_segment,
+            mount_options,
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             next_generation: AtomicU32::new(now().as_secs() as u32),
             self_ref: weak_self.clone(),
@@ -87,6 +136,13 @@ impl Ext2 {
     /// Returns the block size in bytes.
     pub fn block_size(&self) -> usize {
         self.block_size
+    }
+
+    /// Returns whether `statfs` should report Minix-style total blocks.
+    ///
+    /// Linux: /root/linux/fs/ext2/super.c:1454 (test_opt MINIX_DF)
+    pub(super) fn uses_minix_df(&self) -> bool {
+        self.mount_options.uses_minix_df()
     }
 
     pub(super) fn block_group(&self, idx: usize) -> &BlockGroup {
@@ -871,11 +927,87 @@ mod test {
         time::clocks,
     };
 
+    fn expected_statfs_overhead_blocks(sb: &SuperBlock) -> u32 {
+        let groups_count = sb.block_groups_count() as usize;
+        let gdb_count =
+            ((groups_count * size_of::<RawGroupDesc>()).div_ceil(sb.block_size())) as u32;
+        let mut overhead = sb.first_data_block();
+
+        for group_idx in 0..groups_count {
+            if group_idx == 0 || sb.is_backup_group(group_idx) {
+                overhead = overhead.saturating_add(1 + gdb_count);
+            }
+        }
+
+        overhead.saturating_add(sb.block_groups_count() * (2 + sb.itb_per_group()))
+    }
+
     fn make_raw_inode(mode: u16, links_count: u16, dtime: u32) -> RawInode {
         RawInodeBuilder::new(mode)
             .links_count(links_count)
             .dtime(dtime)
             .build()
+    }
+
+    #[ktest]
+    fn statfs_mount_options_parse_minixdf_and_bsddf() {
+        let minixdf = CString::new("minixdf").unwrap();
+        let bsddf_minixdf = CString::new("bsddf,minixdf").unwrap();
+        let minixdf_bsddf = CString::new("minixdf,bsddf").unwrap();
+        let ignored_unknown = CString::new("debug,minixdf").unwrap();
+
+        assert!(Ext2MountOptions::parse(Some(minixdf.as_c_str())).uses_minix_df());
+        assert!(Ext2MountOptions::parse(Some(bsddf_minixdf.as_c_str())).uses_minix_df());
+        assert!(!Ext2MountOptions::parse(Some(minixdf_bsddf.as_c_str())).uses_minix_df());
+        assert!(Ext2MountOptions::parse(Some(ignored_unknown.as_c_str())).uses_minix_df());
+        assert!(!Ext2MountOptions::parse(None).uses_minix_df());
+    }
+
+    #[ktest]
+    fn filesystem_statfs_defaults_to_bsddf_overhead() {
+        let f = Ext2FixtureBuilder::new(3, 512).build().unwrap();
+
+        let stat = FileSystemTrait::sb(f.ext2.as_ref());
+        let expected_overhead = expected_statfs_overhead_blocks(&f.sb);
+
+        assert_eq!(
+            stat.blocks,
+            f.sb.total_blocks().saturating_sub(expected_overhead) as usize
+        );
+        assert!(stat.blocks < f.sb.total_blocks() as usize);
+    }
+
+    #[ktest]
+    fn filesystem_statfs_minixdf_reports_total_blocks() {
+        let f = Ext2FixtureBuilder::new(3, 512).build().unwrap();
+        let minixdf = CString::new("minixdf").unwrap();
+
+        let ext2 = Ext2::open(f.disk.clone() as Arc<dyn BlockDevice>,Some(minixdf.as_c_str())).unwrap();
+
+        let stat = FileSystemTrait::sb(ext2.as_ref());
+        assert_eq!(stat.blocks, f.sb.total_blocks() as usize);
+    }
+
+    #[ktest]
+    fn filesystem_statfs_bavail_still_saturates_reserved_blocks() {
+        let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
+        let mut raw = f
+            .disk
+            .segment()
+            .read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)
+            .unwrap();
+        raw.free_blocks_count = 3;
+        raw.reserved_blocks_count = 5;
+        f.disk
+            .segment()
+            .write_bytes(SUPER_BLOCK_OFFSET, raw.as_bytes())
+            .unwrap();
+
+        let ext2 = Ext2::open(f.disk.clone() as Arc<dyn BlockDevice>,None).unwrap();
+        let stat = FileSystemTrait::sb(ext2.as_ref());
+
+        assert_eq!(stat.bfree, 3);
+        assert_eq!(stat.bavail, 0);
     }
 
     #[ktest]
@@ -894,7 +1026,7 @@ mod test {
         FileSystemTrait::sync(f.ext2.as_ref()).unwrap();
         assert_eq!(f.disk.flush_count(), 1);
 
-        let reopened = Ext2::open(f.disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let reopened = Ext2::open(f.disk.clone() as Arc<dyn BlockDevice>,None).unwrap();
         let reopened_root = reopened.read_inode(ROOT_INO).unwrap();
         assert_eq!(
             reopened_root.lookup("persisted").unwrap().inode_type(),

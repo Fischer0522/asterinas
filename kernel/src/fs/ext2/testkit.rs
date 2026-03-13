@@ -963,7 +963,7 @@ impl Ext2FixtureBuilder {
         let device: Arc<dyn BlockDevice> = self
             .custom_device
             .unwrap_or_else(|| disk.clone() as Arc<dyn BlockDevice>);
-        let ext2 = Ext2::open(device)?;
+        let ext2 = Ext2::open(device,None)?;
 
         Ok(Ext2Fixture {
             disk,

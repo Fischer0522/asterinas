@@ -4,7 +4,7 @@ use core::mem::size_of;
 
 use lru::LruCache;
 
-use super::{inode_block_map::Ext2Bid, fs::Ext2, prelude::*};
+use super::{fs::Ext2, inode_block_map::Ext2Bid, prelude::*};
 
 /// Inode-local cache for indirect metadata blocks.
 #[derive(Debug)]
