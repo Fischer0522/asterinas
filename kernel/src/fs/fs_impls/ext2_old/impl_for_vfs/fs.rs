@@ -2,7 +2,7 @@
 
 use crate::{
     fs::{
-        ext2_old::{Ext2, MAGIC_NUM as EXT2_MAGIC},
+        fs_impls::ext2_old::{Ext2, MAGIC_NUM as EXT2_MAGIC},
         utils::NAME_MAX,
         vfs::{
             file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},

@@ -57,7 +57,7 @@ const XATTR_ENTRY_SIZE: usize = size_of::<XattrEntry>();
 ///  | XattrValue 1       | |
 ///  +--------------------+
 #[derive(Debug)]
-pub(ext2_old) struct Xattr {
+pub(super) struct Xattr {
     /// The buffer of the xattr block, which always keeps its content up-to-date.
     blocks_buf: USegment,
     /// A cache to assist the xattr operations.

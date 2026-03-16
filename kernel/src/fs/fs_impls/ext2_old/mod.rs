@@ -40,7 +40,7 @@ pub use fs::Ext2;
 pub use inode::{FilePerm, Inode};
 pub use super_block::MAGIC_NUM;
 
-use crate::fs::ext2_old::fs::Ext2Type;
+use crate::fs::fs_impls::ext2_old::fs::Ext2Type;
 
 mod block_group;
 mod block_ptr;

@@ -21,7 +21,7 @@
 //! // Opens an Ext2 from the block device.
 //! let ext2 = Ext2::open(block_device)?;
 //! // Lookup the root inode.
-//! let root = ext2.root_inode()?;
+//! let root = ext2.root_inode();
 //! // Create a file inside root directory.
 //! let file = root.create("file", InodeType::File, FilePerm::from_bits_truncate(0o666))?;
 //! // Write data into the file.
@@ -38,22 +38,26 @@
 
 pub use fs::Ext2;
 pub use inode::{FilePerm, Inode};
-pub use super_block::MAGIC_NUM;
 
-use crate::fs::ext2::fs::Ext2Type;
+use self::fs_type::Ext2Type;
+use crate::fs::vfs::registry;
 
+pub(super) fn init() {
+    registry::register(&Ext2Type).unwrap();
+}
 mod block_group;
-mod block_ptr;
 mod dir;
 mod fs;
+mod fs_type;
 mod impl_for_vfs;
-mod indirect_block_cache;
+mod indirect_block_manager;
 mod inode;
+mod inode_block_map;
+mod io_range_mapper;
 mod prelude;
 mod super_block;
 mod utils;
 mod xattr;
 
-pub(super) fn init() {
-    crate::fs::vfs::registry::register(&Ext2Type).unwrap();
-}
+#[cfg(ktest)]
+mod testkit;

@@ -452,7 +452,7 @@ const_assert!(size_of::<RawSuperBlock>() == SUPER_BLOCK_SIZE);
 /// The in-memory representation is provided by [`SuperBlock`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub(ext2_old) struct RawSuperBlock {
+pub(super) struct RawSuperBlock {
     pub inodes_count: u32,
     pub blocks_count: u32,
     pub reserved_blocks_count: u32,
@@ -580,7 +580,7 @@ impl From<&SuperBlock> for RawSuperBlock {
 #[derive(Clone, Copy, Debug, Pod)]
 // FIXME: `pub(super)` is needed due to a bug in `zerocopy`. See
 // <https://github.com/google/zerocopy/issues/1292>.
-pub(ext2_old) struct Reserved([u32; 190]);
+pub(super) struct Reserved([u32; 190]);
 
 impl Default for Reserved {
     fn default() -> Self {
