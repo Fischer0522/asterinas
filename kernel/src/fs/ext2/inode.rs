@@ -159,7 +159,7 @@ impl Inode {
         self.inner.read().links_count()
     }
 
-    pub(super) fn fs_arc(&self) -> Result<Arc<Ext2>> {
+    pub(super) fn fs(&self) -> Result<Arc<Ext2>> {
         self.fs
             .upgrade()
             .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))
@@ -188,8 +188,8 @@ impl Inode {
 
         // SPEC: i_block payload lives in mapping domain.
         let inner = self.inner.read();
-        let mapping_backend = Arc::clone(inner.backend());
-        let mapping = mapping_backend.mapping.read();
+        let backend = inner.backend();
+        let mapping = backend.mapping.read();
         mapping.desc.decode_device_id()
     }
 
@@ -211,7 +211,7 @@ impl Inode {
     }
 
     pub(super) fn resize(&self, new_size: usize) -> Result<()> {
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         let block_size = fs.block_size();
         if block_size == 0 {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
@@ -266,8 +266,8 @@ impl Inode {
     pub(super) fn metadata(&self) -> Metadata {
         // Lock order: inner -> mapping.
         let inner = self.inner.read();
-        let mapping_backend = Arc::clone(inner.backend());
-        let mapping = mapping_backend.mapping.read();
+        let backend = inner.backend();
+        let mapping = backend.mapping.read();
 
         // TODO: should we panic here?
         let (dev, blk_size) = match self.fs.upgrade() {
@@ -460,7 +460,7 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         let block_size = fs.block_size();
         if block_size == 0 {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
@@ -479,7 +479,7 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         let block_size = fs.block_size();
         if block_size == 0 {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
@@ -529,7 +529,7 @@ impl Inode {
             return Ok(0);
         }
 
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         let block_size = fs.block_size();
         if block_size == 0 {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
@@ -564,7 +564,7 @@ impl Inode {
             return_errno!(Errno::EISDIR);
         }
 
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         let block_size = fs.block_size();
         if block_size == 0 {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
@@ -602,7 +602,7 @@ impl Inode {
             return_errno!(Errno::EISDIR);
         }
 
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         let block_size = fs.block_size();
         if block_size == 0 {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
@@ -647,7 +647,7 @@ impl Inode {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         let inner = self.inner.read();
         let ino = inner.find_entry(&fs, name)?;
         fs.read_inode(ino)
@@ -662,7 +662,7 @@ impl Inode {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         let inner = self.inner.read();
         inner.readdir_at(&fs, offset, visitor)
     }
@@ -675,7 +675,7 @@ impl Inode {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         let total_inodes = fs.super_block().total_inodes();
         if parent_ino == 0 || parent_ino > total_inodes {
             return_errno_with_message!(Errno::EINVAL, "parent inode number out of range");
@@ -695,7 +695,7 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         const RMDIR_RETRY_LIMIT: usize = 8;
         for _ in 0..RMDIR_RETRY_LIMIT {
             let child_ino = {
@@ -757,7 +757,7 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         let mut parent_inner = self.inner.write();
         let slot = match parent_inner.scan_dir_for_slot(&fs, name)? {
             DirScanResult::Slot(slot) => slot,
@@ -824,7 +824,7 @@ impl Inode {
                     return Ok(());
                 }
 
-                let fs = self.fs_arc()?;
+                let fs = self.fs()?;
                 let block_size = fs.block_size();
                 if block_size == 0 {
                     return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
@@ -871,14 +871,10 @@ impl Inode {
         // SPEC: fsync step 1 flushes dirty data pages before metadata writeback.
         // Linux: /root/linux/fs/buffer.c:646 (generic_buffers_fsync)
         // -> /root/linux/mm/filemap.c:777 (file_write_and_wait_range).
-        let mapping_backend = {
-            let inner = self.inner.read();
-            Arc::clone(inner.backend())
-        };
-        {
-            let inner = self.inner.read();
-            inner.sync_data_pages()?;
-        }
+        let inner = self.inner.upread();
+        let mapping_backend = inner.backend();
+
+        inner.sync_data_pages()?;
 
         // SPEC: fsync step 2 flushes inode-local indirect metadata before
         // persisting inode-table state.
@@ -887,23 +883,21 @@ impl Inode {
         // SPEC: fsync step 3 persists inode metadata. The caller is
         // responsible for the final device-cache flush.
         // Linux: /root/linux/fs/buffer.c:619 (sync_inode_metadata).
-        self.sync_metadata(sync_inode_table)?;
 
-        Ok(())
+        let fs = self.fs()?;
+        let mut inner = inner.upgrade();
+
+        inner.sync_metadata(self.ino, fs.as_ref(), self.block_group_idx, sync_inode_table)
+
     }
 
     /// Persists inode metadata without flushing the device write cache.
     ///
     /// Linux: /root/linux/fs/buffer.c:619 (sync_inode_metadata)
     pub(super) fn sync_metadata(&self, sync_inode_table: bool) -> Result<()> {
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         let mut inner = self.inner.write();
-        inner.persist(self.ino, &fs)?;
-
-        if sync_inode_table {
-            let block_group = fs.block_group(self.block_group_idx);
-            block_group.sync_inode_table()?;
-        }
+        inner.sync_metadata(self.ino, &fs, self.block_group_idx, sync_inode_table)?;
         Ok(())
     }
 
@@ -938,12 +932,12 @@ impl Inode {
             xattr.write().delete_xattr_block()?;
         }
 
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         let mut inner = self.inner.write();
         // TODO: fix the page cache
         inner.page_cache.discard_range(0..inner.file_size());
         inner.resize_page_cache_and_update_npages(0)?;
-        let mapping_backend = Arc::clone(inner.backend());
+        let mapping_backend = inner.backend().clone();
         inner.set_dtime(now());
         inner.set_file_size(0);
         inner.set_file_acl(0);
@@ -959,29 +953,25 @@ impl Inode {
     }
 
     pub(super) fn sync_data(&self) -> Result<()> {
-        let fs = self.fs_arc()?;
-        let mapping_backend = {
-            let inner = self.inner.read();
-            Arc::clone(inner.backend())
-        };
+        let fs = self.fs()?;
+
+        let inner = self.inner.upread();
+        let backend = inner.backend();
 
         // SPEC: fdatasync writes back dirty data pages first. The caller is
         // responsible for the final device-cache flush.
         // Linux: /root/linux/fs/buffer.c:609 (file_write_and_wait_range).
-        {
-            let inner = self.inner.read();
-            inner.sync_data_pages()?;
-        }
+        inner.sync_data_pages()?;
 
         // fdatasync must also persist dirty indirect metadata needed to reach
         // newly written data blocks before the final device flush.
-        mapping_backend.mapping.write().sync_indirect_blocks()?;
+        backend.mapping.write().sync_indirect_blocks()?;
 
         // SPEC: Linux writes metadata when I_DIRTY_DATASYNC is set.
         // Linux: /root/linux/fs/buffer.c:616-619.
         // Asterinas uses desc.is_dirty() as a conservative approximation
         // so fdatasync never misses i_size/block-mapping persistence.
-        let mut inner = self.inner.write();
+        let mut inner = inner.upgrade();
         if inner.is_dirty() {
             inner.persist(self.ino, &fs)?;
         }
@@ -1037,7 +1027,7 @@ impl Inode {
             return self.mkdir(name, perm);
         } else {
             // Linux: ext2_create → ext2_new_inode + ext2_add_nondir
-            let fs = self.fs_arc()?;
+            let fs = self.fs()?;
             let child = fs.create_inode(self.ino, type_, perm)?;
             let child_ino = child.ino();
             let dir_ft = Self::inode_type_to_dir_file_type(type_);
@@ -1074,8 +1064,8 @@ impl Inode {
         }
 
         // SPEC: cross-filesystem rename check.
-        let fs = self.fs_arc()?;
-        let old_fs = old.fs_arc()?;
+        let fs = self.fs()?;
+        let old_fs = old.fs()?;
         if !Arc::ptr_eq(&fs, &old_fs) {
             return_errno!(Errno::EINVAL);
         }
@@ -1121,7 +1111,7 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         const UNLINK_RETRY_LIMIT: usize = 8;
         for _ in 0..UNLINK_RETRY_LIMIT {
             let child_ino = {
@@ -1186,8 +1176,8 @@ impl Inode {
         }
 
         // SPEC: cross-filesystem rename check.
-        let fs = self.fs_arc()?;
-        let target_fs = target.fs_arc()?;
+        let fs = self.fs()?;
+        let target_fs = target.fs()?;
         if !Arc::ptr_eq(&fs, &target_fs) {
             return_errno!(Errno::EINVAL);
         }
@@ -1490,7 +1480,7 @@ impl Inode {
         file_type: DirEntryFileType,
         update_times: bool,
     ) -> Result<()> {
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         self.validate_set_link_input(name, new_ino, &fs)?;
         let mut inner = self.inner.write();
         let target = inner.find_entry_target(&fs, name)?;
@@ -1838,6 +1828,15 @@ impl InodeInner {
         Ok(())
     }
 
+    fn sync_metadata(&mut self, ino: u32, fs: &Ext2, block_group_idx: usize, sync_inode_table: bool) -> Result<()> {
+        self.persist(ino, fs)?;
+        if sync_inode_table {
+            let block_group = fs.block_group(block_group_idx);
+            block_group.sync_inode_table()?;
+        }
+        Ok(())
+    }
+
     /// Initializes an empty directory with `.` and `..` entries.
     ///
     /// Linux: /root/linux/fs/ext2/dir.c:617 (ext2_make_empty)
@@ -1845,7 +1844,7 @@ impl InodeInner {
         let block_size = fs.block_size();
         let old_size = self.file_size();
         let (old_mapping_desc, new_mapping_desc, new_bid) = {
-            let mapping_backend = Arc::clone(self.backend());
+            let mapping_backend = self.backend();
             let mut mapping = mapping_backend.mapping.write();
             if mapping.desc.block_ptrs[0] != 0 {
                 return_errno_with_message!(Errno::EIO, "dir block pointer already occupied");
@@ -1908,7 +1907,7 @@ impl InodeInner {
     ) {
         self.page_cache().discard_range(0..fs.block_size());
         self.set_file_size(old_size);
-        let mapping_backend = Arc::clone(self.backend());
+        let mapping_backend = self.backend();
         let mut mapping = mapping_backend.mapping.write();
         mapping.desc.block_ptrs = old_mapping_desc.block_ptrs;
         mapping.desc.sector_count = old_mapping_desc.sector_count;
@@ -2456,7 +2455,7 @@ impl InodeInner {
         }
 
         let mapping_desc = {
-            let mapping_backend = Arc::clone(self.backend());
+            let mapping_backend = self.backend();
             let mut mapping = mapping_backend.mapping.write();
             if let Err(err) = mapping.truncate_blocks(fs, old_size) {
                 error!(
@@ -2554,7 +2553,7 @@ impl InodeInner {
 
         // SPEC: allocation under mapping.write(); no PageCache/VMO operations in this scope.
         let mapping_desc = {
-            let mapping_backend = Arc::clone(self.backend());
+            let mapping_backend = self.backend();
             let mut mapping = mapping_backend.mapping.write();
             mapping
                 .get_or_alloc_block(fs, growth_iblock, true)?
@@ -2572,7 +2571,7 @@ impl InodeInner {
             self.page_cache.discard_range(old_size..new_size);
             self.set_file_size(old_size);
             let mapping_desc = {
-                let mapping_backend = Arc::clone(self.backend());
+                let mapping_backend = self.backend();
                 let mut mapping = mapping_backend.mapping.write();
                 mapping.truncate_blocks(fs, old_size)?;
                 *mapping.get_desc()
@@ -2912,7 +2911,7 @@ impl InodeInner {
         // free_inode trigger it instead of per-call-site cleanup.
         // SPEC: mapping truncation happens under mapping.write().
         let mapping_desc = {
-            let mapping_backend = Arc::clone(self.backend());
+            let mapping_backend = self.backend();
             let mut mapping = mapping_backend.mapping.write();
             mapping.truncate_blocks(fs, 0)?;
             *mapping.get_desc()

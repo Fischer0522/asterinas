@@ -215,7 +215,7 @@ impl VfsInode for Inode {
     fn sync_all(&self) -> Result<()> {
         // Linux: /root/linux/fs/ext2/file.c:155 (ext2_fsync)
         Inode::sync_all(self, true)?;
-        if Inode::fs_arc(self)?.block_device().sync()? != BioStatus::Complete {
+        if Inode::fs(self)?.block_device().sync()? != BioStatus::Complete {
             return_errno_with_message!(Errno::EIO, "failed to flush block device");
         }
         Ok(())
@@ -229,7 +229,7 @@ impl VfsInode for Inode {
             Inode::sync_metadata(self, true)?;
         }
 
-        if Inode::fs_arc(self)?.block_device().sync()? != BioStatus::Complete {
+        if Inode::fs(self)?.block_device().sync()? != BioStatus::Complete {
             return_errno_with_message!(Errno::EIO, "failed to flush block device");
         }
         Ok(())
@@ -244,7 +244,7 @@ impl VfsInode for Inode {
 
     fn fs(&self) -> Arc<dyn FileSystem> {
         // SPEC: the inode must belong to a live filesystem instance.
-        Inode::fs_arc(self).unwrap()
+        Inode::fs(self).unwrap()
     }
 
     fn extension(&self) -> &Extension {
