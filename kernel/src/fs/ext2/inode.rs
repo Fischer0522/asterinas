@@ -722,7 +722,10 @@ impl Inode {
 
             child_inner.set_ctime(now());
             child_inner.sub_links_count_saturating(2);
-            let child_reached_zero_link = child_inner.links_count() == 0;
+
+            if child_inner.links_count() == 0 {
+                child_inner.finalize_zero_link_transition(child_ino,&fs)?;
+            }
 
             let parent_inner = guards.inner_mut(self.ino())?;
             parent_inner.delete_entry(name)?;
@@ -731,11 +734,7 @@ impl Inode {
             // domain so a concurrent mkdir cannot revive the child after validation.
             // Linux: /root/linux/fs/ext2/namei.c:302 (ext2_rmdir)
             parent_inner.update_dir_timestamps_and_flags()?;
-            drop(guards);
 
-            if child_reached_zero_link {
-                child.finalize_zero_link_transition(&fs)?;
-            }
             return Ok(());
         }
 
@@ -901,13 +900,6 @@ impl Inode {
         Ok(())
     }
 
-    /// Persists a zero-link inode into the inode-table page cache and removes it from the live cache.
-    ///
-    /// Linux delete-path counterpart: /root/linux/fs/libfs.c:375 (inode_dec_link_count)
-    pub(super) fn finalize_zero_link_transition(&self, fs: &Arc<Ext2>) -> Result<()> {
-        let mut inner = self.inner.write();
-        inner.finalize_zero_link_transition(self.ino, fs)
-    }
 
     /// Attempts Linux-style final reclaim for a deleted inode.
     ///
@@ -1141,11 +1133,9 @@ impl Inode {
             let child_inner = guards.inner_mut(child.ino())?;
             child_inner.set_ctime(now());
             child_inner.sub_links_count_saturating(1);
-            let child_reached_zero_link = child_inner.links_count() == 0;
-            drop(guards);
 
-            if child_reached_zero_link {
-                child.finalize_zero_link_transition(&fs)?;
+            if child_inner.links_count() == 0 {
+                child_inner.finalize_zero_link_transition(child_ino, &fs)?;
             }
             return Ok(());
         }
@@ -1226,8 +1216,9 @@ impl Inode {
         drop(guards);
 
         if let Some(existing) = ctx.existing_inode.as_ref() {
-            if existing.links_count() == 0 {
-                existing.finalize_zero_link_transition(fs)?;
+            let mut inner = existing.inner.write();
+            if inner.links_count() == 0 {
+                inner.finalize_zero_link_transition(existing.ino(), fs)?;
             }
         }
         Ok(true)
@@ -1451,7 +1442,18 @@ impl Inode {
         Ok(())
     }
 
-    fn validate_set_link_input(&self, name: &str, new_ino: u32, fs: &Ext2) -> Result<()> {
+    /// Rewrites an existing directory entry to point to a new inode.
+    ///
+    /// Linux: /root/linux/fs/ext2/dir.c:450 (ext2_set_link)
+    ///
+    pub(super) fn set_link(
+        &self,
+        name: &str,
+        new_ino: u32,
+        file_type: DirEntryFileType,
+        update_times: bool,
+    ) -> Result<()> {
+        let fs = self.fs()?;
         if self.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
@@ -1466,22 +1468,6 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        Ok(())
-    }
-
-    /// Rewrites an existing directory entry to point to a new inode.
-    ///
-    /// Linux: /root/linux/fs/ext2/dir.c:450 (ext2_set_link)
-    ///
-    pub(super) fn set_link(
-        &self,
-        name: &str,
-        new_ino: u32,
-        file_type: DirEntryFileType,
-        update_times: bool,
-    ) -> Result<()> {
-        let fs = self.fs()?;
-        self.validate_set_link_input(name, new_ino, &fs)?;
         let mut inner = self.inner.write();
         let target = inner.find_entry_target(&fs, name)?;
         inner.set_link_in_page_cache(&fs, &target, new_ino, file_type as u8)?;
@@ -1512,26 +1498,6 @@ pub(super) struct InodeBackend {
     fs: Weak<Ext2>,
 }
 
-impl InodeBackend {
-    pub(super) fn new(mapping: InodeBlockMap, fs: Weak<Ext2>, npages: usize) -> Arc<Self> {
-        Arc::new(Self {
-            mapping: RwMutex::new(mapping),
-            npages: AtomicUsize::new(npages),
-            fs,
-        })
-    }
-
-    pub(super) fn npages(&self) -> usize {
-        self.npages.load(Ordering::Acquire)
-    }
-
-    fn fs_arc(&self) -> Result<Arc<Ext2>> {
-        self.fs
-            .upgrade()
-            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))
-    }
-}
-
 impl Drop for Inode {
     fn drop(&mut self) {
         let Some(fs) = self.fs.upgrade() else {
@@ -1547,10 +1513,32 @@ impl Drop for Inode {
     }
 }
 
+impl InodeBackend {
+    pub(super) fn new(mapping: InodeBlockMap, fs: Weak<Ext2>, npages: usize) -> Arc<Self> {
+        Arc::new(Self {
+            mapping: RwMutex::new(mapping),
+            npages: AtomicUsize::new(npages),
+            fs,
+        })
+    }
+
+    pub(super) fn npages(&self) -> usize {
+        self.npages.load(Ordering::Acquire)
+    }
+
+    fn fs(&self) -> Result<Arc<Ext2>> {
+        self.fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))
+    }
+}
+
+
+
 impl PageCacheBackend for InodeBackend {
     fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
         let mapping = self.mapping.read();
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         let iblock = u32::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
 
@@ -1572,7 +1560,7 @@ impl PageCacheBackend for InodeBackend {
 
     fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
         let mapping = self.mapping.read();
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         let iblock = u32::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
 
