@@ -21,7 +21,7 @@ pub(super) struct MappedRange {
 
 pub(super) struct IoRangeMapper<'a> {
     range: Range<u32>,
-    mapping: RwMutexReadGuard<'a, InodeBlockMap>,
+    block_map: RwMutexReadGuard<'a, InodeBlockMap>,
     fs: &'a Ext2,
 }
 
@@ -39,12 +39,12 @@ impl<'a> IoRangeMapper<'a> {
     /// Linux: /root/asterinas/kernel/src/fs/ext2_old/inode.rs:1997 (DeviceRangeReader::new)
     pub(super) fn new(
         range: Range<Ext2Bid>,
-        mapping: RwMutexReadGuard<'a, InodeBlockMap>,
+        block_map: RwMutexReadGuard<'a, InodeBlockMap>,
         fs: &'a Ext2,
     ) -> Self {
         Self {
             range: range.start..range.end,
-            mapping,
+            block_map,
             fs,
         }
     }
@@ -62,7 +62,7 @@ impl<'a> IoRangeMapper<'a> {
         let start_iblock = self.range.start;
         let max_blocks = self.range.end - self.range.start;
         if let Some(device_block_range) =
-            self.mapping
+            self.block_map
                 .get_block_range(self.fs, start_iblock, max_blocks)?
         {
             let logical_end = start_iblock
@@ -82,7 +82,7 @@ impl<'a> IoRangeMapper<'a> {
             let iblock = self.range.start;
             let remaining = self.range.end - iblock;
             if self
-                .mapping
+                .block_map
                 .get_block_range(self.fs, iblock, remaining)?
                 .is_some()
             {
@@ -106,7 +106,7 @@ mod test {
         time::clocks,
     };
 
-    fn make_mapping(block_ptrs: [u32; 15], fs: &Arc<Ext2>) -> InodeBlockMap {
+    fn make_block_map(block_ptrs: [u32; 15], fs: &Arc<Ext2>) -> InodeBlockMap {
         InodeBlockMap::new(BlockMapDesc::from_parts(0, block_ptrs), Arc::downgrade(fs))
     }
 
@@ -120,9 +120,9 @@ mod test {
         block_ptrs[1] = 12;
         block_ptrs[2] = 20;
         block_ptrs[4] = 30;
-        let mapping = make_mapping(block_ptrs, &f.ext2);
+        let block_map = make_block_map(block_ptrs, &f.ext2);
 
-        let binding = RwMutex::new(mapping);
+        let binding = RwMutex::new(block_map);
         let mut mapper = IoRangeMapper::new(0..5, binding.read(), &f.ext2);
 
         assert_eq!(

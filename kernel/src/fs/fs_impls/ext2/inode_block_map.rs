@@ -56,7 +56,7 @@ struct BranchResult {
     chain: Vec<IndirectEntry>,
 }
 
-// In-memory inode mapping (raw on-disk view only i_blocks/i_block[]).
+// In-memory inode block map (raw on-disk view only i_blocks/i_block[]).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct BlockMapDesc {
     pub(super) sector_count: u32,
@@ -1044,7 +1044,7 @@ mod test {
         prelude::*,
     };
 
-    fn make_mapping(block_ptrs: [u32; 15], sector_count: u32, fs: &Arc<Ext2>) -> InodeBlockMap {
+    fn make_block_map(block_ptrs: [u32; 15], sector_count: u32, fs: &Arc<Ext2>) -> InodeBlockMap {
         InodeBlockMap::new(
             BlockMapDesc::from_parts(sector_count, block_ptrs),
             Arc::downgrade(fs),
@@ -1086,7 +1086,7 @@ mod test {
     }
 
     #[ktest]
-    fn block_mapping_direct_and_indirect_ok() {
+    fn block_map_direct_and_indirect_ok() {
         let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let (disk, ext2) = (&f.disk, &f.ext2);
 
@@ -1118,52 +1118,52 @@ mod test {
         block_ptrs[12] = indirect_bid;
         block_ptrs[13] = double_l1_bid;
         block_ptrs[14] = triple_l1_bid;
-        let mapping = make_mapping(block_ptrs, 0, &f.ext2);
+        let block_map = make_block_map(block_ptrs, 0, &f.ext2);
 
-        // Cover exact transition boundaries across all mapping levels.
-        let direct_path = mapping.block_to_path(ext2, 0).unwrap();
+        // Cover exact transition boundaries across all block-map levels.
+        let direct_path = block_map.block_to_path(ext2, 0).unwrap();
         assert_eq!(direct_path.depth, 1);
         assert_eq!(direct_path.offsets[0], 0);
         assert_eq!(direct_path.boundary, 11);
 
-        let direct_last_path = mapping.block_to_path(ext2, 11).unwrap();
+        let direct_last_path = block_map.block_to_path(ext2, 11).unwrap();
         assert_eq!(direct_last_path.depth, 1);
         assert_eq!(direct_last_path.offsets[0], 11);
         assert_eq!(direct_last_path.boundary, 0);
 
-        let indirect_first_path = mapping.block_to_path(ext2, 12).unwrap();
+        let indirect_first_path = block_map.block_to_path(ext2, 12).unwrap();
         assert_eq!(indirect_first_path.depth, 2);
         assert_eq!(indirect_first_path.offsets[0], 12);
         assert_eq!(indirect_first_path.offsets[1], 0);
 
-        let indirect_path = mapping.block_to_path(ext2, 12 + indirect_index).unwrap();
+        let indirect_path = block_map.block_to_path(ext2, 12 + indirect_index).unwrap();
         assert_eq!(indirect_path.depth, 2);
         assert_eq!(indirect_path.offsets[0], 12);
         assert_eq!(indirect_path.offsets[1], indirect_index);
 
         let indirect_last_iblock = 12 + ptrs - 1;
-        let indirect_last_path = mapping.block_to_path(ext2, indirect_last_iblock).unwrap();
+        let indirect_last_path = block_map.block_to_path(ext2, indirect_last_iblock).unwrap();
         assert_eq!(indirect_last_path.depth, 2);
         assert_eq!(indirect_last_path.offsets[0], 12);
         assert_eq!(indirect_last_path.offsets[1], ptrs - 1);
         assert_eq!(indirect_last_path.boundary, 0);
 
         let first_double_iblock = 12 + ptrs;
-        let first_double_path = mapping.block_to_path(ext2, first_double_iblock).unwrap();
+        let first_double_path = block_map.block_to_path(ext2, first_double_iblock).unwrap();
         assert_eq!(first_double_path.depth, 3);
         assert_eq!(first_double_path.offsets[0], 13);
         assert_eq!(first_double_path.offsets[1], 0);
         assert_eq!(first_double_path.offsets[2], 0);
 
         let double_iblock = 12 + ptrs + (3 << ptrs_bits) + 4;
-        let double_path = mapping.block_to_path(ext2, double_iblock).unwrap();
+        let double_path = block_map.block_to_path(ext2, double_iblock).unwrap();
         assert_eq!(double_path.depth, 3);
         assert_eq!(double_path.offsets[0], 13);
         assert_eq!(double_path.offsets[1], 3);
         assert_eq!(double_path.offsets[2], 4);
 
         let first_triple_iblock = 12 + ptrs + double_blocks;
-        let first_triple_path = mapping.block_to_path(ext2, first_triple_iblock).unwrap();
+        let first_triple_path = block_map.block_to_path(ext2, first_triple_iblock).unwrap();
         assert_eq!(first_triple_path.depth, 4);
         assert_eq!(first_triple_path.offsets[0], 14);
         assert_eq!(first_triple_path.offsets[1], 0);
@@ -1172,7 +1172,7 @@ mod test {
 
         let triple_iblock =
             12 + ptrs + double_blocks + (2 << (ptrs_bits * 2)) + (3 << ptrs_bits) + 4;
-        let triple_path = mapping.block_to_path(ext2, triple_iblock).unwrap();
+        let triple_path = block_map.block_to_path(ext2, triple_iblock).unwrap();
         assert_eq!(triple_path.depth, 4);
         assert_eq!(triple_path.offsets[0], 14);
         assert_eq!(triple_path.offsets[1], 2);
@@ -1180,24 +1180,24 @@ mod test {
         assert_eq!(triple_path.offsets[3], 4);
 
         // Verify block lookup resolves direct/indirect/double/triple chains.
-        assert_eq!(mapping.get_block(ext2, 0).unwrap(), Some(11));
-        assert_eq!(mapping.get_block(ext2, 1).unwrap(), None);
+        assert_eq!(block_map.get_block(ext2, 0).unwrap(), Some(11));
+        assert_eq!(block_map.get_block(ext2, 1).unwrap(), None);
         assert_eq!(
-            mapping.get_block(ext2, 12 + indirect_index).unwrap(),
+            block_map.get_block(ext2, 12 + indirect_index).unwrap(),
             Some(mapped_bid)
         );
         assert_eq!(
-            mapping.get_block(ext2, double_iblock).unwrap(),
+            block_map.get_block(ext2, double_iblock).unwrap(),
             Some(double_data_bid)
         );
         assert_eq!(
-            mapping.get_block(ext2, triple_iblock).unwrap(),
+            block_map.get_block(ext2, triple_iblock).unwrap(),
             Some(triple_data_bid)
         );
     }
 
     #[ktest]
-    fn block_mapping_get_block_range_returns_contiguous_runs() {
+    fn block_map_get_block_range_returns_contiguous_runs() {
         let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let (disk, ext2) = (&f.disk, &f.ext2);
 
@@ -1212,17 +1212,17 @@ mod test {
         block_ptrs[1] = 12;
         block_ptrs[2] = 13;
         block_ptrs[12] = indirect_bid;
-        let mapping = make_mapping(block_ptrs, 0, &f.ext2);
+        let block_map = make_block_map(block_ptrs, 0, &f.ext2);
 
-        assert_eq!(mapping.get_block_range(ext2, 0, 4).unwrap(), Some(11..14));
-        assert_eq!(mapping.get_block(ext2, 0).unwrap(), Some(11));
-        assert_eq!(mapping.get_block_range(ext2, 12, 4).unwrap(), Some(70..73));
-        assert_eq!(mapping.get_block_range(ext2, 15, 4).unwrap(), Some(90..91));
-        assert_eq!(mapping.get_block_range(ext2, 3, 4).unwrap(), None);
+        assert_eq!(block_map.get_block_range(ext2, 0, 4).unwrap(), Some(11..14));
+        assert_eq!(block_map.get_block(ext2, 0).unwrap(), Some(11));
+        assert_eq!(block_map.get_block_range(ext2, 12, 4).unwrap(), Some(70..73));
+        assert_eq!(block_map.get_block_range(ext2, 15, 4).unwrap(), Some(90..91));
+        assert_eq!(block_map.get_block_range(ext2, 3, 4).unwrap(), None);
     }
 
     #[ktest]
-    fn block_mapping_invalid_depth_returns_err() {
+    fn block_map_invalid_depth_returns_err() {
         let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let (disk, ext2) = (&f.disk, &f.ext2);
 
@@ -1234,15 +1234,15 @@ mod test {
         let max_iblock = direct + indirect + double_blocks + triple_blocks - 1;
         let too_big = (max_iblock + 1) as u32;
 
-        let mapping = make_mapping([0; 15], 0, &f.ext2);
+        let block_map = make_block_map([0; 15], 0, &f.ext2);
 
         // Linux semantics: max valid iblock is accepted, max + 1 is rejected.
-        mapping.block_to_path(ext2, max_iblock as u32).unwrap();
+        block_map.block_to_path(ext2, max_iblock as u32).unwrap();
 
-        let too_big_err = mapping.block_to_path(ext2, too_big).unwrap_err();
+        let too_big_err = block_map.block_to_path(ext2, too_big).unwrap_err();
         assert_eq!(too_big_err.error(), Errno::EINVAL);
 
-        let get_too_big_err = mapping.get_block(ext2, too_big).unwrap_err();
+        let get_too_big_err = block_map.get_block(ext2, too_big).unwrap_err();
         assert_eq!(get_too_big_err.error(), Errno::EINVAL);
 
         // Inject a deterministic read failure on the indirect block read path.
@@ -1261,23 +1261,23 @@ mod test {
 
         let mut ptrs_for_io = [0u32; 15];
         ptrs_for_io[12] = 40;
-        let io_mapping = make_mapping(ptrs_for_io, 0, &io_f.ext2);
-        let io_err = io_mapping.get_block(io_ext2, 12).unwrap_err();
+        let io_block_map = make_block_map(ptrs_for_io, 0, &io_f.ext2);
+        let io_err = io_block_map.get_block(io_ext2, 12).unwrap_err();
         assert_eq!(io_err.error(), Errno::EIO);
 
         // Any zero pointer on the branch is treated as a hole (None).
         let mut ptrs_for_indirect_hole = [0u32; 15];
         ptrs_for_indirect_hole[12] = 40;
-        let indirect_hole_mapping = make_mapping(ptrs_for_indirect_hole, 0, &f.ext2);
-        assert_eq!(indirect_hole_mapping.get_block(ext2, 12 + 7).unwrap(), None);
+        let indirect_hole_block_map = make_block_map(ptrs_for_indirect_hole, 0, &f.ext2);
+        assert_eq!(indirect_hole_block_map.get_block(ext2, 12 + 7).unwrap(), None);
 
         let mut ptrs_for_double_hole = [0u32; 15];
         ptrs_for_double_hole[13] = 41;
         write_indirect_ptr(disk.as_ref(), 41, 3, 0);
-        let double_hole_mapping = make_mapping(ptrs_for_double_hole, 0, &f.ext2);
+        let double_hole_block_map = make_block_map(ptrs_for_double_hole, 0, &f.ext2);
         let double_hole_iblock = 12 + (ptrs as u32) + (3 << ptrs.trailing_zeros()) + 4;
         assert_eq!(
-            double_hole_mapping
+            double_hole_block_map
                 .get_block(ext2, double_hole_iblock)
                 .unwrap(),
             None
@@ -1287,7 +1287,7 @@ mod test {
         ptrs_for_triple_hole[14] = 43;
         write_indirect_ptr(disk.as_ref(), 43, 2, 44);
         write_indirect_ptr(disk.as_ref(), 44, 3, 0);
-        let triple_hole_mapping = make_mapping(ptrs_for_triple_hole, 0, &f.ext2);
+        let triple_hole_block_map = make_block_map(ptrs_for_triple_hole, 0, &f.ext2);
         let triple_hole_iblock = 12
             + (ptrs as u32)
             + (double_blocks as u32)
@@ -1295,7 +1295,7 @@ mod test {
             + (3 << ptrs.trailing_zeros())
             + 4;
         assert_eq!(
-            triple_hole_mapping
+            triple_hole_block_map
                 .get_block(ext2, triple_hole_iblock)
                 .unwrap(),
             None
@@ -1311,17 +1311,17 @@ mod test {
         let ext2 = &f.ext2;
         let sectors_per_block = (ext2.block_size() / SECTOR_SIZE) as u32;
 
-        let mut mapping = make_mapping([0u32; 15], 0, &f.ext2);
-        assert_eq!(mapping.get_or_alloc_block(ext2, 0, false).unwrap(), None);
-        assert_eq!(mapping.desc.block_ptrs[0], 0);
+        let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
+        assert_eq!(block_map.get_or_alloc_block(ext2, 0, false).unwrap(), None);
+        assert_eq!(block_map.desc.block_ptrs[0], 0);
 
         let free_before = ext2.super_block().free_blocks_count();
-        let allocated = mapping.get_or_alloc_block(ext2, 0, true).unwrap().unwrap();
+        let allocated = block_map.get_or_alloc_block(ext2, 0, true).unwrap().unwrap();
         let free_after = ext2.super_block().free_blocks_count();
 
-        assert_eq!(mapping.desc.block_ptrs[0], allocated);
-        assert_eq!(mapping.get_block(ext2, 0).unwrap(), Some(allocated));
-        assert_eq!(mapping.desc.sector_count, sectors_per_block);
+        assert_eq!(block_map.desc.block_ptrs[0], allocated);
+        assert_eq!(block_map.get_block(ext2, 0).unwrap(), Some(allocated));
+        assert_eq!(block_map.desc.sector_count, sectors_per_block);
         assert_eq!(free_before.saturating_sub(free_after), 1);
     }
 
@@ -1334,28 +1334,28 @@ mod test {
         let ext2 = &f.ext2;
         let sectors_per_block = (ext2.block_size() / SECTOR_SIZE) as u32;
 
-        let mut mapping = make_mapping([0u32; 15], 0, &f.ext2);
+        let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
         let free_before = ext2.super_block().free_blocks_count();
-        let allocated_range = mapping
+        let allocated_range = block_map
             .get_or_alloc_block_range(ext2, 0, 3, true)
             .unwrap()
             .unwrap();
         let free_after = ext2.super_block().free_blocks_count();
 
         assert_eq!(allocated_range.end - allocated_range.start, 3);
-        assert_eq!(mapping.desc.block_ptrs[0], allocated_range.start);
-        assert_eq!(mapping.desc.block_ptrs[1], allocated_range.start + 1);
-        assert_eq!(mapping.desc.block_ptrs[2], allocated_range.start + 2);
+        assert_eq!(block_map.desc.block_ptrs[0], allocated_range.start);
+        assert_eq!(block_map.desc.block_ptrs[1], allocated_range.start + 1);
+        assert_eq!(block_map.desc.block_ptrs[2], allocated_range.start + 2);
         assert_eq!(
-            mapping.get_block_range(ext2, 0, 3).unwrap(),
+            block_map.get_block_range(ext2, 0, 3).unwrap(),
             Some(allocated_range.clone())
         );
         assert_eq!(
-            mapping.get_or_alloc_block(ext2, 0, true).unwrap(),
+            block_map.get_or_alloc_block(ext2, 0, true).unwrap(),
             Some(allocated_range.start)
         );
         assert_eq!(
-            mapping.desc.sector_count,
+            block_map.desc.sector_count,
             sectors_per_block.saturating_mul(3)
         );
         assert_eq!(free_before.saturating_sub(free_after), 3);
@@ -1370,15 +1370,18 @@ mod test {
         let ext2 = &f.ext2;
         let sectors_per_block = (ext2.block_size() / SECTOR_SIZE) as u32;
 
-        let mut mapping = make_mapping([0u32; 15], 0, &f.ext2);
+        let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
         let free_before = ext2.super_block().free_blocks_count();
-        let allocated = mapping.get_or_alloc_block(ext2, 12, true).unwrap().unwrap();
+        let allocated = block_map
+            .get_or_alloc_block(ext2, 12, true)
+            .unwrap()
+            .unwrap();
         let free_after = ext2.super_block().free_blocks_count();
 
-        assert_ne!(mapping.desc.block_ptrs[12], 0);
-        assert_eq!(mapping.get_block(ext2, 12).unwrap(), Some(allocated));
+        assert_ne!(block_map.desc.block_ptrs[12], 0);
+        assert_eq!(block_map.get_block(ext2, 12).unwrap(), Some(allocated));
         assert_eq!(
-            mapping.desc.sector_count,
+            block_map.desc.sector_count,
             sectors_per_block.saturating_mul(2)
         );
         assert_eq!(free_before.saturating_sub(free_after), 2);
@@ -1393,26 +1396,26 @@ mod test {
         let ext2 = &f.ext2;
         let sectors_per_block = (ext2.block_size() / SECTOR_SIZE) as u32;
 
-        let mut mapping = make_mapping([0u32; 15], 0, &f.ext2);
+        let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
         let free_before = ext2.super_block().free_blocks_count();
-        let allocated_range = mapping
+        let allocated_range = block_map
             .get_or_alloc_block_range(ext2, 12, 4, true)
             .unwrap()
             .unwrap();
         let free_after = ext2.super_block().free_blocks_count();
 
-        assert_ne!(mapping.desc.block_ptrs[12], 0);
+        assert_ne!(block_map.desc.block_ptrs[12], 0);
         assert_eq!(allocated_range.end - allocated_range.start, 4);
         assert_eq!(
-            mapping.get_block_range(ext2, 12, 4).unwrap(),
+            block_map.get_block_range(ext2, 12, 4).unwrap(),
             Some(allocated_range.clone())
         );
         assert_eq!(
-            mapping.get_block(ext2, 12).unwrap(),
+            block_map.get_block(ext2, 12).unwrap(),
             Some(allocated_range.start)
         );
         assert_eq!(
-            mapping.desc.sector_count,
+            block_map.desc.sector_count,
             sectors_per_block.saturating_mul(5)
         );
         assert_eq!(free_before.saturating_sub(free_after), 5);
@@ -1427,11 +1430,11 @@ mod test {
             .unwrap();
         let ext2 = &f.ext2;
 
-        let mut mapping = make_mapping([0u32; 15], 0, &f.ext2);
-        let err = mapping.get_or_alloc_block(ext2, 0, true).unwrap_err();
+        let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
+        let err = block_map.get_or_alloc_block(ext2, 0, true).unwrap_err();
         assert_eq!(err.error(), Errno::ENOSPC);
-        assert_eq!(mapping.desc.block_ptrs, [0u32; 15]);
-        assert_eq!(mapping.desc.sector_count, 0);
+        assert_eq!(block_map.desc.block_ptrs, [0u32; 15]);
+        assert_eq!(block_map.desc.sector_count, 0);
     }
 
     #[ktest]
@@ -1471,15 +1474,15 @@ mod test {
 
         let ptrs = (ext2.block_size() / size_of::<u32>()) as u32;
         let first_double_iblock = 12 + ptrs;
-        let mut mapping = make_mapping([0u32; 15], 0, &f.ext2);
+        let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
 
-        let allocated_data = mapping
+        let allocated_data = block_map
             .get_or_alloc_block(ext2, first_double_iblock, true)
             .unwrap()
             .unwrap();
-        assert_ne!(mapping.desc.block_ptrs[13], 0);
+        assert_ne!(block_map.desc.block_ptrs[13], 0);
         assert_eq!(
-            mapping.get_block(ext2, first_double_iblock).unwrap(),
+            block_map.get_block(ext2, first_double_iblock).unwrap(),
             Some(allocated_data)
         );
 
@@ -1488,7 +1491,7 @@ mod test {
         assert_eq!(ext2.super_block().free_blocks_count(), 0);
         assert_eq!(f.ext2.block_group(0).free_blocks_count(), 0);
         assert_eq!(
-            mapping.desc.sector_count,
+            block_map.desc.sector_count,
             ((block_size / SECTOR_SIZE) as u32) * 3
         );
     }
@@ -1504,32 +1507,32 @@ mod test {
         let ptrs = (block_size / size_of::<u32>()) as u32;
         let first_double_iblock = 12 + ptrs;
 
-        let mut mapping = make_mapping([0u32; 15], 0, &f.ext2);
-        mapping
+        let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
+        block_map
             .get_or_alloc_block(ext2, first_double_iblock, true)
             .unwrap();
-        mapping
+        block_map
             .get_or_alloc_block(ext2, first_double_iblock + 1, true)
             .unwrap();
-        mapping
+        block_map
             .get_or_alloc_block(ext2, first_double_iblock + 2, true)
             .unwrap();
 
-        mapping
+        block_map
             .truncate_blocks(ext2, (first_double_iblock as usize + 1) * block_size)
             .unwrap();
         assert!(
-            mapping
+            block_map
                 .get_block(ext2, first_double_iblock)
                 .unwrap()
                 .is_some()
         );
         assert_eq!(
-            mapping.get_block(ext2, first_double_iblock + 1).unwrap(),
+            block_map.get_block(ext2, first_double_iblock + 1).unwrap(),
             None
         );
         assert_eq!(
-            mapping.get_block(ext2, first_double_iblock + 2).unwrap(),
+            block_map.get_block(ext2, first_double_iblock + 2).unwrap(),
             None
         );
     }
@@ -1546,26 +1549,26 @@ mod test {
         let first_double_iblock = 12 + ptrs;
         let first_triple_iblock = 12 + ptrs + (1u32 << (ptrs.trailing_zeros() * 2));
 
-        let mut mapping = make_mapping([0u32; 15], 0, &f.ext2);
-        mapping.get_or_alloc_block(ext2, 12, true).unwrap();
-        mapping
+        let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
+        block_map.get_or_alloc_block(ext2, 12, true).unwrap();
+        block_map
             .get_or_alloc_block(ext2, first_double_iblock, true)
             .unwrap();
-        mapping
+        block_map
             .get_or_alloc_block(ext2, first_triple_iblock, true)
             .unwrap();
-        assert_ne!(mapping.desc.block_ptrs[12], 0);
-        assert_ne!(mapping.desc.block_ptrs[13], 0);
-        assert_ne!(mapping.desc.block_ptrs[14], 0);
+        assert_ne!(block_map.desc.block_ptrs[12], 0);
+        assert_ne!(block_map.desc.block_ptrs[13], 0);
+        assert_ne!(block_map.desc.block_ptrs[14], 0);
 
-        mapping.truncate_blocks(ext2, 0).unwrap();
-        assert_eq!(mapping.desc.block_ptrs[12], 0);
-        assert_eq!(mapping.desc.block_ptrs[13], 0);
-        assert_eq!(mapping.desc.block_ptrs[14], 0);
-        assert_eq!(mapping.get_block(ext2, 12).unwrap(), None);
-        assert_eq!(mapping.get_block(ext2, first_double_iblock).unwrap(), None);
-        assert_eq!(mapping.get_block(ext2, first_triple_iblock).unwrap(), None);
-        assert_eq!(mapping.desc.sector_count, 0);
+        block_map.truncate_blocks(ext2, 0).unwrap();
+        assert_eq!(block_map.desc.block_ptrs[12], 0);
+        assert_eq!(block_map.desc.block_ptrs[13], 0);
+        assert_eq!(block_map.desc.block_ptrs[14], 0);
+        assert_eq!(block_map.get_block(ext2, 12).unwrap(), None);
+        assert_eq!(block_map.get_block(ext2, first_double_iblock).unwrap(), None);
+        assert_eq!(block_map.get_block(ext2, first_triple_iblock).unwrap(), None);
+        assert_eq!(block_map.desc.sector_count, 0);
     }
 
     #[ktest]
@@ -1580,23 +1583,23 @@ mod test {
         let ptrs = (block_size / size_of::<u32>()) as u32;
         let first_triple_iblock = 12 + ptrs + (1u32 << (ptrs.trailing_zeros() * 2));
 
-        let mut mapping = make_mapping([0u32; 15], 0, &f.ext2);
-        mapping
+        let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
+        block_map
             .get_or_alloc_block(ext2, first_triple_iblock, true)
             .unwrap();
-        let root = mapping.desc.block_ptrs[14];
+        let root = block_map.desc.block_ptrs[14];
         assert_ne!(root, 0);
         assert_eq!(
-            mapping.desc.sector_count,
+            block_map.desc.sector_count,
             sectors_per_block.saturating_mul(4)
         );
 
         let free_before = ext2.super_block().free_blocks_count();
-        mapping.free_branches(ext2, root, 3);
-        mapping.desc.block_ptrs[14] = 0;
+        block_map.free_branches(ext2, root, 3);
+        block_map.desc.block_ptrs[14] = 0;
         let free_after = ext2.super_block().free_blocks_count();
 
         assert_eq!(free_after.saturating_sub(free_before), 4);
-        assert_eq!(mapping.desc.sector_count, 0);
+        assert_eq!(block_map.desc.sector_count, 0);
     }
 }

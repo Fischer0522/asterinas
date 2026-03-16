@@ -186,11 +186,11 @@ impl Inode {
             return 0;
         }
 
-        // SPEC: i_block payload lives in mapping domain.
+        // SPEC: i_block payload lives in the block_map domain.
         let inner = self.inner.read();
         let backend = inner.backend();
-        let mapping = backend.mapping.read();
-        mapping.desc.decode_device_id()
+        let block_map = backend.block_map.read();
+        block_map.desc.decode_device_id()
     }
 
     /// Sets the encoded device ID for special files and persists it.
@@ -201,7 +201,7 @@ impl Inode {
             // SPEC: fail with EINVAL for non-device inodes; no lock/state mutation needed.
             return_errno!(Errno::EINVAL);
         }
-        // Lock order: inner -> mapping.
+        // Lock order: inner -> block_map.
         let mut inner = self.inner.write();
         inner.encode_device_id(device_id)?;
         // DIFF from Linux: Linux caches dev_t in i_rdev and encodes during write_inode;
@@ -264,10 +264,10 @@ impl Inode {
     }
 
     pub(super) fn metadata(&self) -> Metadata {
-        // Lock order: inner -> mapping.
+        // Lock order: inner -> block_map.
         let inner = self.inner.read();
         let backend = inner.backend();
-        let mapping = backend.mapping.read();
+        let block_map = backend.block_map.read();
 
         let (container_dev_id, optimal_block_size) = match self.fs.upgrade() {
             Some(fs) => (fs.block_device().id(), fs.block_size()),
@@ -276,7 +276,7 @@ impl Inode {
         let self_dev_id =
             if self.type_ == InodeType::CharDevice || self.type_ == InodeType::BlockDevice {
                 // SPEC: for device inodes, decode rdev from i_block old/new format.
-                DeviceId::from_encoded_u64(mapping.desc.decode_device_id())
+                DeviceId::from_encoded_u64(block_map.desc.decode_device_id())
             } else {
                 None
             };
@@ -284,7 +284,7 @@ impl Inode {
             ino: self.ino as u64,
             size: inner.file_size(),
             optimal_block_size,
-            nr_sectors_allocated: mapping.desc.sector_count as usize,
+            nr_sectors_allocated: block_map.desc.sector_count as usize,
             last_access_at: inner.atime(),
             last_modify_at: inner.mtime(),
             last_meta_change_at: inner.ctime(),
@@ -862,13 +862,13 @@ impl Inode {
         // Linux: /root/linux/fs/buffer.c:646 (generic_buffers_fsync)
         // -> /root/linux/mm/filemap.c:777 (file_write_and_wait_range).
         let inner = self.inner.upread();
-        let mapping_backend = inner.backend();
+        let block_map_backend = inner.backend();
 
         inner.sync_data_pages()?;
 
         // SPEC: fsync step 2 flushes inode-local indirect metadata before
         // persisting inode-table state.
-        mapping_backend.mapping.write().sync_indirect_blocks()?;
+        block_map_backend.block_map.write().sync_indirect_blocks()?;
 
         // SPEC: fsync step 3 persists inode metadata. The caller is
         // responsible for the final device-cache flush.
@@ -923,14 +923,14 @@ impl Inode {
         // TODO: fix the page cache
         inner.page_cache.discard_range(0..inner.file_size());
         inner.resize_page_cache_and_update_npages(0)?;
-        let mapping_backend = inner.backend().clone();
+        let block_map_backend = inner.backend().clone();
         inner.set_dtime(now());
         inner.set_file_size(0);
         inner.set_file_acl(0);
         if inner.desc.sector_count > 0 {
-            let mut mapping = mapping_backend.mapping.write();
-            mapping.truncate_blocks(&fs, 0)?;
-            inner.sync_desc_mapping_from_snapshot(*mapping.get_desc());
+            let mut block_map = block_map_backend.block_map.write();
+            block_map.truncate_blocks(&fs, 0)?;
+            inner.sync_desc_block_map_from_snapshot(*block_map.get_desc());
         }
         inner.persist(self.ino, &fs)?;
 
@@ -951,7 +951,7 @@ impl Inode {
 
         // fdatasync must also persist dirty indirect metadata needed to reach
         // newly written data blocks before the final device flush.
-        backend.mapping.write().sync_indirect_blocks()?;
+        backend.block_map.write().sync_indirect_blocks()?;
 
         // SPEC: Linux writes metadata when I_DIRTY_DATASYNC is set.
         // Linux: /root/linux/fs/buffer.c:616-619.
@@ -1484,8 +1484,8 @@ impl Inode {
 
 #[derive(Debug)]
 pub(super) struct InodeBackend {
-    /// Serializes backend traversal vs foreground mapping mutations.
-    mapping: RwMutex<InodeBlockMap>,
+    /// Serializes backend traversal vs foreground block-map mutations.
+    block_map: RwMutex<InodeBlockMap>,
     /// Cached `npages` bound for PageCache.
     npages: AtomicUsize,
     /// Filesystem handle for indirect I/O and BIO submission.
@@ -1508,9 +1508,9 @@ impl Drop for Inode {
 }
 
 impl InodeBackend {
-    pub(super) fn new(mapping: InodeBlockMap, fs: Weak<Ext2>, npages: usize) -> Arc<Self> {
+    pub(super) fn new(block_map: InodeBlockMap, fs: Weak<Ext2>, npages: usize) -> Arc<Self> {
         Arc::new(Self {
-            mapping: RwMutex::new(mapping),
+            block_map: RwMutex::new(block_map),
             npages: AtomicUsize::new(npages),
             fs,
         })
@@ -1529,12 +1529,12 @@ impl InodeBackend {
 
 impl PageCacheBackend for InodeBackend {
     fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
-        let mapping = self.mapping.read();
+        let block_map = self.block_map.read();
         let fs = self.fs()?;
         let iblock = u32::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
 
-        match mapping.get_block(&fs, iblock)? {
+        match block_map.get_block(&fs, iblock)? {
             Some(bid) => {
                 let bio_segment = BioSegment::new_from_segment(
                     Segment::from(frame.clone()).into(),
@@ -1551,12 +1551,12 @@ impl PageCacheBackend for InodeBackend {
     }
 
     fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
-        let mapping = self.mapping.read();
+        let block_map = self.block_map.read();
         let fs = self.fs()?;
         let iblock = u32::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
 
-        let bid = mapping.get_block(&fs, iblock)?.ok_or_else(|| {
+        let bid = block_map.get_block(&fs, iblock)?.ok_or_else(|| {
             error!("write_page_async: no block mapping for idx {}", idx);
             Error::with_message(Errno::EIO, "missing block mapping for writeback")
         })?;
@@ -1651,9 +1651,9 @@ impl InodeInner {
         &self.backend
     }
 
-    fn sync_desc_mapping_from_snapshot(&mut self, mapping_desc: BlockMapDesc) {
-        self.desc.sector_count = mapping_desc.sector_count;
-        self.desc.block_ptrs = mapping_desc.block_ptrs;
+    fn sync_desc_block_map_from_snapshot(&mut self, block_map_desc: BlockMapDesc) {
+        self.desc.sector_count = block_map_desc.sector_count;
+        self.desc.block_ptrs = block_map_desc.block_ptrs;
     }
 
     fn resize_page_cache_and_update_npages(&mut self, new_size_bytes: usize) -> Result<()> {
@@ -1789,11 +1789,11 @@ impl InodeInner {
     }
 
     fn encode_device_id(&mut self, device_id: u64) -> Result<()> {
-        let mapping_backend = self.backend().clone();
-        let mut mapping = mapping_backend.mapping.write();
-        mapping.desc.encode_device_id(device_id);
-        let snapshot = *mapping.get_desc();
-        self.sync_desc_mapping_from_snapshot(snapshot);
+        let block_map_backend = self.backend().clone();
+        let mut block_map = block_map_backend.block_map.write();
+        block_map.desc.encode_device_id(device_id);
+        let snapshot = *block_map.get_desc();
+        self.sync_desc_block_map_from_snapshot(snapshot);
         Ok(())
     }
 
@@ -1829,24 +1829,24 @@ impl InodeInner {
     fn make_empty(&mut self, ino: u32, parent_ino: u32, fs: &Ext2) -> Result<()> {
         let block_size = fs.block_size();
         let old_size = self.file_size();
-        let (old_mapping_desc, new_mapping_desc, new_bid) = {
-            let mapping_backend = self.backend();
-            let mut mapping = mapping_backend.mapping.write();
-            if mapping.desc.block_ptrs[0] != 0 {
+        let (old_block_map_desc, new_block_map_desc, new_bid) = {
+            let block_map_backend = self.backend();
+            let mut block_map = block_map_backend.block_map.write();
+            if block_map.desc.block_ptrs[0] != 0 {
                 return_errno_with_message!(Errno::EIO, "dir block pointer already occupied");
             }
-            let old_mapping_desc = *mapping.get_desc();
-            let bid = mapping.get_or_alloc_block(fs, 0, true)?.ok_or_else(|| {
+            let old_block_map_desc = *block_map.get_desc();
+            let bid = block_map.get_or_alloc_block(fs, 0, true)?.ok_or_else(|| {
                 Error::with_message(Errno::ENOSPC, "failed to allocate first dir block")
             })?;
-            let new_mapping_desc = *mapping.get_desc();
-            (old_mapping_desc, new_mapping_desc, bid)
+            let new_block_map_desc = *block_map.get_desc();
+            (old_block_map_desc, new_block_map_desc, bid)
         };
-        self.sync_desc_mapping_from_snapshot(new_mapping_desc);
+        self.sync_desc_block_map_from_snapshot(new_block_map_desc);
         self.set_file_size(block_size);
 
         if let Err(err) = self.resize_page_cache_and_update_npages(block_size) {
-            self.rollback_make_empty(old_size, old_mapping_desc, new_bid, fs);
+            self.rollback_make_empty(old_size, old_block_map_desc, new_bid, fs);
             return Err(err);
         }
 
@@ -1877,7 +1877,7 @@ impl InodeInner {
                     old_size, resize_err
                 );
             }
-            self.rollback_make_empty(old_size, old_mapping_desc, new_bid, fs);
+            self.rollback_make_empty(old_size, old_block_map_desc, new_bid, fs);
             return Err(err.into());
         }
 
@@ -1887,20 +1887,20 @@ impl InodeInner {
     fn rollback_make_empty(
         &mut self,
         old_size: usize,
-        old_mapping_desc: BlockMapDesc,
+        old_block_map_desc: BlockMapDesc,
         new_bid: u32,
         fs: &Ext2,
     ) {
         self.page_cache().discard_range(0..fs.block_size());
         self.set_file_size(old_size);
-        let mapping_backend = self.backend();
-        let mut mapping = mapping_backend.mapping.write();
-        mapping.desc.block_ptrs = old_mapping_desc.block_ptrs;
-        mapping.desc.sector_count = old_mapping_desc.sector_count;
+        let block_map_backend = self.backend();
+        let mut block_map = block_map_backend.block_map.write();
+        block_map.desc.block_ptrs = old_block_map_desc.block_ptrs;
+        block_map.desc.sector_count = old_block_map_desc.sector_count;
         let _ = fs.free_blocks(new_bid, 1);
-        let mapping_desc = *mapping.get_desc();
-        drop(mapping);
-        self.sync_desc_mapping_from_snapshot(mapping_desc);
+        let block_map_desc = *block_map.get_desc();
+        drop(block_map);
+        self.sync_desc_block_map_from_snapshot(block_map_desc);
     }
 
     /// Reads file data directly from data blocks into `writer`.
@@ -1914,11 +1914,11 @@ impl InodeInner {
         writer: &mut VmWriter,
     ) -> Result<()> {
         let block_size = fs.block_size();
-        let mapping = self.backend.mapping.read();
+        let block_map = self.backend.block_map.read();
 
         let mut range_mapper = IoRangeMapper::new(
             (offset / block_size) as u32..(end.div_ceil(block_size)) as u32,
-            mapping,
+            block_map,
             fs,
         );
         while let Some(range) = range_mapper.next()? {
@@ -1949,11 +1949,11 @@ impl InodeInner {
         debug_assert_eq!(write_len % block_size, 0);
         // end is already checked in `Inode::write_direct_at`.
         let end = offset + write_len;
-        let mapping = self.backend.mapping.read();
+        let block_map = self.backend.block_map.read();
 
         let mut range_mapper = IoRangeMapper::new(
             (offset / block_size) as u32..(end.div_ceil(block_size)) as u32,
-            mapping,
+            block_map,
             fs,
         );
         while let Some(range) = range_mapper.next()? {
@@ -2104,13 +2104,13 @@ impl InodeInner {
         self.resize_page_cache_and_update_npages(new_size_aligned)?;
 
         let backend = self.backend.clone();
-        let mut mapping = backend.mapping.write();
-        if let Err(err) = mapping.truncate_blocks(&fs, new_size) {
+        let mut block_map = backend.block_map.write();
+        if let Err(err) = block_map.truncate_blocks(&fs, new_size) {
             self.resize_page_cache_and_update_npages(old_size_aligned)?;
             return Err(err);
         }
-        let snapshot = *mapping.get_desc();
-        self.sync_desc_mapping_from_snapshot(snapshot);
+        let snapshot = *block_map.get_desc();
+        self.sync_desc_block_map_from_snapshot(snapshot);
         self.set_file_size(new_size);
         self.touch_mtime_ctime(now());
         Ok(())
@@ -2320,8 +2320,8 @@ impl InodeInner {
 
         let eof_iblock = u32::try_from(old_size / block_size)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
-        let mapping = self.backend.mapping.read();
-        let Some(_bid) = mapping.get_block(fs, eof_iblock)? else {
+        let block_map = self.backend.block_map.read();
+        let Some(_bid) = block_map.get_block(fs, eof_iblock)? else {
             return Ok(());
         };
 
@@ -2350,9 +2350,9 @@ impl InodeInner {
         let start_block = offset / block_size;
         let end_block = end.div_ceil(block_size);
 
-        let (mapping_desc, new_blocks, alloc_result) = {
-            let mapping_backend = self.backend().clone();
-            let mut mapping = mapping_backend.mapping.write();
+        let (block_map_desc, new_blocks, alloc_result) = {
+            let block_map_backend = self.backend().clone();
+            let mut block_map = block_map_backend.block_map.write();
             let mut new_blocks = Vec::new();
             let alloc_result = (|| -> Result<()> {
                 let mut current_block = start_block;
@@ -2364,12 +2364,12 @@ impl InodeInner {
                         Error::with_message(Errno::EINVAL, "logical block range overflow")
                     })?;
 
-                    if let Some(mapped_range) = mapping.get_block_range(fs, iblock, remaining)? {
+                    if let Some(mapped_range) = block_map.get_block_range(fs, iblock, remaining)? {
                         current_block +=
                             mapped_range.end.saturating_sub(mapped_range.start) as usize;
                         continue;
                     }
-                    let allocated_range = mapping
+                    let allocated_range = block_map
                         .get_or_alloc_block_range(fs, iblock, remaining, true)?
                         .ok_or_else(|| {
                             Error::with_message(
@@ -2383,9 +2383,9 @@ impl InodeInner {
                 }
                 Ok(())
             })();
-            (*mapping.get_desc(), new_blocks, alloc_result)
+            (*block_map.get_desc(), new_blocks, alloc_result)
         };
-        self.sync_desc_mapping_from_snapshot(mapping_desc);
+        self.sync_desc_block_map_from_snapshot(block_map_desc);
 
         if !new_blocks.is_empty() {
             self.set_ctime(now());
@@ -2440,21 +2440,21 @@ impl InodeInner {
             );
         }
 
-        let mapping_desc = {
-            let mapping_backend = self.backend();
-            let mut mapping = mapping_backend.mapping.write();
-            if let Err(err) = mapping.truncate_blocks(fs, old_size) {
+        let block_map_desc = {
+            let block_map_backend = self.backend();
+            let mut block_map = block_map_backend.block_map.write();
+            if let Err(err) = block_map.truncate_blocks(fs, old_size) {
                 error!(
                     "ext2: write_at cleanup truncate_blocks failed: old_size={}, err={:?}",
                     old_size, err
                 );
                 None
             } else {
-                Some(*mapping.get_desc())
+                Some(*block_map.get_desc())
             }
         };
-        if let Some(mapping_desc) = mapping_desc {
-            self.sync_desc_mapping_from_snapshot(mapping_desc);
+        if let Some(block_map_desc) = block_map_desc {
+            self.sync_desc_block_map_from_snapshot(block_map_desc);
         }
 
         self.set_file_size(old_size);
@@ -2537,18 +2537,18 @@ impl InodeInner {
         let growth_iblock = u32::try_from(data_blocks)
             .map_err(|_| Error::with_message(Errno::EINVAL, "directory block index overflow"))?;
 
-        // SPEC: allocation under mapping.write(); no PageCache/VMO operations in this scope.
-        let mapping_desc = {
-            let mapping_backend = self.backend();
-            let mut mapping = mapping_backend.mapping.write();
-            mapping
+        // SPEC: allocation under block_map.write(); no PageCache/VMO operations in this scope.
+        let block_map_desc = {
+            let block_map_backend = self.backend();
+            let mut block_map = block_map_backend.block_map.write();
+            block_map
                 .get_or_alloc_block(fs, growth_iblock, true)?
                 .ok_or_else(|| {
                     Error::with_message(Errno::ENOSPC, "failed to grow directory block")
                 })?;
-            *mapping.get_desc()
+            *block_map.get_desc()
         };
-        self.sync_desc_mapping_from_snapshot(mapping_desc);
+        self.sync_desc_block_map_from_snapshot(block_map_desc);
 
         let new_size = old_size.saturating_add(block_size);
         self.set_file_size(new_size);
@@ -2556,13 +2556,13 @@ impl InodeInner {
             // SPEC: rollback allocated growth on resize failure.
             self.page_cache.discard_range(old_size..new_size);
             self.set_file_size(old_size);
-            let mapping_desc = {
-                let mapping_backend = self.backend();
-                let mut mapping = mapping_backend.mapping.write();
-                mapping.truncate_blocks(fs, old_size)?;
-                *mapping.get_desc()
+            let block_map_desc = {
+                let block_map_backend = self.backend();
+                let mut block_map = block_map_backend.block_map.write();
+                block_map.truncate_blocks(fs, old_size)?;
+                *block_map.get_desc()
             };
-            self.sync_desc_mapping_from_snapshot(mapping_desc);
+            self.sync_desc_block_map_from_snapshot(block_map_desc);
             return Err(err);
         }
 
@@ -2895,14 +2895,14 @@ impl InodeInner {
         // explicitly trigger truncate-based release on rollback/removal paths.
         // TODO: Move this logic into a shared truncate/evict pipeline, and make
         // free_inode trigger it instead of per-call-site cleanup.
-        // SPEC: mapping truncation happens under mapping.write().
-        let mapping_desc = {
-            let mapping_backend = self.backend();
-            let mut mapping = mapping_backend.mapping.write();
-            mapping.truncate_blocks(fs, 0)?;
-            *mapping.get_desc()
+        // SPEC: block_map truncation happens under block_map.write().
+        let block_map_desc = {
+            let block_map_backend = self.backend();
+            let mut block_map = block_map_backend.block_map.write();
+            block_map.truncate_blocks(fs, 0)?;
+            *block_map.get_desc()
         };
-        self.sync_desc_mapping_from_snapshot(mapping_desc);
+        self.sync_desc_block_map_from_snapshot(block_map_desc);
         self.page_cache.discard_range(0..self.file_size());
         self.resize_page_cache_and_update_npages(0)?;
         // SPEC: cleanup path must leave directory size at zero.
@@ -3214,7 +3214,7 @@ impl TryFrom<&RawInode> for InodeDesc {
 
         let flags = FileFlags::from_bits(raw.flags)
             .ok_or_else(|| Error::with_message(Errno::EIO, "invalid inode flags"))?;
-        let mapping = BlockMapDesc::from_raw(raw);
+        let block_map = BlockMapDesc::from_raw(raw);
 
         Ok(InodeDesc {
             type_,
@@ -3227,11 +3227,11 @@ impl TryFrom<&RawInode> for InodeDesc {
             mtime,
             dtime: Duration::from_secs(raw.dtime as u64),
             links_count: raw.links_count,
-            sector_count: mapping.sector_count,
+            sector_count: block_map.sector_count,
             flags,
             file_acl: raw.file_acl,
             generation: raw.generation,
-            block_ptrs: mapping.block_ptrs,
+            block_ptrs: block_map.block_ptrs,
         })
     }
 }
