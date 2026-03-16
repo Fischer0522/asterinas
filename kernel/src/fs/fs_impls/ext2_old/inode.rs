@@ -2120,7 +2120,7 @@ impl Iterator for DeviceRangeReader<'_> {
 ///
 /// Each block group has an inode table it is responsible for.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct InodeDesc {
+pub(ext2_old) struct InodeDesc {
     /// Type.
     type_: InodeType,
     /// Permission.
@@ -2359,7 +2359,7 @@ const_assert!(size_of::<RawInode>() == 128);
 /// The raw inode on device.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, Pod)]
-pub(super) struct RawInode {
+pub(ext2_old) struct RawInode {
     /// File mode (type and permissions).
     pub mode: u16,
     /// Low 16 bits of User Id.
@@ -2437,7 +2437,7 @@ impl From<&InodeDesc> for RawInode {
 /// OS dependent Value 2
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, Pod)]
-pub(super) struct Osd2 {
+pub(ext2_old) struct Osd2 {
     /// Fragment number.
     pub frag_num: u8,
     /// Fragment size.

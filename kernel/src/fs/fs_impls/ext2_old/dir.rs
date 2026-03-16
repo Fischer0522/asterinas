@@ -81,7 +81,7 @@ impl DirEntry {
 /// The header of `DirEntry`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
-pub(super) struct DirEntryHeader {
+pub(ext2_old) struct DirEntryHeader {
     /// Inode number
     ino: u32,
     /// Directory entry length
@@ -314,7 +314,7 @@ impl Iterator for DirEntryIter<'_> {
 /// including the entry header and the entry's offset. The entry name is not
 /// present and will be retrieved from the page cache when needed.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct DirEntryItem {
+pub(ext2_old) struct DirEntryItem {
     header: DirEntryHeader,
     offset: usize,
 }
