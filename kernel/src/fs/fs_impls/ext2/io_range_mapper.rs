@@ -35,8 +35,6 @@ pub(super) enum IoRange {
 }
 
 impl<'a> IoRangeMapper<'a> {
-    /// Linux: /root/linux/fs/ext2/inode.c:783 (ext2_get_block)
-    /// Linux: /root/asterinas/kernel/src/fs/ext2_old/inode.rs:1997 (DeviceRangeReader::new)
     pub(super) fn new(
         range: Range<Ext2Bid>,
         block_map: RwMutexReadGuard<'a, InodeBlockMap>,

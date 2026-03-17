@@ -553,7 +553,6 @@ impl Xattr {
 
     /// Creates or replaces one extended attribute. Allocates block if needed.
     ///
-    /// Linux: /root/linux/fs/ext2/xattr.c:405-651 (ext2_xattr_set)
     pub(super) fn set_xattr(
         &mut self,
         name: XattrName,
@@ -611,7 +610,6 @@ impl Xattr {
 
     /// Reads one extended-attribute value. Size query if `vm_writer.avail() == 0`.
     ///
-    /// Linux: /root/linux/fs/ext2/xattr.c:195-275 (ext2_xattr_get)
     pub(super) fn get_xattr(&mut self, name: XattrName, vm_writer: &mut VmWriter) -> Result<usize> {
         let (target_index, target_name) = Self::parse_target_name(name)?;
 
@@ -646,7 +644,6 @@ impl Xattr {
 
     /// Lists extended-attribute names in one namespace. Size query if `list_writer.avail() == 0`.
     ///
-    /// Linux: /root/linux/fs/ext2/xattr.c:287-364 (ext2_xattr_list)
     pub(super) fn list_xattr(
         &mut self,
         namespace: XattrNamespace,
@@ -699,7 +696,6 @@ impl Xattr {
 
     /// Removes one extended attribute. Frees block if last entry removed.
     ///
-    /// Linux: /root/linux/fs/ext2/xattr.c:405-651 (ext2_xattr_set with value == NULL)
     pub(super) fn remove_xattr(&mut self, name: XattrName) -> Result<()> {
         let (target_index, target_name) = Self::parse_target_name(name)?;
 
@@ -733,7 +729,6 @@ impl Xattr {
 
     /// Frees the xattr block entirely (called during inode eviction).
     ///
-    /// Linux: /root/linux/fs/ext2/xattr.c:816-861 (ext2_xattr_delete_inode)
     pub(super) fn delete_xattr_block(&mut self) -> Result<()> {
         if self.bid == 0 {
             self.block_buf = None;

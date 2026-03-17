@@ -21,7 +21,7 @@ use crate::{
     thread::Thread,
 };
 
-/// The root inode number (Linux EXT2_ROOT_INO).
+/// The root inode number defined by the ext2 on-disk format.
 pub const ROOT_INO: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -39,7 +39,6 @@ struct Ext2MountOptions {
 impl Ext2MountOptions {
     /// Parses the subset of ext2 mount options that affects `statfs`.
     ///
-    /// Linux: /root/linux/fs/ext2/super.c:494 (ext2_parse_param)
     fn parse(data: Option<&CStr>) -> Self {
         let mut options = Self::default();
         let Some(data) = data else {
@@ -143,7 +142,6 @@ impl Ext2 {
 
     /// Returns whether `statfs` should report Minix-style total blocks.
     ///
-    /// Linux: /root/linux/fs/ext2/super.c:1454 (test_opt MINIX_DF)
     pub(super) fn uses_minix_df(&self) -> bool {
         self.mount_options.uses_minix_df()
     }
@@ -173,7 +171,6 @@ impl Ext2 {
 
     /// Reads an inode via per-block-group inode cache.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:1387 (ext2_iget)
     pub(super) fn read_inode(&self, ino: u32) -> Result<Arc<Inode>> {
         if self.self_ref.upgrade().is_none() {
             return_errno_with_message!(Errno::EIO, "filesystem already dropped");
@@ -211,7 +208,6 @@ impl Ext2 {
 
     /// Removes one inode from the live block-group cache.
     ///
-    /// Linux analogue: /root/linux/fs/inode.c:1910 (iput_final)
     pub(super) fn remove_inode_cache(&self, ino: u32) -> Option<Arc<Inode>> {
         if ino == 0 {
             return None;
@@ -225,7 +221,6 @@ impl Ext2 {
 
     /// Returns the inode table block ID for the given group.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:1314 (ext2_get_inode)
     pub(super) fn inode_table_block(
         &self,
         group_idx: usize,
@@ -243,7 +238,6 @@ impl Ext2 {
     /// Thin orchestrator: validates ino, computes group/index, delegates to
     /// `BlockGroup::read_inode_desc`.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:1314 (ext2_get_inode)
     pub(super) fn read_inode_desc(&self, ino: u32) -> Result<InodeDesc> {
         let sb = self.super_block.read();
         Self::read_inode_desc_from_parts(&sb, &self.block_groups, ino)
@@ -255,7 +249,7 @@ impl Ext2 {
         block_groups: &[BlockGroup],
         ino: u32,
     ) -> Result<InodeDesc> {
-        // SPEC: same inode number validity condition as Linux `ext2_get_inode`.
+        // SPEC: apply ext2 inode-number validity rules before indexing groups.
         if (ino != ROOT_INO && ino < sb.first_ino()) || ino > sb.total_inodes() {
             return_errno_with_message!(Errno::EINVAL, "inode number out of valid range");
         }
@@ -276,11 +270,10 @@ impl Ext2 {
     /// Thin orchestrator: validates ino, computes group/index, delegates to
     /// `BlockGroup::write_inode_desc`.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:1512 (__ext2_write_inode / mark_buffer_dirty)
     pub(super) fn write_inode_desc(&self, ino: u32, raw: &RawInode) -> Result<()> {
         let sb = self.super_block.read();
 
-        // SPEC: same inode number validity condition as Linux `ext2_get_inode`.
+        // SPEC: apply ext2 inode-number validity rules before indexing groups.
         if (ino != ROOT_INO && ino < sb.first_ino()) || ino > sb.total_inodes() {
             return_errno_with_message!(Errno::EINVAL, "inode number out of valid range");
         }
@@ -301,7 +294,6 @@ impl Ext2 {
     /// Loads the group descriptor table into a segment.
 
     ///
-    /// Linux: /root/linux/fs/ext2/super.c:695 (ext2_check_descriptors)
     pub(super) fn load_group_desc_table(
         block_device: &dyn BlockDevice,
         sb: &SuperBlock,
@@ -332,7 +324,6 @@ impl Ext2 {
 
     /// Validates the group descriptor table.
     ///
-    /// Linux: /root/linux/fs/ext2/super.c:695 (ext2_check_descriptors)
     pub(super) fn check_group_desc_table(sb: &SuperBlock, group_descs: &USegment) -> Result<()> {
         let groups_count = sb.block_groups_count() as usize;
         let itb_per_group = sb.itb_per_group();
@@ -384,7 +375,6 @@ impl Ext2 {
     /// Non-privileged users are denied when free blocks fall below the reserved
     /// threshold, unless they have `CAP_SYS_RESOURCE` or match `s_resuid`/`s_resgid`.
     ///
-    /// Linux: /root/linux/fs/ext2/balloc.c:1158 (ext2_has_free_blocks)
     fn has_free_blocks(
         &self,
         free_blocks: u32,
@@ -406,7 +396,7 @@ impl Ext2 {
 
         let credentials = posix_thread.credentials();
 
-        // Linux: capable(CAP_SYS_RESOURCE)
+        // Treat `CAP_SYS_RESOURCE` as bypass permission for reserved blocks.
         if credentials
             .effective_capset()
             .contains(CapSet::SYS_RESOURCE)
@@ -414,12 +404,12 @@ impl Ext2 {
             return true;
         }
 
-        // Linux: uid_eq(sbi->s_resuid, current_fsuid())
+        // Allow the reserved-block owner to bypass the quota.
         if u32::from(credentials.fsuid()) == resuid {
             return true;
         }
 
-        // Linux: !gid_eq(sbi->s_resgid, GLOBAL_ROOT_GID) && in_group_p(sbi->s_resgid)
+        // Allow the reserved-block group to bypass the quota when configured.
         let resgid_val = Gid::from(resgid);
         if !resgid_val.is_root() {
             if credentials.fsgid() == resgid_val {
@@ -435,9 +425,9 @@ impl Ext2 {
 
     /// Allocates up to `count` contiguous blocks.
     ///
-    /// Thin orchestrator: starts from goal group (Linux ext2_new_blocks behavior),
-    /// iterates groups cyclically, delegates to `BlockGroup::alloc_blocks`, and
-    /// updates superblock counter on success.
+    /// Thin orchestrator that starts from the goal group, scans groups cyclically,
+    /// delegates to `BlockGroup::alloc_blocks`, and updates the superblock count
+    /// after a successful allocation.
     pub(super) fn alloc_blocks(&self, count: u32, goal: Ext2Bid) -> Result<Range<u32>> {
         if count == 0 {
             return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
@@ -470,7 +460,6 @@ impl Ext2 {
             return_errno_with_message!(Errno::ENOSPC, "no free blocks on device");
         }
 
-        // Linux: /root/linux/fs/ext2/balloc.c:1262 (ext2_has_free_blocks check)
         if !self.has_free_blocks(sb_free_blocks, reserved_blocks, resuid, resgid) {
             return_errno_with_message!(
                 Errno::ENOSPC,
@@ -478,7 +467,6 @@ impl Ext2 {
             );
         }
 
-        // Linux: /root/linux/fs/ext2/balloc.c:1260 (goal-based group start).
         let goal_raw = goal;
         let first_data_raw = first_data_block;
         let goal_group = if goal_raw > first_data_raw {
@@ -630,7 +618,6 @@ impl Ext2 {
 
     /// Allocates and initializes a new inode.
     ///
-    /// Linux: /root/linux/fs/ext2/ialloc.c:419 (ext2_new_inode)
     pub(super) fn create_inode(
         &self,
         parent_ino: u32,
@@ -645,7 +632,6 @@ impl Ext2 {
         // SPEC: initialize a valid on-disk inode before publishing it.
         let mode = (inode_type as u16) | (perm.bits() & 0o07777);
         let links_count = if inode_type.is_directory() { 2 } else { 1 };
-        // Linux: /root/linux/fs/ext2/ialloc.c:540-549 (owner + timestamp init).
         let (uid, gid) = if let Some(thread) = Thread::current() {
             if let Some(posix_thread) = thread.as_posix_thread() {
                 let credentials = posix_thread.credentials();
@@ -654,18 +640,16 @@ impl Ext2 {
                     u32::from(credentials.fsgid()),
                 )
             } else {
-                // DIFF from Linux: tests/internal tasks may not have POSIX credentials.
+                // Tests and internal tasks may not have POSIX credentials.
                 // Fall back to root ownership in that case.
                 (0, 0)
             }
         } else {
-            // DIFF from Linux: tests/internal tasks may not have a thread context.
+            // Tests and internal tasks may not have a thread context.
             // Fall back to root ownership in that case.
             (0, 0)
         };
-        // Linux: /root/linux/fs/ext2/ialloc.c:549 (simple_inode_init_ts).
         let now_secs = now().as_secs() as u32;
-        // Linux: /root/linux/fs/ext2/ialloc.c:564-566 (s_next_generation++)
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let raw = RawInode {
             mode,
@@ -789,7 +773,6 @@ impl Ext2 {
         }
         let mut sb_guard = self.super_block.write();
 
-        // Linux: /root/linux/fs/ext2/super.c:1288-1289 (ext2_sync_super)
         // Recompute free counters from group descriptors — they are the source of truth.
         let mut total_free_blocks: u32 = 0;
         let mut total_free_inodes: u32 = 0;

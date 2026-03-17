@@ -13,10 +13,6 @@ use super::{
 use crate::fs::utils::IdBitmap;
 
 /// Backend of the inode table page cache in one block group.
-///
-/// Linux equivalent: `sb_bread()` buffer_head cache path in
-/// `/root/linux/fs/ext2/inode.c:1314` (`ext2_get_inode`).
-/// Asterinas equivalent: `PageCacheBackend` implementation.
 struct InodeTableBackend {
     /// Physical block ID of `bg_inode_table`.
     inode_table_bid: Ext2Bid,
@@ -83,8 +79,8 @@ pub(super) struct BlockGroup {
     inode_table_cache: PageCache,
     /// Per-group inode cache keyed by group-local inode index.
     ///
-    /// Linux equivalent is VFS global inode hash (fs/inode.c:63).
-    /// Asterinas keeps per-group cache because VFS does not provide inode caching.
+    /// Ext2 keeps this cache locally because the VFS layer does not provide
+    /// a shared inode cache for filesystem implementations.
     inode_cache: RwMutex<BTreeMap<u32, Arc<Inode>>>,
 }
 
@@ -98,7 +94,6 @@ impl fmt::Debug for BlockGroup {
 
 /// On-disk block group descriptor (32 bytes).
 ///
-/// Linux: /root/linux/fs/ext2/ext2.h:191 (struct ext2_group_desc)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
 pub(super) struct RawGroupDesc {
@@ -216,8 +211,6 @@ impl BlockGroup {
 
     /// Looks up an allocated inode by group-local index and returns cached/in-memory object.
     ///
-    /// Linux: /root/linux/fs/inode.c:1371 (iget_locked hash lookup + allocate on miss)
-    /// Linux: /root/linux/fs/ext2/inode.c:1387 (ext2_iget)
     pub(super) fn lookup_inode(
         &self,
         inode_idx: u32,
@@ -266,14 +259,12 @@ impl BlockGroup {
 
     /// Removes one inode from the per-group live cache.
     ///
-    /// Linux analogue: /root/linux/fs/inode.c:1910 (iput_final)
     pub(super) fn remove_inode_cache(&self, inode_idx: u32) -> Option<Arc<Inode>> {
         self.inode_cache.write().remove(&inode_idx)
     }
 
     /// Syncs per-group inode state and bitmap metadata.
     ///
-    /// Linux trigger analogue: /root/linux/fs/inode.c:1910 (iput_final)
     pub(super) fn sync_all(&self, group_descs: &USegment) -> Result<()> {
         self.sync_inodes()?;
         self.sync_metadata(group_descs)?;
@@ -476,7 +467,6 @@ impl BlockGroup {
 
     /// Loads and validates the block bitmap for this group.
     ///
-    /// Linux: /root/linux/fs/ext2/balloc.c:129 (read_block_bitmap)
     fn load_block_bitmap(
         block_device: &dyn BlockDevice,
         first_block: u32,
@@ -565,7 +555,6 @@ impl BlockGroup {
 
     /// Loads the inode bitmap for this group.
     ///
-    /// Linux: /root/linux/fs/ext2/ialloc.c:31 (read_inode_bitmap)
     fn load_inode_bitmap(
         block_device: &dyn BlockDevice,
         inodes_per_group: u32,
@@ -594,7 +583,6 @@ impl BlockGroup {
     /// Returns `Ok((Some(range), saw_corruption))` with filesystem-wide block numbers
     /// on success, `Ok((None, saw_corruption))` if no allocatable blocks.
     ///
-    /// Linux: /root/linux/fs/ext2/balloc.c:682 (ext2_try_to_allocate)
     pub(super) fn alloc_blocks(
         &self,
         count: u32,
@@ -680,7 +668,6 @@ impl BlockGroup {
     /// `bit` is the group-relative start index, `group_count` is the number
     /// of blocks to free. Returns the number of blocks actually freed.
     ///
-    /// Linux: /root/linux/fs/ext2/balloc.c:482 (ext2_free_blocks, per-group portion)
     pub(super) fn free_blocks(&self, bit: u32, group_count: u32) -> Result<u32> {
         // Validate system zone overlap using filesystem-wide coordinates.
         let abs_start = self.first_block + bit;
@@ -690,8 +677,7 @@ impl BlockGroup {
 
         let mut bitmap = self.block_bitmap.write();
 
-        // Linux: balloc.c:542-556 — per-bit clear, only count bits that actually
-        // transitioned allocated→free (group_freed pattern).
+        // Clear bits one by one and count only allocated-to-free transitions.
         let range_start = bit as u16;
         let range_end = (bit + group_count) as u16;
         let mut actually_freed: u32 = 0;
@@ -720,7 +706,6 @@ impl BlockGroup {
     /// Returns `Ok(Some(inode_idx))` with the 0-based group-relative inode index,
     /// or `Ok(None)` if no free inode. Does NOT update counters.
     ///
-    /// Linux: /root/linux/fs/ext2/ialloc.c:419 (ext2_new_inode, per-group portion)
     pub(super) fn alloc_inode(&self) -> Result<Option<u16>> {
         let mut bitmap = self.inode_bitmap.write();
         let Some(inode_idx) = bitmap.alloc() else {
@@ -739,7 +724,6 @@ impl BlockGroup {
     /// Returns `true` if the bit transitioned allocated→free,
     /// `false` if it was already free (logs warning). Does NOT update counters.
     ///
-    /// Linux: /root/linux/fs/ext2/ialloc.c:79 (ext2_free_inode, per-group portion)
     pub(super) fn free_inode(&self, bit: u16) -> Result<bool> {
         let mut bitmap = self.inode_bitmap.write();
         if !bitmap.is_allocated(bit) {
@@ -758,7 +742,6 @@ impl BlockGroup {
     ///
     /// `index_in_group` is the 0-based inode index within this group.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:1314 (ext2_get_inode)
     pub(super) fn read_inode_desc(&self, index_in_group: u32) -> Result<InodeDesc> {
         let offset_bytes = (index_in_group as usize) * self.inode_size;
         let raw: RawInode = self.inode_table_cache.pages().read_val(offset_bytes)?;
@@ -769,7 +752,6 @@ impl BlockGroup {
     ///
     /// `index_in_group` is the 0-based inode index within this group.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:1512 (__ext2_write_inode / mark_buffer_dirty)
     pub(super) fn write_inode_desc(&self, index_in_group: u32, raw: &RawInode) -> Result<()> {
         let offset_bytes = (index_in_group as usize) * self.inode_size;
         self.inode_table_cache
@@ -781,7 +763,6 @@ impl BlockGroup {
     /// Checks whether [start, start+count-1] overlaps any system metadata block
     /// (block bitmap, inode bitmap, inode table) of this group.
     ///
-    /// Linux: /root/linux/fs/ext2/balloc.c:115 (ext2_bg_has_super + system zone check)
     fn overlaps_system_zone(&self, start: u32, count: u32) -> bool {
         let Some(end) = start.checked_add(count - 1) else {
             return true;

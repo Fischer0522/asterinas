@@ -15,10 +15,8 @@ pub(super) struct IndirectBlockManager {
 }
 
 impl IndirectBlockManager {
-    /// Linux: /root/linux/fs/ext2/inode.c:234 (ext2_get_branch)
-    /// Linux: /root/linux/fs/ext2/inode.c:561 (ext2_splice_branch)
     pub(super) fn new(fs: Weak<Ext2>) -> Self {
-        /// Use the same value as Linux `BH_LRU_SIZE`.
+        /// Keeps the resident indirect-block cache small and bounded.
         const MAX_SIZE: usize = 16;
 
         Self {
@@ -28,7 +26,6 @@ impl IndirectBlockManager {
         }
     }
 
-    /// Linux: /root/linux/fs/ext2/inode.c:234 (ext2_get_branch)
     pub(super) fn find(&mut self, bid: Ext2Bid) -> Result<&IndirectBlock> {
         if self.cache.get(&bid).is_none() {
             self.try_shink()?;
@@ -41,7 +38,6 @@ impl IndirectBlockManager {
         })
     }
 
-    /// Linux: /root/linux/fs/ext2/inode.c:234 (ext2_get_branch)
     pub(super) fn find_mut(&mut self, bid: Ext2Bid) -> Result<&mut IndirectBlock> {
         if self.cache.get(&bid).is_none() {
             self.try_shink()?;
@@ -54,7 +50,6 @@ impl IndirectBlockManager {
         })
     }
 
-    /// Linux: /root/linux/fs/ext2/inode.c:479 (ext2_alloc_branch)
     pub(super) fn insert_new(&mut self, bid: Ext2Bid, block: IndirectBlock) -> Result<()> {
         if block.bid() != bid {
             return_errno_with_message!(Errno::EIO, "indirect block inserted with mismatched bid");
@@ -65,12 +60,10 @@ impl IndirectBlockManager {
         Ok(())
     }
 
-    /// Linux: /root/linux/fs/ext2/inode.c:1136 (ext2_free_branches)
     pub(super) fn remove(&mut self, bid: Ext2Bid) -> Option<IndirectBlock> {
         self.cache.pop(&bid)
     }
 
-    /// Linux: /root/linux/fs/ext2/super.c:1308 (ext2_sync_fs)
     pub(super) fn sync(&mut self) -> Result<()> {
         let fs = self.fs_arc()?;
         let dirty_bids: Vec<Ext2Bid> = self
@@ -89,7 +82,6 @@ impl IndirectBlockManager {
         Ok(())
     }
 
-    /// Linux: /root/linux/fs/ext2/inode.c:234 (ext2_get_branch)
     pub(super) fn try_shink(&mut self) -> Result<()> {
         while self.cache.len() >= self.capacity {
             self.evict()?;
@@ -97,7 +89,6 @@ impl IndirectBlockManager {
         Ok(())
     }
 
-    /// Linux: /root/linux/fs/ext2/inode.c:561 (ext2_splice_branch)
     fn evict(&mut self) -> Result<()> {
         let Some((bid, mut block)) = self.cache.pop_lru() else {
             return Ok(());
@@ -158,7 +149,6 @@ pub(super) struct IndirectBlock {
 }
 
 impl IndirectBlock {
-    /// Linux: /root/linux/fs/ext2/inode.c:234 (ext2_get_branch)
     pub(super) fn alloc_uninit() -> Result<Self> {
         Ok(Self {
             block: FrameAllocOptions::new().zeroed(false).alloc_frame()?,
@@ -167,7 +157,6 @@ impl IndirectBlock {
         })
     }
 
-    /// Linux: /root/linux/fs/ext2/inode.c:479 (ext2_alloc_branch)
     pub(super) fn alloc_new(bid: Ext2Bid) -> Result<Self> {
         Ok(Self {
             block: FrameAllocOptions::new().alloc_frame()?,
@@ -176,7 +165,6 @@ impl IndirectBlock {
         })
     }
 
-    /// Linux: /root/linux/fs/ext2/inode.c:234 (ext2_get_branch)
     pub(super) fn read_bid(&self, idx: usize) -> Result<Ext2Bid> {
         let offset = self.slot_offset(idx)?;
         self.block
@@ -184,7 +172,6 @@ impl IndirectBlock {
             .map_err(|_| Error::with_message(Errno::EIO, "failed to read indirect pointer"))
     }
 
-    /// Linux: /root/linux/fs/ext2/inode.c:561 (ext2_splice_branch)
     pub(super) fn write_bid(&mut self, idx: usize, bid: Ext2Bid) -> Result<()> {
         let offset = self.slot_offset(idx)?;
         self.block

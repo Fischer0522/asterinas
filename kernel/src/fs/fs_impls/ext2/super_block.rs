@@ -121,7 +121,6 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
     type Error = crate::error::Error;
 
     fn try_from(sb: RawSuperBlock) -> Result<Self> {
-        // Linux: /root/linux/fs/ext2/super.c:877 (ext2_fill_super)
         if sb.magic != MAGIC_NUM {
             return_errno_with_message!(Errno::EINVAL, "bad ext2 magic number");
         }
@@ -206,9 +205,8 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
         let blocks_after = blocks_count - first_data_block - 1;
         let groups_count = (blocks_after / blocks_per_group as u64) + 1;
 
-        // Linux does not require exact equality between inodes_count and
-        // groups_count * inodes_per_group. The last group may have fewer inodes.
-        // Linux: /root/linux/fs/ext2/super.c:960-980.
+        // The last block group may legitimately contain fewer inodes than the
+        // full per-group capacity.
         let max_inodes = groups_count * (inodes_per_group as u64);
         let min_inodes = (groups_count - 1) * (inodes_per_group as u64);
         let inodes_count = sb.inodes_count as u64;
@@ -283,7 +281,6 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
 
 /// Reads and validates the on-disk superblock.
 ///
-/// Linux: /root/linux/fs/ext2/super.c:877 (ext2_fill_super)
 fn load_super_block(device: &dyn BlockDevice, read_only: bool) -> Result<SuperBlock> {
     let raw = device.read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)?;
     let mut sb = SuperBlock::try_from(raw)?;
@@ -301,8 +298,7 @@ fn load_super_block(device: &dyn BlockDevice, read_only: bool) -> Result<SuperBl
     }
 
     if !read_only {
-        // Linux mount-time setup updates superblock fields immediately.
-        // Linux: /root/linux/fs/ext2/super.c:645 (ext2_setup_super).
+        // Writable mounts update the superblock state immediately.
         sb.mnt_count = sb.mnt_count.saturating_add(1);
         sb.state.remove(FsState::VALID);
         sb.set_wtime(super::utils::now());
@@ -352,14 +348,12 @@ impl SuperBlock {
 
     /// Returns the first block number of a block group.
     ///
-    /// Linux: /root/linux/fs/ext2/ext2.h:798 (ext2_group_first_block_no)
     pub(super) fn group_first_block_no(&self, group_idx: usize) -> u32 {
         (group_idx as u32) * self.blocks_per_group + self.first_data_block()
     }
 
     /// Returns the last block number of a block group.
     ///
-    /// Linux: /root/linux/fs/ext2/ext2.h:804 (ext2_group_last_block_no)
     pub(super) fn group_last_block_no(&self, group_idx: usize) -> u32 {
         let groups_count = self.block_groups_count();
         if group_idx as u32 == groups_count - 1 {
@@ -371,7 +365,6 @@ impl SuperBlock {
 
     /// Returns whether a data block range is valid.
     ///
-    /// Linux: /root/linux/fs/ext2/balloc.c:1177 (ext2_data_block_valid)
     pub(super) fn data_block_valid(&self, start_blk: u32, count: u32) -> bool {
         if count == 0 {
             return false;
@@ -427,7 +420,6 @@ impl SuperBlock {
 
     /// Returns the number of group descriptor blocks in each superblock copy.
     ///
-    /// Linux: /root/linux/fs/ext2/balloc.c:1531 (ext2_bg_num_gdb)
     pub(super) fn group_descriptor_blocks_count(&self) -> u32 {
         let descriptor_bytes = (self.block_groups_count() as usize) * size_of::<RawGroupDesc>();
         descriptor_bytes.div_ceil(self.block_size) as u32
@@ -475,14 +467,12 @@ impl SuperBlock {
 
     /// Returns the default uid for reserved blocks.
     ///
-    /// Linux: /root/linux/fs/ext2/super.c:917 (sbi->s_resuid)
     pub(super) fn def_resuid(&self) -> u32 {
         self.def_resuid
     }
 
     /// Returns the default gid for reserved blocks.
     ///
-    /// Linux: /root/linux/fs/ext2/super.c:918 (sbi->s_resgid)
     pub(super) fn def_resgid(&self) -> u32 {
         self.def_resgid
     }
@@ -553,14 +543,11 @@ impl SuperBlock {
 
     /// Returns whether the given group stores a superblock copy.
     ///
-    /// Linux: /root/linux/fs/ext2/balloc.c:1514 (ext2_bg_has_super)
     pub(super) fn has_super_block(&self, block_group_idx: usize) -> bool {
         block_group_idx == 0 || self.is_backup_group(block_group_idx)
     }
 
-    /// Computes the metadata overhead subtracted by Linux `ext2_statfs`.
-    ///
-    /// Linux: /root/linux/fs/ext2/super.c:1446 (ext2_statfs)
+    /// Computes the metadata overhead subtracted from `statfs` totals.
     pub(super) fn statfs_overhead_blocks(&self) -> u32 {
         let groups_count = self.block_groups_count() as usize;
         let gdb_count = self.group_descriptor_blocks_count();

@@ -9,17 +9,14 @@ use crate::fs::vfs::{
 };
 
 /// VFS-visible Ext2 filesystem type.
-/// Linux: /root/linux/fs/ext2/super.c:1698 (ext2_fs_type)
 pub(super) struct Ext2Type;
 
 impl FsType for Ext2Type {
     fn name(&self) -> &'static str {
-        // Linux: /root/linux/fs/ext2/super.c:1700 (.name = "ext2")
         "ext2"
     }
 
     fn properties(&self) -> FsProperties {
-        // Linux: /root/linux/fs/ext2/super.c:1702 (.fs_flags = FS_REQUIRES_DEV)
         FsProperties::NEED_DISK
     }
 
@@ -29,7 +26,6 @@ impl FsType for Ext2Type {
         args: Option<CString>,
         disk: Option<Arc<dyn BlockDevice>>,
     ) -> Result<Arc<dyn FileSystem>> {
-        // Linux: /root/linux/fs/ext2/super.c:1703 (init_fs_context -> mount flow)
         let disk = disk.ok_or_else(|| {
             Error::with_message(Errno::EINVAL, "the ext2 filesystem requires a block device")
         })?;
@@ -37,7 +33,6 @@ impl FsType for Ext2Type {
     }
 
     fn sysnode(&self) -> Option<Arc<dyn SysNode>> {
-        // Linux: /root/linux/fs/ext2/super.c:1698 (ext2_fs_type)
         None
     }
 }

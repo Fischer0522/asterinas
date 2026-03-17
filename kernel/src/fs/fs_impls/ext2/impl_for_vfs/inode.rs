@@ -32,7 +32,6 @@ impl InodeIo for Inode {
         writer: &mut VmWriter,
         status_flags: StatusFlags,
     ) -> Result<usize> {
-        // Linux: /root/linux/fs/ext2/file.c:283 (ext2_file_read_iter)
         if status_flags.contains(StatusFlags::O_DIRECT) {
             Inode::read_direct_at(self, offset, writer)
         } else {
@@ -46,7 +45,6 @@ impl InodeIo for Inode {
         reader: &mut VmReader,
         status_flags: StatusFlags,
     ) -> Result<usize> {
-        // Linux: /root/linux/fs/ext2/file.c:295 (ext2_file_write_iter)
         if status_flags.contains(StatusFlags::O_DIRECT) {
             Inode::write_direct_at(self, offset, reader)
         } else {
@@ -161,7 +159,6 @@ impl VfsInode for Inode {
     }
 
     fn mknod(&self, name: &str, mode: InodeMode, type_: MknodType) -> Result<Arc<dyn VfsInode>> {
-        // Linux: /root/linux/fs/ext2/namei.c:136-155 (ext2_mknod)
         // SPEC: map mknod request to ext2 inode type plus optional encoded device id.
         let (inode_type, device_id) = match type_ {
             MknodType::CharDevice(dev_id) => (InodeType::CharDevice, Some(dev_id)),
@@ -171,7 +168,7 @@ impl VfsInode for Inode {
 
         let new_inode = Inode::create(self, name, inode_type, mode.into())?;
         if let Some(device_id) = device_id {
-            // SPEC: persist Linux-compatible i_block[0..2] device encoding.
+            // SPEC: persist the ext2 special-file device encoding in `i_block`.
             new_inode.set_device_id(device_id)?;
         }
 
@@ -217,7 +214,6 @@ impl VfsInode for Inode {
     }
 
     fn sync_all(&self) -> Result<()> {
-        // Linux: /root/linux/fs/ext2/file.c:155 (ext2_fsync)
         Inode::sync_all(self, true)?;
         if Inode::fs(self)?.block_device().sync()? != BioStatus::Complete {
             return_errno_with_message!(Errno::EIO, "failed to flush block device");
@@ -226,7 +222,6 @@ impl VfsInode for Inode {
     }
 
     fn sync_data(&self) -> Result<()> {
-        // Linux: /root/linux/fs/buffer.c:602 (generic_buffers_fsync_noflush)
         Inode::sync_data(self)?;
 
         if self.is_dirty() {
@@ -240,9 +235,7 @@ impl VfsInode for Inode {
     }
 
     fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {
-        // Linux ext2 has no `.fallocate` file operation
-        // (/root/linux/fs/ext2/file.c:313-328), so delegate to the
-        // Asterinas compatibility implementation.
+        // Route VFS fallocate requests through the ext2 compatibility path.
         Inode::fallocate(self, mode, offset, len)
     }
 

@@ -18,21 +18,18 @@ pub(super) struct DirEntry {
 impl DirEntry {
     /// Converts on-disk rec_len to host-endian.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:38 (ext2_rec_len_from_disk)
     pub(super) fn rec_len_from_disk(rec_len: u16) -> u16 {
         u16::from_le(rec_len)
     }
 
     /// Returns the minimal record length for a given name length.
     ///
-    /// Linux: /root/linux/fs/ext2/ext2.h:607 (EXT2_DIR_REC_LEN)
     pub(super) fn dir_rec_len(name_len: usize) -> u16 {
         ((name_len + 8 + 3) & !3) as u16
     }
 
     /// Validates a directory entry layout.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:99 (ext2_check_folio)
     pub(super) fn validate(
         rec_len: u16,
         name_len: u8,
@@ -76,7 +73,6 @@ impl DirEntry {
 
     /// Parses a directory entry at a given offset.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:99 (ext2_check_folio)
     pub(super) fn parse_at(
         buf: &[u8],
         offset: usize,
@@ -179,7 +175,7 @@ mod test {
 
     #[ktest]
     fn parse_valid_entries_ok() {
-        // Linux helper semantics: rec_len decode and EXT2_DIR_REC_LEN rounding.
+        // Validate ext2 record-length decoding and 4-byte alignment rules.
         assert_eq!(DirEntry::rec_len_from_disk(0x1234), 0x1234);
         assert_eq!(DirEntry::dir_rec_len(0), 8);
         assert_eq!(DirEntry::dir_rec_len(1), 12);

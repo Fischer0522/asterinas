@@ -18,7 +18,6 @@ pub(super) type Ext2Bid = u32;
 /// Block path offsets for direct/indirect traversal.
 ///
 /// Produced by `block_to_path` from a logical block number.
-/// Linux analogue: output of `ext2_block_to_path` in `fs/ext2/inode.c`.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct BlockPath {
     /// Number of levels in the pointer chain (1 = direct, 2 = single indirect,
@@ -37,7 +36,6 @@ pub(super) struct BlockPath {
 
 /// A single level in the block-pointer chain.
 ///
-/// Linux analogue: `Indirect` entry in `/root/linux/fs/ext2/inode.c`.
 #[derive(Clone, Debug)]
 struct IndirectEntry {
     /// Physical block number read from this level's slot; 0 means hole.
@@ -78,10 +76,7 @@ impl BlockMapDesc {
         }
     }
 
-    /// Decodes Linux ext2 old/new special-file device encoding from `i_block`.
-    ///
-    /// Linux: /root/linux/fs/ext2/inode.c:1493-1500
-    /// Linux: /root/linux/include/linux/kdev_t.h:34-37,46-51
+    /// Decodes the ext2 special-file device encoding stored in `i_block`.
     pub(super) fn decode_device_id(&self) -> u64 {
         let (major, minor) = if self.block_ptrs[0] != 0 {
             let val = self.block_ptrs[0];
@@ -89,7 +84,7 @@ impl BlockMapDesc {
             (((val >> 8) & 0xFF), (val & 0xFF))
         } else {
             let dev = self.block_ptrs[1];
-            // SPEC: new_decode_dev bit layout in Linux kdev_t.h.
+            // SPEC: decode the extended major/minor bit layout.
             (
                 ((dev & 0xFFF00) >> 8),
                 ((dev & 0xFF) | ((dev >> 12) & 0xFFF00)),
@@ -99,10 +94,7 @@ impl BlockMapDesc {
         encode_device_numbers(major, minor)
     }
 
-    /// Encodes an Asterinas u64 device ID into Linux ext2 `i_block` layout.
-    ///
-    /// Linux: /root/linux/fs/ext2/inode.c:1589-1599
-    /// Linux: /root/linux/include/linux/kdev_t.h:24-32,39-44
+    /// Encodes a device ID into the ext2 special-file `i_block` layout.
     pub(super) fn encode_device_id(&mut self, device_id: u64) {
         let (major, minor) = decode_device_numbers(device_id);
 
@@ -136,14 +128,12 @@ impl InodeBlockMap {
         &self.desc
     }
 
-    /// Linux: /root/linux/fs/ext2/super.c:1308 (ext2_sync_fs)
     pub(super) fn sync_indirect_blocks(&self) -> Result<()> {
         self.indirect_blocks.lock().sync()
     }
 
     /// Translates a logical block number into a path of block pointer offsets.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:163 (ext2_block_to_path)
     pub(super) fn block_to_path(&self, fs: &Ext2, iblock: u32) -> Result<BlockPath> {
         let sb = fs.super_block();
         let ptrs = (sb.block_size() / size_of::<u32>()) as u32;
@@ -207,7 +197,6 @@ impl InodeBlockMap {
 
     /// Traverses the existing block pointer chain for a block path.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:234 (ext2_get_branch)
     fn get_branch(&self, path: &BlockPath, fs: &Ext2) -> Result<BranchResult> {
         if path.depth == 0 || path.depth > path.offsets.len() {
             return_errno_with_message!(Errno::EIO, "invalid block path depth");
@@ -236,8 +225,8 @@ impl InodeBlockMap {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
         }
 
-        // DIFF from Linux ext2_get_branch: no verify_chain/-EAGAIN retry loop.
-        // Asterinas callers hold InodeInner locks, so chain pointers are stable.
+        // Callers hold `InodeInner` locks, so chain pointers are stable and no
+        // retry loop is needed while walking the existing branch.
         for level in 1..path.depth {
             let parent_key = chain[level - 1].key;
             let next_key = self
@@ -330,7 +319,6 @@ impl InodeBlockMap {
         Ok(Some(first_bid..first_bid.saturating_add(count)))
     }
 
-    /// Linux: /root/linux/fs/ext2/inode.c:361 (ext2_blks_to_allocate)
     fn blks_to_allocate(
         &self,
         branch: &BranchResult,
@@ -485,8 +473,6 @@ impl InodeBlockMap {
         Ok(())
     }
 
-    /// Linux: /root/linux/fs/ext2/inode.c:1096 (ext2_free_data)
-    /// Linux: /root/linux/fs/ext2/inode.c:1136 (ext2_free_branches)
     pub(super) fn free_branches(&mut self, fs: &Ext2, block_nr: Ext2Bid, depth: u32) {
         if block_nr == 0 {
             return;
@@ -530,7 +516,8 @@ impl InodeBlockMap {
                 let block = match indirect_blocks.find(block_nr) {
                     Ok(block) => block,
                     Err(_) => {
-                        // Linux ext2_free_branches logs read failure and skips that branch.
+                        // Skip the damaged branch after logging the read failure so
+                        // cleanup can continue for the remaining subtree.
                         error!(
                             "ext2: free_branches: failed to read indirect block {} (depth {})",
                             block_nr, depth
@@ -567,8 +554,6 @@ impl InodeBlockMap {
         self.desc.sector_count = self.desc.sector_count.saturating_sub(sectors_per_block);
     }
 
-    /// Linux: /root/linux/fs/ext2/inode.c:479 (ext2_alloc_branch)
-    /// Linux: /root/linux/fs/ext2/inode.c:561 (ext2_splice_branch)
     fn alloc_and_splice_branch(
         &mut self,
         fs: &Ext2,
@@ -740,7 +725,6 @@ impl InodeBlockMap {
 
     /// Resolves a logical block to a contiguous physical block range.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:624 (ext2_get_blocks, create = 0)
     pub(super) fn get_block_range(
         &self,
         fs: &Ext2,
@@ -762,7 +746,6 @@ impl InodeBlockMap {
 
     /// Resolves a logical block to physical block (read-only).
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:783 (ext2_get_block)
     pub(super) fn get_block(&self, fs: &Ext2, iblock: u32) -> Result<Option<Ext2Bid>> {
         Ok(self
             .get_block_range(fs, iblock, 1)?
@@ -771,7 +754,6 @@ impl InodeBlockMap {
 
     /// Resolves a logical block to a contiguous physical block range, allocating if needed.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:624 (ext2_get_blocks)
     pub(super) fn get_or_alloc_block_range(
         &mut self,
         fs: &Ext2,
@@ -803,7 +785,6 @@ impl InodeBlockMap {
 
     /// Resolves a logical block to physical, optionally allocating missing branch.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:624 (ext2_get_blocks)
     pub(super) fn get_or_alloc_block(
         &mut self,
         fs: &Ext2,
@@ -817,7 +798,6 @@ impl InodeBlockMap {
 
     /// Truncates all blocks beyond `new_size`.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:1172 (__ext2_truncate_blocks)
     pub(super) fn truncate_blocks(&mut self, fs: &Ext2, new_size: usize) -> Result<()> {
         let block_size = fs.block_size();
         if block_size == 0 {
@@ -845,8 +825,7 @@ impl InodeBlockMap {
 
         // === Case 1: Direct blocks only ===
         if path.depth == 1 {
-            // Linux: ext2_free_data(i_data + offsets[0], i_data + EXT2_NDIR_BLOCKS).
-            // Free direct blocks from offsets[0] to block_ptrs[11].
+            // Free direct blocks from `offsets[0]` through `block_ptrs[11]`.
             let start = (path.offsets[0] as usize).min(12);
             for idx in start..12 {
                 let ptr = self.desc.block_ptrs[idx];
@@ -891,8 +870,8 @@ impl InodeBlockMap {
             };
 
             // --- Step 3: all_zeroes optimization ---
-            // SPEC: preserve Linux all_zeroes optimization by walking up to the
-            // highest indirect block that can be fully detached.
+            // SPEC: walk upward to the highest indirect block that can be fully
+            // detached when the preserved left side is all zeros.
             // If the left side (to be kept) of an indirect block is all zeros,
             // we can free the entire indirect block and handle it at a higher level.
             while partial > 0 {
@@ -997,7 +976,6 @@ impl InodeBlockMap {
         }
 
         // === Step 6: Free complete indirect block trees ===
-        // Linux: do_indirects switch/fallthrough by offsets[0].
         // If truncation point is in direct blocks, free all indirect trees.
         // If in single indirect, free double and triple indirect trees, etc.
         if path.offsets[0] < 12 {
@@ -1236,7 +1214,7 @@ mod test {
 
         let block_map = make_block_map([0; 15], 0, &f.ext2);
 
-        // Linux semantics: max valid iblock is accepted, max + 1 is rejected.
+        // Accept the maximum valid logical block and reject the next one.
         block_map.block_to_path(ext2, max_iblock as u32).unwrap();
 
         let too_big_err = block_map.block_to_path(ext2, too_big).unwrap_err();

@@ -30,7 +30,6 @@ use crate::{
 
 /// Maximum bytes storable in ext2 inode i_block area for fast symlink payload.
 ///
-/// Linux: /root/linux/fs/ext2/namei.c:177 (`sizeof(EXT2_I(inode)->i_data)`).
 const MAX_FAST_SYMLINK_LEN: usize = size_of::<u32>() * 15;
 const MAX_LINK_COUNT: u16 = 32000;
 
@@ -179,7 +178,6 @@ impl Inode {
 
     /// Returns the encoded device ID for special files.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:1493-1500 (ext2_iget)
     pub(super) fn device_id(&self) -> u64 {
         // SPEC: non-device inodes report rdev = 0.
         if self.type_ != InodeType::CharDevice && self.type_ != InodeType::BlockDevice {
@@ -195,7 +193,6 @@ impl Inode {
 
     /// Sets the encoded device ID for special files and persists it.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:1589-1599 (__ext2_write_inode)
     pub(super) fn set_device_id(&self, device_id: u64) -> Result<()> {
         if self.type_ != InodeType::CharDevice && self.type_ != InodeType::BlockDevice {
             // SPEC: fail with EINVAL for non-device inodes; no lock/state mutation needed.
@@ -204,8 +201,8 @@ impl Inode {
         // Lock order: inner -> block_map.
         let mut inner = self.inner.write();
         inner.encode_device_id(device_id)?;
-        // DIFF from Linux: Linux caches dev_t in i_rdev and encodes during write_inode;
-        // Asterinas stores the Linux-compatible on-disk encoding directly in block_ptrs.
+        // Store the ext2 on-disk device encoding directly in `block_ptrs`
+        // instead of caching a decoded value separately.
         inner.set_ctime(now());
         Ok(())
     }
@@ -225,7 +222,6 @@ impl Inode {
 
         let old_size = {
             let inner = self.inner.read();
-            // Linux: /root/linux/fs/ext2/inode.c:48-55 (ext2_inode_is_fast_symlink).
             // Keep resize invalid for existing fast symlinks (inline payload), but
             // allow empty newly-created symlink inodes to grow into slow symlinks.
             if inner.desc.is_fast_symlink(block_size) && inner.file_size() != 0 {
@@ -362,7 +358,6 @@ impl Inode {
 
     /// Reads one extended-attribute value and writes it to `value_writer`.
     ///
-    /// Linux: /root/linux/fs/ext2/xattr.c:195-275 (ext2_xattr_get)
     pub(super) fn get_xattr(&self, name: XattrName, value_writer: &mut VmWriter) -> Result<usize> {
         let mut xattr = self
             .xattr
@@ -377,7 +372,6 @@ impl Inode {
 
     /// Lists extended-attribute names in one namespace and writes them to `list_writer`.
     ///
-    /// Linux: /root/linux/fs/ext2/xattr.c:287-364 (ext2_xattr_list)
     pub(super) fn list_xattr(
         &self,
         namespace: XattrNamespace,
@@ -396,7 +390,6 @@ impl Inode {
 
     /// Creates or replaces one extended attribute.
     ///
-    /// Linux: /root/linux/fs/ext2/xattr.c:405-651 (ext2_xattr_set)
     pub(super) fn set_xattr(
         &self,
         name: XattrName,
@@ -423,7 +416,6 @@ impl Inode {
 
     /// Removes one extended attribute.
     ///
-    /// Linux: /root/linux/fs/ext2/xattr.c:405-651 (ext2_xattr_set with value == NULL)
     pub(super) fn remove_xattr(&self, name: XattrName) -> Result<()> {
         let mut xattr = self
             .xattr
@@ -444,8 +436,6 @@ impl Inode {
 
     /// Reads symbolic-link target bytes and decodes them as UTF-8.
     ///
-    /// Linux fast path: /root/linux/fs/ext2/inode.c:1483-1487
-    /// Linux slow path: /root/linux/fs/namei.c:6227-6234 (page_get_link)
     pub(super) fn read_link(&self) -> Result<String> {
         if self.type_ != InodeType::SymLink {
             return_errno!(Errno::EINVAL);
@@ -463,8 +453,6 @@ impl Inode {
 
     /// Writes symbolic-link target bytes into either fast-inline or slow-pagecache storage.
     ///
-    /// Linux length gate and fast/slow split: /root/linux/fs/ext2/namei.c:165-191
-    /// Linux slow write primitive: /root/linux/fs/namei.c:6273-6302 (page_symlink)
     pub(super) fn write_link(&self, target: &str) -> Result<()> {
         if self.type_ != InodeType::SymLink {
             return_errno!(Errno::EINVAL);
@@ -481,7 +469,6 @@ impl Inode {
             Error::with_message(Errno::ENAMETOOLONG, "symlink target length overflow")
         })?;
 
-        // Linux: /root/linux/fs/ext2/namei.c:165-166 (`strlen(symname)+1 > sb->s_blocksize`).
         if with_nul > block_size {
             return_errno!(Errno::ENAMETOOLONG);
         }
@@ -549,7 +536,6 @@ impl Inode {
 
     /// Direct-I/O read path.
     ///
-    /// Linux: /root/linux/fs/ext2/file.c:168 (ext2_dio_read_iter)
     pub(super) fn read_direct_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
         if self.type_ == InodeType::Dir {
             return_errno!(Errno::EISDIR);
@@ -585,9 +571,6 @@ impl Inode {
 
     /// Direct-I/O write path with pre-allocation and rollback.
     ///
-    /// Linux: /root/linux/fs/ext2/file.c:214 (ext2_dio_write_iter)
-    /// Linux: /root/linux/fs/ext2/file.c:183 (ext2_dio_write_end_io)
-    /// Linux: /root/linux/fs/ext2/inode.c:59 (ext2_write_failed)
     pub(super) fn write_direct_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
         if self.type_ == InodeType::Dir {
             return_errno!(Errno::EISDIR);
@@ -616,8 +599,8 @@ impl Inode {
         // The block range between old_size % block_size + 1 and offset is still as hole, no need to zero.
         inner.zero_direct_write_eof_tail(&fs, old_size, offset, block_size)?;
 
-        // Differ from Linux, Linux fallback to buffered io when encountered hole.
-        // We pre allocate blocks for direct write, so there should be no hole.
+        // Preallocate direct-write blocks up front so the data path does not
+        // need to fall back when it encounters a hole.
         if let Err(err) = inner.prepare_write_blocks(&fs, offset, end, block_size, true) {
             inner.write_failed_cleanup(&fs, old_size, end, block_size);
             return Err(err);
@@ -660,7 +643,6 @@ impl Inode {
 
     /// Initializes a directory with `.` and `..`.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:617 (ext2_make_empty)
     fn make_empty(&self, parent_ino: u32) -> Result<()> {
         if self.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
@@ -723,7 +705,6 @@ impl Inode {
             parent_inner.sub_links_count_saturating(1);
             // Keep the emptiness check and unlink in one stable parent+child lock
             // domain so a concurrent mkdir cannot revive the child after validation.
-            // Linux: /root/linux/fs/ext2/namei.c:302 (ext2_rmdir)
             parent_inner.update_dir_timestamps_and_flags()?;
 
             return Ok(());
@@ -737,7 +718,6 @@ impl Inode {
 
     /// Creates a subdirectory under this directory.
     ///
-    /// Linux: /root/linux/fs/ext2/namei.c:228 (ext2_mkdir)
     pub(super) fn mkdir(&self, name: &str, perm: FilePerm) -> Result<Arc<Inode>> {
         if self.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
@@ -789,12 +769,6 @@ impl Inode {
     }
 
     /// Implements fallocate operations for ext2.
-    ///
-    /// Linux ext2 has no native fallocate; this provides compatibility
-    /// matching the old Asterinas ext2 implementation.
-    ///
-    /// Linux: /root/linux/fs/ext2/file.c:313-328 (`ext2_file_operations`, no `.fallocate`).
-    /// Compat reference: /root/asterinas/kernel/src/fs/ext2_old/inode.rs:804-836.
     pub(super) fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {
         match mode {
             FallocMode::PunchHoleKeepSize => {
@@ -859,8 +833,6 @@ impl Inode {
 
     pub(super) fn sync_all(&self, sync_inode_table: bool) -> Result<()> {
         // SPEC: fsync step 1 flushes dirty data pages before metadata writeback.
-        // Linux: /root/linux/fs/buffer.c:646 (generic_buffers_fsync)
-        // -> /root/linux/mm/filemap.c:777 (file_write_and_wait_range).
         let inner = self.inner.upread();
         let block_map_backend = inner.backend();
 
@@ -872,7 +844,6 @@ impl Inode {
 
         // SPEC: fsync step 3 persists inode metadata. The caller is
         // responsible for the final device-cache flush.
-        // Linux: /root/linux/fs/buffer.c:619 (sync_inode_metadata).
 
         let fs = self.fs()?;
         let mut inner = inner.upgrade();
@@ -887,7 +858,6 @@ impl Inode {
 
     /// Persists inode metadata without flushing the device write cache.
     ///
-    /// Linux: /root/linux/fs/buffer.c:619 (sync_inode_metadata)
     pub(super) fn sync_metadata(&self, sync_inode_table: bool) -> Result<()> {
         let fs = self.fs()?;
         let mut inner = self.inner.write();
@@ -895,9 +865,7 @@ impl Inode {
         Ok(())
     }
 
-    /// Attempts Linux-style final reclaim for a deleted inode.
-    ///
-    /// Linux: /root/linux/fs/ext2/inode.c:72 (ext2_evict_inode)
+    /// Attempts final reclaim for a deleted inode.
     pub(super) fn try_reclaim_deleted_inode(&self, fs: &Ext2) -> Result<bool> {
         if self.links_count() != 0 {
             return Ok(false);
@@ -946,17 +914,14 @@ impl Inode {
 
         // SPEC: fdatasync writes back dirty data pages first. The caller is
         // responsible for the final device-cache flush.
-        // Linux: /root/linux/fs/buffer.c:609 (file_write_and_wait_range).
         inner.sync_data_pages()?;
 
         // fdatasync must also persist dirty indirect metadata needed to reach
         // newly written data blocks before the final device flush.
         backend.block_map.write().sync_indirect_blocks()?;
 
-        // SPEC: Linux writes metadata when I_DIRTY_DATASYNC is set.
-        // Linux: /root/linux/fs/buffer.c:616-619.
-        // Asterinas uses desc.is_dirty() as a conservative approximation
-        // so fdatasync never misses i_size/block-mapping persistence.
+        // Persist metadata conservatively whenever the descriptor is dirty so
+        // `fdatasync` does not miss file-size or block-mapping updates.
         let mut inner = inner.upgrade();
         if inner.is_dirty() {
             inner.persist(self.ino, &fs)?;
@@ -980,8 +945,6 @@ impl Inode {
 
     /// Creates a child inode and directory entry under this directory.
     ///
-    /// Linux: /root/linux/fs/ext2/namei.c:102 (ext2_create)
-    /// Linux: /root/linux/fs/ext2/namei.c:228 (ext2_mkdir)
     pub(super) fn create(
         &self,
         name: &str,
@@ -997,7 +960,6 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        // Linux: /root/linux/fs/ext2/namei.c:136-155 (ext2_mknod)
         // Accept ext2 special inode kinds needed by mknod in addition to regular kinds.
         if type_ != InodeType::File
             && type_ != InodeType::Dir
@@ -1012,7 +974,6 @@ impl Inode {
         if type_ == InodeType::Dir {
             return self.mkdir(name, perm);
         } else {
-            // Linux: ext2_create → ext2_new_inode + ext2_add_nondir
             let fs = self.fs()?;
             let child = fs.create_inode(self.ino, type_, perm)?;
             let child_ino = child.ino();
@@ -1033,7 +994,6 @@ impl Inode {
 
     /// Adds a hard link in this directory to an existing non-directory inode.
     ///
-    /// Linux: /root/linux/fs/ext2/namei.c:204 (ext2_link)
     pub(super) fn link(&self, old: &Inode, name: &str) -> Result<()> {
         // SPEC: self must be a directory.
         if self.type_ != InodeType::Dir {
@@ -1059,7 +1019,6 @@ impl Inode {
         let dir_ft = Self::inode_type_to_dir_file_type(old.type_);
         let (mut dir_inner, mut old_inner) = write_lock_two_inodes(self, old);
 
-        // Linux: inode_set_ctime_current + inode_inc_link_count before add_link.
         if old_inner.links_count() >= MAX_LINK_COUNT {
             return_errno!(Errno::EOVERFLOW);
         }
@@ -1086,7 +1045,6 @@ impl Inode {
 
     /// Removes a non-directory entry from this directory.
     ///
-    /// Linux: /root/linux/fs/ext2/namei.c:273 (ext2_unlink)
     pub(super) fn unlink(&self, name: &str) -> Result<()> {
         // SPEC: self must be a directory.
         if self.type_ != InodeType::Dir {
@@ -1122,8 +1080,7 @@ impl Inode {
             let parent_inner = guards.inner_mut(self.ino())?;
             parent_inner.delete_entry(name)?;
 
-            // Linux: inode_set_ctime_to_ts(inode, inode_get_ctime(dir))
-            // then inode_dec_link_count.
+            // Update timestamps before dropping the target link count.
             let child_inner = guards.inner_mut(child.ino())?;
             child_inner.set_ctime(now());
             child_inner.sub_links_count_saturating(1);
@@ -1142,7 +1099,6 @@ impl Inode {
 
     /// Renames or moves an entry from this directory to `target` directory.
     ///
-    /// Linux: /root/linux/fs/ext2/namei.c:318 (ext2_rename)
     pub(super) fn rename(&self, old_name: &str, target: &Inode, new_name: &str) -> Result<()> {
         // SPEC: both self and target must be directories.
         if self.type_ != InodeType::Dir {
@@ -1358,7 +1314,6 @@ impl Inode {
             dir_inner.update_dir_timestamps_and_flags()?;
         } else {
             // Cross-directory: publish destination first, then remove source entry.
-            // This mirrors Linux ext2 rename sequencing.
             {
                 let target_inner = guards.inner_mut(ctx.target_dir.ino)?;
                 Self::apply_rename_target_locked(
@@ -1438,7 +1393,6 @@ impl Inode {
 
     /// Rewrites an existing directory entry to point to a new inode.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:450 (ext2_set_link)
     ///
     pub(super) fn set_link(
         &self,
@@ -1825,7 +1779,6 @@ impl InodeInner {
 
     /// Initializes an empty directory with `.` and `..` entries.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:617 (ext2_make_empty)
     fn make_empty(&mut self, ino: u32, parent_ino: u32, fs: &Ext2) -> Result<()> {
         let block_size = fs.block_size();
         let old_size = self.file_size();
@@ -1905,7 +1858,6 @@ impl InodeInner {
 
     /// Reads file data directly from data blocks into `writer`.
     ///
-    /// Linux: /root/linux/fs/ext2/file.c:168 (ext2_dio_read_iter)
     fn read_direct_at(
         &self,
         fs: &Ext2,
@@ -1942,7 +1894,6 @@ impl InodeInner {
 
     /// Writes file data directly to already-allocated data blocks.
     ///
-    /// Linux: /root/linux/fs/ext2/file.c:214 (ext2_dio_write_iter)
     fn write_direct_at(&self, fs: &Ext2, offset: usize, reader: &mut VmReader) -> Result<()> {
         let block_size = fs.block_size();
         let write_len = reader.remain();
@@ -1976,7 +1927,6 @@ impl InodeInner {
 
     /// Checks whether this directory contains only `.` and `..` as live entries.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:659 (ext2_empty_dir)
     fn empty_dir(&self, fs: &Ext2, self_ino: u32) -> bool {
         if self.inode_type() != InodeType::Dir {
             return false;
@@ -2040,7 +1990,6 @@ impl InodeInner {
 
     /// Finds a directory entry by name and returns its inode number.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:342 (ext2_find_entry)
     fn find_entry(&self, fs: &Ext2, name: &str) -> Result<u32> {
         if self.inode_type() != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
@@ -2050,8 +1999,7 @@ impl InodeInner {
         let block_size = fs.block_size();
         let size = self.file_size();
         let max_inumber = sb.total_inodes();
-        // SPEC: bound directory scan by i_size-derived pages (Linux dir_pages).
-        // Linux: /root/linux/fs/ext2/dir.c:349 (npages = dir_pages(dir)).
+        // SPEC: bound the directory scan by the number of blocks covered by `i_size`.
         let max_blocks = size.div_ceil(block_size);
 
         for block_idx in 0..max_blocks {
@@ -2125,7 +2073,6 @@ impl InodeInner {
 
     /// Reads directory entries starting at byte offset and feeds visitor.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:257 (ext2_readdir)
     fn readdir_at(
         &self,
         fs: &Ext2,
@@ -2298,7 +2245,6 @@ impl InodeInner {
 
     /// Zeroes the hidden stale-data window in the old EOF block before direct EOF extension.
     ///
-    /// Linux: /root/linux/fs/direct-io.c:852-875 (`dio_zero_block`)
     fn zero_direct_write_eof_tail(
         &self,
         fs: &Ext2,
@@ -2332,7 +2278,6 @@ impl InodeInner {
 
     /// Allocates missing data blocks that cover the requested file byte range.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:624 (`ext2_get_blocks`)
     fn allocate_range_blocks(
         &mut self,
         fs: &Ext2,
@@ -2397,7 +2342,6 @@ impl InodeInner {
 
     /// Zeroes newly allocated data blocks before exposing them via mapped reads.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:742-757 (`ext2_get_blocks`, DAX zeroout path)
     fn zero_new_blocks(&self, fs: &Ext2, blocks: &[Ext2Bid], block_size: usize) -> Result<()> {
         if blocks.is_empty() {
             return Ok(());
@@ -2462,7 +2406,6 @@ impl InodeInner {
 
     /// Phase 1: scan directory blocks for reusable slot or duplicate.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link scan loop)
     fn scan_dir_for_slot(&self, fs: &Ext2, name: &str) -> Result<DirScanResult> {
         if self.inode_type() != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
@@ -2529,7 +2472,6 @@ impl InodeInner {
 
     /// Phase 2: grow directory by one data block.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link growth path)
     fn grow_dir_block(&mut self, fs: &Ext2) -> Result<DirSlotInfo> {
         let block_size = fs.block_size();
         let old_size = self.file_size();
@@ -2575,7 +2517,6 @@ impl InodeInner {
 
     /// Phase 3: write a new entry into a selected slot via PageCache.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:476 (ext2_add_link commit)
     fn write_dir_entry(
         &self,
         fs: &Ext2,
@@ -2622,7 +2563,6 @@ impl InodeInner {
 
     /// Locate a target entry by name for delete/set_link operations.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:342 (ext2_find_entry)
     fn find_entry_target(&self, fs: &Ext2, name: &str) -> Result<DirEntryTarget> {
         let max_inumber = fs.super_block().total_inodes();
         let block_size = fs.block_size();
@@ -2661,7 +2601,6 @@ impl InodeInner {
 
     /// Delete a located entry by zeroing inode and merging rec_len.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:560 (ext2_delete_entry)
     fn delete_entry_in_page_cache(&self, fs: &Ext2, target: &DirEntryTarget) -> Result<()> {
         let block_size = fs.block_size();
         let block_base = (target.dir_offset / block_size).saturating_mul(block_size);
@@ -2689,7 +2628,6 @@ impl InodeInner {
 
     /// Rewrite a located entry's inode/type via PageCache.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:450 (ext2_set_link)
     fn set_link_in_page_cache(
         &self,
         fs: &Ext2,
@@ -2718,7 +2656,6 @@ impl InodeInner {
 
     /// Add a directory entry.
     ///
-    /// Linux: /root/linux/fs/ext2/namei.c:various (ext2_add_link)
     fn add_entry(&mut self, name: &str, new_ino: u32, file_type: DirEntryFileType) -> Result<()> {
         let fs = self.fs_arc()?;
         let slot = match self.scan_dir_for_slot(&fs, name)? {
@@ -2732,7 +2669,6 @@ impl InodeInner {
 
     /// Delete a directory entry by name.
     ///
-    /// Linux: /root/linux/fs/ext2/dir.c:560 (ext2_delete_entry)
     fn delete_entry(&mut self, name: &str) -> Result<()> {
         let fs = self.fs_arc()?;
         let target = self.find_entry_target(&fs, name).map_err(|err| {
@@ -2779,11 +2715,9 @@ impl InodeInner {
         }
 
         // TODO: Maybe we can simplify the mask logic here.
-        // Linux ext2_delete_entry aligns `from` to the start of the chunk that
-        // contains `entry_offset` via: from &= ~(chunk_size - 1).
-        // For power-of-two chunk sizes, this mask clears low offset bits and keeps
-        // the chunk base. In our block-buffer path, `entry_offset` is block-local,
-        // so this usually becomes 0, but we keep the same alignment logic.
+        // Align `from` to the start of the chunk that contains `entry_offset`.
+        // For power-of-two chunk sizes, this clears the low offset bits and
+        // leaves the chunk base.
         let chunk_mask = !(chunk_size.saturating_sub(1));
         let mut from = entry_offset & chunk_mask;
         // Walk from chunk base to target entry to find its previous dirent.
@@ -2816,7 +2750,7 @@ impl InodeInner {
 
         if let Some(prev) = prev_offset {
             // Merge the removed entry range into the previous entry by extending
-            // previous rec_len from `prev` to `to`, matching Linux behavior.
+            // the previous `rec_len` from `prev` to `to`.
             from = prev;
             let merged_len = to.saturating_sub(from);
             Self::write_rec_len(block_buf, prev, merged_len as u16)?;
@@ -2888,11 +2822,8 @@ impl InodeInner {
     }
 
     fn release_dir_data_blocks_for_cleanup(&mut self, fs: &Ext2) -> Result<()> {
-        // DIFF from Linux:
-        // Linux mkdir-failure/rmdir cleanup reaches block release through
-        // discard_new_inode()/iput() -> ext2_evict_inode() -> ext2_truncate_blocks().
-        // Asterinas currently has no unified inode evict+truncate path, so we
-        // explicitly trigger truncate-based release on rollback/removal paths.
+        // Asterinas does not yet have a unified evict-plus-truncate path, so
+        // rollback and removal paths explicitly trigger truncate-based release.
         // TODO: Move this logic into a shared truncate/evict pipeline, and make
         // free_inode trigger it instead of per-call-site cleanup.
         // SPEC: block_map truncation happens under block_map.write().
@@ -2919,7 +2850,6 @@ impl InodeInner {
 
     fn sync_data_pages(&self) -> Result<()> {
         // SPEC: file_write_and_wait_range on an empty file is a no-op.
-        // Linux: /root/linux/mm/filemap.c:782-783.
         let file_size = self.file_size();
         if file_size == 0 {
             return Ok(());
@@ -3137,7 +3067,6 @@ impl InodeDesc {
 
     /// Determines whether the symlink payload is stored inline in `i_block[15]`.
     ///
-    /// Linux: /root/linux/fs/ext2/inode.c:48-55 (ext2_inode_is_fast_symlink).
     fn is_fast_symlink(&self, block_size: usize) -> bool {
         let ea_blocks = if self.file_acl != 0 {
             (block_size / SECTOR_SIZE) as u32
@@ -3148,10 +3077,7 @@ impl InodeDesc {
         self.type_ == InodeType::SymLink && self.sector_count.checked_sub(ea_blocks) == Some(0)
     }
 
-    /// Decodes Linux ext2 old/new special-file device encoding from `i_block`.
-    ///
-    /// Linux: /root/linux/fs/ext2/inode.c:1495-1500
-    /// Linux: /root/linux/include/linux/kdev_t.h:34-37,46-51
+    /// Decodes the ext2 special-file device encoding stored in `i_block`.
     fn decode_device_id(&self) -> u64 {
         let (major, minor) = if self.block_ptrs[0] != 0 {
             let val = self.block_ptrs[0];
@@ -3159,7 +3085,7 @@ impl InodeDesc {
             (((val >> 8) & 0xFF), (val & 0xFF))
         } else {
             let dev = self.block_ptrs[1];
-            // SPEC: new_decode_dev bit layout in Linux kdev_t.h.
+            // SPEC: decode the extended major/minor bit layout.
             (
                 ((dev & 0xFFF00) >> 8),
                 ((dev & 0xFF) | ((dev >> 12) & 0xFFF00)),
@@ -3169,10 +3095,7 @@ impl InodeDesc {
         encode_device_numbers(major, minor)
     }
 
-    /// Encodes an Asterinas u64 device ID into Linux ext2 `i_block` layout.
-    ///
-    /// Linux: /root/linux/fs/ext2/inode.c:1589-1599
-    /// Linux: /root/linux/include/linux/kdev_t.h:24-32,39-44
+    /// Encodes a device ID into the ext2 special-file `i_block` layout.
     fn encode_device_id(&mut self, device_id: u64) {
         let (major, minor) = decode_device_numbers(device_id);
 
@@ -3280,7 +3203,6 @@ impl From<&InodeDesc> for RawInode {
 
 /// On-disk inode structure (128 bytes for GOOD_OLD_REV).
 ///
-/// Linux: /root/linux/fs/ext2/ext2.h:290 (struct ext2_inode)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
 pub(super) struct RawInode {
@@ -3313,7 +3235,6 @@ const_assert!(size_of::<RawInode>() == 128);
 
 /// On-disk directory entry with file_type (header only; name follows on disk).
 ///
-/// Linux: /root/linux/fs/ext2/ext2.h:615 (struct ext2_dir_entry_2)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
 pub(super) struct RawDirEntry {
@@ -3454,7 +3375,7 @@ mod test {
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
         let root = f.ext2.read_inode(ROOT_INO).unwrap();
 
-        // Linux ext2_create intent: allocate inode then publish dir entry.
+        // Allocate the inode before publishing its directory entry.
         let created = root
             .create(
                 "alpha",
@@ -3465,7 +3386,7 @@ mod test {
         assert_eq!(lookup_ino(&root, "alpha").unwrap(), created.ino());
         assert_eq!(inode_nlinks(&created), 1);
 
-        // Linux ext2_mkdir intent: child links=2 and parent link count +1.
+        // A new directory starts with `.` and `..`, and increments the parent link count.
         let created_dir = root
             .create("sub", InodeType::Dir, FilePerm::from_bits_truncate(0o755))
             .unwrap();
@@ -3523,7 +3444,7 @@ mod test {
         let mut payload_reader = VmReader::from(payload.as_slice()).to_fallible();
         old.write_direct_at(0, &mut payload_reader).unwrap();
 
-        // Linux ext2_link intent: increase nlink before publishing name.
+        // Increase the target link count before publishing the new name.
         root.link(&old, "alias").unwrap();
         assert_eq!(lookup_ino(&root, "alias").unwrap(), old_ino);
         assert_eq!(inode_nlinks(&old) as u16, old_links_before + 1);
@@ -3536,7 +3457,7 @@ mod test {
             Errno::EPERM
         );
 
-        // Linux ext2_unlink intent: remove name then decrement target nlink.
+        // Remove the name before dropping the target link count.
         root.unlink("alias").unwrap();
         assert_eq!(
             lookup_ino(&root, "alias").unwrap_err().error(),
@@ -3608,7 +3529,7 @@ mod test {
         let ctime_before = root.ctime();
         let mtime_before = root.mtime();
 
-        // Linux ext2_set_link with update_times=false keeps ctime/mtime unchanged.
+        // `update_times = false` keeps `ctime` and `mtime` unchanged.
         root.set_link("src", target.ino(), DirEntryFileType::File, false)
             .unwrap();
         assert_eq!(lookup_ino(&root, "src").unwrap(), target.ino());
@@ -3758,7 +3679,7 @@ mod test {
         let old_ino = old.ino();
         let replaced_ino = new.ino();
 
-        // Linux ext2_rename replacement path: dst is overwritten and old name removed.
+        // Replacement rename overwrites the destination and removes the old name.
         root.rename("old", &root, "new").unwrap();
         assert_eq!(lookup_ino(&root, "new").unwrap(), old_ino);
         assert_eq!(lookup_ino(&root, "old").unwrap_err().error(), Errno::ENOENT);
