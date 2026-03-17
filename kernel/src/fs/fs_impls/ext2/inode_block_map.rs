@@ -1194,8 +1194,14 @@ mod test {
 
         assert_eq!(block_map.get_block_range(ext2, 0, 4).unwrap(), Some(11..14));
         assert_eq!(block_map.get_block(ext2, 0).unwrap(), Some(11));
-        assert_eq!(block_map.get_block_range(ext2, 12, 4).unwrap(), Some(70..73));
-        assert_eq!(block_map.get_block_range(ext2, 15, 4).unwrap(), Some(90..91));
+        assert_eq!(
+            block_map.get_block_range(ext2, 12, 4).unwrap(),
+            Some(70..73)
+        );
+        assert_eq!(
+            block_map.get_block_range(ext2, 15, 4).unwrap(),
+            Some(90..91)
+        );
         assert_eq!(block_map.get_block_range(ext2, 3, 4).unwrap(), None);
     }
 
@@ -1247,7 +1253,10 @@ mod test {
         let mut ptrs_for_indirect_hole = [0u32; 15];
         ptrs_for_indirect_hole[12] = 40;
         let indirect_hole_block_map = make_block_map(ptrs_for_indirect_hole, 0, &f.ext2);
-        assert_eq!(indirect_hole_block_map.get_block(ext2, 12 + 7).unwrap(), None);
+        assert_eq!(
+            indirect_hole_block_map.get_block(ext2, 12 + 7).unwrap(),
+            None
+        );
 
         let mut ptrs_for_double_hole = [0u32; 15];
         ptrs_for_double_hole[13] = 41;
@@ -1294,7 +1303,10 @@ mod test {
         assert_eq!(block_map.desc.block_ptrs[0], 0);
 
         let free_before = ext2.super_block().free_blocks_count();
-        let allocated = block_map.get_or_alloc_block(ext2, 0, true).unwrap().unwrap();
+        let allocated = block_map
+            .get_or_alloc_block(ext2, 0, true)
+            .unwrap()
+            .unwrap();
         let free_after = ext2.super_block().free_blocks_count();
 
         assert_eq!(block_map.desc.block_ptrs[0], allocated);
@@ -1544,8 +1556,14 @@ mod test {
         assert_eq!(block_map.desc.block_ptrs[13], 0);
         assert_eq!(block_map.desc.block_ptrs[14], 0);
         assert_eq!(block_map.get_block(ext2, 12).unwrap(), None);
-        assert_eq!(block_map.get_block(ext2, first_double_iblock).unwrap(), None);
-        assert_eq!(block_map.get_block(ext2, first_triple_iblock).unwrap(), None);
+        assert_eq!(
+            block_map.get_block(ext2, first_double_iblock).unwrap(),
+            None
+        );
+        assert_eq!(
+            block_map.get_block(ext2, first_triple_iblock).unwrap(),
+            None
+        );
         assert_eq!(block_map.desc.sector_count, 0);
     }
 

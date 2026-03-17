@@ -771,19 +771,7 @@ impl Inode {
     /// Implements fallocate operations for ext2.
     pub(super) fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {
         match mode {
-            FallocMode::PunchHoleKeepSize => {
-                let inner = self.inner.read();
-                let file_size = inner.file_size();
-                if offset >= file_size {
-                    return Ok(());
-                }
-                let end = offset
-                    .checked_add(len)
-                    .ok_or_else(|| Error::with_message(Errno::EINVAL, "fallocate range overflow"))?
-                    .min(file_size);
-                inner.page_cache().fill_zeros(offset..end)
-            }
-            FallocMode::Allocate | FallocMode::AllocateKeepSize => {
+            FallocMode::Allocate => {
                 if len == 0 {
                     return Ok(());
                 }
@@ -813,11 +801,9 @@ impl Inode {
                     return Err(err);
                 }
 
-                if mode == FallocMode::Allocate && end > old_size {
-                    if let Err(err) = inner.expand(end) {
-                        inner.write_failed_cleanup(&fs, old_size, end, block_size);
-                        return Err(err);
-                    }
+                if let Err(err) = inner.expand(end) {
+                    inner.write_failed_cleanup(&fs, old_size, end, block_size);
+                    return Err(err);
                 }
 
                 Ok(())
