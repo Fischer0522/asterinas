@@ -1491,21 +1491,29 @@ impl PageCacheBackend for InodeBackend {
     }
 
     fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
-        let block_map = self.block_map.read();
+        let block_map = self.block_map.upread();
         let fs = self.fs()?;
         let iblock = u32::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
 
-        let bid = block_map.get_block(&fs, iblock)?.ok_or_else(|| {
-            error!("write_page_async: no block mapping for idx {}", idx);
-            Error::with_message(Errno::EIO, "missing block mapping for writeback")
-        })?;
+        // Fast path: bid is already allocated, only acquire read lock.
+        let mut bid = block_map.get_block(&fs, iblock)?;
+
+        // Slow path: bid is not allocated, acquire write lock and allocate.
+        // In the normal write path, the blocks should be already allocated by foreground write,
+        // but if we perform mmap then truncate and resize to the origin size, 
+        // the blocks are already reclaimed and only holes left.
+        // In this case, we need to allocate new blocks for the mmaped pages when triggering writeback.
+        if bid.is_none() {
+            let mut block_map = block_map.upgrade();
+            bid = block_map.get_or_alloc_block(&fs, iblock, true)?;
+        }
 
         let bio_segment = BioSegment::new_from_segment(
             Segment::from(frame.clone()).into(),
             BioDirection::ToDevice,
         );
-        Ok(fs.write_blocks_async(bid, bio_segment)?)
+        Ok(fs.write_blocks_async(bid.unwrap(), bio_segment)?)
     }
 
     fn npages(&self) -> usize {
@@ -2256,6 +2264,8 @@ impl InodeInner {
         let Some(_bid) = block_map.get_block(fs, eof_iblock)? else {
             return Ok(());
         };
+
+        drop(block_map);
 
         self.page_cache().fill_zeros(old_size..zero_end)?;
         self.sync_data_pages()?;
