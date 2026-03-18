@@ -63,7 +63,24 @@ impl PageCache {
     /// Evict the data within a specified range from the page cache without persisting
     /// them to the backend.
     pub fn discard_range(&self, range: Range<usize>) {
-        self.manager.discard_range(range)
+        if range.is_empty() {
+            return;
+        }
+
+        self.manager.discard_range(range.clone());
+
+        let decommit_end = range.end.min(self.pages.size());
+        if range.start >= decommit_end {
+            return;
+        }
+
+        if let Err(err) = self.pages.decommit(range.start..decommit_end) {
+            error!(
+                "page_cache: failed to decommit discarded resident pages: range={:?}, err={:?}",
+                range.start..decommit_end,
+                err
+            );
+        }
     }
 
     /// Returns the backend.
