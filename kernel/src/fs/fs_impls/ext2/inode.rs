@@ -519,9 +519,18 @@ impl Inode {
 
         let mut inner = self.inner.write();
         let old_size = inner.file_size();
-        if let Err(err) = inner.prepare_write_blocks(&fs, offset, end, block_size, false) {
+
+        inner.zero_old_eof_tail(&fs, old_size, offset, block_size)?;
+
+        let partial_ranges = inner.find_partial_ranges_in_hole(&fs, offset, end, block_size)?;
+
+        if let Err(err) = inner.prepare_write_blocks(&fs, offset, end, block_size) {
             inner.write_failed_cleanup(&fs, old_size, end, block_size);
             return Err(err);
+        }
+        
+        for range in partial_ranges {
+            inner.page_cache().fill_zeros(range)?;
         }
 
         if let Err(err) = inner.page_cache().pages().write(offset, reader) {
@@ -595,15 +604,20 @@ impl Inode {
         let mut inner = self.inner.write();
         let old_size = inner.file_size();
 
-        // If the new write will expand the file, we need to zero the tail of the last block of old size.
-        // The block range between old_size % block_size + 1 and offset is still as hole, no need to zero.
-        inner.zero_direct_write_eof_tail(&fs, old_size, offset, block_size)?;
+        inner.zero_old_eof_tail(&fs, old_size, offset, block_size)?;
 
         // Preallocate direct-write blocks up front so the data path does not
         // need to fall back when it encounters a hole.
-        if let Err(err) = inner.prepare_write_blocks(&fs, offset, end, block_size, true) {
+        if let Err(err) = inner.prepare_write_blocks(&fs, offset, end, block_size) {
             inner.write_failed_cleanup(&fs, old_size, end, block_size);
             return Err(err);
+        }
+
+        // Discard overlapping cached pages before direct write.
+        let discard_start = offset.min(old_size);
+        let discard_end = end.min(old_size);
+        if discard_start < discard_end {
+            inner.page_cache().discard_range(discard_start..discard_end);
         }
 
         if let Err(err) = inner.write_direct_at(&fs, offset, reader) {
@@ -801,9 +815,11 @@ impl Inode {
                     return Err(err);
                 }
 
-                if let Err(err) = inner.expand(end) {
-                    inner.write_failed_cleanup(&fs, old_size, end, block_size);
-                    return Err(err);
+                if end > old_size {
+                    if let Err(err) = inner.expand(end) {
+                        inner.write_failed_cleanup(&fs, old_size, end, block_size);
+                        return Err(err);
+                    }
                 }
 
                 Ok(())
@@ -1501,7 +1517,7 @@ impl PageCacheBackend for InodeBackend {
 
         // Slow path: bid is not allocated, acquire write lock and allocate.
         // In the normal write path, the blocks should be already allocated by foreground write,
-        // but if we perform mmap then truncate and resize to the origin size, 
+        // but if we perform mmap then truncate and resize to the origin size,
         // the blocks are already reclaimed and only holes left.
         // In this case, we need to allocate new blocks for the mmaped pages when triggering writeback.
         if bid.is_none() {
@@ -2054,12 +2070,24 @@ impl InodeInner {
         let snapshot = *block_map.get_desc();
         self.sync_desc_block_map_from_snapshot(snapshot);
         self.set_file_size(new_size);
+        drop(block_map);
+
+        self.zero_new_eof_tail(&fs, new_size, block_size)?;
         self.touch_mtime_ctime(now());
         Ok(())
     }
 
     fn expand(&mut self, new_size: usize) -> Result<()> {
+        let fs = self.fs_arc()?;
+        let block_size = fs.block_size();
+        let old_size = self.file_size();
+
+        if (new_size <= old_size) {
+            return Ok(());
+        }
+
         self.resize_page_cache_and_update_npages(new_size)?;
+        self.zero_old_eof_tail(&fs, old_size, new_size, block_size)?;
         self.set_file_size(new_size);
         self.touch_mtime_ctime(now());
         Ok(())
@@ -2165,7 +2193,7 @@ impl InodeInner {
             let fs = self.fs_arc()?;
             let block_size = fs.block_size();
             // slow path, write to page cache
-            self.prepare_write_blocks(&fs, 0, target_len, block_size, false)?;
+            self.prepare_write_blocks(&fs, 0, target_len, block_size)?;
             self.page_cache()
                 .pages()
                 .write_bytes(0, target.as_bytes())?;
@@ -2206,19 +2234,54 @@ impl InodeInner {
             .map_err(|_| Error::with_message(Errno::EIO, "symlink target is not valid UTF-8"))
     }
 
+    // Returns the range of partial blocks that are holes.
+    fn find_partial_ranges_in_hole(
+        &self,
+        fs: &Ext2,
+        offset: usize,
+        end: usize,
+        block_size: usize,
+    ) -> Result<Vec<Range<usize>>> {
+        let start_block = offset / block_size;
+        let end_block = end / block_size;
+        let block_map = self.backend.block_map.read();
+        let mut partial_ranges = Vec::new();
+
+        if !offset.is_multiple_of(block_size)
+            && block_map.get_block(fs, start_block as u32)?.is_none()
+        {
+            let start_offset = start_block * block_size;
+            partial_ranges.push(start_offset..offset);
+        }
+
+        // FIXME: if the write end exceeds the file size, we should also zero the tail block.
+        // Because mmap can read this range. But currently, we can not serialize the concurrent modification to a singe page.
+        // If we zero the tail block, it will break the concurrent write.
+        if end < self.file_size()
+            && end_block != start_block
+            && !end.is_multiple_of(block_size)
+            && block_map.get_block(fs, end_block as u32)?.is_none()
+        {
+            let end_offset = end.align_up(block_size);
+            partial_ranges.push(end..end_offset);
+        }
+
+        Ok(partial_ranges)
+    }
+
     fn prepare_write_blocks(
         &mut self,
         fs: &Ext2,
         offset: usize,
         end: usize,
         block_size: usize,
-        discard_page_cache: bool,
     ) -> Result<()> {
         if block_size == 0 {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
         }
 
         let old_size = self.file_size();
+
         self.allocate_range_blocks(fs, offset, end, block_size)?;
 
         if end > old_size {
@@ -2226,50 +2289,74 @@ impl InodeInner {
             self.set_file_size(end);
         }
 
-        if discard_page_cache {
-            let discard_start = offset.min(old_size);
-            let discard_end = end.min(old_size);
-            if discard_start < discard_end {
-                self.page_cache().discard_range(discard_start..discard_end);
+        Ok(())
+    }
+
+    /// Zeroes bytes in the specified range, but only for blocks that already have mappings.
+    /// Does not flush - caller is responsible for sync if needed.
+    fn zero_mapped_range(&self, fs: &Ext2, range: Range<usize>, block_size: usize) -> Result<()> {
+        if block_size == 0 {
+            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
+        }
+        if range.is_empty() {
+            return Ok(());
+        }
+
+        let block_map = self.backend.block_map.read();
+        let start_block = range.start / block_size;
+        let end_block = range.end.div_ceil(block_size);
+        let mut mapped_ranges = Vec::new();
+
+        for block_idx in start_block..end_block {
+            let iblock = block_idx as u32;
+            if block_map.get_block(fs, iblock)?.is_some() {
+                let block_start = block_idx * block_size;
+                let zero_start = range.start.max(block_start);
+                let zero_end = range.end.min(block_start + block_size);
+                mapped_ranges.push(zero_start..zero_end);
             }
+        }
+
+        drop(block_map);
+
+        for mapped_range in mapped_ranges {
+            self.page_cache().fill_zeros(mapped_range)?;
         }
 
         Ok(())
     }
 
-    /// Zeroes the hidden stale-data window in the old EOF block before direct EOF extension.
+    /// Zeroes newly visible bytes in the old EOF partial block before growth.
     ///
-    fn zero_direct_write_eof_tail(
+    /// Linux: `/root/linux/mm/truncate.c` (`pagecache_isize_extended`)
+    fn zero_old_eof_tail(
         &self,
         fs: &Ext2,
         old_size: usize,
-        offset: usize,
+        new_visible_size: usize,
         block_size: usize,
     ) -> Result<()> {
-        if block_size == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
-        }
-        if offset <= old_size || old_size.is_multiple_of(block_size) {
+        if new_visible_size <= old_size || old_size.is_multiple_of(block_size) {
             return Ok(());
         }
 
-        let zero_end = offset.min(old_size.align_up(block_size));
+        let zero_end = new_visible_size.min(old_size.align_up(block_size));
         if zero_end <= old_size {
             return Ok(());
         }
 
-        let eof_iblock = u32::try_from(old_size / block_size)
-            .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
-        let block_map = self.backend.block_map.read();
-        let Some(_bid) = block_map.get_block(fs, eof_iblock)? else {
+        self.zero_mapped_range(fs, old_size..zero_end, block_size)
+    }
+
+    /// Zeroes bytes past the new EOF in the surviving partial block after shrink.
+    ///
+    /// Linux: `/root/linux/fs/ext2/inode.c` (`ext2_setsize`)
+    fn zero_new_eof_tail(&self, fs: &Ext2, new_size: usize, block_size: usize) -> Result<()> {
+        if new_size == 0 || new_size.is_multiple_of(block_size) {
             return Ok(());
-        };
+        }
 
-        drop(block_map);
-
-        self.page_cache().fill_zeros(old_size..zero_end)?;
-        self.sync_data_pages()?;
-        Ok(())
+        self.zero_mapped_range(fs, new_size..new_size.align_up(block_size), block_size)
     }
 
     /// Allocates missing data blocks that cover the requested file byte range.
