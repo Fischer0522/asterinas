@@ -321,6 +321,53 @@ impl SuperBlock {
         self.block_size
     }
 
+    /// Returns the maximum regular file size supported by this ext2 instance.
+    pub(super) fn max_file_size(&self) -> usize {
+        const DIRECT_BLOCKS: u64 = 12;
+
+        let block_size_bits = self.block_size.trailing_zeros();
+        let ptrs_per_block = 1u64 << (block_size_bits - 2);
+        let mut max_blocks = DIRECT_BLOCKS;
+        let mut metadata_blocks = 1u64;
+        let mut upper_limit = (1u64 << 32) - 1;
+
+        // `i_blocks` stores the total 512-byte sector count for data and
+        // indirect metadata. Linux keeps ext2 one filesystem block below the
+        // 32-bit sector accounting limit.
+        upper_limit >>= block_size_bits - 9;
+
+        max_blocks += 1u64 << (block_size_bits - 2);
+        max_blocks += 1u64 << (2 * (block_size_bits - 2));
+        max_blocks += 1u64 << (3 * (block_size_bits - 2));
+
+        metadata_blocks += 1 + ptrs_per_block;
+        metadata_blocks += 1 + ptrs_per_block + ptrs_per_block * ptrs_per_block;
+
+        if max_blocks + metadata_blocks > upper_limit {
+            max_blocks = upper_limit;
+
+            upper_limit -= DIRECT_BLOCKS;
+
+            metadata_blocks = 1;
+            upper_limit -= ptrs_per_block;
+
+            if upper_limit < ptrs_per_block * ptrs_per_block {
+                metadata_blocks += 1 + upper_limit.div_ceil(ptrs_per_block);
+                max_blocks -= metadata_blocks;
+            } else {
+                metadata_blocks += 1 + ptrs_per_block;
+                upper_limit -= ptrs_per_block * ptrs_per_block;
+                metadata_blocks += 1
+                    + upper_limit.div_ceil(ptrs_per_block)
+                    + upper_limit.div_ceil(ptrs_per_block * ptrs_per_block);
+                max_blocks -= metadata_blocks;
+            }
+        }
+
+        let max_bytes = (max_blocks << block_size_bits).min(i64::MAX as u64);
+        max_bytes as usize
+    }
+
     /// Returns the size of inode structure.
     pub(super) fn inode_size(&self) -> usize {
         self.inode_size

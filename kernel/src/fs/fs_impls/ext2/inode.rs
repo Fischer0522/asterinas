@@ -528,7 +528,7 @@ impl Inode {
             inner.write_failed_cleanup(&fs, old_size, end, block_size);
             return Err(err);
         }
-        
+
         for range in partial_ranges {
             inner.page_cache().fill_zeros(range)?;
         }
@@ -801,6 +801,9 @@ impl Inode {
                 })?;
                 let mut inner = self.inner.write();
                 let old_size = inner.file_size();
+                if end > old_size {
+                    inner.ensure_size_within_limit(&fs, end)?;
+                }
 
                 let new_blocks = match inner.allocate_range_blocks(&fs, offset, end, block_size) {
                     Ok(new_blocks) => new_blocks,
@@ -1752,6 +1755,23 @@ impl InodeInner {
             .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))
     }
 
+    /// Returns the maximum on-disk size supported for this inode.
+    fn max_size(&self, fs: &Ext2) -> usize {
+        match self.inode_type() {
+            InodeType::File => fs.max_file_size(),
+            _ => u32::MAX as usize,
+        }
+    }
+
+    /// Rejects growth beyond the ext2-representable size limit before mutating state.
+    fn ensure_size_within_limit(&self, fs: &Ext2, new_size: usize) -> Result<()> {
+        if new_size > self.max_size(fs) {
+            return_errno_with_message!(Errno::EFBIG, "inode size exceeds ext2 maximum");
+        }
+
+        Ok(())
+    }
+
     fn encode_device_id(&mut self, device_id: u64) -> Result<()> {
         let block_map_backend = self.backend().clone();
         let mut block_map = block_map_backend.block_map.write();
@@ -2082,10 +2102,11 @@ impl InodeInner {
         let block_size = fs.block_size();
         let old_size = self.file_size();
 
-        if (new_size <= old_size) {
+        if new_size <= old_size {
             return Ok(());
         }
 
+        self.ensure_size_within_limit(&fs, new_size)?;
         self.resize_page_cache_and_update_npages(new_size)?;
         self.zero_old_eof_tail(&fs, old_size, new_size, block_size)?;
         self.set_file_size(new_size);
@@ -2281,6 +2302,9 @@ impl InodeInner {
         }
 
         let old_size = self.file_size();
+        if end > old_size {
+            self.ensure_size_within_limit(fs, end)?;
+        }
 
         self.allocate_range_blocks(fs, offset, end, block_size)?;
 
@@ -4946,6 +4970,58 @@ mod test {
         VfsInodeTrait::resize(file.as_ref(), block_size).unwrap();
         assert_eq!(inode_size(&file), block_size);
         assert_eq!(vmo.size(), block_size.align_up(BLOCK_SIZE));
+    }
+
+    #[ktest]
+    fn file_resize_beyond_ext2_max_returns_efbig() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256).build().unwrap();
+        let file = make_live_file_inode(&f.ext2, 67, 0, 0, FileFlags::empty(), [0; 15]);
+        let too_large = f.ext2.max_file_size() + 1;
+
+        let err = file.resize(too_large).unwrap_err();
+        assert_eq!(err.error(), Errno::EFBIG);
+        assert_eq!(file.file_size(), 0);
+    }
+
+    #[ktest]
+    fn file_high_offset_write_beyond_ext2_max_returns_efbig() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .build()
+            .unwrap();
+        let file = make_live_file_inode(&f.ext2, 68, 0, 0, FileFlags::empty(), [0; 15]);
+        let free_before = f.ext2.super_block().free_blocks_count();
+        let mut payload_reader = VmReader::from([0x61u8].as_slice()).to_fallible();
+
+        let err = file
+            .write_at(f.ext2.max_file_size(), &mut payload_reader)
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EFBIG);
+        assert_eq!(file.file_size(), 0);
+        assert_eq!(f.ext2.super_block().free_blocks_count(), free_before);
+    }
+
+    #[ktest]
+    fn falloc_beyond_ext2_max_returns_efbig() {
+        clocks::init_for_ktest();
+
+        let f = Ext2FixtureBuilder::new(1, 256)
+            .with_free_blocks(64, 64)
+            .build()
+            .unwrap();
+        let file = make_live_file_inode(&f.ext2, 69, 0, 0, FileFlags::empty(), [0; 15]);
+        let free_before = f.ext2.super_block().free_blocks_count();
+
+        let err = file
+            .fallocate(FallocMode::Allocate, f.ext2.max_file_size(), 1)
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EFBIG);
+        assert_eq!(file.file_size(), 0);
+        assert_eq!(f.ext2.super_block().free_blocks_count(), free_before);
     }
 
     #[ktest]

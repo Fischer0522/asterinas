@@ -140,6 +140,13 @@ impl Ext2 {
         self.block_size
     }
 
+    /// Returns the maximum regular file size supported by this ext2 instance.
+    ///
+    /// Linux: `/root/linux/fs/ext2/super.c` (`ext2_max_size`)
+    pub(super) fn max_file_size(&self) -> usize {
+        self.super_block.read().max_file_size()
+    }
+
     /// Returns whether `statfs` should report Minix-style total blocks.
     ///
     pub(super) fn uses_minix_df(&self) -> bool {
