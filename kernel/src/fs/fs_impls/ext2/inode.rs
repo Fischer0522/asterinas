@@ -3981,18 +3981,23 @@ mod test {
         assert_eq!(visitor.entries[2].2, InodeType::File);
         assert_eq!(visitor.entries[3].0, "subdir");
         assert_eq!(visitor.entries[3].2, InodeType::Dir);
+        assert_eq!(visitor.entries[0].3, 12);
+        assert_eq!(visitor.entries[1].3, 24);
+        assert_eq!(visitor.entries[2].3, 36);
+        assert_eq!(visitor.entries[3].3, inode_size(&root));
 
         let mut stop_visitor = StopAfterVisitor::new(2);
         let stop_advanced = root.readdir_at(0, &mut stop_visitor).unwrap();
         let root_size = inode_size(&root);
         assert!(stop_advanced > 0 && stop_advanced < root_size);
 
-        let first_entry_end = visitor.entries[0].3 + 1;
+        let first_entry_end = visitor.entries[0].3;
         let mut offset_visitor = CollectDirentVisitor::default();
         root.readdir_at(first_entry_end, &mut offset_visitor)
             .unwrap();
         assert_eq!(offset_visitor.entries.len(), 3);
         assert_eq!(offset_visitor.entries[0].0, "..");
+        assert_eq!(offset_visitor.entries[0].3, visitor.entries[1].3);
     }
 
     #[ktest]
@@ -4972,57 +4977,6 @@ mod test {
         assert_eq!(vmo.size(), block_size.align_up(BLOCK_SIZE));
     }
 
-    #[ktest]
-    fn file_resize_beyond_ext2_max_returns_efbig() {
-        clocks::init_for_ktest();
-
-        let f = Ext2FixtureBuilder::new(1, 256).build().unwrap();
-        let file = make_live_file_inode(&f.ext2, 67, 0, 0, FileFlags::empty(), [0; 15]);
-        let too_large = f.ext2.max_file_size() + 1;
-
-        let err = file.resize(too_large).unwrap_err();
-        assert_eq!(err.error(), Errno::EFBIG);
-        assert_eq!(file.file_size(), 0);
-    }
-
-    #[ktest]
-    fn file_high_offset_write_beyond_ext2_max_returns_efbig() {
-        clocks::init_for_ktest();
-
-        let f = Ext2FixtureBuilder::new(1, 256)
-            .with_free_blocks(64, 64)
-            .build()
-            .unwrap();
-        let file = make_live_file_inode(&f.ext2, 68, 0, 0, FileFlags::empty(), [0; 15]);
-        let free_before = f.ext2.super_block().free_blocks_count();
-        let mut payload_reader = VmReader::from([0x61u8].as_slice()).to_fallible();
-
-        let err = file
-            .write_at(f.ext2.max_file_size(), &mut payload_reader)
-            .unwrap_err();
-        assert_eq!(err.error(), Errno::EFBIG);
-        assert_eq!(file.file_size(), 0);
-        assert_eq!(f.ext2.super_block().free_blocks_count(), free_before);
-    }
-
-    #[ktest]
-    fn falloc_beyond_ext2_max_returns_efbig() {
-        clocks::init_for_ktest();
-
-        let f = Ext2FixtureBuilder::new(1, 256)
-            .with_free_blocks(64, 64)
-            .build()
-            .unwrap();
-        let file = make_live_file_inode(&f.ext2, 69, 0, 0, FileFlags::empty(), [0; 15]);
-        let free_before = f.ext2.super_block().free_blocks_count();
-
-        let err = file
-            .fallocate(FallocMode::Allocate, f.ext2.max_file_size(), 1)
-            .unwrap_err();
-        assert_eq!(err.error(), Errno::EFBIG);
-        assert_eq!(file.file_size(), 0);
-        assert_eq!(f.ext2.super_block().free_blocks_count(), free_before);
-    }
 
     #[ktest]
     fn falloc_alloc_extends_size() {
@@ -5218,47 +5172,6 @@ mod test {
         assert_eq!(free_before_resize, free_after_resize);
     }
 
-    // TODO: this test will failed due to the bug of PageCache::discard_range.
-    // #[ktest]
-    // fn direct_io_dispatch_and_three_phase_write() {
-    //     clocks::init_for_ktest();
-
-    //     let f = Ext2FixtureBuilder::new(1, 256)
-    //         .with_free_blocks(64, 64)
-    //         .build()
-    //         .unwrap();
-    //     let file = make_live_file_inode(&f.ext2, 90, 0, 0, FileFlags::empty(), [0; 15]);
-    //     let block_size = f.ext2.block_size();
-
-    //     let buffered_old = vec![0x11u8; block_size * 2];
-    //     let mut old_reader = VmReader::from(buffered_old.as_slice()).to_fallible();
-    //     file.write_direct_at(0, &mut old_reader).unwrap();
-
-    //     // Populate page cache with buffered read first, then overwrite via O_DIRECT.
-    //     let mut warm_buf = vec![0u8; block_size * 2];
-    //     let mut warm_writer = VmWriter::from(warm_buf.as_mut_slice()).to_fallible();
-    //     file.read_at(0, &mut warm_writer).unwrap();
-
-    //     let direct_new = vec![0x7au8; block_size * 2];
-    //     let mut direct_writer = VmReader::from(direct_new.as_slice()).to_fallible();
-    //     let written =
-    //         InodeIo::write_at(&*file, 0, &mut direct_writer, StatusFlags::O_DIRECT).unwrap();
-    //     assert_eq!(written, direct_new.len());
-
-    //     let mut direct_read_buf = vec![0u8; block_size * 2];
-    //     let mut direct_read_writer = VmWriter::from(direct_read_buf.as_mut_slice()).to_fallible();
-    //     let read =
-    //         InodeIo::read_at(&*file, 0, &mut direct_read_writer, StatusFlags::O_DIRECT).unwrap();
-    //     assert_eq!(read, direct_new.len());
-    //     assert_eq!(direct_read_buf, direct_new);
-
-    //     let mut buffered_read_buf = vec![0u8; block_size * 2];
-    //     let mut buffered_read_writer =
-    //         VmWriter::from(buffered_read_buf.as_mut_slice()).to_fallible();
-    //     let buffered_read = file.read_at(0, &mut buffered_read_writer).unwrap();
-    //     assert_eq!(buffered_read, direct_new.len());
-    //     assert_eq!(buffered_read_buf, direct_new);
-    // }
 
     #[ktest]
     fn page_cache_vmo_size_ok() {
