@@ -2186,7 +2186,7 @@ impl InodeInner {
                             entry.name.as_str()?,
                             entry.inode as u64,
                             inode_type,
-                            entry_offset,
+                            next_offset,
                         )
                         .is_err()
                     {
