@@ -21,6 +21,7 @@ stdenvNoCC.mkDerivation {
     ${pkgs.gnused}/bin:\
     ${pkgs.gawk}/bin:\
     ${pkgs.coreutils}/bin:\
+    ${pkgs.glibc.bin}/bin:\
     ${pkgs.findutils}/bin:\
     ${pkgs.util-linux}/bin:\
     ${pkgs.util-linux}/sbin:\
