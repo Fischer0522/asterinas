@@ -6,6 +6,7 @@ use device_id::DeviceId;
 use ostd::mm::VmIo;
 
 use crate::{
+    current_userspace,
     device::{Device, DeviceType, add_node},
     events::IoEvents,
     fs::{
@@ -48,10 +49,11 @@ pub(super) fn init_in_first_process(path_resolver: &PathResolver) -> Result<()> 
 }
 
 mod ioctl_defs {
-    use crate::util::ioctl::{OutData, ioc};
+    use crate::util::ioctl::{NoData, OutData, ioc};
 
     // Reference: <https://elixir.bootlin.com/linux/v6.18/source/include/uapi/linux/fs.h>
     pub(super) type BlkGetSize64 = ioc!(BLKGETSIZE64, 0x12, 114, OutData<u64>);
+    pub(super) type BlkGetSectorSize = ioc!(BLKSSZGET, 0x1268, NoData);
 }
 
 /// Represents a block device inode in the filesystem.
@@ -139,6 +141,13 @@ impl FileIo for OpenBlockFile {
         use ioctl_defs::*;
 
         dispatch_ioctl!(match raw_ioctl {
+            _cmd @ BlkGetSectorSize => {
+                // TODO: Query the per-device logical block size from block device
+                // metadata instead of using the hardcoded `SECTOR_SIZE`.
+                let sector_size = SECTOR_SIZE as i32;
+                current_userspace!().write_val(raw_ioctl.arg(), &sector_size)?;
+                Ok(0)
+            }
             cmd @ BlkGetSize64 => {
                 let size = (self.0.metadata().nr_sectors * SECTOR_SIZE) as u64;
                 cmd.write(&size)?;
