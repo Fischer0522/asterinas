@@ -849,7 +849,7 @@ impl Ext2 {
     ) -> Result<BioWaiter> {
         let waiter = self
             .block_device
-            .read_blocks_async(Bid::new(bid as u64), bio_segment)?;
+            .read_blocks_async(Bid::new(bid as u64), bio_segment,None)?;
         Ok(waiter)
     }
 
@@ -872,7 +872,7 @@ impl Ext2 {
     ) -> Result<BioWaiter> {
         let waiter = self
             .block_device
-            .write_blocks_async(Bid::new(bid as u64), bio_segment)?;
+            .write_blocks_async(Bid::new(bid as u64), bio_segment, None)?;
         Ok(waiter)
     }
 

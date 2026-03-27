@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use core::fmt;
+
+use aster_block::bio::BioCompleteFn;
 use ostd::const_assert;
 
 use super::{
@@ -23,22 +25,28 @@ struct InodeTableBackend {
 }
 
 impl PageCacheBackend for InodeTableBackend {
-    fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
+    fn read_page_raw(
+        &self,
+        idx: usize,
+        bio_segment: BioSegment,
+        complete_fn: Option<BioCompleteFn>,
+    ) -> Result<BioWaiter> {
         let bid = Bid::new(self.inode_table_bid as u64) + idx as u64;
-        let bio_segment = BioSegment::new_from_segment(
-            Segment::from(frame.clone()).into(),
-            BioDirection::FromDevice,
-        );
-        Ok(self.block_device.read_blocks_async(bid, bio_segment)?)
+        Ok(self
+            .block_device
+            .read_blocks_async(bid, bio_segment, complete_fn)?)
     }
 
-    fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
+    fn write_page_raw(
+        &self,
+        idx: usize,
+        bio_segment: BioSegment,
+        complete_fn: Option<BioCompleteFn>,
+    ) -> Result<BioWaiter> {
         let bid = Bid::new(self.inode_table_bid as u64) + idx as u64;
-        let bio_segment = BioSegment::new_from_segment(
-            Segment::from(frame.clone()).into(),
-            BioDirection::ToDevice,
-        );
-        Ok(self.block_device.write_blocks_async(bid, bio_segment)?)
+        Ok(self
+            .block_device
+            .write_blocks_async(bid, bio_segment, complete_fn)?)
     }
 
     fn npages(&self) -> usize {
@@ -190,7 +198,7 @@ impl BlockGroup {
             block_device: block_device.clone(),
         });
         let inode_table_cache =
-            PageCache::with_capacity(raw_inodes_size, Arc::downgrade(&backend) as _)?;
+            PageCacheOps::with_capacity(raw_inodes_size, Arc::downgrade(&backend) as _)?;
 
         Ok(Self {
             idx,
@@ -300,7 +308,7 @@ impl BlockGroup {
     pub(super) fn sync_inode_table(&self) -> Result<()> {
         let size = self.inodes_per_group as usize * self.inode_size;
         let range = 0..size;
-        self.inode_table_cache.evict_range(range)
+        self.inode_table_cache.flush_range(range)
     }
 
     pub(super) fn block_bitmap(&self) -> RwMutexReadGuard<'_, Dirty<IdBitmap>> {
@@ -744,7 +752,7 @@ impl BlockGroup {
     ///
     pub(super) fn read_inode_desc(&self, index_in_group: u32) -> Result<InodeDesc> {
         let offset_bytes = (index_in_group as usize) * self.inode_size;
-        let raw: RawInode = self.inode_table_cache.pages().read_val(offset_bytes)?;
+        let raw: RawInode = self.inode_table_cache.read_val(offset_bytes)?;
         InodeDesc::try_from(&raw)
     }
 
@@ -754,9 +762,7 @@ impl BlockGroup {
     ///
     pub(super) fn write_inode_desc(&self, index_in_group: u32, raw: &RawInode) -> Result<()> {
         let offset_bytes = (index_in_group as usize) * self.inode_size;
-        self.inode_table_cache
-            .pages()
-            .write_val(offset_bytes, raw)?;
+        self.inode_table_cache.write_val(offset_bytes, raw)?;
         Ok(())
     }
 

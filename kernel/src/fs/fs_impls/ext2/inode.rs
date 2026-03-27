@@ -5,6 +5,7 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use aster_block::bio::BioCompleteFn;
 use device_id::{DeviceId, decode_device_numbers, encode_device_numbers};
 use ostd::{const_assert, mm::io::util::HasVmReaderWriter};
 
@@ -492,7 +493,7 @@ impl Inode {
         }
         let read_len = writer.avail().min(file_size - offset);
         writer.limit(read_len);
-        inner.page_cache().pages().read(offset, writer)?;
+        inner.page_cache().read(offset, writer)?;
         inner.upgrade().set_atime(now());
         Ok(read_len)
     }
@@ -533,7 +534,7 @@ impl Inode {
             inner.page_cache().fill_zeros(range)?;
         }
 
-        if let Err(err) = inner.page_cache().pages().write(offset, reader) {
+        if let Err(err) = inner.page_cache().write(offset, reader) {
             inner.write_failed_cleanup(&fs, old_size, end, block_size);
             return Err(err.into());
         }
@@ -572,7 +573,7 @@ impl Inode {
             .checked_add(read_len)
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "read range overflow"))?;
 
-        inner.page_cache().evict_range(offset..end)?;
+        inner.page_cache().flush_range(offset..end)?;
         inner.read_direct_at(&fs, offset, end, writer)?;
         inner.upgrade().set_atime(now());
         Ok(read_len)
@@ -617,7 +618,11 @@ impl Inode {
         let discard_start = offset.min(old_size);
         let discard_end = end.min(old_size);
         if discard_start < discard_end {
-            inner.page_cache().discard_range(discard_start..discard_end);
+            inner
+                .page_cache()
+                .flush_range(discard_start..discard_end)?;
+            
+            inner.page_cache().evict_range(discard_start..discard_end)?;
         }
 
         if let Err(err) = inner.write_direct_at(&fs, offset, reader) {
@@ -893,9 +898,8 @@ impl Inode {
 
         let fs = self.fs()?;
         let mut inner = self.inner.write();
-        // TODO: fix the page cache
-        inner.page_cache.discard_range(0..inner.file_size());
-        inner.resize_page_cache_and_update_npages(0)?;
+        let old_size = inner.file_size();
+        inner.resize_page_cache_and_update_npages(0, old_size)?;
         let block_map_backend = inner.backend().clone();
         inner.set_dtime(now());
         inner.set_file_size(0);
@@ -1437,7 +1441,7 @@ impl Inode {
     }
 
     pub(super) fn page_cache_vmo(&self) -> Arc<Vmo> {
-        self.inner.read().page_cache().pages().clone()
+        self.inner.read().page_cache().clone()
     }
 }
 
@@ -1487,7 +1491,11 @@ impl InodeBackend {
 }
 
 impl PageCacheBackend for InodeBackend {
-    fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
+    fn read_page_async(
+        &self,
+        idx: usize,
+        frame: crate::fs::vfs::page_cache::LockedCachePage,
+    ) -> Result<BioWaiter> {
         let block_map = self.block_map.read();
         let fs = self.fs()?;
         let iblock = u32::try_from(idx)
@@ -1496,20 +1504,54 @@ impl PageCacheBackend for InodeBackend {
         match block_map.get_block(&fs, iblock)? {
             Some(bid) => {
                 let bio_segment = BioSegment::new_from_segment(
-                    Segment::from(frame.clone()).into(),
+                    Segment::from(frame.deref().clone()).into(),
                     BioDirection::FromDevice,
                 );
-                Ok(fs.read_blocks_async(bid, bio_segment)?)
+                let complete_fn: Box<dyn FnOnce(bool) + Send + Sync> = Box::new(move |success| {
+                    if success {
+                        frame.set_up_to_date();
+                    }
+                });
+                Ok(fs.block_device().read_blocks_async(
+                    Bid::new(bid as u64),
+                    bio_segment,
+                    Some(complete_fn),
+                )?)
             }
             None => {
-                // Sparse hole: return a zero-filled page without issuing BIO.
+                // Sparse hole: synthesize a zero-filled page without issuing BIO.
                 frame.writer().fill_zeros(BLOCK_SIZE);
+                frame.set_up_to_date();
                 Ok(BioWaiter::new())
             }
         }
     }
 
-    fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
+    fn read_page_raw(
+        &self,
+        idx: usize,
+        bio_segment: BioSegment,
+        complete_fn: Option<BioCompleteFn>,
+    ) -> Result<BioWaiter> {
+        let block_map = self.block_map.read();
+        let fs = self.fs()?;
+        let iblock = u32::try_from(idx)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
+
+        let bid = block_map
+            .get_block(&fs, iblock)?
+            .ok_or_else(|| Error::with_message(Errno::EIO, "sparse hole should not issue raw read"))?;
+        Ok(fs
+            .block_device()
+            .read_blocks_async(Bid::new(bid as u64), bio_segment, complete_fn)?)
+    }
+
+    fn write_page_raw(
+        &self,
+        idx: usize,
+        bio_segment: BioSegment,
+        complete_fn: Option<BioCompleteFn>,
+    ) -> Result<BioWaiter> {
         let block_map = self.block_map.upread();
         let fs = self.fs()?;
         let iblock = u32::try_from(idx)
@@ -1528,11 +1570,11 @@ impl PageCacheBackend for InodeBackend {
             bid = block_map.get_or_alloc_block(&fs, iblock, true)?;
         }
 
-        let bio_segment = BioSegment::new_from_segment(
-            Segment::from(frame.clone()).into(),
-            BioDirection::ToDevice,
-        );
-        Ok(fs.write_blocks_async(bid.unwrap(), bio_segment)?)
+        Ok(fs.block_device().write_blocks_async(
+            Bid::new(bid.unwrap() as u64),
+            bio_segment,
+            complete_fn,
+        )?)
     }
 
     fn npages(&self) -> usize {
@@ -1595,12 +1637,8 @@ impl InodeInner {
         let page_cache_backend: Weak<dyn PageCacheBackend> = Arc::downgrade(&backend) as _;
         // Keep page-cache capacity aligned with inode size so `npages`/VMO window
         // and on-disk data extent stay consistent from mount time.
-        let page_cache = if num_page_bytes == 0 {
-            PageCache::new(page_cache_backend)
-        } else {
-            PageCache::with_capacity(num_page_bytes, page_cache_backend)
-        }
-        .expect("ext2 inode page cache allocation failed");
+        let page_cache = PageCacheOps::with_capacity(num_page_bytes, page_cache_backend)
+            .expect("ext2 inode page cache allocation failed");
 
         Self {
             desc,
@@ -1623,10 +1661,14 @@ impl InodeInner {
         self.desc.block_ptrs = block_map_desc.block_ptrs;
     }
 
-    fn resize_page_cache_and_update_npages(&mut self, new_size_bytes: usize) -> Result<()> {
-        self.page_cache.resize(new_size_bytes)?;
+    fn resize_page_cache_and_update_npages(
+        &mut self,
+        new_size_bytes: usize,
+        old_size_bytes: usize,
+    ) -> Result<()> {
+        self.page_cache.resize(new_size_bytes, old_size_bytes)?;
         self.backend.npages.store(
-            self.page_cache.pages().size() / BLOCK_SIZE,
+            self.page_cache.size() / BLOCK_SIZE,
             Ordering::Release,
         );
         Ok(())
@@ -1828,7 +1870,7 @@ impl InodeInner {
         self.sync_desc_block_map_from_snapshot(new_block_map_desc);
         self.set_file_size(block_size);
 
-        if let Err(err) = self.resize_page_cache_and_update_npages(block_size) {
+        if let Err(err) = self.resize_page_cache_and_update_npages(block_size, old_size) {
             self.rollback_make_empty(old_size, old_block_map_desc, new_bid, fs);
             return Err(err);
         }
@@ -1852,9 +1894,10 @@ impl InodeInner {
             DirEntryFileType::Dir as u8,
         )?;
 
-        if let Err(err) = self.page_cache().pages().write_bytes(0, &buf) {
-            self.page_cache().discard_range(0..block_size);
-            if let Err(resize_err) = self.resize_page_cache_and_update_npages(old_size) {
+        if let Err(err) = self.page_cache().write_bytes(0, &buf) {
+            // TODO: maybe handle this rollback of page cache?
+            if let Err(resize_err) = self.resize_page_cache_and_update_npages(old_size, block_size)
+            {
                 error!(
                     "ext2: make_empty rollback resize failed: old_size={}, err={:?}",
                     old_size, resize_err
@@ -1874,7 +1917,6 @@ impl InodeInner {
         new_bid: u32,
         fs: &Ext2,
     ) {
-        self.page_cache().discard_range(0..fs.block_size());
         self.set_file_size(old_size);
         let block_map_backend = self.backend();
         let mut block_map = block_map_backend.block_map.write();
@@ -1970,11 +2012,7 @@ impl InodeInner {
         for block_idx in 0..data_blocks {
             let mut buf = vec![0u8; block_size];
             let block_offset = block_idx * block_size;
-            if self
-                .page_cache
-                .pages()
-                .read_bytes(block_offset, &mut buf)
-                .is_err()
+            if self.page_cache.read_bytes(block_offset, &mut buf).is_err()
             {
                 return false;
             }
@@ -2041,11 +2079,7 @@ impl InodeInner {
             }
 
             let mut buf = vec![0u8; block_size];
-            if self
-                .page_cache
-                .pages()
-                .read_bytes(block_offset, &mut buf)
-                .is_err()
+            if self.page_cache.read_bytes(block_offset, &mut buf).is_err()
             {
                 return_errno_with_message!(Errno::EIO, "failed to read dir block via page cache");
             }
@@ -2075,16 +2109,12 @@ impl InodeInner {
         let old_size_aligned = old_size.align_up(block_size);
         let new_size_aligned = new_size.align_up(block_size);
 
-        if new_size_aligned < old_size_aligned {
-            self.page_cache
-                .discard_range(new_size_aligned..old_size_aligned);
-        }
-        self.resize_page_cache_and_update_npages(new_size_aligned)?;
+        self.resize_page_cache_and_update_npages(new_size_aligned, old_size)?;
 
         let backend = self.backend.clone();
         let mut block_map = backend.block_map.write();
         if let Err(err) = block_map.truncate_blocks(&fs, new_size) {
-            self.resize_page_cache_and_update_npages(old_size_aligned)?;
+            self.resize_page_cache_and_update_npages(old_size_aligned, new_size)?;
             return Err(err);
         }
         let snapshot = *block_map.get_desc();
@@ -2107,7 +2137,7 @@ impl InodeInner {
         }
 
         self.ensure_size_within_limit(&fs, new_size)?;
-        self.resize_page_cache_and_update_npages(new_size)?;
+        self.resize_page_cache_and_update_npages(new_size, old_size)?;
         self.zero_old_eof_tail(&fs, old_size, new_size, block_size)?;
         self.set_file_size(new_size);
         self.touch_mtime_ctime(now());
@@ -2153,11 +2183,7 @@ impl InodeInner {
             }
 
             let mut buf = vec![0u8; block_size];
-            if self
-                .page_cache
-                .pages()
-                .read_bytes(block_offset, &mut buf)
-                .is_err()
+            if self.page_cache.read_bytes(block_offset, &mut buf).is_err()
             {
                 return_errno_with_message!(Errno::EIO, "failed to read dir block via page cache");
             }
@@ -2215,9 +2241,7 @@ impl InodeInner {
             let block_size = fs.block_size();
             // slow path, write to page cache
             self.prepare_write_blocks(&fs, 0, target_len, block_size)?;
-            self.page_cache()
-                .pages()
-                .write_bytes(0, target.as_bytes())?;
+            self.page_cache().write_bytes(0, target.as_bytes())?;
         }
 
         self.set_file_size(target_len);
@@ -2245,7 +2269,6 @@ impl InodeInner {
 
         let mut target = vec![0u8; link_size];
         self.page_cache()
-            .pages()
             .read_bytes(0, &mut target)
             .map_err(|_| {
                 Error::with_message(Errno::EIO, "failed to read symlink target from page cache")
@@ -2309,7 +2332,7 @@ impl InodeInner {
         self.allocate_range_blocks(fs, offset, end, block_size)?;
 
         if end > old_size {
-            self.resize_page_cache_and_update_npages(end.align_up(block_size))?;
+            self.resize_page_cache_and_update_npages(end.align_up(block_size), old_size)?;
             self.set_file_size(end);
         }
 
@@ -2481,10 +2504,8 @@ impl InodeInner {
 
         let old_size_aligned = old_size.align_up(block_size);
         let end_aligned = end.align_up(block_size);
-        self.page_cache()
-            .discard_range(old_size_aligned..end_aligned);
 
-        if let Err(err) = self.resize_page_cache_and_update_npages(old_size_aligned) {
+        if let Err(err) = self.resize_page_cache_and_update_npages(old_size_aligned, end) {
             error!(
                 "ext2: write_at cleanup page cache resize failed: old_size_aligned={}, err={:?}",
                 old_size_aligned, err
@@ -2542,7 +2563,7 @@ impl InodeInner {
 
             let mut buf = vec![0u8; block_size];
             // SPEC: directory scan reads through inode page cache.
-            self.page_cache.pages().read_bytes(block_offset, &mut buf)?;
+            self.page_cache.read_bytes(block_offset, &mut buf)?;
 
             let entries = Self::collect_dir_entries_with_offsets(&buf, limit, max_inumber)?;
             for (entry_offset, entry) in entries {
@@ -2601,19 +2622,23 @@ impl InodeInner {
 
         let new_size = old_size.saturating_add(block_size);
         self.set_file_size(new_size);
-        if let Err(err) = self.resize_page_cache_and_update_npages(new_size) {
-            // SPEC: rollback allocated growth on resize failure.
-            self.page_cache.discard_range(old_size..new_size);
-            self.set_file_size(old_size);
-            let block_map_desc = {
-                let block_map_backend = self.backend();
-                let mut block_map = block_map_backend.block_map.write();
-                block_map.truncate_blocks(fs, old_size)?;
-                *block_map.get_desc()
-            };
-            self.sync_desc_block_map_from_snapshot(block_map_desc);
-            return Err(err);
-        }
+        self.resize_page_cache_and_update_npages(new_size, old_size)?;
+
+        // TODO: handle this rollback
+
+        // {
+        //     // SPEC: rollback allocated growth on resize failure.
+        //     let _ = self.page_cache.discard_range(old_size..new_size);
+        //     self.set_file_size(old_size);
+        //     let block_map_desc = {
+        //         let block_map_backend = self.backend();
+        //         let mut block_map = block_map_backend.block_map.write();
+        //         block_map.truncate_blocks(fs, old_size)?;
+        //         *block_map.get_desc()
+        //     };
+        //     self.sync_desc_block_map_from_snapshot(block_map_desc);
+        //     return Err(err);
+        // }
 
         Ok(DirSlotInfo {
             dir_offset: old_size,
@@ -2656,7 +2681,6 @@ impl InodeInner {
             // SPEC: when splitting, commit predecessor rec_len before writing new entry.
             let split_len = (slot.used_rec_len as u16).to_le_bytes();
             self.page_cache
-                .pages()
                 .write_bytes(slot.dir_offset.saturating_add(4), &split_len)?;
             offset = slot.dir_offset.saturating_add(slot.used_rec_len);
             rec_len = slot.slot_rec_len.saturating_sub(slot.used_rec_len);
@@ -2664,7 +2688,7 @@ impl InodeInner {
 
         let mut entry_buf = vec![0u8; rec_len];
         Self::write_dir_entry_bytes(&mut entry_buf, 0, ino, rec_len as u16, name_bytes, ft)?;
-        self.page_cache.pages().write_bytes(offset, &entry_buf)?;
+        self.page_cache.write_bytes(offset, &entry_buf)?;
         Ok(())
     }
 
@@ -2684,7 +2708,7 @@ impl InodeInner {
             }
 
             let mut buf = vec![0u8; block_size];
-            self.page_cache.pages().read_bytes(block_offset, &mut buf)?;
+            self.page_cache.read_bytes(block_offset, &mut buf)?;
 
             let entries = Self::collect_dir_entries_with_offsets(&buf, limit, max_inumber)?;
             for (entry_offset, entry) in entries {
@@ -2717,9 +2741,7 @@ impl InodeInner {
             .min(block_size);
 
         let mut block_buf = vec![0u8; block_size];
-        self.page_cache
-            .pages()
-            .read_bytes(block_base, &mut block_buf)?;
+        self.page_cache.read_bytes(block_base, &mut block_buf)?;
         Self::delete_entry_in_block(
             &mut block_buf,
             limit,
@@ -2727,9 +2749,7 @@ impl InodeInner {
             entry_offset,
             target.entry_rec_len,
         )?;
-        self.page_cache
-            .pages()
-            .write_bytes(block_base, &block_buf)?;
+        self.page_cache.write_bytes(block_base, &block_buf)?;
         Ok(())
     }
 
@@ -2747,17 +2767,13 @@ impl InodeInner {
         let entry_offset = target.dir_offset.saturating_sub(block_base);
 
         let mut block_buf = vec![0u8; block_size];
-        self.page_cache
-            .pages()
-            .read_bytes(block_base, &mut block_buf)?;
+        self.page_cache.read_bytes(block_base, &mut block_buf)?;
         Self::write_inode_number(&mut block_buf, entry_offset, new_ino)?;
         if entry_offset.saturating_add(size_of::<RawDirEntry>()) > block_buf.len() {
             return_errno_with_message!(Errno::EIO, "dir entry header out of bounds");
         }
         block_buf[entry_offset + 7] = ft;
-        self.page_cache
-            .pages()
-            .write_bytes(block_base, &block_buf)?;
+        self.page_cache.write_bytes(block_base, &block_buf)?;
         Ok(())
     }
 
@@ -2941,8 +2957,7 @@ impl InodeInner {
             *block_map.get_desc()
         };
         self.sync_desc_block_map_from_snapshot(block_map_desc);
-        self.page_cache.discard_range(0..self.file_size());
-        self.resize_page_cache_and_update_npages(0)?;
+        self.resize_page_cache_and_update_npages(0, self.file_size())?;
         // SPEC: cleanup path must leave directory size at zero.
         self.set_file_size(0);
         Ok(())
@@ -2964,7 +2979,7 @@ impl InodeInner {
 
         // SPEC: evict_range writes back dirty pages in [0, file_size), waits for
         // completion, and keeps pages cached as UpToDate.
-        self.page_cache.evict_range(0..file_size)
+        self.page_cache.flush_range(0..file_size)
     }
 
     fn finalize_zero_link_transition(&mut self, ino: u32, fs: &Ext2) -> Result<()> {
