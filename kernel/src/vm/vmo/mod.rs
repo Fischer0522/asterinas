@@ -509,6 +509,35 @@ impl Vmo {
         Ok(())
     }
 
+    /// Fills anonymous pages with zeros without dirty tracking.
+    fn fill_zeros_in_anonymous_pages(
+        &self,
+        range: &Range<usize>,
+        page_offset: &mut usize,
+    ) -> Result<()> {
+        let page_idx_range = get_page_idx_range(range);
+        let mut current_idx = page_idx_range.start;
+        let mut remaining_len = range.len();
+
+        while current_idx < page_idx_range.end {
+            let pages = self.collect_pages(current_idx, page_idx_range.end, false)?;
+
+            for (_, page) in &pages {
+                let fill_len = (PAGE_SIZE - *page_offset).min(remaining_len);
+                let zeroed_len = page.writer().skip(*page_offset).fill_zeros(fill_len);
+                debug_assert_eq!(zeroed_len, fill_len);
+                *page_offset = 0;
+                remaining_len -= fill_len;
+            }
+
+            // `current_idx < page_idx_range.end` guarantees at least one page is successfully collected here.
+            current_idx = pages.last().unwrap().0 + 1;
+        }
+
+        debug_assert_eq!(remaining_len, 0);
+        Ok(())
+    }
+
     /// Writes data to disk-backed pages with dirty tracking.
     ///
     /// Each page is locked before writing to ensure correct state transitions
@@ -545,6 +574,82 @@ impl Vmo {
 
         Ok(())
     }
+
+    /// Fills disk-backed pages with zeros while preserving dirty tracking.
+    fn fill_zeros_in_disk_backed_pages(
+        &self,
+        range: &Range<usize>,
+        page_offset: &mut usize,
+        will_overwrite: bool,
+    ) -> Result<()> {
+        let page_idx_range = get_page_idx_range(range);
+        let mut current_idx = page_idx_range.start;
+        let mut remaining_len = range.len();
+
+        while current_idx < page_idx_range.end {
+            let pages = self.collect_pages(current_idx, page_idx_range.end, will_overwrite)?;
+
+            // `current_idx < page_idx_range.end` guarantees at least one page is successfully collected here.
+            let next_idx = pages.last().unwrap().0 + 1;
+
+            for (_, page) in pages {
+                let fill_len = (PAGE_SIZE - *page_offset).min(remaining_len);
+                let locked_page = page.lock();
+                locked_page.set_dirty();
+                let zeroed_len = locked_page.writer().skip(*page_offset).fill_zeros(fill_len);
+                debug_assert_eq!(zeroed_len, fill_len);
+                *page_offset = 0;
+                remaining_len -= fill_len;
+            }
+
+            current_idx = next_idx;
+        }
+
+        debug_assert_eq!(remaining_len, 0);
+        Ok(())
+    }
+
+    fn fill_zeros_internal(&self, offset: usize, len: usize) -> Result<usize> {
+        if offset > self.size() {
+            return_errno_with_message!(Errno::EINVAL, "the offset is outside the VMO");
+        }
+
+        let fill_len = len.min(self.size() - offset);
+        if fill_len == 0 {
+            return Ok(0);
+        }
+
+        let fill_range = offset..(offset + fill_len);
+        let mut page_offset = offset % PAGE_SIZE;
+
+        if !self.is_disk_backed() {
+            self.fill_zeros_in_anonymous_pages(&fill_range, &mut page_offset)?;
+            return Ok(fill_len);
+        }
+
+        if fill_range.len() < PAGE_SIZE {
+            self.fill_zeros_in_disk_backed_pages(&fill_range, &mut page_offset, false)?;
+            return Ok(fill_len);
+        }
+
+        let up_align_start = fill_range.start.align_up(PAGE_SIZE);
+        let down_align_end = fill_range.end.align_down(PAGE_SIZE);
+
+        if fill_range.start != up_align_start {
+            let head = fill_range.start..up_align_start;
+            self.fill_zeros_in_disk_backed_pages(&head, &mut page_offset, false)?;
+        }
+        if up_align_start != down_align_end {
+            let middle = up_align_start..down_align_end;
+            self.fill_zeros_in_disk_backed_pages(&middle, &mut page_offset, true)?;
+        }
+        if down_align_end != fill_range.end {
+            let tail = down_align_end..fill_range.end;
+            self.fill_zeros_in_disk_backed_pages(&tail, &mut page_offset, false)?;
+        }
+
+        Ok(fill_len)
+    }
 }
 
 impl VmIo for Vmo {
@@ -565,14 +670,15 @@ impl VmIoFill for Vmo {
         offset: usize,
         len: usize,
     ) -> core::result::Result<(), (ostd::Error, usize)> {
-        // TODO: Support efficient `fill_zeros()`.
-        for i in 0..len {
-            match self.write_slice(offset + i, &[0u8]) {
-                Ok(()) => continue,
-                Err(err) => return Err((err, i)),
-            }
+        let filled_len = self
+            .fill_zeros_internal(offset, len)
+            .map_err(|err| (ostd::Error::from(err), 0))?;
+
+        if filled_len == len {
+            Ok(())
+        } else {
+            Err((ostd::Error::InvalidArgs, filled_len))
         }
-        Ok(())
     }
 }
 
