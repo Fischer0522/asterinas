@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use core::{fmt::Debug, ops::MulAssign, time::Duration};
-
+use super::prelude::*;
 use crate::{prelude::warn, time::Clock};
 
 pub(super) trait IsPowerOf: Copy + Sized + MulAssign + PartialOrd {
@@ -44,7 +44,7 @@ impl<T: Debug> Dirty<T> {
     }
 
     /// Creates a new Dirty with setting the dirty flag.
-    pub(super) fn new_dirty(val: T) -> Dirty<T> {
+    pub(super) fn _new_dirty(val: T) -> Dirty<T> {
         Dirty {
             value: val,
             dirty: true,
@@ -62,7 +62,7 @@ impl<T: Debug> Dirty<T> {
     }
 }
 
-impl<T: Debug> core::ops::Deref for Dirty<T> {
+impl<T: Debug> Deref for Dirty<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -70,7 +70,7 @@ impl<T: Debug> core::ops::Deref for Dirty<T> {
     }
 }
 
-impl<T: Debug> core::ops::DerefMut for Dirty<T> {
+impl<T: Debug> DerefMut for Dirty<T> {
     fn deref_mut(&mut self) -> &mut T {
         self.dirty = true;
         &mut self.value

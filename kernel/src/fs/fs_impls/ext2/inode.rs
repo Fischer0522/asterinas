@@ -6,7 +6,7 @@ use core::{
 };
 
 use aster_block::bio::BioCompleteFn;
-use device_id::{DeviceId, decode_device_numbers, encode_device_numbers};
+use device_id::DeviceId;
 use ostd::{const_assert, mm::io::util::HasVmReaderWriter};
 
 use super::{
@@ -1491,42 +1491,6 @@ impl InodeBackend {
 }
 
 impl PageCacheBackend for InodeBackend {
-    fn read_page_async(
-        &self,
-        idx: usize,
-        frame: crate::fs::vfs::page_cache::LockedCachePage,
-    ) -> Result<BioWaiter> {
-        let block_map = self.block_map.read();
-        let fs = self.fs()?;
-        let iblock = u32::try_from(idx)
-            .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
-
-        match block_map.get_block(&fs, iblock)? {
-            Some(bid) => {
-                let bio_segment = BioSegment::new_from_segment(
-                    Segment::from(frame.deref().clone()).into(),
-                    BioDirection::FromDevice,
-                );
-                let complete_fn: Box<dyn FnOnce(bool) + Send + Sync> = Box::new(move |success| {
-                    if success {
-                        frame.set_up_to_date();
-                    }
-                });
-                Ok(fs.block_device().read_blocks_async(
-                    Bid::new(bid as u64),
-                    bio_segment,
-                    Some(complete_fn),
-                )?)
-            }
-            None => {
-                // Sparse hole: synthesize a zero-filled page without issuing BIO.
-                frame.writer().fill_zeros(BLOCK_SIZE);
-                frame.set_up_to_date();
-                Ok(BioWaiter::new())
-            }
-        }
-    }
-
     fn read_page_raw(
         &self,
         idx: usize,
@@ -1541,9 +1505,7 @@ impl PageCacheBackend for InodeBackend {
         let bid = block_map
             .get_block(&fs, iblock)?
             .ok_or_else(|| Error::with_message(Errno::EIO, "sparse hole should not issue raw read"))?;
-        Ok(fs
-            .block_device()
-            .read_blocks_async(Bid::new(bid as u64), bio_segment, complete_fn)?)
+        fs.read_blocks_async(bid, bio_segment, complete_fn)
     }
 
     fn write_page_raw(
@@ -1569,12 +1531,9 @@ impl PageCacheBackend for InodeBackend {
             let mut block_map = block_map.upgrade();
             bid = block_map.get_or_alloc_block(&fs, iblock, true)?;
         }
-
-        Ok(fs.block_device().write_blocks_async(
-            Bid::new(bid.unwrap() as u64),
-            bio_segment,
-            complete_fn,
-        )?)
+        // The bid is guaranteed to be allocated.
+        let bid = bid.unwrap();
+        fs.write_blocks_async(bid, bio_segment, complete_fn)
     }
 
     fn npages(&self) -> usize {
@@ -1742,17 +1701,9 @@ impl InodeInner {
         self.desc.ctime = t;
     }
 
-    fn touch_ctime(&mut self, t: Duration) {
-        self.set_ctime(t);
-    }
-
     fn touch_mtime_ctime(&mut self, t: Duration) {
         self.set_mtime(t);
         self.set_ctime(t);
-    }
-
-    fn dtime(&self) -> Duration {
-        self.desc.dtime
     }
 
     fn set_dtime(&mut self, t: Duration) {
@@ -1771,20 +1722,9 @@ impl InodeInner {
         self.desc.links_count = self.desc.links_count.saturating_sub(delta);
     }
 
-    fn flags(&self) -> FileFlags {
-        self.desc.flags
-    }
-
-    fn set_flags(&mut self, flags: FileFlags) {
-        self.desc.flags = flags;
-    }
 
     fn remove_flags(&mut self, flags: FileFlags) {
         self.desc.flags.remove(flags);
-    }
-
-    fn file_acl(&self) -> u32 {
-        self.desc.file_acl
     }
 
     fn set_file_acl(&mut self, file_acl: u32) {
@@ -2503,7 +2443,6 @@ impl InodeInner {
         }
 
         let old_size_aligned = old_size.align_up(block_size);
-        let end_aligned = end.align_up(block_size);
 
         if let Err(err) = self.resize_page_cache_and_update_npages(old_size_aligned, end) {
             error!(
@@ -2994,7 +2933,7 @@ impl InodeInner {
 
 /// Acquires `inner.read()` locks on two inodes in ascending ino order.
 /// Returns guards in `(a, b)` order regardless of which ino is smaller.
-fn read_lock_two_inodes<'a>(
+fn _read_lock_two_inodes<'a>(
     a: &'a Inode,
     b: &'a Inode,
 ) -> (
@@ -3198,39 +3137,6 @@ impl InodeDesc {
 
         self.type_ == InodeType::SymLink && self.sector_count.checked_sub(ea_blocks) == Some(0)
     }
-
-    /// Decodes the ext2 special-file device encoding stored in `i_block`.
-    fn decode_device_id(&self) -> u64 {
-        let (major, minor) = if self.block_ptrs[0] != 0 {
-            let val = self.block_ptrs[0];
-            // SPEC: old_decode_dev((major << 8) | minor) with 8-bit major/minor.
-            (((val >> 8) & 0xFF), (val & 0xFF))
-        } else {
-            let dev = self.block_ptrs[1];
-            // SPEC: decode the extended major/minor bit layout.
-            (
-                ((dev & 0xFFF00) >> 8),
-                ((dev & 0xFF) | ((dev >> 12) & 0xFFF00)),
-            )
-        };
-
-        encode_device_numbers(major, minor)
-    }
-
-    /// Encodes a device ID into the ext2 special-file `i_block` layout.
-    fn encode_device_id(&mut self, device_id: u64) {
-        let (major, minor) = decode_device_numbers(device_id);
-
-        // SPEC: old_valid_dev => MAJOR/MINOR must both fit in 8 bits.
-        if major < 256 && minor < 256 {
-            self.block_ptrs[0] = (major << 8) | minor;
-            self.block_ptrs[1] = 0;
-        } else {
-            self.block_ptrs[0] = 0;
-            self.block_ptrs[1] = (minor & 0xFF) | (major << 8) | ((minor & !0xFF) << 12);
-            self.block_ptrs[2] = 0;
-        }
-    }
 }
 
 impl TryFrom<&RawInode> for InodeDesc {
@@ -3377,7 +3283,7 @@ mod test {
     use super::*;
     use crate::{
         fs::{
-            file::{InodeMode, StatusFlags},
+            file::StatusFlags,
             fs_impls::ext2::{
                 fs::ROOT_INO,
                 testkit::{
@@ -3386,7 +3292,7 @@ mod test {
                 },
             },
             vfs::{
-                inode::{Inode as VfsInodeTrait, InodeIo, MknodType},
+                inode::{Inode as VfsInodeTrait, InodeIo},
                 xattr::{XattrName, XattrNamespace, XattrSetFlags},
             },
         },
@@ -3885,51 +3791,6 @@ mod test {
         raw_dir.size_high = u32::MAX;
         let dir_desc = InodeDesc::try_from(&raw_dir).unwrap();
         assert_eq!(dir_desc.size, 7);
-    }
-
-    #[ktest]
-    fn unlink_special_inode_does_not_free_encoded_rdev_block() {
-        clocks::init_for_ktest();
-
-        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
-        let root = f.ext2.read_inode(ROOT_INO).unwrap();
-        let free_blocks_before = f.ext2.super_block().free_blocks_count();
-
-        let special = VfsInodeTrait::mknod(
-            root.as_ref(),
-            "null",
-            InodeMode::from_bits_truncate(0o666),
-            MknodType::CharDevice(encode_device_numbers(1, 3)),
-        )
-        .unwrap();
-        let special_ino = special.ino();
-
-        root.unlink("null").unwrap();
-        drop(special);
-        f.ext2.sync_all().unwrap();
-
-        assert_eq!(f.ext2.super_block().free_blocks_count(), free_blocks_before);
-        assert_eq!(
-            f.ext2.read_inode(special_ino as u32).unwrap_err().error(),
-            Errno::ENOENT
-        );
-    }
-
-    #[ktest]
-    fn raw_inode_roundtrip_preserves_special_inode_type_on_mode_update() {
-        let mut raw = make_raw_inode(0o020600);
-        raw.block[0] = 0x0103;
-
-        let mut desc = InodeDesc::try_from(&raw).unwrap();
-        assert_eq!(desc.type_, InodeType::CharDevice);
-        assert_eq!(desc.perm.bits(), 0o600);
-        assert_eq!(desc.decode_device_id(), encode_device_numbers(1, 3));
-
-        desc.perm = FilePerm::from_bits_truncate(0o666);
-        let updated_raw = RawInode::from(&desc);
-        assert_eq!(updated_raw.mode, 0o020666);
-        assert_eq!(updated_raw.block[0], 0x0103);
-        assert_eq!(updated_raw.block[1], 0);
     }
 
     #[ktest]
