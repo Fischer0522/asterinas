@@ -849,9 +849,9 @@ impl Ext2 {
         bio_segment: BioSegment,
         complete_fn: Option<BioCompleteFn>,
     ) -> Result<BioWaiter> {
-        let waiter = self
-            .block_device
-            .read_blocks_async(Bid::new(bid as u64), bio_segment, complete_fn)?;
+        let waiter =
+            self.block_device
+                .read_blocks_async(Bid::new(bid as u64), bio_segment, complete_fn)?;
         Ok(waiter)
     }
 
@@ -873,9 +873,9 @@ impl Ext2 {
         bio_segment: BioSegment,
         complete_fn: Option<BioCompleteFn>,
     ) -> Result<BioWaiter> {
-        let waiter = self
-            .block_device
-            .write_blocks_async(Bid::new(bid as u64), bio_segment, complete_fn)?;
+        let waiter =
+            self.block_device
+                .write_blocks_async(Bid::new(bid as u64), bio_segment, complete_fn)?;
         Ok(waiter)
     }
 

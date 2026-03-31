@@ -2,7 +2,7 @@
 
 use core::mem::size_of;
 
-use super::{prelude::*, inode::RawDirEntry};
+use super::{inode::RawDirEntry, prelude::*};
 use crate::fs::utils::NAME_MAX;
 
 /// A parsed directory entry.

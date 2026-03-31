@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use core::{fmt::Debug, ops::MulAssign, time::Duration};
+
 use super::prelude::*;
 use crate::{prelude::warn, time::Clock};
 
