@@ -10,7 +10,7 @@ use device_id::DeviceId;
 use ostd::{const_assert, mm::io::util::HasVmReaderWriter};
 
 use super::{
-    dir::{DirEntry, DirEntryIter},
+    dir::{DirBlock, DirEntry},
     fs::Ext2,
     inode_block_map::{BlockMapDesc, Ext2Bid, InodeBlockMap},
     io_range_mapper::{IoRange, IoRangeMapper},
@@ -690,7 +690,8 @@ impl Inode {
             child_inner.sub_links_count_saturating(2);
 
             if child_inner.links_count() == 0 {
-                child_inner.finalize_zero_link_transition(child_ino, &fs)?;
+                child_inner.persist(child_ino, &fs)?;
+                let _ = fs.remove_inode_cache(child_ino);
             }
 
             let parent_inner = guards.inner_mut(self.ino())?;
@@ -1031,7 +1032,8 @@ impl Inode {
             child_inner.sub_links_count_saturating(1);
 
             if child_inner.links_count() == 0 {
-                child_inner.finalize_zero_link_transition(child_ino, &fs)?;
+            child_inner.persist(child_ino, &fs)?;
+            let _ = fs.remove_inode_cache(child_ino);
             }
             return Ok(());
         }
@@ -1113,7 +1115,8 @@ impl Inode {
         if let Some(existing) = ctx.existing_inode.as_ref() {
             let mut inner = existing.inner.write();
             if inner.links_count() == 0 {
-                inner.finalize_zero_link_transition(existing.ino(), fs)?;
+                inner.persist(existing.ino(), fs)?;
+                let _ = fs.remove_inode_cache(existing.ino());
             }
         }
         Ok(true)
@@ -1707,18 +1710,10 @@ impl InodeInner {
         // Allocate one block for the directory.
         self.prepare_write(fs, 0, block_size, block_size)?;
 
-        let mut buf = vec![0u8; block_size];
-        Self::write_dir_entry_bytes(
-            &mut buf,
-            0,
-            ino,
-            DirEntry::dir_rec_len(1),
-            b".",
-            DirEntryFileType::Dir as u8,
-        )?;
+        let mut block = DirBlock::new_zeroed(block_size, fs.super_block().total_inodes());
         let dot_len = DirEntry::dir_rec_len(1) as usize;
-        Self::write_dir_entry_bytes(
-            &mut buf,
+        block.write_entry(0, ino, DirEntry::dir_rec_len(1), b".", DirEntryFileType::Dir as u8)?;
+        block.write_entry(
             dot_len,
             parent_ino,
             (block_size - dot_len) as u16,
@@ -1726,7 +1721,7 @@ impl InodeInner {
             DirEntryFileType::Dir as u8,
         )?;
 
-        if let Err(_) = self.page_cache().write_bytes(0, &buf) {
+        if let Err(_) = self.page_cache().write_bytes(0, block.as_bytes()) {
             self.rollback_write(fs, 0, block_size);
             return_errno_with_message!(Errno::EIO, "failed to write directory block");
         }
@@ -1813,24 +1808,15 @@ impl InodeInner {
         }
 
         let block_size = fs.block_size();
-        let size = self.file_size();
-        let max_inumber = fs.super_block().total_inodes();
-        let data_blocks = size.div_ceil(block_size);
+        let data_blocks = self.file_size().div_ceil(block_size);
 
         for block_idx in 0..data_blocks {
-            let mut buf = vec![0u8; block_size];
-            let block_offset = block_idx * block_size;
-            if self.page_cache.read_bytes(block_offset, &mut buf).is_err() {
-                return false;
-            }
+            let block = match self.read_dir_block(fs, block_idx) {
+                Ok(b) => b,
+                Err(_) => return false,
+            };
 
-            let block_offset = block_idx * block_size;
-            let limit = (size - block_offset).min(block_size);
-            if limit == 0 {
-                continue;
-            }
-
-            let mut iter = match DirEntryIter::new(&buf, limit, max_inumber) {
+            let mut iter = match block.iter() {
                 Ok(iter) => iter,
                 Err(_) => return false,
             };
@@ -1870,27 +1856,13 @@ impl InodeInner {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let sb = fs.super_block();
         let block_size = fs.block_size();
         let size = self.file_size();
-        let max_inumber = sb.total_inodes();
-        // SPEC: bound the directory scan by the number of blocks covered by `i_size`.
         let max_blocks = size.div_ceil(block_size);
 
         for block_idx in 0..max_blocks {
-            let block_offset = block_idx * block_size;
-            let remain = size - block_offset;
-            let limit = remain.min(block_size);
-            if limit == 0 {
-                break;
-            }
-
-            let mut buf = vec![0u8; block_size];
-            if self.page_cache.read_bytes(block_offset, &mut buf).is_err() {
-                return_errno_with_message!(Errno::EIO, "failed to read dir block via page cache");
-            }
-
-            let mut iter = DirEntryIter::new(&buf, limit, max_inumber)?;
+            let block = self.read_dir_block(fs, block_idx)?;
+            let mut iter = block.iter()?;
             while let Some(entry) = iter.next_entry()? {
                 if entry.inode == 0 {
                     continue;
@@ -1898,8 +1870,7 @@ impl InodeInner {
                 if entry.name_len as usize != name.len() {
                     continue;
                 }
-                let entry_name = entry.name.as_bytes();
-                if entry_name.len() == name.len() && entry_name == name.as_bytes() {
+                if entry.name.as_bytes() == name.as_bytes() {
                     return Ok(entry.inode);
                 }
             }
@@ -1981,18 +1952,9 @@ impl InodeInner {
             if block_offset >= size {
                 break;
             }
-            let remain = size - block_offset;
-            let limit = remain.min(block_size);
-            if limit == 0 {
-                break;
-            }
 
-            let mut buf = vec![0u8; block_size];
-            if self.page_cache.read_bytes(block_offset, &mut buf).is_err() {
-                return_errno_with_message!(Errno::EIO, "failed to read dir block via page cache");
-            }
-
-            let mut iter = DirEntryIter::new(&buf, limit, max_inumber)?;
+            let block = self.read_dir_block(fs, block_idx)?;
+            let mut iter = block.iter()?;
             let mut inner_off = 0usize;
             while let Some(entry) = iter.next_entry()? {
                 let entry_offset = block_offset + inner_off;
@@ -2269,6 +2231,16 @@ impl InodeInner {
         self.sync_desc_block_map_from_snapshot(desc);
     }
 
+    /// Reads a directory block by index into a `DirBlock`.
+    fn read_dir_block(&self, fs: &Ext2, block_idx: usize) -> Result<DirBlock> {
+        let block_size = fs.block_size();
+        let block_offset = block_idx * block_size;
+        let limit = self.file_size().saturating_sub(block_offset).min(block_size);
+        let mut buf = vec![0u8; block_size];
+        self.page_cache.read_bytes(block_offset, &mut buf)?;
+        Ok(DirBlock::new(buf, limit, fs.super_block().total_inodes()))
+    }
+
     /// Phase 1: scan directory blocks for reusable slot or duplicate.
     ///
     fn scan_dir_for_slot(&self, fs: &Ext2, name: &str) -> Result<DirScanResult> {
@@ -2298,12 +2270,8 @@ impl InodeInner {
                 continue;
             }
 
-            let mut buf = vec![0u8; block_size];
-            // SPEC: directory scan reads through inode page cache.
-            self.page_cache.read_bytes(block_offset, &mut buf)?;
-
-            let entries = Self::collect_dir_entries_with_offsets(&buf, limit, max_inumber)?;
-            for (entry_offset, entry) in entries {
+            let block = self.read_dir_block(fs, block_idx)?;
+            for (entry_offset, entry) in block.entries()? {
                 if entry.inode != 0
                     && entry.name_len as usize == name_bytes.len()
                     && entry.name.as_bytes() == name_bytes
@@ -2391,32 +2359,23 @@ impl InodeInner {
             rec_len = slot.slot_rec_len.saturating_sub(slot.used_rec_len);
         }
 
-        let mut entry_buf = vec![0u8; rec_len];
-        Self::write_dir_entry_bytes(&mut entry_buf, 0, ino, rec_len as u16, name_bytes, ft)?;
-        self.page_cache.write_bytes(offset, &entry_buf)?;
+        let mut block = DirBlock::new_zeroed(rec_len, fs.super_block().total_inodes());
+        block.write_entry(0, ino, rec_len as u16, name_bytes, ft)?;
+        self.page_cache.write_bytes(offset, block.as_bytes())?;
         Ok(())
     }
 
     /// Locate a target entry by name for delete/set_link operations.
     ///
     fn find_entry_target(&self, fs: &Ext2, name: &str) -> Result<DirEntryTarget> {
-        let max_inumber = fs.super_block().total_inodes();
         let block_size = fs.block_size();
         let size = self.file_size();
         let name_bytes = name.as_bytes();
 
         for block_idx in 0..size.div_ceil(block_size) {
             let block_offset = block_idx * block_size;
-            let limit = (size - block_offset).min(block_size);
-            if limit == 0 {
-                continue;
-            }
-
-            let mut buf = vec![0u8; block_size];
-            self.page_cache.read_bytes(block_offset, &mut buf)?;
-
-            let entries = Self::collect_dir_entries_with_offsets(&buf, limit, max_inumber)?;
-            for (entry_offset, entry) in entries {
+            let block = self.read_dir_block(fs, block_idx)?;
+            for (entry_offset, entry) in block.entries()? {
                 if entry.inode == 0 {
                     continue;
                 }
@@ -2439,22 +2398,14 @@ impl InodeInner {
     ///
     fn delete_entry(&self, fs: &Ext2, target: &DirEntryTarget) -> Result<()> {
         let block_size = fs.block_size();
+        let block_size = fs.block_size();
         let block_base = (target.dir_offset / block_size).saturating_mul(block_size);
+        let block_idx = block_base / block_size;
         let entry_offset = target.dir_offset.saturating_sub(block_base);
-        let limit = (self.file_size())
-            .saturating_sub(block_base)
-            .min(block_size);
 
-        let mut block_buf = vec![0u8; block_size];
-        self.page_cache.read_bytes(block_base, &mut block_buf)?;
-        Self::delete_entry_in_block(
-            &mut block_buf,
-            limit,
-            block_size,
-            entry_offset,
-            target.entry_rec_len,
-        )?;
-        self.page_cache.write_bytes(block_base, &block_buf)?;
+        let mut block = self.read_dir_block(fs, block_idx)?;
+        block.delete_entry(block_size, entry_offset, target.entry_rec_len)?;
+        self.page_cache.write_bytes(block_base, block.as_bytes())?;
         Ok(())
     }
 
@@ -2463,154 +2414,13 @@ impl InodeInner {
     fn set_link(&self, fs: &Ext2, target: &DirEntryTarget, new_ino: u32, ft: u8) -> Result<()> {
         let block_size = fs.block_size();
         let block_base = (target.dir_offset / block_size).saturating_mul(block_size);
+        let block_idx = block_base / block_size;
         let entry_offset = target.dir_offset.saturating_sub(block_base);
 
-        let mut block_buf = vec![0u8; block_size];
-        self.page_cache.read_bytes(block_base, &mut block_buf)?;
-        Self::write_inode_number(&mut block_buf, entry_offset, new_ino)?;
-        if entry_offset.saturating_add(size_of::<RawDirEntry>()) > block_buf.len() {
-            return_errno_with_message!(Errno::EIO, "dir entry header out of bounds");
-        }
-        block_buf[entry_offset + 7] = ft;
-        self.page_cache.write_bytes(block_base, &block_buf)?;
-        Ok(())
-    }
-
-    fn collect_dir_entries_with_offsets(
-        buf: &[u8],
-        limit: usize,
-        max_inumber: u32,
-    ) -> Result<Vec<(usize, DirEntry)>> {
-        let mut iter = DirEntryIter::new(buf, limit, max_inumber)?;
-        let mut entries = Vec::new();
-        let mut entry_offset = 0usize;
-
-        while let Some(entry) = iter.next_entry()? {
-            let rec_len = entry.rec_len as usize;
-            entries.push((entry_offset, entry));
-            entry_offset = entry_offset.saturating_add(rec_len);
-        }
-
-        Ok(entries)
-    }
-
-    fn delete_entry_in_block(
-        block_buf: &mut [u8],
-        limit: usize,
-        chunk_size: usize,
-        entry_offset: usize,
-        entry_rec_len: usize,
-    ) -> Result<()> {
-        // `to` is the end offset of the entry being removed.
-        let to = entry_offset.saturating_add(entry_rec_len);
-        if entry_rec_len == 0 || to > limit {
-            return_errno_with_message!(Errno::EIO, "invalid dir entry rec_len for delete");
-        }
-
-        // TODO: Maybe we can simplify the mask logic here.
-        // Align `from` to the start of the chunk that contains `entry_offset`.
-        // For power-of-two chunk sizes, this clears the low offset bits and
-        // leaves the chunk base.
-        let chunk_mask = !(chunk_size.saturating_sub(1));
-        let mut from = entry_offset & chunk_mask;
-        // Walk from chunk base to target entry to find its previous dirent.
-        let mut de_offset = from;
-        let mut prev_offset = None;
-
-        while de_offset < entry_offset {
-            if de_offset.saturating_add(size_of::<RawDirEntry>()) > limit {
-                return_errno_with_message!(Errno::EIO, "dir entry header out of bounds");
-            }
-
-            let rec_len = u16::from_le_bytes([block_buf[de_offset + 4], block_buf[de_offset + 5]]);
-            if rec_len == 0 {
-                return_errno_with_message!(Errno::EIO, "zero rec_len in dir entry chain");
-            }
-
-            let next = de_offset.saturating_add(rec_len as usize);
-            if next > limit {
-                return_errno_with_message!(Errno::EIO, "dir entry chain exceeds block limit");
-            }
-
-            prev_offset = Some(de_offset);
-            de_offset = next;
-        }
-
-        // If traversal does not land exactly on the target entry, layout is corrupt.
-        if de_offset != entry_offset {
-            return_errno_with_message!(Errno::EIO, "dir entry chain offset mismatch");
-        }
-
-        if let Some(prev) = prev_offset {
-            // Merge the removed entry range into the previous entry by extending
-            // the previous `rec_len` from `prev` to `to`.
-            from = prev;
-            let merged_len = to.saturating_sub(from);
-            Self::write_rec_len(block_buf, prev, merged_len as u16)?;
-        }
-
-        // Mark removed entry as unused.
-        Self::write_inode_number(block_buf, entry_offset, 0)?;
-        Ok(())
-    }
-
-    fn write_dir_entry_bytes(
-        buf: &mut [u8],
-        offset: usize,
-        inode: u32,
-        rec_len: u16,
-        name: &[u8],
-        file_type: u8,
-    ) -> Result<()> {
-        let header_len = size_of::<RawDirEntry>();
-        if name.len() > u8::MAX as usize {
-            return_errno_with_message!(Errno::EIO, "dir entry name too long");
-        }
-
-        let rec_len_usize = rec_len as usize;
-        if rec_len_usize < DirEntry::dir_rec_len(name.len()) as usize {
-            return_errno_with_message!(Errno::EIO, "dir entry rec_len too small");
-        }
-        if rec_len_usize & 3 != 0 {
-            return_errno_with_message!(Errno::EIO, "dir entry rec_len not aligned");
-        }
-        if offset.saturating_add(rec_len_usize) > buf.len() {
-            return_errno_with_message!(Errno::EIO, "dir entry exceeds buffer");
-        }
-
-        let name_start = offset + header_len;
-        let name_end = name_start.saturating_add(name.len());
-        if name_end > offset.saturating_add(rec_len_usize) {
-            return_errno_with_message!(Errno::EIO, "dir entry name exceeds rec_len");
-        }
-
-        buf[offset..offset + 4].copy_from_slice(&inode.to_le_bytes());
-        buf[offset + 4..offset + 6].copy_from_slice(&rec_len.to_le_bytes());
-        buf[offset + 6] = name.len() as u8;
-        buf[offset + 7] = file_type;
-        buf[name_start..name_end].copy_from_slice(name);
-        Ok(())
-    }
-
-    fn write_rec_len(buf: &mut [u8], offset: usize, rec_len: u16) -> Result<()> {
-        if rec_len == 0 || rec_len & 3 != 0 {
-            return_errno_with_message!(Errno::EIO, "invalid rec_len value");
-        }
-        if offset.saturating_add(size_of::<RawDirEntry>()) > buf.len() {
-            return_errno_with_message!(Errno::EIO, "dir entry header out of bounds");
-        }
-        if offset.saturating_add(rec_len as usize) > buf.len() {
-            return_errno_with_message!(Errno::EIO, "rec_len exceeds buffer");
-        }
-        buf[offset + 4..offset + 6].copy_from_slice(&rec_len.to_le_bytes());
-        Ok(())
-    }
-
-    fn write_inode_number(buf: &mut [u8], offset: usize, inode: u32) -> Result<()> {
-        if offset.saturating_add(size_of::<RawDirEntry>()) > buf.len() {
-            return_errno_with_message!(Errno::EIO, "dir entry header out of bounds");
-        }
-        buf[offset..offset + 4].copy_from_slice(&inode.to_le_bytes());
+        let mut block = self.read_dir_block(fs, block_idx)?;
+        block.set_inode(entry_offset, new_ino)?;
+        block.set_file_type(entry_offset, ft)?;
+        self.page_cache.write_bytes(block_base, block.as_bytes())?;
         Ok(())
     }
 
@@ -2624,15 +2434,6 @@ impl InodeInner {
         // SPEC: evict_range writes back dirty pages in [0, file_size), waits for
         // completion, and keeps pages cached as UpToDate.
         self.page_cache.flush_range(0..file_size)
-    }
-
-    fn finalize_zero_link_transition(&mut self, ino: u32, fs: &Ext2) -> Result<()> {
-        if self.links_count() != 0 {
-            return Ok(());
-        }
-        self.persist(ino, fs)?;
-        let _ = fs.remove_inode_cache(ino);
-        Ok(())
     }
 }
 

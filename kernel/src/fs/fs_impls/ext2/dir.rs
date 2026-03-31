@@ -155,6 +155,181 @@ impl<'a> DirEntryIter<'a> {
     }
 }
 
+/// A mutable view over a single directory block buffer.
+pub(super) struct DirBlock {
+    buf: Vec<u8>,
+    /// Valid data length within `buf` (may be less than `buf.len()` for the last block).
+    limit: usize,
+    max_inumber: u32,
+}
+
+impl DirBlock {
+    /// Creates a new zeroed directory block.
+    pub(super) fn new_zeroed(block_size: usize, max_inumber: u32) -> Self {
+        Self {
+            buf: vec![0u8; block_size],
+            limit: block_size,
+            max_inumber,
+        }
+    }
+
+    /// Creates a `DirBlock` from existing data (e.g. read from page cache).
+    pub(super) fn new(buf: Vec<u8>, limit: usize, max_inumber: u32) -> Self {
+        Self {
+            buf,
+            limit,
+            max_inumber,
+        }
+    }
+
+    /// Returns the underlying buffer for writing back to page cache.
+    pub(super) fn as_bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Returns an iterator over directory entries in this block.
+    pub(super) fn iter(&self) -> Result<DirEntryIter<'_>> {
+        DirEntryIter::new(&self.buf, self.limit, self.max_inumber)
+    }
+
+    /// Collects all entries with their byte offsets.
+    pub(super) fn entries(&self) -> Result<Vec<(usize, DirEntry)>> {
+        let mut iter = self.iter()?;
+        let mut entries = Vec::new();
+        let mut entry_offset = 0usize;
+
+        while let Some(entry) = iter.next_entry()? {
+            let rec_len = entry.rec_len as usize;
+            entries.push((entry_offset, entry));
+            entry_offset = entry_offset.saturating_add(rec_len);
+        }
+
+        Ok(entries)
+    }
+
+    /// Serializes a directory entry at the given offset.
+    pub(super) fn write_entry(
+        &mut self,
+        offset: usize,
+        ino: u32,
+        rec_len: u16,
+        name: &[u8],
+        ft: u8,
+    ) -> Result<()> {
+        let header_len = size_of::<RawDirEntry>();
+        if name.len() > u8::MAX as usize {
+            return_errno_with_message!(Errno::EIO, "dir entry name too long");
+        }
+
+        let rec_len_usize = rec_len as usize;
+        if rec_len_usize < DirEntry::dir_rec_len(name.len()) as usize {
+            return_errno_with_message!(Errno::EIO, "dir entry rec_len too small");
+        }
+        if rec_len_usize & 3 != 0 {
+            return_errno_with_message!(Errno::EIO, "dir entry rec_len not aligned");
+        }
+        if offset.saturating_add(rec_len_usize) > self.buf.len() {
+            return_errno_with_message!(Errno::EIO, "dir entry exceeds buffer");
+        }
+
+        let name_start = offset + header_len;
+        let name_end = name_start.saturating_add(name.len());
+        if name_end > offset.saturating_add(rec_len_usize) {
+            return_errno_with_message!(Errno::EIO, "dir entry name exceeds rec_len");
+        }
+
+        self.buf[offset..offset + 4].copy_from_slice(&ino.to_le_bytes());
+        self.buf[offset + 4..offset + 6].copy_from_slice(&rec_len.to_le_bytes());
+        self.buf[offset + 6] = name.len() as u8;
+        self.buf[offset + 7] = ft;
+        self.buf[name_start..name_end].copy_from_slice(name);
+        Ok(())
+    }
+
+    /// Deletes an entry by zeroing its inode and merging `rec_len` with the predecessor.
+    pub(super) fn delete_entry(
+        &mut self,
+        chunk_size: usize,
+        entry_offset: usize,
+        entry_rec_len: usize,
+    ) -> Result<()> {
+        let to = entry_offset.saturating_add(entry_rec_len);
+        if entry_rec_len == 0 || to > self.limit {
+            return_errno_with_message!(Errno::EIO, "invalid dir entry rec_len for delete");
+        }
+
+        let chunk_mask = !(chunk_size.saturating_sub(1));
+        let from = entry_offset & chunk_mask;
+        let mut de_offset = from;
+        let mut prev_offset = None;
+
+        while de_offset < entry_offset {
+            if de_offset.saturating_add(size_of::<RawDirEntry>()) > self.limit {
+                return_errno_with_message!(Errno::EIO, "dir entry header out of bounds");
+            }
+
+            let rec_len =
+                u16::from_le_bytes([self.buf[de_offset + 4], self.buf[de_offset + 5]]);
+            if rec_len == 0 {
+                return_errno_with_message!(Errno::EIO, "zero rec_len in dir entry chain");
+            }
+
+            let next = de_offset.saturating_add(rec_len as usize);
+            if next > self.limit {
+                return_errno_with_message!(Errno::EIO, "dir entry chain exceeds block limit");
+            }
+
+            prev_offset = Some(de_offset);
+            de_offset = next;
+        }
+
+        if de_offset != entry_offset {
+            return_errno_with_message!(Errno::EIO, "dir entry chain offset mismatch");
+        }
+
+        if let Some(prev) = prev_offset {
+            let merged_len = to.saturating_sub(prev);
+            self.set_rec_len(prev, merged_len as u16)?;
+        }
+
+        self.set_inode(entry_offset, 0)?;
+        Ok(())
+    }
+
+    /// Overwrites the inode number field at an entry offset.
+    pub(super) fn set_inode(&mut self, offset: usize, ino: u32) -> Result<()> {
+        if offset.saturating_add(size_of::<RawDirEntry>()) > self.buf.len() {
+            return_errno_with_message!(Errno::EIO, "dir entry header out of bounds");
+        }
+        self.buf[offset..offset + 4].copy_from_slice(&ino.to_le_bytes());
+        Ok(())
+    }
+
+    /// Overwrites the `rec_len` field at an entry offset.
+    pub(super) fn set_rec_len(&mut self, offset: usize, rec_len: u16) -> Result<()> {
+        if rec_len == 0 || rec_len & 3 != 0 {
+            return_errno_with_message!(Errno::EIO, "invalid rec_len value");
+        }
+        if offset.saturating_add(size_of::<RawDirEntry>()) > self.buf.len() {
+            return_errno_with_message!(Errno::EIO, "dir entry header out of bounds");
+        }
+        if offset.saturating_add(rec_len as usize) > self.buf.len() {
+            return_errno_with_message!(Errno::EIO, "rec_len exceeds buffer");
+        }
+        self.buf[offset + 4..offset + 6].copy_from_slice(&rec_len.to_le_bytes());
+        Ok(())
+    }
+
+    /// Overwrites the file type byte at an entry offset.
+    pub(super) fn set_file_type(&mut self, offset: usize, ft: u8) -> Result<()> {
+        if offset.saturating_add(size_of::<RawDirEntry>()) > self.buf.len() {
+            return_errno_with_message!(Errno::EIO, "dir entry header out of bounds");
+        }
+        self.buf[offset + 7] = ft;
+        Ok(())
+    }
+}
+
 #[cfg(ktest)]
 mod test {
     use ostd::prelude::*;
