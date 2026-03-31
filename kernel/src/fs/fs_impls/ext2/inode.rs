@@ -1710,20 +1710,23 @@ impl InodeInner {
         // Allocate one block for the directory.
         self.prepare_write(fs, 0, block_size, block_size)?;
 
-        let mut block = DirBlock::new_zeroed(block_size, fs.super_block().total_inodes());
+        let block = DirBlock::new(self.page_cache(), 0, block_size);
         let dot_len = DirEntry::dir_rec_len(1) as usize;
-        block.write_entry(0, ino, DirEntry::dir_rec_len(1), b".", DirEntryFileType::Dir as u8)?;
-        block.write_entry(
-            dot_len,
-            parent_ino,
-            (block_size - dot_len) as u16,
-            b"..",
-            DirEntryFileType::Dir as u8,
-        )?;
+        let write_result = (|| -> Result<()> {
+            block.write_entry(0, ino, DirEntry::dir_rec_len(1), b".", DirEntryFileType::Dir as u8)?;
+            block.write_entry(
+                dot_len,
+                parent_ino,
+                (block_size - dot_len) as u16,
+                b"..",
+                DirEntryFileType::Dir as u8,
+            )?;
+            Ok(())
+        })();
 
-        if let Err(_) = self.page_cache().write_bytes(0, block.as_bytes()) {
+        if let Err(err) = write_result {
             self.rollback_write(fs, 0, block_size);
-            return_errno_with_message!(Errno::EIO, "failed to write directory block");
+            return Err(err);
         }
 
         self.set_file_size(block_size);
@@ -1808,39 +1811,40 @@ impl InodeInner {
         }
 
         let block_size = fs.block_size();
-        let data_blocks = self.file_size().div_ceil(block_size);
+        let file_size = self.file_size();
+        let data_blocks = file_size.div_ceil(block_size);
+        let mut name_buf = [0u8; 2]; // Only need to read "." and ".."
 
         for block_idx in 0..data_blocks {
-            let block = match self.read_dir_block(fs, block_idx) {
-                Ok(b) => b,
-                Err(_) => return false,
-            };
-
-            let mut iter = match block.iter() {
-                Ok(iter) => iter,
-                Err(_) => return false,
-            };
+            let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, file_size);
+            let block_offset = block_idx * block_size;
+            let mut iter = block.iter_entries();
 
             loop {
-                let entry = match iter.next_entry() {
-                    Ok(Some(entry)) => entry,
+                let (entry_offset, header) = match iter.next_entry(block_offset) {
+                    Ok(Some(pair)) => pair,
                     Ok(None) => break,
                     Err(_) => return false,
                 };
 
-                if entry.inode == 0 {
+                if header.inode == 0 {
                     continue;
                 }
 
-                let name = entry.name.as_bytes();
-                if name == b"." {
-                    if entry.inode != self_ino {
+                let name_len = header.name_len as usize;
+                if name_len <= 2 {
+                    if block.read_name(entry_offset, name_len, &mut name_buf).is_err() {
                         return false;
                     }
-                    continue;
-                }
-                if name == b".." {
-                    continue;
+                    if &name_buf[..name_len] == b"." {
+                        if u32::from_le(header.inode) != self_ino {
+                            return false;
+                        }
+                        continue;
+                    }
+                    if &name_buf[..name_len] == b".." {
+                        continue;
+                    }
                 }
                 return false;
             }
@@ -1857,21 +1861,26 @@ impl InodeInner {
         }
 
         let block_size = fs.block_size();
-        let size = self.file_size();
-        let max_blocks = size.div_ceil(block_size);
+        let file_size = self.file_size();
+        let name_bytes = name.as_bytes();
+        let mut name_buf = [0u8; u8::MAX as usize];
 
-        for block_idx in 0..max_blocks {
-            let block = self.read_dir_block(fs, block_idx)?;
-            let mut iter = block.iter()?;
-            while let Some(entry) = iter.next_entry()? {
-                if entry.inode == 0 {
+        for block_idx in 0..file_size.div_ceil(block_size) {
+            let block_offset = block_idx * block_size;
+            let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, file_size);
+            let mut iter = block.iter_entries();
+            while let Some((entry_offset, header)) = iter.next_entry(block_offset)? {
+                let ino = u32::from_le(header.inode);
+                if ino == 0 {
                     continue;
                 }
-                if entry.name_len as usize != name.len() {
+                let name_len = header.name_len as usize;
+                if name_len != name_bytes.len() {
                     continue;
                 }
-                if entry.name.as_bytes() == name.as_bytes() {
-                    return Ok(entry.inode);
+                block.read_name(entry_offset, name_len, &mut name_buf[..name_len])?;
+                if &name_buf[..name_len] == name_bytes {
+                    return Ok(ino);
                 }
             }
         }
@@ -1938,9 +1947,7 @@ impl InodeInner {
             return Ok(0);
         }
 
-        let sb = fs.super_block();
         let block_size = fs.block_size();
-        let max_inumber = sb.total_inodes();
 
         let start_block = offset / block_size;
         let mut current_offset = offset;
@@ -1953,33 +1960,32 @@ impl InodeInner {
                 break;
             }
 
-            let block = self.read_dir_block(fs, block_idx)?;
-            let mut iter = block.iter()?;
-            let mut inner_off = 0usize;
-            while let Some(entry) = iter.next_entry()? {
-                let entry_offset = block_offset + inner_off;
-                let next_offset = entry_offset + entry.rec_len as usize;
+            let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, size);
+            let mut iter = block.iter_entries();
+            let mut name_buf = [0u8; u8::MAX as usize];
+            while let Some((entry_off, header)) = iter.next_entry(block_offset)? {
+                let entry_offset = block_offset + entry_off;
+                let rec_len = u16::from_le(header.rec_len) as usize;
+                let next_offset = entry_offset + rec_len;
 
                 if next_offset <= current_offset {
-                    inner_off = next_offset - block_offset;
                     continue;
                 }
                 if entry_offset < current_offset {
                     current_offset = next_offset;
-                    inner_off = next_offset - block_offset;
                     continue;
                 }
 
-                if entry.inode != 0 {
-                    let dtype = DirEntryFileType::from(entry.file_type);
+                let ino = u32::from_le(header.inode);
+                if ino != 0 {
+                    let name_len = header.name_len as usize;
+                    block.read_name(entry_off, name_len, &mut name_buf[..name_len])?;
+                    let name = core::str::from_utf8(&name_buf[..name_len])
+                        .map_err(|_| Error::with_message(Errno::EIO, "invalid dir entry name"))?;
+                    let dtype = DirEntryFileType::from(header.file_type);
                     let inode_type = InodeType::from(dtype);
                     if visitor
-                        .visit(
-                            entry.name.as_str()?,
-                            entry.inode as u64,
-                            inode_type,
-                            next_offset,
-                        )
+                        .visit(name, ino as u64, inode_type, next_offset)
                         .is_err()
                     {
                         advanced = current_offset - offset;
@@ -1988,7 +1994,6 @@ impl InodeInner {
                 }
 
                 current_offset = next_offset;
-                inner_off = next_offset - block_offset;
             }
 
             advanced = current_offset - offset;
@@ -2231,16 +2236,6 @@ impl InodeInner {
         self.sync_desc_block_map_from_snapshot(desc);
     }
 
-    /// Reads a directory block by index into a `DirBlock`.
-    fn read_dir_block(&self, fs: &Ext2, block_idx: usize) -> Result<DirBlock> {
-        let block_size = fs.block_size();
-        let block_offset = block_idx * block_size;
-        let limit = self.file_size().saturating_sub(block_offset).min(block_size);
-        let mut buf = vec![0u8; block_size];
-        self.page_cache.read_bytes(block_offset, &mut buf)?;
-        Ok(DirBlock::new(buf, limit, fs.super_block().total_inodes()))
-    }
-
     /// Phase 1: scan directory blocks for reusable slot or duplicate.
     ///
     fn scan_dir_for_slot(&self, fs: &Ext2, name: &str) -> Result<DirScanResult> {
@@ -2259,37 +2254,37 @@ impl InodeInner {
             return_errno_with_message!(Errno::ENOSPC, "dir entry too large for block");
         }
 
-        let size = self.file_size();
-        let max_inumber = fs.super_block().total_inodes();
-        let data_blocks = size.div_ceil(block_size);
+        let file_size = self.file_size();
+        let data_blocks = file_size.div_ceil(block_size);
+        let mut name_buf = [0u8; u8::MAX as usize];
 
         for block_idx in 0..data_blocks {
             let block_offset = block_idx * block_size;
-            let limit = (size - block_offset).min(block_size);
-            if limit == 0 {
-                continue;
-            }
+            let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, file_size);
+            let mut iter = block.iter_entries();
 
-            let block = self.read_dir_block(fs, block_idx)?;
-            for (entry_offset, entry) in block.entries()? {
-                if entry.inode != 0
-                    && entry.name_len as usize == name_bytes.len()
-                    && entry.name.as_bytes() == name_bytes
-                {
-                    // SPEC: duplicate names fail with EEXIST.
-                    return_errno!(Errno::EEXIST);
+            while let Some((entry_offset, header)) = iter.next_entry(block_offset)? {
+                let ino = u32::from_le(header.inode);
+                let rec_len = u16::from_le(header.rec_len) as usize;
+
+                // Check for duplicate name.
+                if ino != 0 && header.name_len as usize == name_bytes.len() {
+                    let name_len = header.name_len as usize;
+                    block.read_name(entry_offset, name_len, &mut name_buf[..name_len])?;
+                    if &name_buf[..name_len] == name_bytes {
+                        return_errno!(Errno::EEXIST);
+                    }
                 }
 
-                let rec_len = entry.rec_len as usize;
-                let used_len = if entry.inode == 0 {
+                let used_len = if ino == 0 {
                     0
                 } else {
-                    DirEntry::dir_rec_len(entry.name_len as usize) as usize
+                    DirEntry::dir_rec_len(header.name_len as usize) as usize
                 };
 
-                // SPEC: free entry can be reused, occupied entry can be split.
-                if (entry.inode == 0 && rec_len >= reclen)
-                    || (entry.inode != 0 && rec_len >= used_len.saturating_add(reclen))
+                // Free entry can be reused, occupied entry can be split.
+                if (ino == 0 && rec_len >= reclen)
+                    || (ino != 0 && rec_len >= used_len.saturating_add(reclen))
                 {
                     return Ok(DirScanResult::Slot(DirSlotInfo {
                         dir_offset: block_offset + entry_offset,
@@ -2351,17 +2346,15 @@ impl InodeInner {
             if slot.used_rec_len >= slot.slot_rec_len {
                 return_errno_with_message!(Errno::EIO, "corrupted dir entry split");
             }
-            // SPEC: when splitting, commit predecessor rec_len before writing new entry.
-            let split_len = (slot.used_rec_len as u16).to_le_bytes();
+            // When splitting, update the predecessor's rec_len first.
             self.page_cache
-                .write_bytes(slot.dir_offset.saturating_add(4), &split_len)?;
+                .write_bytes(slot.dir_offset.saturating_add(4), &(slot.used_rec_len as u16).to_le_bytes())?;
             offset = slot.dir_offset.saturating_add(slot.used_rec_len);
             rec_len = slot.slot_rec_len.saturating_sub(slot.used_rec_len);
         }
 
-        let mut block = DirBlock::new_zeroed(rec_len, fs.super_block().total_inodes());
+        let block = DirBlock::new(self.page_cache(), offset, rec_len);
         block.write_entry(0, ino, rec_len as u16, name_bytes, ft)?;
-        self.page_cache.write_bytes(offset, block.as_bytes())?;
         Ok(())
     }
 
@@ -2369,23 +2362,28 @@ impl InodeInner {
     ///
     fn find_entry_target(&self, fs: &Ext2, name: &str) -> Result<DirEntryTarget> {
         let block_size = fs.block_size();
-        let size = self.file_size();
+        let file_size = self.file_size();
         let name_bytes = name.as_bytes();
+        let mut name_buf = [0u8; u8::MAX as usize];
 
-        for block_idx in 0..size.div_ceil(block_size) {
+        for block_idx in 0..file_size.div_ceil(block_size) {
             let block_offset = block_idx * block_size;
-            let block = self.read_dir_block(fs, block_idx)?;
-            for (entry_offset, entry) in block.entries()? {
-                if entry.inode == 0 {
+            let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, file_size);
+            let mut iter = block.iter_entries();
+            while let Some((entry_offset, header)) = iter.next_entry(block_offset)? {
+                let ino = u32::from_le(header.inode);
+                if ino == 0 {
                     continue;
                 }
-                if entry.name_len as usize != name_bytes.len() {
+                let name_len = header.name_len as usize;
+                if name_len != name_bytes.len() {
                     continue;
                 }
-                if entry.name.as_bytes() == name_bytes {
+                block.read_name(entry_offset, name_len, &mut name_buf[..name_len])?;
+                if &name_buf[..name_len] == name_bytes {
                     return Ok(DirEntryTarget {
                         dir_offset: block_offset + entry_offset,
-                        entry_rec_len: entry.rec_len as usize,
+                        entry_rec_len: u16::from_le(header.rec_len) as usize,
                     });
                 }
             }
@@ -2394,33 +2392,30 @@ impl InodeInner {
         return_errno!(Errno::ENOENT)
     }
 
-    /// Delete a located entry by zeroing inode and merging rec_len.
+    /// Deletes a located entry by zeroing inode and merging rec_len.
     ///
     fn delete_entry(&self, fs: &Ext2, target: &DirEntryTarget) -> Result<()> {
         let block_size = fs.block_size();
-        let block_size = fs.block_size();
-        let block_base = (target.dir_offset / block_size).saturating_mul(block_size);
+        let block_base = (target.dir_offset / block_size) * block_size;
         let block_idx = block_base / block_size;
-        let entry_offset = target.dir_offset.saturating_sub(block_base);
+        let entry_offset = target.dir_offset - block_base;
 
-        let mut block = self.read_dir_block(fs, block_idx)?;
+        let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, self.file_size());
         block.delete_entry(block_size, entry_offset, target.entry_rec_len)?;
-        self.page_cache.write_bytes(block_base, block.as_bytes())?;
         Ok(())
     }
 
-    /// Rewrite a located entry's inode/type.
+    /// Rewrites a located entry's inode/type.
     ///
     fn set_link(&self, fs: &Ext2, target: &DirEntryTarget, new_ino: u32, ft: u8) -> Result<()> {
         let block_size = fs.block_size();
-        let block_base = (target.dir_offset / block_size).saturating_mul(block_size);
+        let block_base = (target.dir_offset / block_size) * block_size;
         let block_idx = block_base / block_size;
-        let entry_offset = target.dir_offset.saturating_sub(block_base);
+        let entry_offset = target.dir_offset - block_base;
 
-        let mut block = self.read_dir_block(fs, block_idx)?;
+        let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, self.file_size());
         block.set_inode(entry_offset, new_ino)?;
         block.set_file_type(entry_offset, ft)?;
-        self.page_cache.write_bytes(block_base, block.as_bytes())?;
         Ok(())
     }
 
