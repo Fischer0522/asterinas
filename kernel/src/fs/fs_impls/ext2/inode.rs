@@ -246,10 +246,12 @@ impl Inode {
 
         let mut inner = self.inner.write();
         if new_size < old_size {
-            inner.shrink(new_size)
+            inner.shrink(new_size)?;
         } else {
-            inner.expand(new_size)
+            inner.expand(new_size)?;
         }
+        inner.touch_mtime_ctime(now());
+        Ok(())
     }
 
     pub(super) fn metadata(&self) -> Metadata {
@@ -466,7 +468,9 @@ impl Inode {
             return_errno!(Errno::ENAMETOOLONG);
         }
         let mut inner = self.inner.write();
-        inner.write_link(target)
+        inner.write_link(target)?;
+        inner.touch_mtime_ctime(now());
+        Ok(())
     }
 
     pub(super) fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
@@ -705,54 +709,6 @@ impl Inode {
         )
     }
 
-    /// Creates a subdirectory under this directory.
-    ///
-    pub(super) fn mkdir(&self, name: &str, perm: FilePerm) -> Result<Arc<Inode>> {
-        if self.type_ != InodeType::Dir {
-            return_errno!(Errno::ENOTDIR);
-        }
-
-        if Self::has_invalid_child_name(name) {
-            return_errno!(Errno::EINVAL);
-        }
-
-        let fs = self.fs()?;
-        let mut parent_inner = self.inner.write();
-        let slot = match parent_inner.scan_dir_for_slot(&fs, name)? {
-            DirScanResult::Slot(slot) => slot,
-            DirScanResult::NeedGrowth => parent_inner.grow_dir_block(&fs)?,
-        };
-
-        let child = match fs.create_inode(self.ino, InodeType::Dir, perm) {
-            Ok(child) => child,
-            Err(err) => {
-                return Err(err);
-            }
-        };
-        let child_ino = child.ino();
-        let mut child_inner = child.inner.write();
-        if let Err(err) = child_inner.make_empty(child_ino, self.ino, &fs) {
-            let _ = fs.free_inode(child_ino, true);
-            return Err(err);
-        }
-
-        // If write dir entry failed, the resource of child inode (e.g., inode number, blocks) 
-        // will be claimed automatically by `Drop`.
-        parent_inner.write_dir_entry(
-            &fs,
-            &slot,
-            name,
-            child_ino,
-            DirEntryFileType::Dir as u8,
-        )?;
-
-        parent_inner.add_links_count_saturating(1);
-        parent_inner.touch_mtime_ctime(now());
-        fs.insert_inode_cache(child.clone());
-        drop(child_inner);
-        Ok(child)
-    }
-
     /// Implements fallocate operations for ext2.
     pub(super) fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {
         match mode {
@@ -796,6 +752,7 @@ impl Inode {
                     }
                 }
 
+                inner.touch_mtime_ctime(now());
                 Ok(())
             }
             _ => {
@@ -926,7 +883,6 @@ impl Inode {
         type_: InodeType,
         perm: FilePerm,
     ) -> Result<Arc<Inode>> {
-        // SPEC: self must be a directory.
         if self.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
@@ -935,36 +891,48 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        // Accept ext2 special inode kinds needed by mknod in addition to regular kinds.
-        if type_ != InodeType::File
-            && type_ != InodeType::Dir
-            && type_ != InodeType::SymLink
-            && type_ != InodeType::CharDevice
-            && type_ != InodeType::BlockDevice
-            && type_ != InodeType::NamedPipe
-        {
+        if !matches!(
+            type_,
+            InodeType::File
+                | InodeType::Dir
+                | InodeType::SymLink
+                | InodeType::CharDevice
+                | InodeType::BlockDevice
+                | InodeType::NamedPipe
+        ) {
             return_errno!(Errno::EINVAL);
         }
 
-        if type_ == InodeType::Dir {
-            return self.mkdir(name, perm);
-        } else {
-            let fs = self.fs()?;
-            let child = fs.create_inode(self.ino, type_, perm)?;
-            let child_ino = child.ino();
-            let dir_ft = Self::inode_type_to_dir_file_type(type_);
-            let mut inner = self.inner.write();
-            if let Err(err) = inner.add_entry(name, child_ino, dir_ft) {
-                // SPEC: rollback — ext2_add_nondir failure path:
-                // decrement link count and discard inode.
-                let _ = fs.free_inode(child_ino, false);
-                return Err(err);
-            }
+        let is_dir = type_ == InodeType::Dir;
+        let fs = self.fs()?;
+        let dir_ft = Self::inode_type_to_dir_file_type(type_);
 
-            fs.insert_inode_cache(child.clone());
+        // Scan for a slot before creating the child inode to avoid wasting
+        // an inode allocation when the name already exists (EEXIST).
+        let mut parent_inner = self.inner.write();
+        let slot = match parent_inner.scan_dir_for_slot(&fs, name)? {
+            DirScanResult::Slot(slot) => slot,
+            DirScanResult::NeedGrowth => parent_inner.grow_dir_block(&fs)?,
+        };
 
-            Ok(child)
+        let child = fs.create_inode(self.ino, type_, perm)?;
+        let child_ino = child.ino();
+
+        if is_dir {
+            let mut child_inner = child.inner.write();
+            child_inner.make_empty(child_ino, self.ino, &fs)?;
         }
+
+        parent_inner.add_entry(&fs, &slot, name, child_ino, dir_ft as u8)?;
+
+        // Link the child dir's `..` to parent dir.
+        if is_dir {
+            parent_inner.add_links_count_saturating(1);
+        }
+        parent_inner.touch_mtime_ctime(now());
+
+        fs.insert_inode_cache(child.clone());
+        Ok(child)
     }
 
     /// Adds a hard link in this directory to an existing non-directory inode.
@@ -1005,7 +973,7 @@ impl Inode {
                 DirScanResult::Slot(slot) => slot,
                 DirScanResult::NeedGrowth => dir_inner.grow_dir_block(&fs)?,
             };
-            dir_inner.write_dir_entry(&fs, &slot, name, old.ino, dir_ft as u8)?;
+            dir_inner.add_entry(&fs, &slot, name, old.ino, dir_ft as u8)?;
             dir_inner.touch_mtime_ctime(now());
             Ok(())
         })();
@@ -1364,7 +1332,7 @@ impl Inode {
             DirScanResult::Slot(slot) => slot,
             DirScanResult::NeedGrowth => target_inner.grow_dir_block(fs)?,
         };
-        target_inner.write_dir_entry(fs, &slot, new_name, old_ino, moved_ft)?;
+        target_inner.add_entry(fs, &slot, new_name, old_ino, moved_ft)?;
         Ok(())
     }
 
@@ -1959,7 +1927,6 @@ impl InodeInner {
         // Fill the partial tail of the new EOF block.
         self.zero_eof_tail(new_size, block_size)?;
         self.sync_desc_block_map_from_snapshot(snapshot);
-        self.touch_mtime_ctime(now());
         self.set_file_size(new_size);
         Ok(())
     }
@@ -1979,7 +1946,6 @@ impl InodeInner {
         self.zero_eof_tail(old_size, block_size)?;
         self.zero_eof_tail(new_size, block_size)?;
         self.set_file_size(new_size);
-        self.touch_mtime_ctime(now());
         Ok(())
     }
 
@@ -2086,8 +2052,6 @@ impl InodeInner {
         }
 
         self.set_file_size(target_len);
-        self.touch_mtime_ctime(now());
-
         Ok(())
     }
 
@@ -2249,10 +2213,6 @@ impl InodeInner {
         };
         self.sync_desc_block_map_from_snapshot(block_map_desc);
 
-        if !new_blocks.is_empty() {
-            self.set_ctime(now());
-        }
-
         alloc_result?;
         Ok(new_blocks)
     }
@@ -2394,7 +2354,7 @@ impl InodeInner {
 
     /// Phase 3: write a new entry into a selected slot via PageCache.
     ///
-    fn write_dir_entry(
+    fn add_entry(
         &self,
         fs: &Ext2,
         slot: &DirSlotInfo,
@@ -2500,13 +2460,7 @@ impl InodeInner {
 
     /// Rewrite a located entry's inode/type.
     ///
-    fn set_link(
-        &self,
-        fs: &Ext2,
-        target: &DirEntryTarget,
-        new_ino: u32,
-        ft: u8,
-    ) -> Result<()> {
+    fn set_link(&self, fs: &Ext2, target: &DirEntryTarget, new_ino: u32, ft: u8) -> Result<()> {
         let block_size = fs.block_size();
         let block_base = (target.dir_offset / block_size).saturating_mul(block_size);
         let entry_offset = target.dir_offset.saturating_sub(block_base);
@@ -2519,19 +2473,6 @@ impl InodeInner {
         }
         block_buf[entry_offset + 7] = ft;
         self.page_cache.write_bytes(block_base, &block_buf)?;
-        Ok(())
-    }
-
-    /// Add a directory entry.
-    ///
-    fn add_entry(&mut self, name: &str, new_ino: u32, file_type: DirEntryFileType) -> Result<()> {
-        let fs = self.fs_arc()?;
-        let slot = match self.scan_dir_for_slot(&fs, name)? {
-            DirScanResult::Slot(slot) => slot,
-            DirScanResult::NeedGrowth => self.grow_dir_block(&fs)?,
-        };
-        self.write_dir_entry(&fs, &slot, name, new_ino, file_type as u8)?;
-        self.touch_mtime_ctime(now());
         Ok(())
     }
 
@@ -3309,13 +3250,12 @@ mod test {
         let src = root
             .create("src", InodeType::File, FilePerm::from_bits_truncate(0o644))
             .unwrap();
-        root
-            .create(
-                "target",
-                InodeType::File,
-                FilePerm::from_bits_truncate(0o644),
-            )
-            .unwrap();
+        root.create(
+            "target",
+            InodeType::File,
+            FilePerm::from_bits_truncate(0o644),
+        )
+        .unwrap();
 
         // Rename to itself is a no-op success.
         root.rename("target", &root, "target").unwrap();
