@@ -310,7 +310,7 @@ pub(super) fn build_group_desc_segment(sb: &SuperBlock, descs: &[RawGroupDesc]) 
 
 pub(super) struct RawInodeBuilder {
     mode: u16,
-    links_count: u16,
+    link_count: u16,
     dtime: u32,
     size_lo: u32,
     sector_count: u32,
@@ -322,7 +322,7 @@ impl RawInodeBuilder {
     pub(super) fn new(mode: u16) -> Self {
         Self {
             mode,
-            links_count: 1,
+            link_count: 1,
             dtime: 0,
             size_lo: 0,
             sector_count: 0,
@@ -331,8 +331,8 @@ impl RawInodeBuilder {
         }
     }
 
-    pub(super) fn links_count(mut self, v: u16) -> Self {
-        self.links_count = v;
+    pub(super) fn link_count(mut self, v: u16) -> Self {
+        self.link_count = v;
         self
     }
 
@@ -366,7 +366,7 @@ impl RawInodeBuilder {
             mtime: 0,
             dtime: self.dtime,
             gid: 0,
-            links_count: self.links_count,
+            link_count: self.link_count,
             sector_count: self.sector_count,
             flags: self.flags,
             osd1: 0,
@@ -515,7 +515,7 @@ pub(super) fn write_block_bitmap(
     mark_block(sb.group_descriptors_bid(0));
     mark_block(desc.block_bitmap);
     mark_block(desc.inode_bitmap);
-    for block in desc.inode_table..desc.inode_table.saturating_add(sb.itb_per_group()) {
+    for block in desc.inode_table..desc.inode_table.saturating_add(sb.inode_table_blocks_per_group()) {
         mark_block(block);
     }
 
@@ -587,7 +587,7 @@ pub(super) fn group0_layout(sb: &SuperBlock) -> Group0Layout {
         next = next.saturating_add(1);
     }
     let inode_table = next;
-    let first_data = inode_table.saturating_add(sb.itb_per_group());
+    let first_data = inode_table.saturating_add(sb.inode_table_blocks_per_group());
 
     Group0Layout {
         group_desc_bid,
@@ -613,7 +613,7 @@ pub(super) fn validate_group0_layout(sb: &SuperBlock, layout: &Group0Layout) -> 
 
     let inode_table_last = layout
         .inode_table
-        .saturating_add(sb.itb_per_group())
+        .saturating_add(sb.inode_table_blocks_per_group())
         .saturating_sub(1);
     if inode_table_last > last {
         return_errno_with_message!(Errno::EINVAL, "test layout inode table out of range");
@@ -655,7 +655,7 @@ pub(super) fn validate_group0_layout(sb: &SuperBlock, layout: &Group0Layout) -> 
 
 fn make_root_raw_inode(root_bid: u32, block_size: usize) -> RawInode {
     RawInodeBuilder::new(InodeType::Dir as u16 | 0o755)
-        .links_count(2)
+        .link_count(2)
         .size_lo(block_size as u32)
         .sector_count((block_size / SECTOR_SIZE) as u32)
         .block_ptrs({
@@ -874,7 +874,7 @@ impl Ext2FixtureBuilder {
                 }
             }
 
-            let itb = sb.itb_per_group();
+            let itb = sb.inode_table_blocks_per_group();
             for i in 0..itb {
                 set_bit_lsb0(&mut bitmap_block, (desc.inode_table + i - first) as usize);
             }
@@ -898,7 +898,7 @@ impl Ext2FixtureBuilder {
             // Mark actual metadata block positions relative to group start.
             set_bit_lsb0(&mut bitmap_block, (descs[0].block_bitmap - first) as usize);
             set_bit_lsb0(&mut bitmap_block, (descs[0].inode_bitmap - first) as usize);
-            let itb = sb.itb_per_group();
+            let itb = sb.inode_table_blocks_per_group();
             for i in 0..itb {
                 set_bit_lsb0(
                     &mut bitmap_block,

@@ -76,7 +76,7 @@ pub(super) struct BlockGroup {
     /// Cached geometry: last filesystem-wide block number of this group.
     last_block: u32,
     /// Cached geometry: inode table blocks per group.
-    itb_per_group: u32,
+    inode_table_blocks_per_group: u32,
     /// Cached geometry: inodes per group.
     inodes_per_group: u32,
     /// Cached geometry: inode size in bytes.
@@ -175,7 +175,7 @@ impl BlockGroup {
         // Cache geometry from SuperBlock at load time.
         let first_block = sb.group_first_block_no(idx);
         let last_block = sb.group_last_block_no(idx);
-        let itb_per_group = sb.itb_per_group();
+        let inode_table_blocks_per_group = sb.inode_table_blocks_per_group();
         let inodes_per_group = sb.inodes_per_group();
         let inode_size = sb.inode_size();
 
@@ -184,7 +184,7 @@ impl BlockGroup {
             block_device.as_ref(),
             first_block,
             last_block,
-            itb_per_group,
+            inode_table_blocks_per_group,
             &desc,
         )?;
         let inode_bitmap = Self::load_inode_bitmap(block_device.as_ref(), inodes_per_group, &desc)?;
@@ -207,7 +207,7 @@ impl BlockGroup {
             block_device,
             first_block,
             last_block,
-            itb_per_group,
+            inode_table_blocks_per_group: inode_table_blocks_per_group,
             inodes_per_group,
             inode_size,
             _inode_table_backend: backend,
@@ -478,7 +478,7 @@ impl BlockGroup {
         block_device: &dyn BlockDevice,
         first_block: u32,
         last_block: u32,
-        itb_per_group: u32,
+        inode_table_blocks_per_group: u32,
         desc: &GroupDesc,
     ) -> Result<IdBitmap> {
         let bitmap_bid = desc.block_bitmap;
@@ -536,12 +536,12 @@ impl BlockGroup {
             if inode_table < first_block || offset > max_bit {
                 return_errno_with_message!(Errno::EINVAL, "inode table start out of group range");
             }
-            let table_last = offset + itb_per_group - 1;
+            let table_last = offset + inode_table_blocks_per_group - 1;
             if table_last > max_bit {
                 return_errno_with_message!(Errno::EINVAL, "inode table extends beyond group");
             }
 
-            let end = offset + itb_per_group;
+            let end = offset + inode_table_blocks_per_group;
             let mut bit = offset;
             while bit < end {
                 if !bitmap.is_allocated(bit as u16) {
@@ -785,7 +785,7 @@ impl BlockGroup {
         if Self::ranges_overlap(start, end, inode_bitmap, 1) {
             return true;
         }
-        if Self::ranges_overlap(start, end, inode_table, self.itb_per_group) {
+        if Self::ranges_overlap(start, end, inode_table, self.inode_table_blocks_per_group) {
             return true;
         }
         false

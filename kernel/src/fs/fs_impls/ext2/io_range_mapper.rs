@@ -6,7 +6,7 @@ use ostd::sync::RwMutexReadGuard;
 
 use super::{
     fs::Ext2,
-    inode_block_map::{Ext2Bid, InodeBlockMap},
+    inode_block_map::{Ext2Bid, BlockPtrTree},
     prelude::*,
 };
 
@@ -21,7 +21,7 @@ pub(super) struct MappedRange {
 
 pub(super) struct IoRangeMapper<'a> {
     range: Range<u32>,
-    block_map: RwMutexReadGuard<'a, InodeBlockMap>,
+    block_map: RwMutexReadGuard<'a, BlockPtrTree>,
     fs: &'a Ext2,
 }
 
@@ -37,7 +37,7 @@ pub(super) enum IoRange {
 impl<'a> IoRangeMapper<'a> {
     pub(super) fn new(
         range: Range<Ext2Bid>,
-        block_map: RwMutexReadGuard<'a, InodeBlockMap>,
+        block_map: RwMutexReadGuard<'a, BlockPtrTree>,
         fs: &'a Ext2,
     ) -> Self {
         Self {
@@ -61,7 +61,7 @@ impl<'a> IoRangeMapper<'a> {
         let max_blocks = self.range.end - self.range.start;
         if let Some(device_block_range) =
             self.block_map
-                .get_block_range(self.fs, start_iblock, max_blocks)?
+                .lookup_block_range(self.fs, start_iblock, max_blocks)?
         {
             let logical_end = start_iblock
                 + device_block_range
@@ -81,7 +81,7 @@ impl<'a> IoRangeMapper<'a> {
             let remaining = self.range.end - iblock;
             if self
                 .block_map
-                .get_block_range(self.fs, iblock, remaining)?
+                .lookup_block_range(self.fs, iblock, remaining)?
                 .is_some()
             {
                 break;
@@ -99,13 +99,13 @@ mod test {
 
     use super::*;
     use crate::{
-        fs::fs_impls::ext2::{inode_block_map::BlockMapDesc, testkit::Ext2FixtureBuilder},
+        fs::fs_impls::ext2::{inode_block_map::RawBlockPtrs, testkit::Ext2FixtureBuilder},
         prelude::*,
         time::clocks,
     };
 
-    fn make_block_map(block_ptrs: [u32; 15], fs: &Arc<Ext2>) -> InodeBlockMap {
-        InodeBlockMap::new(BlockMapDesc::from_parts(0, block_ptrs), Arc::downgrade(fs))
+    fn make_block_map(block_ptrs: [u32; 15], fs: &Arc<Ext2>) -> BlockPtrTree {
+        BlockPtrTree::new(RawBlockPtrs::from_parts(0, block_ptrs), Arc::downgrade(fs))
     }
 
     #[ktest]

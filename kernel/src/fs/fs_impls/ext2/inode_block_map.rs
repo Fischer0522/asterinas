@@ -17,9 +17,9 @@ pub(super) type Ext2Bid = u32;
 // TODO: Refactor this into a more idiomatic Rust representation, such as an `enum`.
 /// Block path offsets for direct/indirect traversal.
 ///
-/// Produced by `block_to_path` from a logical block number.
+/// Produced by `logical_block_to_path` from a logical block number.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct BlockPath {
+pub(super) struct BlockPointerPath {
     /// Number of levels in the pointer chain (1 = direct, 2 = single indirect,
     /// 3 = double indirect, 4 = triple indirect). A depth of 0 is invalid.
     pub depth: usize,
@@ -37,7 +37,7 @@ pub(super) struct BlockPath {
 /// A single level in the block-pointer chain.
 ///
 #[derive(Clone, Debug)]
-struct IndirectEntry {
+struct IndirectBlockEntry {
     /// Physical block number read from this level's slot; 0 means hole.
     key: Ext2Bid,
     /// Indirect metadata block that contains this level's slot.
@@ -47,21 +47,21 @@ struct IndirectEntry {
 
 /// Result of traversing a block-pointer chain.
 #[derive(Debug)]
-struct BranchResult {
+struct BranchChainWalkResult {
     /// Level where traversal stopped on a zero pointer, or `path.depth` if complete.
     partial_level: usize,
     /// Entries traversed so far.
-    chain: Vec<IndirectEntry>,
+    chain: Vec<IndirectBlockEntry>,
 }
 
 // In-memory inode block map for the raw on-disk `i_blocks` and `i_block[]` state.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct BlockMapDesc {
+pub(super) struct RawBlockPtrs {
     pub(super) sector_count: u32,
     pub(super) block_ptrs: [u32; 15],
 }
 
-impl BlockMapDesc {
+impl RawBlockPtrs {
     pub(super) fn from_raw(raw: &RawInode) -> Self {
         Self {
             sector_count: raw.sector_count,
@@ -111,20 +111,20 @@ impl BlockMapDesc {
 }
 
 #[derive(Debug)]
-pub(super) struct InodeBlockMap {
-    pub(super) desc: Dirty<BlockMapDesc>,
+pub(super) struct BlockPtrTree {
+    pub(super) desc: Dirty<RawBlockPtrs>,
     pub(super) indirect_blocks: Mutex<IndirectBlockManager>,
 }
 
-impl InodeBlockMap {
-    pub(super) fn new(desc: BlockMapDesc, fs: Weak<Ext2>) -> Self {
+impl BlockPtrTree {
+    pub(super) fn new(desc: RawBlockPtrs, fs: Weak<Ext2>) -> Self {
         Self {
             desc: Dirty::new(desc),
             indirect_blocks: Mutex::new(IndirectBlockManager::new(fs)),
         }
     }
 
-    pub(super) fn get_desc(&self) -> &BlockMapDesc {
+    pub(super) fn desc(&self) -> &RawBlockPtrs {
         &self.desc
     }
 
@@ -134,7 +134,7 @@ impl InodeBlockMap {
 
     /// Translates a logical block number into a path of block pointer offsets.
     ///
-    pub(super) fn block_to_path(&self, fs: &Ext2, iblock: u32) -> Result<BlockPath> {
+    pub(super) fn logical_block_to_path(&self, fs: &Ext2, iblock: u32) -> Result<BlockPointerPath> {
         let sb = fs.super_block();
         let ptrs = (sb.block_size() / size_of::<u32>()) as u32;
         if ptrs == 0 {
@@ -188,7 +188,7 @@ impl InodeBlockMap {
             return_errno_with_message!(Errno::EINVAL, "block number exceeds maximum");
         }
 
-        Ok(BlockPath {
+        Ok(BlockPointerPath {
             depth,
             offsets,
             boundary,
@@ -197,7 +197,7 @@ impl InodeBlockMap {
 
     /// Traverses the existing block pointer chain for a block path.
     ///
-    fn get_branch(&self, path: &BlockPath, fs: &Ext2) -> Result<BranchResult> {
+    fn walk_block_chain(&self, path: &BlockPointerPath, fs: &Ext2) -> Result<BranchChainWalkResult> {
         if path.depth == 0 || path.depth > path.offsets.len() {
             return_errno_with_message!(Errno::EIO, "invalid block path depth");
         }
@@ -209,13 +209,13 @@ impl InodeBlockMap {
             })?;
 
         let mut chain = Vec::with_capacity(path.depth);
-        chain.push(IndirectEntry {
+        chain.push(IndirectBlockEntry {
             key: top_key,
             bh: None,
         });
         if top_key == 0 {
             // SPEC: zero pointer means the chain is broken at level 0.
-            return Ok(BranchResult {
+            return Ok(BranchChainWalkResult {
                 partial_level: 0,
                 chain,
             });
@@ -234,33 +234,33 @@ impl InodeBlockMap {
                 .lock()
                 .find(parent_key)?
                 .read_bid(path.offsets[level] as usize)?;
-            chain.push(IndirectEntry {
+            chain.push(IndirectBlockEntry {
                 key: next_key,
                 bh: Some(parent_key),
             });
             if next_key == 0 {
                 // SPEC: include the zero-key entry and report break level.
-                return Ok(BranchResult {
+                return Ok(BranchChainWalkResult {
                     partial_level: level,
                     chain,
                 });
             }
         }
 
-        Ok(BranchResult {
+        Ok(BranchChainWalkResult {
             partial_level: path.depth,
             chain,
         })
     }
 
-    fn max_blocks_in_run(path: &BlockPath, max_blocks: u32) -> u32 {
+    fn max_blocks_in_run(path: &BlockPointerPath, max_blocks: u32) -> u32 {
         max_blocks.min(path.boundary.saturating_add(1))
     }
 
     fn mapped_range_from_branch(
         &self,
-        path: &BlockPath,
-        branch: &BranchResult,
+        path: &BlockPointerPath,
+        branch: &BranchChainWalkResult,
         max_blocks: u32,
     ) -> Result<Option<Range<Ext2Bid>>> {
         if max_blocks == 0 {
@@ -321,8 +321,8 @@ impl InodeBlockMap {
 
     fn blks_to_allocate(
         &self,
-        branch: &BranchResult,
-        path: &BlockPath,
+        branch: &BranchChainWalkResult,
+        path: &BlockPointerPath,
         max_blocks: u32,
     ) -> Result<(u32, u32)> {
         if max_blocks == 0 {
@@ -559,8 +559,8 @@ impl InodeBlockMap {
         fs: &Ext2,
         indirect_blks: u32,
         data_blks: u32,
-        path: &BlockPath,
-        branch: &BranchResult,
+        path: &BlockPointerPath,
+        branch: &BranchChainWalkResult,
     ) -> Result<Range<Ext2Bid>> {
         if data_blks == 0 {
             return_errno_with_message!(Errno::EIO, "invalid zero data allocation");
@@ -725,7 +725,7 @@ impl InodeBlockMap {
 
     /// Resolves a logical block to a contiguous physical block range.
     ///
-    pub(super) fn get_block_range(
+    pub(super) fn lookup_block_range(
         &self,
         fs: &Ext2,
         iblock: u32,
@@ -735,26 +735,26 @@ impl InodeBlockMap {
             return_errno_with_message!(Errno::EINVAL, "zero block range requested");
         }
 
-        let path = self.block_to_path(fs, iblock)?;
+        let path = self.logical_block_to_path(fs, iblock)?;
         if path.depth == 0 {
             return Ok(None);
         }
 
-        let branch = self.get_branch(&path, fs)?;
+        let branch = self.walk_block_chain(&path, fs)?;
         self.mapped_range_from_branch(&path, &branch, max_blocks)
     }
 
     /// Resolves a logical block to physical block (read-only).
     ///
-    pub(super) fn get_block(&self, fs: &Ext2, iblock: u32) -> Result<Option<Ext2Bid>> {
+    pub(super) fn lookup_block(&self, fs: &Ext2, iblock: u32) -> Result<Option<Ext2Bid>> {
         Ok(self
-            .get_block_range(fs, iblock, 1)?
+            .lookup_block_range(fs, iblock, 1)?
             .map(|range| range.start))
     }
 
     /// Resolves a logical block to a contiguous physical block range, allocating if needed.
     ///
-    pub(super) fn get_or_alloc_block_range(
+    pub(super) fn lookup_or_alloc_block_range(
         &mut self,
         fs: &Ext2,
         iblock: u32,
@@ -765,12 +765,12 @@ impl InodeBlockMap {
             return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
         }
 
-        let path = self.block_to_path(fs, iblock)?;
+        let path = self.logical_block_to_path(fs, iblock)?;
         if path.depth == 0 {
             return_errno_with_message!(Errno::EIO, "invalid block path depth");
         }
 
-        let branch = self.get_branch(&path, fs)?;
+        let branch = self.walk_block_chain(&path, fs)?;
         if branch.partial_level == path.depth {
             return self.mapped_range_from_branch(&path, &branch, max_blocks);
         }
@@ -785,14 +785,14 @@ impl InodeBlockMap {
 
     /// Resolves a logical block to physical, optionally allocating missing branch.
     ///
-    pub(super) fn get_or_alloc_block(
+    pub(super) fn lookup_or_alloc_block(
         &mut self,
         fs: &Ext2,
         iblock: u32,
         create: bool,
     ) -> Result<Option<Ext2Bid>> {
         Ok(self
-            .get_or_alloc_block_range(fs, iblock, 1, create)?
+            .lookup_or_alloc_block_range(fs, iblock, 1, create)?
             .map(|range| range.start))
     }
 
@@ -813,7 +813,7 @@ impl InodeBlockMap {
             .map_err(|_| Error::with_message(Errno::EINVAL, "truncate size exceeds ext2 limits"))?;
 
         // Convert logical block number to access path (depth + offsets).
-        let path = self.block_to_path(fs, iblock)?;
+        let path = self.logical_block_to_path(fs, iblock)?;
         if path.depth == 0 {
             return Ok(());
         }
@@ -847,7 +847,7 @@ impl InodeBlockMap {
             while k > 1 && path.offsets[k - 1] == 0 {
                 k -= 1;
             }
-            let shared_path = BlockPath {
+            let shared_path = BlockPointerPath {
                 depth: k,
                 offsets: path.offsets,
                 boundary: path.boundary,
@@ -856,7 +856,7 @@ impl InodeBlockMap {
             // --- Step 2: Read indirect block chain ---
             // branch.chain[i] contains the i-th level indirect block.
             // branch.partial_level indicates how deep we successfully read.
-            let branch = self.get_branch(&shared_path, fs)?;
+            let branch = self.walk_block_chain(&shared_path, fs)?;
             // `partial` is an index into `branch.chain[]`, pointing to the
             // deepest level from which we start detaching and freeing blocks.
             // If the full chain was read (partial_level == k), the last valid
@@ -1022,9 +1022,9 @@ mod test {
         prelude::*,
     };
 
-    fn make_block_map(block_ptrs: [u32; 15], sector_count: u32, fs: &Arc<Ext2>) -> InodeBlockMap {
-        InodeBlockMap::new(
-            BlockMapDesc::from_parts(sector_count, block_ptrs),
+    fn make_block_map(block_ptrs: [u32; 15], sector_count: u32, fs: &Arc<Ext2>) -> BlockPtrTree {
+        BlockPtrTree::new(
+            RawBlockPtrs::from_parts(sector_count, block_ptrs),
             Arc::downgrade(fs),
         )
     }
@@ -1099,49 +1099,49 @@ mod test {
         let block_map = make_block_map(block_ptrs, 0, &f.ext2);
 
         // Cover exact transition boundaries across all block-map levels.
-        let direct_path = block_map.block_to_path(ext2, 0).unwrap();
+        let direct_path = block_map.logical_block_to_path(ext2, 0).unwrap();
         assert_eq!(direct_path.depth, 1);
         assert_eq!(direct_path.offsets[0], 0);
         assert_eq!(direct_path.boundary, 11);
 
-        let direct_last_path = block_map.block_to_path(ext2, 11).unwrap();
+        let direct_last_path = block_map.logical_block_to_path(ext2, 11).unwrap();
         assert_eq!(direct_last_path.depth, 1);
         assert_eq!(direct_last_path.offsets[0], 11);
         assert_eq!(direct_last_path.boundary, 0);
 
-        let indirect_first_path = block_map.block_to_path(ext2, 12).unwrap();
+        let indirect_first_path = block_map.logical_block_to_path(ext2, 12).unwrap();
         assert_eq!(indirect_first_path.depth, 2);
         assert_eq!(indirect_first_path.offsets[0], 12);
         assert_eq!(indirect_first_path.offsets[1], 0);
 
-        let indirect_path = block_map.block_to_path(ext2, 12 + indirect_index).unwrap();
+        let indirect_path = block_map.logical_block_to_path(ext2, 12 + indirect_index).unwrap();
         assert_eq!(indirect_path.depth, 2);
         assert_eq!(indirect_path.offsets[0], 12);
         assert_eq!(indirect_path.offsets[1], indirect_index);
 
         let indirect_last_iblock = 12 + ptrs - 1;
-        let indirect_last_path = block_map.block_to_path(ext2, indirect_last_iblock).unwrap();
+        let indirect_last_path = block_map.logical_block_to_path(ext2, indirect_last_iblock).unwrap();
         assert_eq!(indirect_last_path.depth, 2);
         assert_eq!(indirect_last_path.offsets[0], 12);
         assert_eq!(indirect_last_path.offsets[1], ptrs - 1);
         assert_eq!(indirect_last_path.boundary, 0);
 
         let first_double_iblock = 12 + ptrs;
-        let first_double_path = block_map.block_to_path(ext2, first_double_iblock).unwrap();
+        let first_double_path = block_map.logical_block_to_path(ext2, first_double_iblock).unwrap();
         assert_eq!(first_double_path.depth, 3);
         assert_eq!(first_double_path.offsets[0], 13);
         assert_eq!(first_double_path.offsets[1], 0);
         assert_eq!(first_double_path.offsets[2], 0);
 
         let double_iblock = 12 + ptrs + (3 << ptrs_bits) + 4;
-        let double_path = block_map.block_to_path(ext2, double_iblock).unwrap();
+        let double_path = block_map.logical_block_to_path(ext2, double_iblock).unwrap();
         assert_eq!(double_path.depth, 3);
         assert_eq!(double_path.offsets[0], 13);
         assert_eq!(double_path.offsets[1], 3);
         assert_eq!(double_path.offsets[2], 4);
 
         let first_triple_iblock = 12 + ptrs + double_blocks;
-        let first_triple_path = block_map.block_to_path(ext2, first_triple_iblock).unwrap();
+        let first_triple_path = block_map.logical_block_to_path(ext2, first_triple_iblock).unwrap();
         assert_eq!(first_triple_path.depth, 4);
         assert_eq!(first_triple_path.offsets[0], 14);
         assert_eq!(first_triple_path.offsets[1], 0);
@@ -1150,7 +1150,7 @@ mod test {
 
         let triple_iblock =
             12 + ptrs + double_blocks + (2 << (ptrs_bits * 2)) + (3 << ptrs_bits) + 4;
-        let triple_path = block_map.block_to_path(ext2, triple_iblock).unwrap();
+        let triple_path = block_map.logical_block_to_path(ext2, triple_iblock).unwrap();
         assert_eq!(triple_path.depth, 4);
         assert_eq!(triple_path.offsets[0], 14);
         assert_eq!(triple_path.offsets[1], 2);
@@ -1158,18 +1158,18 @@ mod test {
         assert_eq!(triple_path.offsets[3], 4);
 
         // Verify block lookup resolves direct/indirect/double/triple chains.
-        assert_eq!(block_map.get_block(ext2, 0).unwrap(), Some(11));
-        assert_eq!(block_map.get_block(ext2, 1).unwrap(), None);
+        assert_eq!(block_map.lookup_block(ext2, 0).unwrap(), Some(11));
+        assert_eq!(block_map.lookup_block(ext2, 1).unwrap(), None);
         assert_eq!(
-            block_map.get_block(ext2, 12 + indirect_index).unwrap(),
+            block_map.lookup_block(ext2, 12 + indirect_index).unwrap(),
             Some(mapped_bid)
         );
         assert_eq!(
-            block_map.get_block(ext2, double_iblock).unwrap(),
+            block_map.lookup_block(ext2, double_iblock).unwrap(),
             Some(double_data_bid)
         );
         assert_eq!(
-            block_map.get_block(ext2, triple_iblock).unwrap(),
+            block_map.lookup_block(ext2, triple_iblock).unwrap(),
             Some(triple_data_bid)
         );
     }
@@ -1192,17 +1192,17 @@ mod test {
         block_ptrs[12] = indirect_bid;
         let block_map = make_block_map(block_ptrs, 0, &f.ext2);
 
-        assert_eq!(block_map.get_block_range(ext2, 0, 4).unwrap(), Some(11..14));
-        assert_eq!(block_map.get_block(ext2, 0).unwrap(), Some(11));
+        assert_eq!(block_map.lookup_block_range(ext2, 0, 4).unwrap(), Some(11..14));
+        assert_eq!(block_map.lookup_block(ext2, 0).unwrap(), Some(11));
         assert_eq!(
-            block_map.get_block_range(ext2, 12, 4).unwrap(),
+            block_map.lookup_block_range(ext2, 12, 4).unwrap(),
             Some(70..73)
         );
         assert_eq!(
-            block_map.get_block_range(ext2, 15, 4).unwrap(),
+            block_map.lookup_block_range(ext2, 15, 4).unwrap(),
             Some(90..91)
         );
-        assert_eq!(block_map.get_block_range(ext2, 3, 4).unwrap(), None);
+        assert_eq!(block_map.lookup_block_range(ext2, 3, 4).unwrap(), None);
     }
 
     #[ktest]
@@ -1221,12 +1221,12 @@ mod test {
         let block_map = make_block_map([0; 15], 0, &f.ext2);
 
         // Accept the maximum valid logical block and reject the next one.
-        block_map.block_to_path(ext2, max_iblock as u32).unwrap();
+        block_map.logical_block_to_path(ext2, max_iblock as u32).unwrap();
 
-        let too_big_err = block_map.block_to_path(ext2, too_big).unwrap_err();
+        let too_big_err = block_map.logical_block_to_path(ext2, too_big).unwrap_err();
         assert_eq!(too_big_err.error(), Errno::EINVAL);
 
-        let get_too_big_err = block_map.get_block(ext2, too_big).unwrap_err();
+        let get_too_big_err = block_map.lookup_block(ext2, too_big).unwrap_err();
         assert_eq!(get_too_big_err.error(), Errno::EINVAL);
 
         // Inject a deterministic read failure on the indirect block read path.
@@ -1246,7 +1246,7 @@ mod test {
         let mut ptrs_for_io = [0u32; 15];
         ptrs_for_io[12] = 40;
         let io_block_map = make_block_map(ptrs_for_io, 0, &io_f.ext2);
-        let io_err = io_block_map.get_block(io_ext2, 12).unwrap_err();
+        let io_err = io_block_map.lookup_block(io_ext2, 12).unwrap_err();
         assert_eq!(io_err.error(), Errno::EIO);
 
         // Any zero pointer on the branch is treated as a hole (None).
@@ -1254,7 +1254,7 @@ mod test {
         ptrs_for_indirect_hole[12] = 40;
         let indirect_hole_block_map = make_block_map(ptrs_for_indirect_hole, 0, &f.ext2);
         assert_eq!(
-            indirect_hole_block_map.get_block(ext2, 12 + 7).unwrap(),
+            indirect_hole_block_map.lookup_block(ext2, 12 + 7).unwrap(),
             None
         );
 
@@ -1265,7 +1265,7 @@ mod test {
         let double_hole_iblock = 12 + (ptrs as u32) + (3 << ptrs.trailing_zeros()) + 4;
         assert_eq!(
             double_hole_block_map
-                .get_block(ext2, double_hole_iblock)
+                .lookup_block(ext2, double_hole_iblock)
                 .unwrap(),
             None
         );
@@ -1283,7 +1283,7 @@ mod test {
             + 4;
         assert_eq!(
             triple_hole_block_map
-                .get_block(ext2, triple_hole_iblock)
+                .lookup_block(ext2, triple_hole_iblock)
                 .unwrap(),
             None
         );
@@ -1299,18 +1299,18 @@ mod test {
         let sectors_per_block = (ext2.block_size() / SECTOR_SIZE) as u32;
 
         let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
-        assert_eq!(block_map.get_or_alloc_block(ext2, 0, false).unwrap(), None);
+        assert_eq!(block_map.lookup_or_alloc_block(ext2, 0, false).unwrap(), None);
         assert_eq!(block_map.desc.block_ptrs[0], 0);
 
         let free_before = ext2.super_block().free_blocks_count();
         let allocated = block_map
-            .get_or_alloc_block(ext2, 0, true)
+            .lookup_or_alloc_block(ext2, 0, true)
             .unwrap()
             .unwrap();
         let free_after = ext2.super_block().free_blocks_count();
 
         assert_eq!(block_map.desc.block_ptrs[0], allocated);
-        assert_eq!(block_map.get_block(ext2, 0).unwrap(), Some(allocated));
+        assert_eq!(block_map.lookup_block(ext2, 0).unwrap(), Some(allocated));
         assert_eq!(block_map.desc.sector_count, sectors_per_block);
         assert_eq!(free_before.saturating_sub(free_after), 1);
     }
@@ -1327,7 +1327,7 @@ mod test {
         let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
         let free_before = ext2.super_block().free_blocks_count();
         let allocated_range = block_map
-            .get_or_alloc_block_range(ext2, 0, 3, true)
+            .lookup_or_alloc_block_range(ext2, 0, 3, true)
             .unwrap()
             .unwrap();
         let free_after = ext2.super_block().free_blocks_count();
@@ -1337,11 +1337,11 @@ mod test {
         assert_eq!(block_map.desc.block_ptrs[1], allocated_range.start + 1);
         assert_eq!(block_map.desc.block_ptrs[2], allocated_range.start + 2);
         assert_eq!(
-            block_map.get_block_range(ext2, 0, 3).unwrap(),
+            block_map.lookup_block_range(ext2, 0, 3).unwrap(),
             Some(allocated_range.clone())
         );
         assert_eq!(
-            block_map.get_or_alloc_block(ext2, 0, true).unwrap(),
+            block_map.lookup_or_alloc_block(ext2, 0, true).unwrap(),
             Some(allocated_range.start)
         );
         assert_eq!(
@@ -1363,13 +1363,13 @@ mod test {
         let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
         let free_before = ext2.super_block().free_blocks_count();
         let allocated = block_map
-            .get_or_alloc_block(ext2, 12, true)
+            .lookup_or_alloc_block(ext2, 12, true)
             .unwrap()
             .unwrap();
         let free_after = ext2.super_block().free_blocks_count();
 
         assert_ne!(block_map.desc.block_ptrs[12], 0);
-        assert_eq!(block_map.get_block(ext2, 12).unwrap(), Some(allocated));
+        assert_eq!(block_map.lookup_block(ext2, 12).unwrap(), Some(allocated));
         assert_eq!(
             block_map.desc.sector_count,
             sectors_per_block.saturating_mul(2)
@@ -1389,7 +1389,7 @@ mod test {
         let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
         let free_before = ext2.super_block().free_blocks_count();
         let allocated_range = block_map
-            .get_or_alloc_block_range(ext2, 12, 4, true)
+            .lookup_or_alloc_block_range(ext2, 12, 4, true)
             .unwrap()
             .unwrap();
         let free_after = ext2.super_block().free_blocks_count();
@@ -1397,11 +1397,11 @@ mod test {
         assert_ne!(block_map.desc.block_ptrs[12], 0);
         assert_eq!(allocated_range.end - allocated_range.start, 4);
         assert_eq!(
-            block_map.get_block_range(ext2, 12, 4).unwrap(),
+            block_map.lookup_block_range(ext2, 12, 4).unwrap(),
             Some(allocated_range.clone())
         );
         assert_eq!(
-            block_map.get_block(ext2, 12).unwrap(),
+            block_map.lookup_block(ext2, 12).unwrap(),
             Some(allocated_range.start)
         );
         assert_eq!(
@@ -1421,7 +1421,7 @@ mod test {
         let ext2 = &f.ext2;
 
         let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
-        let err = block_map.get_or_alloc_block(ext2, 0, true).unwrap_err();
+        let err = block_map.lookup_or_alloc_block(ext2, 0, true).unwrap_err();
         assert_eq!(err.error(), Errno::ENOSPC);
         assert_eq!(block_map.desc.block_ptrs, [0u32; 15]);
         assert_eq!(block_map.desc.sector_count, 0);
@@ -1444,7 +1444,7 @@ mod test {
         let last = sb.group_last_block_no(0);
         let data_base = first
             .saturating_add(2)
-            .saturating_add(sb.itb_per_group())
+            .saturating_add(sb.inode_table_blocks_per_group())
             .saturating_add(2);
         let free0 = data_base;
         let free1 = data_base.saturating_add(2);
@@ -1467,12 +1467,12 @@ mod test {
         let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
 
         let allocated_data = block_map
-            .get_or_alloc_block(ext2, first_double_iblock, true)
+            .lookup_or_alloc_block(ext2, first_double_iblock, true)
             .unwrap()
             .unwrap();
         assert_ne!(block_map.desc.block_ptrs[13], 0);
         assert_eq!(
-            block_map.get_block(ext2, first_double_iblock).unwrap(),
+            block_map.lookup_block(ext2, first_double_iblock).unwrap(),
             Some(allocated_data)
         );
 
@@ -1499,13 +1499,13 @@ mod test {
 
         let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
         block_map
-            .get_or_alloc_block(ext2, first_double_iblock, true)
+            .lookup_or_alloc_block(ext2, first_double_iblock, true)
             .unwrap();
         block_map
-            .get_or_alloc_block(ext2, first_double_iblock + 1, true)
+            .lookup_or_alloc_block(ext2, first_double_iblock + 1, true)
             .unwrap();
         block_map
-            .get_or_alloc_block(ext2, first_double_iblock + 2, true)
+            .lookup_or_alloc_block(ext2, first_double_iblock + 2, true)
             .unwrap();
 
         block_map
@@ -1513,16 +1513,16 @@ mod test {
             .unwrap();
         assert!(
             block_map
-                .get_block(ext2, first_double_iblock)
+                .lookup_block(ext2, first_double_iblock)
                 .unwrap()
                 .is_some()
         );
         assert_eq!(
-            block_map.get_block(ext2, first_double_iblock + 1).unwrap(),
+            block_map.lookup_block(ext2, first_double_iblock + 1).unwrap(),
             None
         );
         assert_eq!(
-            block_map.get_block(ext2, first_double_iblock + 2).unwrap(),
+            block_map.lookup_block(ext2, first_double_iblock + 2).unwrap(),
             None
         );
     }
@@ -1540,12 +1540,12 @@ mod test {
         let first_triple_iblock = 12 + ptrs + (1u32 << (ptrs.trailing_zeros() * 2));
 
         let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
-        block_map.get_or_alloc_block(ext2, 12, true).unwrap();
+        block_map.lookup_or_alloc_block(ext2, 12, true).unwrap();
         block_map
-            .get_or_alloc_block(ext2, first_double_iblock, true)
+            .lookup_or_alloc_block(ext2, first_double_iblock, true)
             .unwrap();
         block_map
-            .get_or_alloc_block(ext2, first_triple_iblock, true)
+            .lookup_or_alloc_block(ext2, first_triple_iblock, true)
             .unwrap();
         assert_ne!(block_map.desc.block_ptrs[12], 0);
         assert_ne!(block_map.desc.block_ptrs[13], 0);
@@ -1555,13 +1555,13 @@ mod test {
         assert_eq!(block_map.desc.block_ptrs[12], 0);
         assert_eq!(block_map.desc.block_ptrs[13], 0);
         assert_eq!(block_map.desc.block_ptrs[14], 0);
-        assert_eq!(block_map.get_block(ext2, 12).unwrap(), None);
+        assert_eq!(block_map.lookup_block(ext2, 12).unwrap(), None);
         assert_eq!(
-            block_map.get_block(ext2, first_double_iblock).unwrap(),
+            block_map.lookup_block(ext2, first_double_iblock).unwrap(),
             None
         );
         assert_eq!(
-            block_map.get_block(ext2, first_triple_iblock).unwrap(),
+            block_map.lookup_block(ext2, first_triple_iblock).unwrap(),
             None
         );
         assert_eq!(block_map.desc.sector_count, 0);
@@ -1581,7 +1581,7 @@ mod test {
 
         let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
         block_map
-            .get_or_alloc_block(ext2, first_triple_iblock, true)
+            .lookup_or_alloc_block(ext2, first_triple_iblock, true)
             .unwrap();
         let root = block_map.desc.block_ptrs[14];
         assert_ne!(root, 0);

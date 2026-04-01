@@ -324,7 +324,7 @@ impl Ext2 {
     ///
     pub(super) fn check_group_desc_table(sb: &SuperBlock, group_descs: &USegment) -> Result<()> {
         let groups_count = sb.block_groups_count() as usize;
-        let itb_per_group = sb.itb_per_group();
+        let inode_table_blocks_per_group = sb.inode_table_blocks_per_group();
 
         for group_idx in 0..groups_count {
             let offset = group_idx * size_of::<RawGroupDesc>();
@@ -345,7 +345,7 @@ impl Ext2 {
                 error!("Ext2: Inode bitmap out of range");
                 return_errno_with_message!(Errno::EINVAL, "inode bitmap out of group range");
             }
-            let table_last = inode_table + itb_per_group - 1;
+            let table_last = inode_table + inode_table_blocks_per_group - 1;
             if inode_table < first_block || table_last > last_block {
                 error!("Ext2: Inode table out of range");
                 return_errno_with_message!(Errno::EINVAL, "inode table out of group range");
@@ -443,8 +443,8 @@ impl Ext2 {
                 guard.first_data_block(),
                 guard.blocks_per_group(),
                 guard.reserved_blocks_count(),
-                guard.def_resuid(),
-                guard.def_resgid(),
+                guard.default_reserved_uid(),
+                guard.default_reserved_gid(),
             )
         };
         if groups_count == 0 || self.block_groups.len() < groups_count {
@@ -506,7 +506,7 @@ impl Ext2 {
         }
 
         let sb = self.super_block.read();
-        if !sb.data_block_valid(start, count) {
+        if !sb.is_data_block_valid(start, count) {
             return_errno_with_message!(Errno::EIO, "freeing invalid data block range");
         }
         let blocks_per_group = sb.blocks_per_group();
@@ -619,7 +619,7 @@ impl Ext2 {
         let ino = self.alloc_inode(parent_ino, inode_type)?;
         // SPEC: initialize a valid on-disk inode before publishing it.
         let mode = (inode_type as u16) | (perm.bits() & 0o07777);
-        let links_count = if inode_type.is_directory() { 2 } else { 1 };
+        let link_count = if inode_type.is_directory() { 2 } else { 1 };
         let (uid, gid) = if let Some(thread) = Thread::current() {
             if let Some(posix_thread) = thread.as_posix_thread() {
                 let credentials = posix_thread.credentials();
@@ -648,7 +648,7 @@ impl Ext2 {
             mtime: now_secs,
             dtime: 0,
             gid: gid as u16,
-            links_count,
+            link_count,
             sector_count: 0,
             flags: 0,
             osd1: 0,
@@ -916,12 +916,12 @@ mod test {
             }
         }
 
-        overhead.saturating_add(sb.block_groups_count() * (2 + sb.itb_per_group()))
+        overhead.saturating_add(sb.block_groups_count() * (2 + sb.inode_table_blocks_per_group()))
     }
 
-    fn make_raw_inode(mode: u16, links_count: u16, dtime: u32) -> RawInode {
+    fn make_raw_inode(mode: u16, link_count: u16, dtime: u32) -> RawInode {
         RawInodeBuilder::new(mode)
-            .links_count(links_count)
+            .link_count(link_count)
             .dtime(dtime)
             .build()
     }
@@ -1127,7 +1127,7 @@ mod test {
 
         {
             let sb = f.ext2.super_block();
-            assert!(sb.data_block_valid(range.start, alloc_len));
+            assert!(sb.is_data_block_valid(range.start, alloc_len));
             let first_data = sb.first_data_block();
             let start_group = (range.start - first_data) / sb.blocks_per_group();
             let end_group = (range.end - 1 - first_data) / sb.blocks_per_group();
@@ -1364,7 +1364,7 @@ mod test {
         let desc = fixture.ext2.read_inode_desc(ino).unwrap();
         let raw = RawInode::from(&desc);
         assert_eq!(raw.mode, 0o040755);
-        assert_eq!(raw.links_count, 2);
+        assert_eq!(raw.link_count, 2);
         assert_eq!(raw.size_lo, 0);
         assert_eq!(raw.sector_count, 0);
         assert_eq!(raw.block, [0; 15]);
@@ -1421,7 +1421,7 @@ mod test {
 
         let first = sb.group_first_block_no(0);
         let last = sb.group_last_block_no(0);
-        let itb = sb.itb_per_group();
+        let itb = sb.inode_table_blocks_per_group();
         descs[0].inode_table = last.saturating_sub(itb.saturating_sub(2));
         assert!(descs[0].inode_table >= first);
 

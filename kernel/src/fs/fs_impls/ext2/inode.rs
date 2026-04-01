@@ -12,7 +12,7 @@ use ostd::{const_assert, mm::io::util::HasVmReaderWriter};
 use super::{
     dir::{DirBlock, DirEntryHeader},
     fs::Ext2,
-    inode_block_map::{BlockMapDesc, Ext2Bid, InodeBlockMap},
+    inode_block_map::{RawBlockPtrs, Ext2Bid, BlockPtrTree},
     io_range_mapper::{IoRange, IoRangeMapper},
     prelude::*,
     utils::now,
@@ -156,8 +156,8 @@ impl Inode {
         self.block_group_idx
     }
 
-    pub(super) fn links_count(&self) -> u16 {
-        self.inner.read().links_count()
+    pub(super) fn link_count(&self) -> u16 {
+        self.inner.read().link_count()
     }
 
     pub(super) fn fs(&self) -> Result<Arc<Ext2>> {
@@ -166,7 +166,7 @@ impl Inode {
             .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))
     }
 
-    fn has_invalid_child_name(name: &str) -> bool {
+    fn is_invalid_child_name(name: &str) -> bool {
         let name_bytes = name.as_bytes();
         name_bytes.is_empty()
             || name_bytes.len() > u8::MAX as usize
@@ -282,7 +282,7 @@ impl Inode {
             last_meta_change_at: inner.ctime(),
             type_: self.type_,
             mode: inner.mode(),
-            nr_hard_links: inner.links_count() as usize,
+            nr_hard_links: inner.link_count() as usize,
             uid: Uid::new(inner.uid()),
             gid: Gid::new(inner.gid()),
             container_dev_id,
@@ -658,7 +658,7 @@ impl Inode {
             return_errno!(Errno::ENOTDIR);
         }
 
-        if Self::has_invalid_child_name(name) {
+        if Self::is_invalid_child_name(name) {
             return_errno!(Errno::EINVAL);
         }
 
@@ -688,9 +688,9 @@ impl Inode {
             }
 
             child_inner.set_ctime(now());
-            child_inner.sub_links_count_saturating(2);
+            child_inner.sub_link_count_saturating(2);
 
-            if child_inner.links_count() == 0 {
+            if child_inner.link_count() == 0 {
                 child_inner.persist(child_ino, &fs)?;
                 let _ = fs.remove_inode_cache(child_ino);
             }
@@ -699,7 +699,7 @@ impl Inode {
 
             let target_entry = parent_inner.find_entry_target(&fs, name)?;
             parent_inner.delete_entry(&fs, &target_entry)?;
-            parent_inner.sub_links_count_saturating(1);
+            parent_inner.sub_link_count_saturating(1);
             parent_inner.touch_mtime_ctime(now());
 
             return Ok(());
@@ -802,7 +802,7 @@ impl Inode {
 
     /// Attempts final reclaim for a deleted inode.
     pub(super) fn try_reclaim_deleted_inode(&self, fs: &Ext2) -> Result<bool> {
-        if self.links_count() != 0 {
+        if self.link_count() != 0 {
             return Ok(false);
         }
 
@@ -832,7 +832,7 @@ impl Inode {
         if inner.desc.sector_count > 0 {
             let mut block_map = block_map_backend.block_map.write();
             block_map.truncate_blocks(&fs, 0)?;
-            inner.sync_desc_block_map_from_snapshot(*block_map.get_desc());
+            inner.sync_desc_block_map_from_snapshot(*block_map.desc());
         }
         inner.persist(self.ino, &fs)?;
 
@@ -875,7 +875,7 @@ impl Inode {
             return_errno!(Errno::ENOTDIR);
         }
 
-        if Self::has_invalid_child_name(name) {
+        if Self::is_invalid_child_name(name) {
             return_errno!(Errno::EINVAL);
         }
 
@@ -915,7 +915,7 @@ impl Inode {
 
         // Link the child dir's `..` to parent dir.
         if is_dir {
-            parent_inner.add_links_count_saturating(1);
+            parent_inner.add_link_count_saturating(1);
         }
         parent_inner.touch_mtime_ctime(now());
 
@@ -936,7 +936,7 @@ impl Inode {
             return_errno!(Errno::EPERM);
         }
 
-        if Self::has_invalid_child_name(name) {
+        if Self::is_invalid_child_name(name) {
             return_errno!(Errno::EINVAL);
         }
 
@@ -950,11 +950,11 @@ impl Inode {
         let dir_ft = DirEntryFileType::from(old.type_);
         let (mut dir_inner, mut old_inner) = write_lock_two_inodes(self, old);
 
-        if old_inner.links_count() >= MAX_LINK_COUNT {
+        if old_inner.link_count() >= MAX_LINK_COUNT {
             return_errno!(Errno::EOVERFLOW);
         }
         old_inner.set_ctime(now());
-        old_inner.add_links_count_saturating(1);
+        old_inner.add_link_count_saturating(1);
 
         let add_result = (|| -> Result<()> {
             let slot = match dir_inner.scan_dir_for_slot(&fs, name)? {
@@ -968,7 +968,7 @@ impl Inode {
 
         if let Err(err) = add_result {
             // SPEC: rollback link count on add_entry failure.
-            old_inner.sub_links_count_saturating(1);
+            old_inner.sub_link_count_saturating(1);
             return Err(err);
         }
         Ok(())
@@ -982,7 +982,7 @@ impl Inode {
             return_errno!(Errno::ENOTDIR);
         }
 
-        if Self::has_invalid_child_name(name) {
+        if Self::is_invalid_child_name(name) {
             return_errno!(Errno::EINVAL);
         }
 
@@ -1016,9 +1016,9 @@ impl Inode {
             // Update timestamps before dropping the target link count.
             let child_inner = guards.inner_mut(child.ino())?;
             child_inner.set_ctime(now());
-            child_inner.sub_links_count_saturating(1);
+            child_inner.sub_link_count_saturating(1);
 
-            if child_inner.links_count() == 0 {
+            if child_inner.link_count() == 0 {
                 child_inner.persist(child_ino, &fs)?;
                 let _ = fs.remove_inode_cache(child_ino);
             }
@@ -1042,10 +1042,10 @@ impl Inode {
             return_errno!(Errno::ENOTDIR);
         }
 
-        if Self::has_invalid_child_name(old_name) {
+        if Self::is_invalid_child_name(old_name) {
             return_errno!(Errno::EISDIR);
         }
-        if Self::has_invalid_child_name(new_name) {
+        if Self::is_invalid_child_name(new_name) {
             return_errno!(Errno::EISDIR);
         }
 
@@ -1101,7 +1101,7 @@ impl Inode {
 
         if let Some(existing) = ctx.existing_inode.as_ref() {
             let mut inner = existing.inner.write();
-            if inner.links_count() == 0 {
+            if inner.link_count() == 0 {
                 inner.persist(existing.ino(), fs)?;
                 let _ = fs.remove_inode_cache(existing.ino());
             }
@@ -1242,9 +1242,9 @@ impl Inode {
             dir_inner.delete_entry(ctx.fs, &old_target)?;
             if ctx.old_is_dir {
                 if ctx.existing_inode.is_none() {
-                    dir_inner.add_links_count_saturating(1);
+                    dir_inner.add_link_count_saturating(1);
                 }
-                dir_inner.sub_links_count_saturating(1);
+                dir_inner.sub_link_count_saturating(1);
             }
             dir_inner.touch_mtime_ctime(now());
         } else {
@@ -1261,7 +1261,7 @@ impl Inode {
                     ctx.existing_inode.is_some(),
                 )?;
                 if ctx.old_is_dir && ctx.existing_inode.is_none() {
-                    target_inner.add_links_count_saturating(1);
+                    target_inner.add_link_count_saturating(1);
                 }
                 target_inner.touch_mtime_ctime(now());
             }
@@ -1270,7 +1270,7 @@ impl Inode {
                 let source_de = source_inner.find_entry_target(ctx.fs, ctx.old_name)?;
                 source_inner.delete_entry(ctx.fs, &source_de)?;
                 if ctx.old_is_dir {
-                    source_inner.sub_links_count_saturating(1);
+                    source_inner.sub_link_count_saturating(1);
                 }
                 source_inner.touch_mtime_ctime(now());
             }
@@ -1281,9 +1281,9 @@ impl Inode {
             let existing_inner = guards.inner_mut(existing.ino())?;
             existing_inner.set_ctime(now());
             if ctx.old_is_dir {
-                existing_inner.sub_links_count_saturating(1);
+                existing_inner.sub_link_count_saturating(1);
             }
-            existing_inner.sub_links_count_saturating(1);
+            existing_inner.sub_link_count_saturating(1);
         }
 
         let old_inner = guards.inner_mut(ctx.old_inode.ino())?;
@@ -1333,7 +1333,7 @@ impl Inode {
 #[derive(Debug)]
 pub(super) struct InodeBackend {
     /// Serializes backend traversal vs foreground block-map mutations.
-    block_map: RwMutex<InodeBlockMap>,
+    block_map: RwMutex<BlockPtrTree>,
     /// Cached `npages` bound for PageCache.
     npages: AtomicUsize,
     /// Filesystem handle for indirect I/O and BIO submission.
@@ -1356,7 +1356,7 @@ impl Drop for Inode {
 }
 
 impl InodeBackend {
-    pub(super) fn new(block_map: InodeBlockMap, fs: Weak<Ext2>, npages: usize) -> Arc<Self> {
+    pub(super) fn new(block_map: BlockPtrTree, fs: Weak<Ext2>, npages: usize) -> Arc<Self> {
         Arc::new(Self {
             block_map: RwMutex::new(block_map),
             npages: AtomicUsize::new(npages),
@@ -1386,7 +1386,7 @@ impl PageCacheBackend for InodeBackend {
         let fs = self.fs()?;
         let iblock = u32::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
-        match block_map.get_block(&fs, iblock)? {
+        match block_map.lookup_block(&fs, iblock)? {
             Some(bid) => fs.read_blocks_async(bid, bio_segment, complete_fn),
             None => {
                 // Found a hole, zero fill the page.
@@ -1413,7 +1413,7 @@ impl PageCacheBackend for InodeBackend {
         let iblock = u32::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
 
-        match block_map.get_block(&fs, iblock)? {
+        match block_map.lookup_block(&fs, iblock)? {
             Some(bid) => fs.write_blocks_async(bid, bio_segment, complete_fn),
             None => {
                 error!(
@@ -1466,8 +1466,8 @@ impl InodeInner {
         let num_page_bytes = (desc.size as usize).align_up(BLOCK_SIZE);
         let num_pages = num_page_bytes / BLOCK_SIZE;
         let backend = InodeBackend::new(
-            InodeBlockMap::new(
-                BlockMapDesc::from_parts(desc.sector_count, desc.block_ptrs),
+            BlockPtrTree::new(
+                RawBlockPtrs::from_parts(desc.sector_count, desc.block_ptrs),
                 fs.clone(),
             ),
             fs.clone(),
@@ -1495,7 +1495,7 @@ impl InodeInner {
         &self.backend
     }
 
-    fn sync_desc_block_map_from_snapshot(&mut self, block_map_desc: BlockMapDesc) {
+    fn sync_desc_block_map_from_snapshot(&mut self, block_map_desc: RawBlockPtrs) {
         self.desc.sector_count = block_map_desc.sector_count;
         self.desc.block_ptrs = block_map_desc.block_ptrs;
     }
@@ -1589,16 +1589,16 @@ impl InodeInner {
         self.desc.dtime = t;
     }
 
-    fn links_count(&self) -> u16 {
-        self.desc.links_count
+    fn link_count(&self) -> u16 {
+        self.desc.link_count
     }
 
-    fn add_links_count_saturating(&mut self, delta: u16) {
-        self.desc.links_count = self.desc.links_count.saturating_add(delta);
+    fn add_link_count_saturating(&mut self, delta: u16) {
+        self.desc.link_count = self.desc.link_count.saturating_add(delta);
     }
 
-    fn sub_links_count_saturating(&mut self, delta: u16) {
-        self.desc.links_count = self.desc.links_count.saturating_sub(delta);
+    fn sub_link_count_saturating(&mut self, delta: u16) {
+        self.desc.link_count = self.desc.link_count.saturating_sub(delta);
     }
 
     fn remove_flags(&mut self, flags: FileFlags) {
@@ -1636,7 +1636,7 @@ impl InodeInner {
         let block_map_backend = self.backend().clone();
         let mut block_map = block_map_backend.block_map.write();
         block_map.desc.encode_device_id(device_id);
-        let snapshot = *block_map.get_desc();
+        let snapshot = *block_map.desc();
         self.sync_desc_block_map_from_snapshot(snapshot);
         Ok(())
     }
@@ -1861,7 +1861,7 @@ impl InodeInner {
         let mut block_map = backend.block_map.write();
         // TODO: Roll back the page-cache state if block truncation fails.
         block_map.truncate_blocks(&fs, new_size)?;
-        let snapshot = *block_map.get_desc();
+        let snapshot = *block_map.desc();
 
         // Drop the block map lock before fill zeros (might trigger PageCacheBackend.read_page_raw).
         drop(block_map);
@@ -2070,12 +2070,12 @@ impl InodeInner {
 
         let block_map = self.backend().block_map.read();
 
-        if !start.is_multiple_of(block_size) && block_map.get_block(fs, start_iblock)?.is_none() {
+        if !start.is_multiple_of(block_size) && block_map.lookup_block(fs, start_iblock)?.is_none() {
             let new_start_block = start.align_down(block_size);
             self.page_cache().fill_zeros(new_start_block..start)?;
         }
 
-        if !end.is_multiple_of(block_size) && block_map.get_block(fs, end_iblock)?.is_none() {
+        if !end.is_multiple_of(block_size) && block_map.lookup_block(fs, end_iblock)?.is_none() {
             let new_end_block = end.align_up(block_size);
             self.page_cache().fill_zeros(end..new_end_block)?;
         }
@@ -2115,13 +2115,13 @@ impl InodeInner {
                         Error::with_message(Errno::EINVAL, "logical block range overflow")
                     })?;
 
-                    if let Some(mapped_range) = block_map.get_block_range(fs, iblock, remaining)? {
+                    if let Some(mapped_range) = block_map.lookup_block_range(fs, iblock, remaining)? {
                         current_block +=
                             mapped_range.end.saturating_sub(mapped_range.start) as usize;
                         continue;
                     }
                     let allocated_range = block_map
-                        .get_or_alloc_block_range(fs, iblock, remaining, true)?
+                        .lookup_or_alloc_block_range(fs, iblock, remaining, true)?
                         .ok_or_else(|| {
                             Error::with_message(
                                 Errno::EIO,
@@ -2134,7 +2134,7 @@ impl InodeInner {
                 }
                 Ok(())
             })();
-            (*block_map.get_desc(), new_blocks, alloc_result)
+            (*block_map.desc(), new_blocks, alloc_result)
         };
         self.sync_desc_block_map_from_snapshot(block_map_desc);
 
@@ -2190,7 +2190,7 @@ impl InodeInner {
                 old_size, err
             );
         }
-        let desc = *block_map.get_desc();
+        let desc = *block_map.desc();
         self.sync_desc_block_map_from_snapshot(desc);
     }
 
@@ -2519,7 +2519,7 @@ pub(super) struct InodeDesc {
     ctime: Duration,
     mtime: Duration,
     dtime: Duration,
-    links_count: u16,
+    link_count: u16,
     sector_count: u32,
     flags: FileFlags,
     file_acl: u32,
@@ -2548,7 +2548,7 @@ impl InodeDesc {
 impl TryFrom<&RawInode> for InodeDesc {
     type Error = Error;
     fn try_from(raw: &RawInode) -> Result<Self> {
-        if raw.links_count == 0 {
+        if raw.link_count == 0 {
             return_errno_with_message!(Errno::ESTALE, "inode has been deleted");
         }
 
@@ -2571,7 +2571,7 @@ impl TryFrom<&RawInode> for InodeDesc {
 
         let flags = FileFlags::from_bits(raw.flags)
             .ok_or_else(|| Error::with_message(Errno::EIO, "invalid inode flags"))?;
-        let block_map = BlockMapDesc::from_raw(raw);
+        let block_map = RawBlockPtrs::from_raw(raw);
 
         Ok(InodeDesc {
             type_,
@@ -2583,7 +2583,7 @@ impl TryFrom<&RawInode> for InodeDesc {
             ctime,
             mtime,
             dtime: Duration::from_secs(raw.dtime as u64),
-            links_count: raw.links_count,
+            link_count: raw.link_count,
             sector_count: block_map.sector_count,
             flags,
             file_acl: raw.file_acl,
@@ -2616,7 +2616,7 @@ impl From<&InodeDesc> for RawInode {
             mtime: desc.mtime.as_secs() as u32,
             dtime: desc.dtime.as_secs() as u32,
             gid,
-            links_count: desc.links_count,
+            link_count: desc.link_count,
             sector_count: desc.sector_count,
             flags: desc.flags.bits(),
             osd1: 0,
@@ -2648,7 +2648,7 @@ pub(super) struct RawInode {
     pub mtime: u32,        // i_mtime
     pub dtime: u32,        // i_dtime
     pub gid: u16,          // i_gid (low 16 bits)
-    pub links_count: u16,  // i_links_count
+    pub link_count: u16,  // i_link_count
     pub sector_count: u32, // i_blocks (512-byte sectors)
     pub flags: u32,        // i_flags
     pub osd1: u32,         // osd1.linux1.l_i_reserved1
@@ -2903,7 +2903,7 @@ mod test {
         );
         f.ext2.sync_all().unwrap();
         let raw_before_drop = read_raw_inode_from_disk(&f, old_ino);
-        assert_eq!(raw_before_drop.links_count, 0);
+        assert_eq!(raw_before_drop.link_count, 0);
         assert_eq!(raw_before_drop.dtime, 0);
         assert_ne!(raw_before_drop.sector_count, 0);
 
@@ -2920,7 +2920,7 @@ mod test {
                 .is_allocated((old_ino - 1) as u16)
         );
         let raw_after_drop = read_raw_inode_from_disk(&f, old_ino);
-        assert_eq!(raw_after_drop.links_count, 0);
+        assert_eq!(raw_after_drop.link_count, 0);
         assert_eq!(raw_after_drop.sector_count, 0);
         assert_eq!(raw_after_drop.block[0], 0);
         assert_eq!(
@@ -3164,13 +3164,13 @@ mod test {
     #[ktest]
     fn inode_desc_from_raw_err() {
         let mut deleted_inode = make_raw_inode(0);
-        deleted_inode.links_count = 0;
+        deleted_inode.link_count = 0;
         deleted_inode.dtime = 1;
         let deleted_err = InodeDesc::try_from(&deleted_inode).unwrap_err();
         assert_eq!(deleted_err.error(), Errno::ESTALE);
 
         let mut zero_link_live_inode = make_raw_inode(0o100644);
-        zero_link_live_inode.links_count = 0;
+        zero_link_live_inode.link_count = 0;
         let zero_link_err = InodeDesc::try_from(&zero_link_live_inode).unwrap_err();
         assert_eq!(zero_link_err.error(), Errno::ESTALE);
 

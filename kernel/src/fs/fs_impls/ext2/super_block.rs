@@ -42,7 +42,7 @@ pub(super) struct SuperBlock {
     /// Number of inodes in each block group.
     inodes_per_group: u32,
     /// Number of inode table blocks in each group.
-    itb_per_group: u32,
+    inode_table_blocks_per_group: u32,
     /// Mount time.
     mtime: Duration,
     /// Write time.
@@ -66,9 +66,9 @@ pub(super) struct SuperBlock {
     /// Revision level.
     rev_level: RevLevel,
     /// Default UID for reserved blocks.
-    def_resuid: u32,
+    default_reserved_uid: u32,
     /// Default GID for reserved blocks.
-    def_resgid: u32,
+    default_reserved_gid: u32,
     //
     // These fields are valid for RevLevel::Dynamic only.
     //
@@ -191,8 +191,8 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             return_errno_with_message!(Errno::EINVAL, "blocks per group is too large");
         }
 
-        let itb_per_group = inodes_per_group / inodes_per_block;
-        if blocks_per_group <= itb_per_group + 3 {
+        let inode_table_blocks_per_group = inodes_per_group / inodes_per_block;
+        if blocks_per_group <= inode_table_blocks_per_group + 3 {
             return_errno_with_message!(Errno::EINVAL, "blocks per group is too small");
         }
 
@@ -235,7 +235,7 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             blocks_per_group: sb.blocks_per_group,
             frags_per_group: sb.frags_per_group,
             inodes_per_group: sb.inodes_per_group,
-            itb_per_group,
+            inode_table_blocks_per_group: inode_table_blocks_per_group,
             mtime: Duration::from(sb.mtime),
             wtime: Duration::from(sb.wtime),
             mnt_count: sb.mnt_count,
@@ -247,8 +247,8 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             check_interval: Duration::from_secs(sb.check_interval as _),
             creator_os,
             rev_level,
-            def_resuid: sb.def_resuid as _,
-            def_resgid: sb.def_resgid as _,
+            default_reserved_uid: sb.default_reserved_uid as _,
+            default_reserved_gid: sb.default_reserved_gid as _,
             first_ino,
             inode_size,
             block_group_idx: sb.block_group_idx as _,
@@ -411,7 +411,7 @@ impl SuperBlock {
 
     /// Returns whether a data block range is valid.
     ///
-    pub(super) fn data_block_valid(&self, start_blk: u32, count: u32) -> bool {
+    pub(super) fn is_data_block_valid(&self, start_blk: u32, count: u32) -> bool {
         if count == 0 {
             return false;
         }
@@ -450,8 +450,8 @@ impl SuperBlock {
     }
 
     /// Returns the number of inode table blocks in each block group.
-    pub(super) fn itb_per_group(&self) -> u32 {
-        self.itb_per_group
+    pub(super) fn inode_table_blocks_per_group(&self) -> u32 {
+        self.inode_table_blocks_per_group
     }
 
     /// Returns the first non-reserved inode number.
@@ -513,14 +513,14 @@ impl SuperBlock {
 
     /// Returns the default UID for reserved blocks.
     ///
-    pub(super) fn def_resuid(&self) -> u32 {
-        self.def_resuid
+    pub(super) fn default_reserved_uid(&self) -> u32 {
+        self.default_reserved_uid
     }
 
     /// Returns the default GID for reserved blocks.
     ///
-    pub(super) fn def_resgid(&self) -> u32 {
-        self.def_resgid
+    pub(super) fn default_reserved_gid(&self) -> u32 {
+        self.default_reserved_gid
     }
 
     /// Increases the number of free blocks.
@@ -605,7 +605,7 @@ impl SuperBlock {
             }
         }
 
-        overhead.saturating_add(self.block_groups_count() * (2 + self.itb_per_group))
+        overhead.saturating_add(self.block_groups_count() * (2 + self.inode_table_blocks_per_group))
     }
 
     /// Returns the starting block ID of the superblock copy
@@ -766,8 +766,8 @@ pub(super) struct RawSuperBlock {
     pub check_interval: u32,
     pub creator_os: u32,
     pub rev_level: u32,
-    pub def_resuid: u16,
-    pub def_resgid: u16,
+    pub default_reserved_uid: u16,
+    pub default_reserved_gid: u16,
     pub first_ino: u32,
     pub inode_size: u16,
     pub block_group_idx: u16,
@@ -831,8 +831,8 @@ impl From<&SuperBlock> for RawSuperBlock {
             check_interval: sb.check_interval.as_secs() as u32,
             creator_os: sb.creator_os as u32,
             rev_level: sb.rev_level as u32,
-            def_resuid: sb.def_resuid as u16,
-            def_resgid: sb.def_resgid as u16,
+            default_reserved_uid: sb.default_reserved_uid as u16,
+            default_reserved_gid: sb.default_reserved_gid as u16,
             first_ino: sb.first_ino,
             inode_size: sb.inode_size as u16,
             block_group_idx: sb.block_group_idx as u16,

@@ -28,7 +28,7 @@ impl IndirectBlockManager {
 
     pub(super) fn find(&mut self, bid: Ext2Bid) -> Result<&IndirectBlock> {
         if self.cache.get(&bid).is_none() {
-            self.try_shink()?;
+            self.try_shrink()?;
             let block = self.load_block(bid)?;
             self.cache.put(bid, block);
         }
@@ -40,7 +40,7 @@ impl IndirectBlockManager {
 
     pub(super) fn find_mut(&mut self, bid: Ext2Bid) -> Result<&mut IndirectBlock> {
         if self.cache.get(&bid).is_none() {
-            self.try_shink()?;
+            self.try_shrink()?;
             let block = self.load_block(bid)?;
             self.cache.put(bid, block);
         }
@@ -55,7 +55,7 @@ impl IndirectBlockManager {
             return_errno_with_message!(Errno::EIO, "indirect block inserted with mismatched bid");
         }
 
-        self.try_shink()?;
+        self.try_shrink()?;
         self.cache.put(bid, block);
         Ok(())
     }
@@ -82,7 +82,7 @@ impl IndirectBlockManager {
         Ok(())
     }
 
-    pub(super) fn try_shink(&mut self) -> Result<()> {
+    pub(super) fn try_shrink(&mut self) -> Result<()> {
         while self.cache.len() >= self.capacity {
             self.evict()?;
         }
