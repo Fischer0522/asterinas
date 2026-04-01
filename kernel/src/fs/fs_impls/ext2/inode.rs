@@ -1411,7 +1411,7 @@ impl PageCacheBackend for InodeBackend {
         bio_segment: BioSegment,
         complete_fn: Option<BioCompleteFn>,
     ) -> Result<BioWaiter> {
-        let block_map = self.block_map.upread();
+        let block_map = self.block_map.read();
         let fs = self.fs()?;
         let iblock = u32::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
@@ -1425,8 +1425,10 @@ impl PageCacheBackend for InodeBackend {
         // the blocks are already reclaimed and only holes left.
         // In this case, we need to allocate new blocks for the mmaped pages when triggering writeback.
         if bid.is_none() {
-            let mut block_map = block_map.upgrade();
-            bid = block_map.get_or_alloc_block(&fs, iblock, true)?;
+            error!("failed to find a block mapping in PageCacheBackend, idx: {}",idx);
+            return_errno!(Errno::EIO);
+            // let mut block_map = block_map.upgrade();
+            // bid = block_map.get_or_alloc_block(&fs, iblock, true)?;
         }
         // The bid is guaranteed to be allocated.
         let bid = bid.unwrap();
