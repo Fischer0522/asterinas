@@ -23,13 +23,13 @@ use ostd::{
 use super::{
     block_group::RawGroupDesc,
     fs::{Ext2, ROOT_INO},
-    inode::{RawDirEntry, RawInode},
+    inode::{RawInode},
     super_block::{
         ErrorsBehaviour, FsState, MAGIC_NUM, OsId, RawSuperBlock, RevLevel, SUPER_BLOCK_OFFSET,
     },
 };
 use crate::{
-    fs::{file::InodeType, fs_impls::ext2::super_block::SuperBlock, utils::DirentVisitor},
+    fs::{ext2::dir::DirEntryHeader, file::InodeType, fs_impls::ext2::super_block::SuperBlock, utils::DirentVisitor},
     prelude::{Errno, Result, return_errno_with_message, *},
 };
 
@@ -396,7 +396,7 @@ pub(super) fn encode_dir_entry(
     name: &[u8],
     file_type: u8,
 ) {
-    let header_len = size_of::<RawDirEntry>();
+    let header_len = size_of::<DirEntryHeader>();
     assert!(offset + rec_len as usize <= buf.len());
     assert!(name.len() <= (rec_len as usize).saturating_sub(header_len));
 

@@ -10,7 +10,7 @@ use device_id::DeviceId;
 use ostd::{const_assert, mm::io::util::HasVmReaderWriter};
 
 use super::{
-    dir::{DirBlock, DirEntry},
+    dir::{DirBlock, DirEntryHeader},
     fs::Ext2,
     inode_block_map::{BlockMapDesc, Ext2Bid, InodeBlockMap},
     io_range_mapper::{IoRange, IoRangeMapper},
@@ -20,11 +20,10 @@ use super::{
 };
 use crate::{
     fs::{
-        file::InodeMode,
-        vfs::{
+        ext2::dir::DirEntryFileType, file::InodeMode, vfs::{
             inode::{Extension, FallocMode, Metadata},
             xattr::{XattrName, XattrNamespace, XattrSetFlags},
-        },
+        }
     },
     process::{Gid, Uid},
 };
@@ -69,7 +68,7 @@ struct RenameContext<'a> {
     existing_ino: Option<u32>,
     existing_inode: Option<Arc<Inode>>,
     old_is_dir: bool,
-    moved_ft: u8,
+    moved_ft: DirEntryFileType,
 }
 
 impl RenameContext<'_> {
@@ -862,20 +861,6 @@ impl Inode {
         Ok(())
     }
 
-    /// Converts an `InodeType` to the corresponding `DirEntryFileType`.
-    fn inode_type_to_dir_file_type(type_: InodeType) -> DirEntryFileType {
-        match type_ {
-            InodeType::File => DirEntryFileType::File,
-            InodeType::Dir => DirEntryFileType::Dir,
-            InodeType::CharDevice => DirEntryFileType::Char,
-            InodeType::BlockDevice => DirEntryFileType::Block,
-            InodeType::NamedPipe => DirEntryFileType::Fifo,
-            InodeType::Socket => DirEntryFileType::Socket,
-            InodeType::SymLink => DirEntryFileType::Symlink,
-            _ => DirEntryFileType::Unknown,
-        }
-    }
-
     /// Creates a child inode and directory entry under this directory.
     ///
     pub(super) fn create(
@@ -906,14 +891,14 @@ impl Inode {
 
         let is_dir = type_ == InodeType::Dir;
         let fs = self.fs()?;
-        let dir_ft = Self::inode_type_to_dir_file_type(type_);
+        let dir_ft = DirEntryFileType::from(type_);
 
         // Scan for a slot before creating the child inode to avoid wasting
         // an inode allocation when the name already exists (EEXIST).
         let mut parent_inner = self.inner.write();
         let slot = match parent_inner.scan_dir_for_slot(&fs, name)? {
-            DirScanResult::Slot(slot) => slot,
-            DirScanResult::NeedGrowth => parent_inner.grow_dir_block(&fs)?,
+            Some(slot) => slot,
+            None => parent_inner.grow_dir_block(&fs)?,
         };
 
         let child = fs.create_inode(self.ino, type_, perm)?;
@@ -924,7 +909,7 @@ impl Inode {
             child_inner.make_empty(child_ino, self.ino, &fs)?;
         }
 
-        parent_inner.add_entry(&fs, &slot, name, child_ino, dir_ft as u8)?;
+        parent_inner.add_entry(&fs, &slot, name, child_ino, dir_ft)?;
 
         // Link the child dir's `..` to parent dir.
         if is_dir {
@@ -960,7 +945,7 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        let dir_ft = Self::inode_type_to_dir_file_type(old.type_);
+        let dir_ft = DirEntryFileType::from(old.type_);
         let (mut dir_inner, mut old_inner) = write_lock_two_inodes(self, old);
 
         if old_inner.links_count() >= MAX_LINK_COUNT {
@@ -971,10 +956,10 @@ impl Inode {
 
         let add_result = (|| -> Result<()> {
             let slot = match dir_inner.scan_dir_for_slot(&fs, name)? {
-                DirScanResult::Slot(slot) => slot,
-                DirScanResult::NeedGrowth => dir_inner.grow_dir_block(&fs)?,
+                Some(slot) => slot,
+                None => dir_inner.grow_dir_block(&fs)?,
             };
-            dir_inner.add_entry(&fs, &slot, name, old.ino, dir_ft as u8)?;
+            dir_inner.add_entry(&fs, &slot, name, old.ino, dir_ft)?;
             dir_inner.touch_mtime_ctime(now());
             Ok(())
         })();
@@ -1145,7 +1130,7 @@ impl Inode {
         };
 
         let old_is_dir = old_inode.type_ == InodeType::Dir;
-        let moved_ft = Self::inode_type_to_dir_file_type(old_inode.type_) as u8;
+        let moved_ft = DirEntryFileType::from(old_inode.type_);
         Ok(RenameContext {
             fs,
             source_dir: self,
@@ -1307,7 +1292,7 @@ impl Inode {
                 ctx.fs,
                 &dotdot,
                 ctx.target_dir.ino,
-                DirEntryFileType::Dir as u8,
+                DirEntryFileType::Dir,
             )?;
             old_inner.remove_flags(FileFlags::INDEX_DIR);
         }
@@ -1320,7 +1305,7 @@ impl Inode {
         fs: &Arc<Ext2>,
         new_name: &str,
         old_ino: u32,
-        moved_ft: u8,
+        moved_ft: DirEntryFileType,
         has_existing: bool,
     ) -> Result<()> {
         if has_existing {
@@ -1332,8 +1317,8 @@ impl Inode {
 
         // No destination entry: ext2_add_link semantics.
         let slot = match target_inner.scan_dir_for_slot(fs, new_name)? {
-            DirScanResult::Slot(slot) => slot,
-            DirScanResult::NeedGrowth => target_inner.grow_dir_block(fs)?,
+            Some(slot) => slot,
+            None => target_inner.grow_dir_block(fs)?,
         };
         target_inner.add_entry(fs, &slot, new_name, old_ino, moved_ft)?;
         Ok(())
@@ -1462,15 +1447,6 @@ struct InodeInner {
     /// Dedicated backend used by pager callbacks.
     backend: Arc<InodeBackend>,
     fs: Weak<Ext2>,
-}
-
-/// Scan result for directory slot search.
-#[derive(Debug)]
-enum DirScanResult {
-    /// Found a usable slot in an existing block.
-    Slot(DirSlotInfo),
-    /// No slot found; directory must grow by one block.
-    NeedGrowth,
 }
 
 /// Information about a candidate directory entry slot.
@@ -1711,15 +1687,15 @@ impl InodeInner {
         self.prepare_write(fs, 0, block_size, block_size)?;
 
         let block = DirBlock::new(self.page_cache(), 0, block_size);
-        let dot_len = DirEntry::dir_rec_len(1) as usize;
+        let dot_len = DirEntryHeader::dir_rec_len(1) as usize;
         let write_result = (|| -> Result<()> {
-            block.write_entry(0, ino, DirEntry::dir_rec_len(1), b".", DirEntryFileType::Dir as u8)?;
+            block.write_entry(0, ino, DirEntryHeader::dir_rec_len(1), b".", DirEntryFileType::Dir)?;
             block.write_entry(
                 dot_len,
                 parent_ino,
                 (block_size - dot_len) as u16,
                 b"..",
-                DirEntryFileType::Dir as u8,
+                DirEntryFileType::Dir,
             )?;
             Ok(())
         })();
@@ -1813,7 +1789,6 @@ impl InodeInner {
         let block_size = fs.block_size();
         let file_size = self.file_size();
         let data_blocks = file_size.div_ceil(block_size);
-        let mut name_buf = [0u8; 2]; // Only need to read "." and ".."
 
         for block_idx in 0..data_blocks {
             let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, file_size);
@@ -1821,30 +1796,25 @@ impl InodeInner {
             let mut iter = block.iter_entries();
 
             loop {
-                let (entry_offset, header) = match iter.next_entry(block_offset) {
+                let (_entry_offset, entry) = match iter.next_entry(block_offset) {
                     Ok(Some(pair)) => pair,
                     Ok(None) => break,
                     Err(_) => return false,
                 };
 
-                if header.inode == 0 {
+                if entry.header.inode == 0 {
                     continue;
                 }
 
-                let name_len = header.name_len as usize;
-                if name_len <= 2 {
-                    if block.read_name(entry_offset, name_len, &mut name_buf).is_err() {
+                let name = entry.name.as_bytes();
+                if name == b"." {
+                    if u32::from_le(entry.header.inode) != self_ino {
                         return false;
                     }
-                    if &name_buf[..name_len] == b"." {
-                        if u32::from_le(header.inode) != self_ino {
-                            return false;
-                        }
-                        continue;
-                    }
-                    if &name_buf[..name_len] == b".." {
-                        continue;
-                    }
+                    continue;
+                }
+                if name == b".." {
+                    continue;
                 }
                 return false;
             }
@@ -1863,23 +1833,17 @@ impl InodeInner {
         let block_size = fs.block_size();
         let file_size = self.file_size();
         let name_bytes = name.as_bytes();
-        let mut name_buf = [0u8; u8::MAX as usize];
 
         for block_idx in 0..file_size.div_ceil(block_size) {
             let block_offset = block_idx * block_size;
             let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, file_size);
             let mut iter = block.iter_entries();
-            while let Some((entry_offset, header)) = iter.next_entry(block_offset)? {
-                let ino = u32::from_le(header.inode);
+            while let Some((_entry_offset, entry)) = iter.next_entry(block_offset)? {
+                let ino = u32::from_le(entry.header.inode);
                 if ino == 0 {
                     continue;
                 }
-                let name_len = header.name_len as usize;
-                if name_len != name_bytes.len() {
-                    continue;
-                }
-                block.read_name(entry_offset, name_len, &mut name_buf[..name_len])?;
-                if &name_buf[..name_len] == name_bytes {
+                if entry.name.as_bytes() == name_bytes {
                     return Ok(ino);
                 }
             }
@@ -1942,7 +1906,7 @@ impl InodeInner {
         }
 
         let size = self.file_size();
-        let min_rec_len = DirEntry::dir_rec_len(1) as usize;
+        let min_rec_len = DirEntryHeader::dir_rec_len(1) as usize;
         if size < min_rec_len || offset > size - min_rec_len {
             return Ok(0);
         }
@@ -1962,10 +1926,9 @@ impl InodeInner {
 
             let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, size);
             let mut iter = block.iter_entries();
-            let mut name_buf = [0u8; u8::MAX as usize];
-            while let Some((entry_off, header)) = iter.next_entry(block_offset)? {
+            while let Some((entry_off, entry)) = iter.next_entry(block_offset)? {
                 let entry_offset = block_offset + entry_off;
-                let rec_len = u16::from_le(header.rec_len) as usize;
+                let rec_len = u16::from_le(entry.header.rec_len) as usize;
                 let next_offset = entry_offset + rec_len;
 
                 if next_offset <= current_offset {
@@ -1976,13 +1939,11 @@ impl InodeInner {
                     continue;
                 }
 
-                let ino = u32::from_le(header.inode);
+                let ino = u32::from_le(entry.header.inode);
                 if ino != 0 {
-                    let name_len = header.name_len as usize;
-                    block.read_name(entry_off, name_len, &mut name_buf[..name_len])?;
-                    let name = core::str::from_utf8(&name_buf[..name_len])
+                    let name = core::str::from_utf8(entry.name.as_bytes())
                         .map_err(|_| Error::with_message(Errno::EIO, "invalid dir entry name"))?;
-                    let dtype = DirEntryFileType::from(header.file_type);
+                    let dtype = DirEntryFileType::from(entry.header.file_type);
                     let inode_type = InodeType::from(dtype);
                     if visitor
                         .visit(name, ino as u64, inode_type, next_offset)
@@ -2080,7 +2041,7 @@ impl InodeInner {
         self.allocate_range_blocks(fs, offset, end, block_size)?;
         Ok(())
     }
-
+    // NOTE: Make sure the page cache is already resized before calling this function.
     // When the file is expanded, we need to zero the partial tail of the old EOF block and the new EOF block.
     // So, we don't need to zero the old eof tail, because the responsiblity of cleaning eof belongs to
     // who changes the file size (write, shrink, expand, and fallocate).
@@ -2238,7 +2199,7 @@ impl InodeInner {
 
     /// Phase 1: scan directory blocks for reusable slot or duplicate.
     ///
-    fn scan_dir_for_slot(&self, fs: &Ext2, name: &str) -> Result<DirScanResult> {
+    fn scan_dir_for_slot(&self, fs: &Ext2, name: &str) -> Result<Option<DirSlotInfo>> {
         if self.inode_type() != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
@@ -2249,44 +2210,39 @@ impl InodeInner {
         }
 
         let block_size = fs.block_size();
-        let reclen = DirEntry::dir_rec_len(name_bytes.len()) as usize;
+        let reclen = DirEntryHeader::dir_rec_len(name_bytes.len()) as usize;
         if reclen > block_size {
             return_errno_with_message!(Errno::ENOSPC, "dir entry too large for block");
         }
 
         let file_size = self.file_size();
         let data_blocks = file_size.div_ceil(block_size);
-        let mut name_buf = [0u8; u8::MAX as usize];
 
         for block_idx in 0..data_blocks {
             let block_offset = block_idx * block_size;
             let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, file_size);
             let mut iter = block.iter_entries();
 
-            while let Some((entry_offset, header)) = iter.next_entry(block_offset)? {
-                let ino = u32::from_le(header.inode);
-                let rec_len = u16::from_le(header.rec_len) as usize;
+            while let Some((entry_offset, entry)) = iter.next_entry(block_offset)? {
+                let ino = u32::from_le(entry.header.inode);
+                let rec_len = u16::from_le(entry.header.rec_len) as usize;
 
                 // Check for duplicate name.
-                if ino != 0 && header.name_len as usize == name_bytes.len() {
-                    let name_len = header.name_len as usize;
-                    block.read_name(entry_offset, name_len, &mut name_buf[..name_len])?;
-                    if &name_buf[..name_len] == name_bytes {
-                        return_errno!(Errno::EEXIST);
-                    }
+                if ino != 0 && entry.name.as_bytes() == name_bytes {
+                    return_errno!(Errno::EEXIST);
                 }
 
                 let used_len = if ino == 0 {
                     0
                 } else {
-                    DirEntry::dir_rec_len(header.name_len as usize) as usize
+                    DirEntryHeader::dir_rec_len(entry.header.name_len as usize) as usize
                 };
 
                 // Free entry can be reused, occupied entry can be split.
                 if (ino == 0 && rec_len >= reclen)
                     || (ino != 0 && rec_len >= used_len.saturating_add(reclen))
                 {
-                    return Ok(DirScanResult::Slot(DirSlotInfo {
+                    return Ok(Some(DirSlotInfo {
                         dir_offset: block_offset + entry_offset,
                         slot_rec_len: rec_len,
                         used_rec_len: used_len,
@@ -2295,7 +2251,7 @@ impl InodeInner {
             }
         }
 
-        Ok(DirScanResult::NeedGrowth)
+        Ok(None)
     }
 
     /// Phase 2: grow directory by one data block.
@@ -2323,7 +2279,7 @@ impl InodeInner {
         slot: &DirSlotInfo,
         name: &str,
         ino: u32,
-        ft: u8,
+        ft: DirEntryFileType,
     ) -> Result<()> {
         let max_inumber = fs.super_block().total_inodes();
         if ino == 0 || ino > max_inumber {
@@ -2335,7 +2291,7 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
-        let entry_reclen = DirEntry::dir_rec_len(name_bytes.len()) as usize;
+        let entry_reclen = DirEntryHeader::dir_rec_len(name_bytes.len()) as usize;
         if entry_reclen > slot.slot_rec_len {
             return_errno_with_message!(Errno::ENOSPC, "slot too small for dir entry");
         }
@@ -2364,26 +2320,20 @@ impl InodeInner {
         let block_size = fs.block_size();
         let file_size = self.file_size();
         let name_bytes = name.as_bytes();
-        let mut name_buf = [0u8; u8::MAX as usize];
 
         for block_idx in 0..file_size.div_ceil(block_size) {
             let block_offset = block_idx * block_size;
             let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, file_size);
             let mut iter = block.iter_entries();
-            while let Some((entry_offset, header)) = iter.next_entry(block_offset)? {
-                let ino = u32::from_le(header.inode);
+            while let Some((entry_offset, entry)) = iter.next_entry(block_offset)? {
+                let ino = u32::from_le(entry.header.inode);
                 if ino == 0 {
                     continue;
                 }
-                let name_len = header.name_len as usize;
-                if name_len != name_bytes.len() {
-                    continue;
-                }
-                block.read_name(entry_offset, name_len, &mut name_buf[..name_len])?;
-                if &name_buf[..name_len] == name_bytes {
+                if entry.name.as_bytes() == name_bytes {
                     return Ok(DirEntryTarget {
                         dir_offset: block_offset + entry_offset,
-                        entry_rec_len: u16::from_le(header.rec_len) as usize,
+                        entry_rec_len: u16::from_le(entry.header.rec_len) as usize,
                     });
                 }
             }
@@ -2407,7 +2357,7 @@ impl InodeInner {
 
     /// Rewrites a located entry's inode/type.
     ///
-    fn set_link(&self, fs: &Ext2, target: &DirEntryTarget, new_ino: u32, ft: u8) -> Result<()> {
+    fn set_link(&self, fs: &Ext2, target: &DirEntryTarget, new_ino: u32, ft: DirEntryFileType) -> Result<()> {
         let block_size = fs.block_size();
         let block_base = (target.dir_offset / block_size) * block_size;
         let block_idx = block_base / block_size;
@@ -2507,57 +2457,7 @@ fn write_lock_multiple_inodes<'a>(inodes: &[&'a Inode]) -> Vec<RwMutexWriteGuard
         .collect()
 }
 
-/// Directory entry type mapping (ext2 file_type field).
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) enum DirEntryFileType {
-    /// Unknown file type.
-    Unknown = 0,
-    /// Regular file.
-    File = 1,
-    /// Directory.
-    Dir = 2,
-    /// Character device.
-    Char = 3,
-    /// Block device.
-    Block = 4,
-    /// FIFO.
-    Fifo = 5,
-    /// Socket.
-    Socket = 6,
-    /// Symlink.
-    Symlink = 7,
-}
 
-impl From<u8> for DirEntryFileType {
-    fn from(value: u8) -> Self {
-        match value {
-            1 => Self::File,
-            2 => Self::Dir,
-            3 => Self::Char,
-            4 => Self::Block,
-            5 => Self::Fifo,
-            6 => Self::Socket,
-            7 => Self::Symlink,
-            _ => Self::Unknown,
-        }
-    }
-}
-
-impl From<DirEntryFileType> for InodeType {
-    fn from(file_type: DirEntryFileType) -> Self {
-        match file_type {
-            DirEntryFileType::Unknown => Self::Unknown,
-            DirEntryFileType::File => Self::File,
-            DirEntryFileType::Dir => Self::Dir,
-            DirEntryFileType::Char => Self::CharDevice,
-            DirEntryFileType::Block => Self::BlockDevice,
-            DirEntryFileType::Fifo => Self::NamedPipe,
-            DirEntryFileType::Socket => Self::Socket,
-            DirEntryFileType::Symlink => Self::SymLink,
-        }
-    }
-}
 
 bitflags! {
     struct FileFlags: u32 {
@@ -2762,18 +2662,6 @@ pub(super) struct RawInode {
 
 const_assert!(size_of::<RawInode>() == 128);
 
-/// On-disk directory entry with file_type (header only; name follows on disk).
-///
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Pod)]
-pub(super) struct RawDirEntry {
-    pub inode: u32,    // inode
-    pub rec_len: u16,  // rec_len
-    pub name_len: u8,  // name_len
-    pub file_type: u8, // file_type
-}
-
-const_assert!(size_of::<RawDirEntry>() == 8);
 
 #[cfg(ktest)]
 mod test {
