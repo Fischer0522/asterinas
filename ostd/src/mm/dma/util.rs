@@ -18,7 +18,7 @@ use crate::{
     util::range_alloc::RangeAllocator,
 };
 #[cfg(any(debug_assertions, all(target_arch = "x86_64", feature = "cvm_guest")))]
-use crate::{sync::SpinLock, util::range_counter::RangeCounter};
+use crate::{sync::{LocalIrqDisabled, SpinLock}, util::range_counter::RangeCounter};
 
 /// Metadata for frames behind a [`KVirtArea`] of different page table flags.
 ///
@@ -47,7 +47,7 @@ static DADDR_ALLOCATOR: RangeAllocator = RangeAllocator::new({
 ///  - check if the same physical page is DMA mapped twice, or to
 ///  - track if we need to protect/unprotect pages in the CVM.
 #[cfg(any(debug_assertions, all(target_arch = "x86_64", feature = "cvm_guest")))]
-static PADDR_REF_CNTS: SpinLock<RangeCounter> = SpinLock::new(RangeCounter::new());
+  static PADDR_REF_CNTS: SpinLock<RangeCounter, LocalIrqDisabled> = SpinLock::new(RangeCounter::new());
 
 pub(super) fn cvm_need_private_protection() -> bool {
     #[cfg(target_arch = "x86_64")]
