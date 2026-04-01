@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! In-memory [`Inode`] and directory/symlink/file operations.
+
 use core::{
     mem::size_of,
     sync::atomic::{AtomicUsize, Ordering},
@@ -35,6 +37,7 @@ use crate::{
 const MAX_FAST_SYMLINK_LEN: usize = size_of::<u32>() * 15;
 const MAX_LINK_COUNT: u16 = 32000;
 
+/// Ext2 file permission bits (lower 12 bits of `i_mode`).
 #[derive(Clone, Copy, Debug)]
 pub struct FilePerm(u16);
 
@@ -48,6 +51,13 @@ impl FilePerm {
     }
 }
 
+/// Represents an in-memory ext2 inode.
+///
+/// Each `Inode` corresponds to one on-disk inode
+/// identified by a unique inode number (`ino`).
+/// It caches the inode descriptor, manages the data page cache,
+/// and exposes directory, symlink, and regular-file operations
+/// through the VFS [`VfsInode`] trait.
 #[derive(Debug)]
 pub struct Inode {
     ino: u32,
@@ -1330,6 +1340,11 @@ impl Inode {
     }
 }
 
+/// [`PageCacheBackend`] implementation for inode data.
+///
+/// Translates logical page indices to physical device blocks
+/// via the block-pointer tree,
+/// then submits BIO requests to the underlying block device.
 #[derive(Debug)]
 pub(super) struct InodeBackend {
     /// Serializes backend traversal vs foreground block-map mutations.
@@ -2507,7 +2522,10 @@ bitflags! {
     }
 }
 
-/// In-memory inode descriptor (raw on-disk view).
+/// Parsed in-memory mirror of an on-disk inode's metadata fields.
+///
+/// Unlike [`RawInode`], fields are decoded into Rust types
+/// (e.g., `Duration` for timestamps, [`InodeType`] for file type).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct InodeDesc {
     type_: InodeType,

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! Inode-local cache of indirect metadata blocks.
+
 use core::mem::size_of;
 
 use lru::LruCache;

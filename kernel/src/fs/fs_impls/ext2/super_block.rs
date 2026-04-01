@@ -697,18 +697,20 @@ bitflags! {
     }
 }
 
+/// Action the filesystem driver takes when an error is detected.
 #[repr(u16)]
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, TryFromInt)]
 pub(super) enum ErrorsBehavior {
     /// Continues execution.
     #[default]
     Continue = 1,
-    // Remounts the filesystem read-only.
+    /// Remounts the filesystem read-only.
     RemountReadonly = 2,
-    // Panics.
+    /// Panics.
     Panic = 3,
 }
 
+/// OS that created the filesystem (`s_creator_os`).
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, TryFromInt)]
 pub(super) enum OsId {
@@ -719,6 +721,7 @@ pub(super) enum OsId {
     Lites = 4,
 }
 
+/// Ext2 revision level (`s_rev_level`).
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, TryFromInt)]
 pub(super) enum RevLevel {

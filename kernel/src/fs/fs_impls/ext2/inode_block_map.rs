@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! Logical-to-physical block translation via the ext2 block-pointer tree.
+
 use core::{mem::size_of, ops::Range};
 
 use device_id::{decode_device_numbers, encode_device_numbers};
@@ -54,7 +56,9 @@ struct BranchChainWalkResult {
     chain: Vec<IndirectBlockEntry>,
 }
 
-// In-memory inode block map for the raw on-disk `i_blocks` and `i_block[]` state.
+/// On-disk block pointer state copied from [`RawInode`].
+///
+/// Holds `i_blocks` (sector count) and the 15-entry `i_block[]` array.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct RawBlockPtrs {
     pub(super) sector_count: u32,
@@ -110,6 +114,12 @@ impl RawBlockPtrs {
     }
 }
 
+/// Manages the ext2 block-pointer tree for one inode.
+///
+/// Translates logical block numbers to physical device blocks
+/// by traversing the direct, single-indirect, double-indirect,
+/// and triple-indirect pointer chain stored in `i_block[15]`.
+/// Also handles block allocation, deallocation, and truncation.
 #[derive(Debug)]
 pub(super) struct BlockPtrTree {
     pub(super) desc: Dirty<RawBlockPtrs>,

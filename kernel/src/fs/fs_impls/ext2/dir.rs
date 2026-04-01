@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! Ext2 directory entry parsing and iteration.
+
 use core::mem::size_of;
 
 use ostd::const_assert;
@@ -18,6 +20,7 @@ pub(super) struct DirEntryHeader {
     pub file_type: u8,
 }
 
+/// Parsed ext2 directory entry (header + file name).
 #[derive(Clone, Debug)]
 pub(super) struct DirEntry {
     pub header: DirEntryHeader,

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! Ext2 extended attribute (xattr) block management.
+
 use core::{cmp::Ordering, mem::size_of};
 
 use super::{fs::Ext2, inode::Inode, inode_block_map::Ext2Bid, prelude::*};
@@ -25,6 +27,10 @@ pub(super) fn xattr_value_size(size: usize) -> usize {
     (size + XATTR_ROUND) & !XATTR_ROUND
 }
 
+/// Ext2 xattr namespace index stored in `e_name_index`.
+///
+/// Determines the namespace prefix prepended to the attribute name
+/// (e.g., `user.`, `security.`).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromInt)]
 pub(super) enum XattrNameIndex {
@@ -72,6 +78,10 @@ impl XattrNameIndex {
     }
 }
 
+/// On-disk header of an ext2 extended-attribute block (32 bytes).
+///
+/// For the format specification, see
+/// <https://www.nongnu.org/ext2-internals/ext2-xattrs.html>.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod)]
 pub(super) struct XattrHeader {
@@ -82,6 +92,9 @@ pub(super) struct XattrHeader {
     pub h_reserved: [u32; 4],
 }
 
+/// On-disk extended-attribute entry header.
+///
+/// Immediately followed by `e_name_len` bytes of the attribute name.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod)]
 pub(super) struct XattrEntryRaw {
@@ -100,6 +113,10 @@ struct XattrEntryData {
     value: Vec<u8>,
 }
 
+/// Manages the single external extended-attribute block for one inode.
+///
+/// Reads, writes, and removes xattr entries stored in the
+/// block pointed to by `i_file_acl` in the on-disk inode.
 // TODO: Add an entry cache to avoid repeated parsing.
 #[derive(Debug)]
 pub(super) struct Xattr {

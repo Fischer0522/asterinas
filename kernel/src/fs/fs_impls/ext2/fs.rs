@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! Core [`Ext2`] filesystem state and block-device I/O.
+
 use core::{
     mem::size_of,
     sync::atomic::{AtomicU32, Ordering},

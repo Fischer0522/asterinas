@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! Per-group state: descriptor, bitmaps, inode table, and allocation.
+
 use core::fmt;
 
 use aster_block::bio::BioCompleteFn;

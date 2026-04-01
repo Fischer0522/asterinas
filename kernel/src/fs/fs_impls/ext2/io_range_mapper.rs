@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! Batches logical block lookups into contiguous device-block runs for direct I/O.
+
 use core::ops::Range;
 
 use ostd::sync::RwMutexReadGuard;
@@ -19,6 +21,10 @@ pub(super) struct MappedRange {
     pub(super) device_block_range: Range<Ext2Bid>,
 }
 
+/// Iterates logical block ranges and classifies each as mapped or hole.
+///
+/// Used by the direct-I/O path to batch contiguous device-block runs
+/// into single BIO requests.
 pub(super) struct IoRangeMapper<'a> {
     range: Range<u32>,
     block_map: RwMutexReadGuard<'a, BlockPtrTree>,
