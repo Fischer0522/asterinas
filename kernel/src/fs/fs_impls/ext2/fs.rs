@@ -241,11 +241,7 @@ impl Ext2 {
         Ok(group.inode_table_bid() + table_block_index)
     }
 
-    /// Reads an inode descriptor from the group's PageCache.
-    ///
-    /// Thin orchestrator: validates ino, computes group/index, delegates to
-    /// `BlockGroup::read_inode_desc`.
-    ///
+    /// Reads an inode descriptor from the group's `PageCache`.
     pub(super) fn read_inode_desc(&self, ino: u32) -> Result<InodeDesc> {
         let sb = self.super_block.read();
         Self::read_inode_desc_from_parts(&sb, &self.block_groups, ino)
@@ -273,11 +269,7 @@ impl Ext2 {
         group.read_inode_desc(index_in_group)
     }
 
-    /// Writes an inode descriptor to the group's PageCache (deferred writeback).
-    ///
-    /// Thin orchestrator: validates ino, computes group/index, delegates to
-    /// `BlockGroup::write_inode_desc`.
-    ///
+    /// Writes an inode descriptor to the group's `PageCache`.
     pub(super) fn write_inode_desc(&self, ino: u32, raw: &RawInode) -> Result<()> {
         let sb = self.super_block.read();
 
@@ -300,8 +292,6 @@ impl Ext2 {
     }
 
     /// Loads the group descriptor table into a segment.
-
-    ///
     pub(super) fn load_group_desc_table(
         block_device: &dyn BlockDevice,
         sb: &SuperBlock,
@@ -432,10 +422,6 @@ impl Ext2 {
     }
 
     /// Allocates up to `count` contiguous blocks.
-    ///
-    /// Thin orchestrator that starts from the goal group, scans groups cyclically,
-    /// delegates to `BlockGroup::alloc_blocks`, and updates the superblock count
-    /// after a successful allocation.
     pub(super) fn alloc_blocks(&self, count: u32, goal: Ext2Bid) -> Result<Range<u32>> {
         if count == 0 {
             return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
@@ -514,9 +500,6 @@ impl Ext2 {
     }
 
     /// Frees a range of blocks starting at `start`.
-    ///
-    /// Thin orchestrator: validates range, splits across group boundaries,
-    /// delegates to `BlockGroup::free_blocks`, updates superblock counter.
     pub(super) fn free_blocks(&self, start: u32, count: u32) -> Result<()> {
         if count == 0 {
             return Ok(());
@@ -567,9 +550,6 @@ impl Ext2 {
     }
 
     /// Allocates a new inode number.
-    ///
-    /// Thin orchestrator: validates, iterates groups starting at parent's group,
-    /// delegates to `BlockGroup::alloc_inode`, updates group and superblock counters.
     pub(super) fn alloc_inode(&self, parent_ino: u32, inode_type: InodeType) -> Result<u32> {
         let (groups_count, inodes_per_group, total_inodes, first_ino, free_inodes) = {
             let sb_guard = self.super_block.read();
@@ -703,9 +683,6 @@ impl Ext2 {
     }
 
     /// Frees an inode by number.
-    ///
-    /// Thin orchestrator: validates, delegates bitmap op to `BlockGroup::free_inode`,
-    /// updates group and superblock counters on success.
     pub(super) fn free_inode(&self, ino: u32, is_dir: bool) -> Result<()> {
         let (inodes_per_group, total_inodes, first_ino, groups_count) = {
             let sb_guard = self.super_block.read();

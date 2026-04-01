@@ -14,9 +14,9 @@ pub const SUPER_BLOCK_OFFSET: usize = 1024;
 
 const SUPER_BLOCK_SIZE: usize = 1024;
 
-/// The in-memory rust superblock.
+/// The in-memory Rust superblock.
 ///
-/// It contains all information about the layout of the Ext2.
+/// It contains the layout information for the Ext2 filesystem.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SuperBlock {
     /// Total number of inodes.
@@ -55,8 +55,8 @@ pub(super) struct SuperBlock {
     magic: u16,
     /// Filesystem state.
     state: FsState,
-    /// Behaviour when detecting errors.
-    errors_behaviour: ErrorsBehaviour,
+    /// Behavior when detecting errors.
+    errors_behaviour: ErrorsBehavior,
     /// Time of last check.
     last_check_time: Duration,
     /// Interval between checks.
@@ -65,9 +65,9 @@ pub(super) struct SuperBlock {
     creator_os: OsId,
     /// Revision level.
     rev_level: RevLevel,
-    /// Default uid for reserved blocks.
+    /// Default UID for reserved blocks.
     def_resuid: u32,
-    /// Default gid for reserved blocks.
+    /// Default GID for reserved blocks.
     def_resgid: u32,
     //
     // These fields are valid for RevLevel::Dynamic only.
@@ -82,9 +82,9 @@ pub(super) struct SuperBlock {
     feature_compat: FeatureCompatSet,
     /// Incompatible feature set.
     feature_incompat: FeatureInCompatSet,
-    /// Readonly-compatible feature set.
+    /// Read-only-compatible feature set.
     feature_ro_compat: FeatureRoCompatSet,
-    /// 128-bit uuid for volume.
+    /// 128-bit UUID for the volume.
     uuid: [u8; 16],
     /// Volume name.
     volume_name: Str16,
@@ -137,9 +137,9 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
         let state = FsState::from_bits(sb.state)
             .ok_or(Error::with_message(Errno::EINVAL, "invalid fs state"))?;
 
-        let errors_behaviour = ErrorsBehaviour::try_from(sb.errors)
+        let errors_behaviour = ErrorsBehavior::try_from(sb.errors)
             .map_err(|_| Error::with_message(Errno::EINVAL, "invalid errors behaviour"))?;
-        if errors_behaviour != ErrorsBehaviour::Continue {
+        if errors_behaviour != ErrorsBehavior::Continue {
             return_errno_with_message!(Errno::EINVAL, "unsupported errors behaviour");
         }
 
@@ -511,19 +511,19 @@ impl SuperBlock {
         self.reserved_blocks_count
     }
 
-    /// Returns the default uid for reserved blocks.
+    /// Returns the default UID for reserved blocks.
     ///
     pub(super) fn def_resuid(&self) -> u32 {
         self.def_resuid
     }
 
-    /// Returns the default gid for reserved blocks.
+    /// Returns the default GID for reserved blocks.
     ///
     pub(super) fn def_resgid(&self) -> u32 {
         self.def_resgid
     }
 
-    /// Increase the number of free blocks.
+    /// Increases the number of free blocks.
     pub(super) fn inc_free_blocks(&mut self, count: u32) {
         self.free_blocks_count += count;
     }
@@ -533,7 +533,7 @@ impl SuperBlock {
         self.free_blocks_count = count;
     }
 
-    /// Decrease the number of free blocks.
+    /// Decreases the number of free blocks.
     pub(super) fn dec_free_blocks(&mut self, count: u32) {
         if self.free_blocks_count < count {
             warn!(
@@ -554,7 +554,7 @@ impl SuperBlock {
         self.free_inodes_count = count;
     }
 
-    /// Increase the number of free inodes.
+    /// Increases the number of free inodes.
     pub(super) fn inc_free_inodes(&mut self) {
         self.free_inodes_count += 1;
     }
@@ -563,7 +563,7 @@ impl SuperBlock {
         self.wtime = time;
     }
 
-    /// Decrease the number of free inodes.
+    /// Decreases the number of free inodes.
     pub(super) fn dec_free_inodes(&mut self) {
         debug_assert!(self.free_inodes_count > 0);
         self.free_inodes_count = self.free_inodes_count.saturating_sub(1);
@@ -608,8 +608,8 @@ impl SuperBlock {
         overhead.saturating_add(self.block_groups_count() * (2 + self.itb_per_group))
     }
 
-    /// Returns the starting block id of the super block
-    /// inside the block group pointed by `block_group_idx`.
+    /// Returns the starting block ID of the superblock copy
+    /// inside the block group identified by `block_group_idx`.
     ///
     /// # Panics
     ///
@@ -626,8 +626,8 @@ impl SuperBlock {
         super_block_bid as u32
     }
 
-    /// Returns the starting block id of the block group descriptor table
-    /// inside the block group pointed by `block_group_idx`.
+    /// Returns the starting block ID of the block-group descriptor table
+    /// inside the block group identified by `block_group_idx`.
     ///
     /// # Panics
     ///
@@ -646,11 +646,11 @@ bitflags! {
         const DIR_PREALLOC = 1 << 0;
         /// AFS server inodes exist
         const IMAGIC_INODES = 1 << 1;
-        /// File system has a journal
+        /// Filesystem has a journal
         const HAS_JOURNAL = 1 << 2;
         /// Inodes have extended attributes
         const EXT_ATTR = 1 << 3;
-        /// File system can resize itself for larger partitions
+        /// Filesystem can resize itself for larger partitions
         const RESIZE_INO = 1 << 4;
         /// Directories use hash index
         const DIR_INDEX = 1 << 5;
@@ -664,9 +664,9 @@ bitflags! {
         const COMPRESSION = 1 << 0;
         /// Directory entries contain a type field
         const FILETYPE = 1 << 1;
-        /// File system needs to replay its journal
+        /// Filesystem needs to replay its journal
         const RECOVER = 1 << 2;
-        /// File system uses a journal device
+        /// Filesystem uses a journal device
         const JOURNAL_DEV = 1 << 3;
         /// Metablock block group
         const META_BG = 1 << 4;
@@ -674,13 +674,13 @@ bitflags! {
 }
 
 bitflags! {
-    /// Readonly-compatible feature set.
+    /// Read-only-compatible feature set.
     struct FeatureRoCompatSet: u32 {
         /// Sparse superblocks and group descriptor tables
         const SPARSE_SUPER = 1 << 0;
-        /// File system uses a 64-bit file size
+        /// Filesystem uses a 64-bit file size
         const LARGE_FILE = 1 << 1;
-        /// Directory contents are stored in the form of a Binary Tree
+        /// Directory contents are stored in a binary tree.
         const BTREE_DIR = 1 << 2;
     }
 }
@@ -699,13 +699,13 @@ bitflags! {
 
 #[repr(u16)]
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, TryFromInt)]
-pub(super) enum ErrorsBehaviour {
-    /// Continue execution
+pub(super) enum ErrorsBehavior {
+    /// Continues execution.
     #[default]
     Continue = 1,
-    // Remount fs read-only
+    // Remounts the filesystem read-only.
     RemountReadonly = 2,
-    // Should panic
+    // Panics.
     Panic = 3,
 }
 
@@ -784,7 +784,7 @@ pub(super) struct RawSuperBlock {
     ///
     /// These fields are for journaling support in Ext3.
     ///
-    /// Uuid of journal superblock.
+    /// UUID of the journal superblock.
     pub journal_uuid: [u8; 16],
     /// Inode number of journal file.
     pub journal_ino: u32,
@@ -794,7 +794,7 @@ pub(super) struct RawSuperBlock {
     pub last_orphan: u32,
     /// HTREE hash seed.
     pub hash_seed: [u32; 4],
-    /// Default hash version to use
+    /// Default hash version to use.
     pub def_hash_version: u8,
     reserved_char_pad: u8,
     reserved_word_pad: u16,

@@ -20,10 +20,12 @@ use super::{
 };
 use crate::{
     fs::{
-        ext2::dir::DirEntryFileType, file::InodeMode, vfs::{
+        ext2::dir::DirEntryFileType,
+        file::InodeMode,
+        vfs::{
             inode::{Extension, FallocMode, Metadata},
             xattr::{XattrName, XattrNamespace, XattrSetFlags},
-        }
+        },
     },
     process::{Gid, Uid},
 };
@@ -364,7 +366,7 @@ impl Inode {
         xattr.get_xattr(name, value_writer)
     }
 
-    /// Lists extended-attribute names in one namespace and writes them to `list_writer`.
+    /// Lists extended attribute names in one namespace and writes them to `list_writer`.
     ///
     pub(super) fn list_xattr(
         &self,
@@ -428,7 +430,7 @@ impl Inode {
         Ok(())
     }
 
-    /// Reads symbolic-link target bytes and decodes them as UTF-8.
+    /// Reads symbolic link target bytes and decodes them as UTF-8.
     ///
     pub(super) fn read_link(&self) -> Result<String> {
         if self.type_ != InodeType::SymLink {
@@ -445,7 +447,7 @@ impl Inode {
         inner.read_link()
     }
 
-    /// Writes symbolic-link target bytes into either fast-inline or slow-pagecache storage.
+    /// Writes symbolic link target bytes into either fast-inline or slow-page-cache storage.
     ///
     pub(super) fn write_link(&self, target: &str) -> Result<()> {
         if self.type_ != InodeType::SymLink {
@@ -1017,8 +1019,8 @@ impl Inode {
             child_inner.sub_links_count_saturating(1);
 
             if child_inner.links_count() == 0 {
-            child_inner.persist(child_ino, &fs)?;
-            let _ = fs.remove_inode_cache(child_ino);
+                child_inner.persist(child_ino, &fs)?;
+                let _ = fs.remove_inode_cache(child_ino);
             }
             return Ok(());
         }
@@ -1081,18 +1083,18 @@ impl Inode {
         new_name: &str,
         fs: &Arc<Ext2>,
     ) -> Result<bool> {
-        // Phase 1: read current source/target snapshot without write locks.
+        // Step 1: read the current source/target snapshot without write locks.
         let ctx = self.prepare_rename_context(target, old_name, new_name, fs)?;
 
-        // Phase 2: lock all participating inode inner domains in global ino order.
+        // Step 2: lock all participating inode inner domains in global inode-number order.
         let lock_targets = self.rename_lock_targets(&ctx);
         let mut guards = MultiInodeInnerGuards::lock(&lock_targets);
 
-        // Phase 3: verify snapshot is still valid under locks.
+        // Step 3: verify that the snapshot is still valid under the locks.
         if !self.recheck_rename_state(&ctx, &guards)? {
             return Ok(false);
         }
-        // Phase 4: apply rename mutations and persist metadata.
+        // Step 4: apply the rename mutations and persist the metadata.
         self.validate_rename_overwrite(&ctx, &guards)?;
         self.apply_rename_with_locks(&ctx, &mut guards)?;
         drop(guards);
@@ -1288,12 +1290,7 @@ impl Inode {
         old_inner.set_ctime(now());
         if ctx.old_is_dir && !ctx.is_same_dir() {
             let dotdot = old_inner.find_entry_target(ctx.fs, "..")?;
-            old_inner.set_link(
-                ctx.fs,
-                &dotdot,
-                ctx.target_dir.ino,
-                DirEntryFileType::Dir,
-            )?;
+            old_inner.set_link(ctx.fs, &dotdot, ctx.target_dir.ino, DirEntryFileType::Dir)?;
             old_inner.remove_flags(FileFlags::INDEX_DIR);
         }
         Ok(())
@@ -1417,13 +1414,14 @@ impl PageCacheBackend for InodeBackend {
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
 
         match block_map.get_block(&fs, iblock)? {
-            Some(bid) => {
-                fs.write_blocks_async(bid, bio_segment, complete_fn)
-            }
+            Some(bid) => fs.write_blocks_async(bid, bio_segment, complete_fn),
             None => {
-                error!("faild to find a block mapping in PageCacheBackend, idx: {}",idx);
+                error!(
+                    "faild to find a block mapping in PageCacheBackend, idx: {}",
+                    idx
+                );
                 return_errno!(Errno::EIO);
-            },
+            }
         }
     }
 
@@ -1683,7 +1681,13 @@ impl InodeInner {
         let block = DirBlock::new(self.page_cache(), 0, block_size);
         let dot_len = DirEntryHeader::dir_rec_len(1) as usize;
         let write_result = (|| -> Result<()> {
-            block.write_entry(0, ino, DirEntryHeader::dir_rec_len(1), b".", DirEntryFileType::Dir)?;
+            block.write_entry(
+                0,
+                ino,
+                DirEntryHeader::dir_rec_len(1),
+                b".",
+                DirEntryFileType::Dir,
+            )?;
             block.write_entry(
                 dot_len,
                 parent_ino,
@@ -1855,7 +1859,7 @@ impl InodeInner {
 
         let backend = self.backend.clone();
         let mut block_map = backend.block_map.write();
-        // TODO: handle the rollback here, for page cache.
+        // TODO: Roll back the page-cache state if block truncation fails.
         block_map.truncate_blocks(&fs, new_size)?;
         let snapshot = *block_map.get_desc();
 
@@ -1960,15 +1964,15 @@ impl InodeInner {
     fn write_link(&mut self, target: &str) -> Result<()> {
         let target_len = target.len();
 
-        // Aligned with Linux, Linux use c-style string for symlink target and store the trailing nul,
-        // so we need to reserve one byte for the trailing nul.
+        // Linux stores symlink targets as C-style strings with a trailing NUL,
+        // so reserve one byte for the trailing NUL.
         if target.len() < MAX_FAST_SYMLINK_LEN {
-            // fast path
+            // Fast path.
             self.desc.block_ptrs.as_mut_bytes()[..target_len].copy_from_slice(target.as_bytes());
         } else {
             let fs = self.fs_arc()?;
             let block_size = fs.block_size();
-            // slow path, write to page cache
+            // Slow path: write through the page cache.
             self.prepare_write(&fs, 0, target_len, block_size)?;
             self.page_cache().write_bytes(0, target.as_bytes())?;
         }
@@ -1983,8 +1987,8 @@ impl InodeInner {
         let block_size = fs.block_size();
 
         if self.desc.is_fast_symlink(block_size) {
-            // Aligned with Linux, Linux use c-style string for symlink target and store the trailing nul,
-            // so we need to reserve one byte for the trailing nul.
+            // Linux stores symlink targets as C-style strings with a trailing NUL,
+            // so reserve one byte for the trailing NUL.
             let read_len = link_size.min(MAX_FAST_SYMLINK_LEN - 1);
             let raw = self.desc.block_ptrs.as_bytes();
             return String::from_utf8(raw[..read_len].to_vec())
@@ -2000,12 +2004,10 @@ impl InodeInner {
             .map_err(|_| Error::with_message(Errno::EIO, "symlink target is not valid UTF-8"))
     }
 
-    // 1. Zero the old partial tail if the write extends EOF (no need for write_link, since it is a new inode).
-    // and zero the new tail if the last block is partial.
-    // 2. handle the partial head and tail for current writes.
+    // 1. Zero the old partial tail if the write extends EOF.
+    // 2. Zero the partial head and tail for the current write.
     // 3. Allocate new blocks for the write range.
-    // 4. fill zero for the partial head and tail.
-    // 5. Create a handle that contains enssentail metadata for the write and rollback
+    // 4. Fill zeros for newly exposed partial ranges.
     fn prepare_write(
         &mut self,
         fs: &Ext2,
@@ -2022,23 +2024,24 @@ impl InodeInner {
             self.resize_page_cache_and_update_npages(end, old_size)?;
         }
 
-        // TODO: Different from Linux, currently we lack the protection of a single page for concurrent write.
-        // If we allocate before fill zeros, the mmap can access the dirty contents on disk.
+        // TODO: Unlike Linux, we currently lack single-page protection for
+        // concurrent writes. If allocation happens before zero-filling, `mmap`
+        // may observe stale on-disk contents.
 
-        // The write extends EOF, we need to zero the partial tail of the old EOF block and the new EOF block.
+        // If the write extends EOF, zero the partial tail of the old EOF block.
         if offset > old_size {
             self.zero_eof_tail(old_size, block_size)?;
         }
 
-        // The new partial eof is as the range end.
+        // Treat the write end as the new partial EOF boundary.
         self.zero_partial_writes(fs, offset, end, block_size)?;
         self.allocate_range_blocks(fs, offset, end, block_size)?;
         Ok(())
     }
     // NOTE: Make sure the page cache is already resized before calling this function.
-    // When the file is expanded, we need to zero the partial tail of the old EOF block and the new EOF block.
-    // So, we don't need to zero the old eof tail, because the responsiblity of cleaning eof belongs to
-    // who changes the file size (write, shrink, expand, and fallocate).
+    // When the file expands, zero the partial tail of the old EOF block. EOF
+    // cleanup belongs to the operation that changes the file size, such as
+    // write, shrink, expand, or fallocate.
     fn zero_eof_tail(&self, eof: usize, block_size: usize) -> Result<()> {
         if !eof.is_multiple_of(block_size) {
             let block_end = eof.align_up(block_size);
@@ -2048,10 +2051,10 @@ impl InodeInner {
     }
 
     // NOTE: Make sure the page cache is already resized before calling this function.
-    // Only use for write path (data, symlink and dir)
-    // Conditionally fill zeros for the partial head and tail, it fills:
-    // 1. the partial start block if it's a hole
-    // 2. the partial end block if it's a hole
+    // Use this only on write paths for file data, symlinks, and directories.
+    // Conditionally fill zeros for:
+    // 1. The partial start block when it is a hole.
+    // 2. The partial end block when it is a hole.
     fn zero_partial_writes(
         &mut self,
         fs: &Ext2,
@@ -2139,7 +2142,7 @@ impl InodeInner {
         Ok(new_blocks)
     }
 
-    // TODO: May be we only need zero the page cache?
+    // TODO: Maybe zeroing only the page cache is sufficient here.
     /// Zeroes newly allocated data blocks before exposing them via mapped reads.
     ///
     fn zero_new_blocks(&self, fs: &Ext2, blocks: &[Ext2Bid], block_size: usize) -> Result<()> {
@@ -2191,7 +2194,7 @@ impl InodeInner {
         self.sync_desc_block_map_from_snapshot(desc);
     }
 
-    /// Phase 1: scan directory blocks for reusable slot or duplicate.
+    /// Scans directory blocks for a reusable slot or a duplicate entry.
     ///
     fn scan_dir_for_slot(&self, fs: &Ext2, name: &str) -> Result<Option<DirSlotInfo>> {
         if self.inode_type() != InodeType::Dir {
@@ -2248,7 +2251,7 @@ impl InodeInner {
         Ok(None)
     }
 
-    /// Phase 2: grow directory by one data block.
+    /// Grows the directory by one data block.
     ///
     fn grow_dir_block(&mut self, fs: &Ext2) -> Result<DirSlotInfo> {
         let block_size = fs.block_size();
@@ -2265,7 +2268,7 @@ impl InodeInner {
         })
     }
 
-    /// Phase 3: write a new entry into a selected slot via PageCache.
+    /// Writes a new entry into the selected slot through `PageCache`.
     ///
     fn add_entry(
         &self,
@@ -2297,8 +2300,10 @@ impl InodeInner {
                 return_errno_with_message!(Errno::EIO, "corrupted dir entry split");
             }
             // When splitting, update the predecessor's rec_len first.
-            self.page_cache
-                .write_bytes(slot.dir_offset.saturating_add(4), &(slot.used_rec_len as u16).to_le_bytes())?;
+            self.page_cache.write_bytes(
+                slot.dir_offset.saturating_add(4),
+                &(slot.used_rec_len as u16).to_le_bytes(),
+            )?;
             offset = slot.dir_offset.saturating_add(slot.used_rec_len);
             rec_len = slot.slot_rec_len.saturating_sub(slot.used_rec_len);
         }
@@ -2344,20 +2349,28 @@ impl InodeInner {
         let block_idx = block_base / block_size;
         let entry_offset = target.dir_offset - block_base;
 
-        let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, self.file_size());
+        let block =
+            DirBlock::from_index(self.page_cache(), block_idx, block_size, self.file_size());
         block.delete_entry(block_size, entry_offset, target.entry_rec_len)?;
         Ok(())
     }
 
     /// Rewrites a located entry's inode/type.
     ///
-    fn set_link(&self, fs: &Ext2, target: &DirEntryTarget, new_ino: u32, ft: DirEntryFileType) -> Result<()> {
+    fn set_link(
+        &self,
+        fs: &Ext2,
+        target: &DirEntryTarget,
+        new_ino: u32,
+        ft: DirEntryFileType,
+    ) -> Result<()> {
         let block_size = fs.block_size();
         let block_base = (target.dir_offset / block_size) * block_size;
         let block_idx = block_base / block_size;
         let entry_offset = target.dir_offset - block_base;
 
-        let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, self.file_size());
+        let block =
+            DirBlock::from_index(self.page_cache(), block_idx, block_size, self.file_size());
         block.set_inode(entry_offset, new_ino)?;
         block.set_file_type(entry_offset, ft)?;
         Ok(())
@@ -2451,15 +2464,13 @@ fn write_lock_multiple_inodes<'a>(inodes: &[&'a Inode]) -> Vec<RwMutexWriteGuard
         .collect()
 }
 
-
-
 bitflags! {
     struct FileFlags: u32 {
         /// Secure deletion.
         const SECURE_DEL = 1 << 0;
         /// Undelete.
         const UNDELETE = 1 << 1;
-        /// Compress file.
+        /// Compresses the file.
         const COMPRESS = 1 << 2;
         /// Synchronous updates.
         const SYNC_UPDATE = 1 << 3;
@@ -2469,13 +2480,13 @@ bitflags! {
         const APPEND_ONLY = 1 << 5;
         /// Do not dump file.
         const NO_DUMP = 1 << 6;
-        /// Do not update atime.
+        /// Does not update `atime`.
         const NO_ATIME = 1 << 7;
         /// Dirty.
         const DIRTY = 1 << 8;
         /// One or more compressed clusters.
         const COMPRESS_BLK = 1 << 9;
-        /// Do not compress.
+        /// Does not compress.
         const NO_COMPRESS = 1 << 10;
         /// Encrypted file.
         const ENCRYPT = 1 << 11;
@@ -2487,11 +2498,11 @@ bitflags! {
         const JOURNAL_DATA = 1 << 14;
         /// File tail should not be merged.
         const NO_TAIL = 1 << 15;
-        /// Dirsync behaviour (directories only).
+        /// Dirsync behavior (directories only).
         const DIR_SYNC = 1 << 16;
         /// Top of directory hierarchies.
         const TOP_DIR = 1 << 17;
-        /// Reserved for ext2 lib.
+        /// Reserved for the ext2 library.
         const RESERVED = 1 << 31;
     }
 }
@@ -2655,7 +2666,6 @@ pub(super) struct RawInode {
 }
 
 const_assert!(size_of::<RawInode>() == 128);
-
 
 #[cfg(ktest)]
 mod test {

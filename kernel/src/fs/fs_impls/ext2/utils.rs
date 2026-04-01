@@ -6,9 +6,9 @@ use super::prelude::*;
 use crate::{prelude::warn, time::Clock};
 
 pub(super) trait IsPowerOf: Copy + Sized + MulAssign + PartialOrd {
-    /// Returns true if and only if `self == x^k` for some `k` where `k > 0`.
+    /// Returns whether `self` equals `x^k` for some `k > 0`.
     ///
-    /// The `x` must be a positive value.
+    /// `x` must be positive.
     fn is_power_of(&self, x: Self) -> bool {
         let mut power = x;
         while power < *self {
@@ -36,7 +36,7 @@ pub(super) struct Dirty<T: Debug> {
 }
 
 impl<T: Debug> Dirty<T> {
-    /// Creates a new Dirty without setting the dirty flag.
+    /// Creates a new `Dirty` value without setting the dirty flag.
     pub(super) fn new(val: T) -> Dirty<T> {
         Dirty {
             value: val,
@@ -44,7 +44,7 @@ impl<T: Debug> Dirty<T> {
         }
     }
 
-    /// Creates a new Dirty with setting the dirty flag.
+    /// Creates a new `Dirty` value with the dirty flag set.
     pub(super) fn _new_dirty(val: T) -> Dirty<T> {
         Dirty {
             value: val,
@@ -52,7 +52,7 @@ impl<T: Debug> Dirty<T> {
         }
     }
 
-    /// Returns true if dirty, false otherwise.
+    /// Returns whether the value is dirty.
     pub(super) fn is_dirty(&self) -> bool {
         self.dirty
     }

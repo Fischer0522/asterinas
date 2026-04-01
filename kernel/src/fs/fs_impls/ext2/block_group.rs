@@ -20,7 +20,7 @@ struct InodeTableBackend {
     inode_table_bid: Ext2Bid,
     /// Total inode table size in bytes (`inodes_per_group * inode_size`).
     raw_inodes_size: usize,
-    /// Block device handle for I/O (replaces `Weak<Ext2>`).
+    /// Block device handle for I/O.
     block_device: Arc<dyn BlockDevice>,
 }
 
@@ -159,7 +159,6 @@ impl From<GroupDesc> for RawGroupDesc {
 impl BlockGroup {
     /// Loads a block group from the descriptor table.
     ///
-    /// Now takes `Arc<dyn BlockDevice>` directly instead of `Weak<Ext2>`.
     /// Caches per-group geometry from `SuperBlock` at load time.
     pub(super) fn load(
         group_descs: &USegment,
@@ -217,7 +216,7 @@ impl BlockGroup {
         })
     }
 
-    /// Looks up an allocated inode by group-local index and returns cached/in-memory object.
+    /// Looks up an allocated inode by group-local index.
     ///
     pub(super) fn lookup_inode(
         &self,
@@ -281,7 +280,7 @@ impl BlockGroup {
 
     /// Syncs cached inodes and evicts unreferenced entries.
     fn sync_inodes(&self) -> Result<()> {
-        // Phase 1: remove unreferenced inodes from cache.
+        // Phase 1: remove unreferenced inodes from the cache.
         let unused_inodes: Vec<Arc<Inode>> = self
             .inode_cache
             .write()
@@ -300,7 +299,7 @@ impl BlockGroup {
             inode.sync_all(false)?;
         }
 
-        //Phase 4: sync inode table page cache.
+        // Phase 4: sync the inode-table page cache.
         self.sync_inode_table()?;
         Ok(())
     }

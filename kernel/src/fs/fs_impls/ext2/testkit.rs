@@ -23,13 +23,16 @@ use ostd::{
 use super::{
     block_group::RawGroupDesc,
     fs::{Ext2, ROOT_INO},
-    inode::{RawInode},
+    inode::RawInode,
     super_block::{
-        ErrorsBehaviour, FsState, MAGIC_NUM, OsId, RawSuperBlock, RevLevel, SUPER_BLOCK_OFFSET,
+        ErrorsBehavior, FsState, MAGIC_NUM, OsId, RawSuperBlock, RevLevel, SUPER_BLOCK_OFFSET,
     },
 };
 use crate::{
-    fs::{ext2::dir::DirEntryHeader, file::InodeType, fs_impls::ext2::super_block::SuperBlock, utils::DirentVisitor},
+    fs::{
+        ext2::dir::DirEntryHeader, file::InodeType, fs_impls::ext2::super_block::SuperBlock,
+        utils::DirentVisitor,
+    },
     prelude::{Errno, Result, return_errno_with_message, *},
 };
 
@@ -250,7 +253,7 @@ pub(super) fn make_valid_raw_super_block(groups_count: u32) -> RawSuperBlock {
     raw.log_block_size = 2;
     raw.log_frag_size = 2;
     raw.state = FsState::VALID.bits();
-    raw.errors = ErrorsBehaviour::Continue as u16;
+    raw.errors = ErrorsBehavior::Continue as u16;
     raw.creator_os = OsId::Linux as u32;
     raw.rev_level = RevLevel::GoodOld as u32;
     raw.first_data_block = 1;
@@ -386,8 +389,9 @@ impl RawInodeBuilder {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Encode a directory entry into a buffer at the given offset.
-/// Unified from dir.rs::encode_entry and inode.rs::write_dir_entry.
+/// Encodes a directory entry into a buffer at the given offset.
+///
+/// Shared helper for `dir.rs` and `inode.rs` tests.
 pub(super) fn encode_dir_entry(
     buf: &mut [u8],
     offset: usize,

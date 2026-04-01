@@ -14,7 +14,7 @@ use super::{
 
 pub(super) type Ext2Bid = u32;
 
-///TODO: Refactor this with a more rusty approach (e.g. enum).
+// TODO: Refactor this into a more idiomatic Rust representation, such as an `enum`.
 /// Block path offsets for direct/indirect traversal.
 ///
 /// Produced by `block_to_path` from a logical block number.
@@ -54,7 +54,7 @@ struct BranchResult {
     chain: Vec<IndirectEntry>,
 }
 
-// In-memory inode block map (raw on-disk view only i_blocks/i_block[]).
+// In-memory inode block map for the raw on-disk `i_blocks` and `i_block[]` state.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct BlockMapDesc {
     pub(super) sector_count: u32,

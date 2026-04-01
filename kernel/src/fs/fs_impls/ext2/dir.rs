@@ -4,20 +4,18 @@ use core::mem::size_of;
 
 use ostd::const_assert;
 
-use super::{prelude::*};
+use super::prelude::*;
 use crate::fs::utils::NAME_MAX;
 
-
-
-/// On-disk directory entry with file_type (header only; name follows on disk).
+/// On-disk directory entry header.
 ///
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
 pub(super) struct DirEntryHeader {
-    pub inode: u32,    // inode
-    pub rec_len: u16,  // rec_len
-    pub name_len: u8,  // name_len
-    pub file_type: u8, // file_type
+    pub inode: u32,
+    pub rec_len: u16,
+    pub name_len: u8,
+    pub file_type: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -28,8 +26,7 @@ pub(super) struct DirEntry {
 
 const_assert!(size_of::<DirEntryHeader>() == 8);
 
-
-/// Directory entry type mapping (ext2 file_type field).
+/// Directory entry type mapping for the ext2 `file_type` field.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum DirEntryFileType {
@@ -116,30 +113,36 @@ impl DirEntryHeader {
         if rec_len_usize < min_rec_len {
             return_errno_with_message!(
                 Errno::EIO,
-                "Invalid record length: rec_len  is smaller than minimal"
+                "invalid record length: `rec_len` is smaller than the minimum"
             );
         }
         if (rec_len & 3) != 0 {
-            return_errno_with_message!(Errno::EIO, "Invalid record length: rec_len is not aligned");
+            return_errno_with_message!(
+                Errno::EIO,
+                "invalid record length: `rec_len` is not aligned"
+            );
         }
         if name_len as usize > NAME_MAX {
-            return_errno_with_message!(Errno::EIO, "Invalid name length: name_len is too long");
+            return_errno_with_message!(Errno::EIO, "invalid name length: `name_len` is too large");
         }
         let need = Self::dir_rec_len(name_len as usize) as usize;
         if rec_len_usize < need {
             return_errno_with_message!(
                 Errno::EIO,
-                "Invalid record length: rec_len is smaller than needed"
+                "invalid record length: `rec_len` is smaller than required"
             );
         }
         if offset.saturating_add(rec_len_usize) > limit {
             return_errno_with_message!(
                 Errno::EIO,
-                "Invalid offset: offset + rec_len is out of limit"
+                "invalid offset: `offset + rec_len` is out of bounds"
             );
         }
         if inode > max_inumber {
-            return_errno_with_message!(Errno::EIO, "Invalid inode: inode is out of max_inumber");
+            return_errno_with_message!(
+                Errno::EIO,
+                "invalid inode number: `inode` exceeds the maximum"
+            );
         }
         Ok(())
     }
@@ -207,8 +210,7 @@ impl<'a> DirBlock<'a> {
         let abs = self.offset + entry_offset;
         self.page_cache.write_val(abs, &header)?;
         if !name.is_empty() {
-            self.page_cache
-                .write_bytes(abs + Self::HEADER_LEN, name)?;
+            self.page_cache.write_bytes(abs + Self::HEADER_LEN, name)?;
         }
         Ok(())
     }
@@ -296,10 +298,7 @@ impl DirBlockIter<'_> {
     /// Reads the next entry (header + name). Returns `(offset_within_block, DirEntry)`.
     ///
     /// The `offset_within_block` is relative to the `DirBlock`'s start, not absolute.
-    pub(super) fn next_entry(
-        &mut self,
-        block_offset: usize,
-    ) -> Result<Option<(usize, DirEntry)>> {
+    pub(super) fn next_entry(&mut self, block_offset: usize) -> Result<Option<(usize, DirEntry)>> {
         if self.cursor >= self.end {
             return Ok(None);
         }
@@ -321,8 +320,7 @@ impl DirBlockIter<'_> {
         let name = if name_len > 0 && header.inode != 0 {
             let name_abs = self.cursor + Self::HEADER_LEN;
             let mut buf = [0u8; u8::MAX as usize];
-            self.page_cache
-                .read_bytes(name_abs, &mut buf[..name_len])?;
+            self.page_cache.read_bytes(name_abs, &mut buf[..name_len])?;
             CStr256::from(&buf[..name_len])
         } else {
             CStr256::from(&[] as &[u8])
@@ -357,27 +355,37 @@ mod test {
 
         // Short rec_len.
         assert_eq!(
-            DirEntryHeader::validate(8, 1, 0, 64, 128, 1).unwrap_err().error(),
+            DirEntryHeader::validate(8, 1, 0, 64, 128, 1)
+                .unwrap_err()
+                .error(),
             Errno::EIO
         );
         // Unaligned rec_len.
         assert_eq!(
-            DirEntryHeader::validate(14, 1, 0, 64, 128, 1).unwrap_err().error(),
+            DirEntryHeader::validate(14, 1, 0, 64, 128, 1)
+                .unwrap_err()
+                .error(),
             Errno::EIO
         );
         // name_len exceeds NAME_MAX.
         assert_eq!(
-            DirEntryHeader::validate(12, 10, 0, 64, 128, 1).unwrap_err().error(),
+            DirEntryHeader::validate(12, 10, 0, 64, 128, 1)
+                .unwrap_err()
+                .error(),
             Errno::EIO
         );
         // Record spans beyond limit.
         assert_eq!(
-            DirEntryHeader::validate(16, 4, 56, 64, 128, 1).unwrap_err().error(),
+            DirEntryHeader::validate(16, 4, 56, 64, 128, 1)
+                .unwrap_err()
+                .error(),
             Errno::EIO
         );
         // Inode out of range.
         assert_eq!(
-            DirEntryHeader::validate(12, 1, 0, 64, 8, 9).unwrap_err().error(),
+            DirEntryHeader::validate(12, 1, 0, 64, 8, 9)
+                .unwrap_err()
+                .error(),
             Errno::EIO
         );
     }

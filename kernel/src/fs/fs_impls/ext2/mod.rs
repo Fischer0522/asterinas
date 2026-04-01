@@ -1,40 +1,38 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! A safe Rust Ext2 filesystem.
+//! Implements the Ext2 filesystem in safe Rust.
 //!
-//! The Second Extended File System(Ext2) is a major rewrite of the Ext filesystem.
-//! It is the predominant filesystem in use by Linux from the early 1990s to the early 2000s.
-//! The structures of Ext3 and Ext4 are based on Ext2 and add some additional options
-//! such as journaling.
+//! The Second Extended File System (Ext2) is a major rewrite of the original
+//! Ext filesystem. It was the predominant filesystem used by Linux from the
+//! early 1990s to the early 2000s. Ext3 and Ext4 build on the Ext2 on-disk
+//! format and add features such as journaling.
 //!
-//! The features of this version of Ext2 are as follows:
-//! 1. No unsafe Rust. The filesystem is written is Rust without any unsafe code,
-//!    ensuring that there are no memory safety issues in the code.
-//! 2. Deep integration with PageCache. The data and metadata of the filesystem are
-//!    stored in PageCache, which accelerates the performance of data access.
-//! 3. Compatible with queue-based block device. The filesystem can submits multiple
-//!    BIO requests to be block device at once, thereby enhancing I/O performance.
+//! This implementation has the following properties:
+//! 1. It contains no `unsafe` Rust.
+//! 2. It integrates deeply with `PageCache` for both data and metadata.
+//! 3. It supports queue-based block devices and can submit multiple BIO
+//!    requests in one operation.
 //!
 //! # Example
 //!
 //! ```no_run
-//! // Opens an Ext2 from the block device.
+//! // Opens an `Ext2` filesystem from the block device.
 //! let ext2 = Ext2::open(block_device)?;
-//! // Lookup the root inode.
+//! // Looks up the root inode.
 //! let root = ext2.root_inode();
-//! // Create a file inside root directory.
+//! // Creates a file inside the root directory.
 //! let file = root.create("file", InodeType::File, FilePerm::from_bits_truncate(0o666))?;
-//! // Write data into the file.
+//! // Writes data into the file.
 //! const WRITE_DATA: &[u8] = b"Hello, World";
 //! let len = file.write_at(0, WRITE_DATA)?;
 //! assert!(len == WRITE_DATA.len());
 //! ```
 //!
-//! # Limitation
+//! # Limitations
 //!
-//! Here we summarizes the features that need to be implemented in the future.
-//! 1. Supports merging small read/write operations.
-//! 2. Handles the intermediate failure status correctly.
+//! The following improvements are still planned:
+//! 1. Merge small read and write operations more efficiently.
+//! 2. Handle intermediate failure cases more robustly.
 
 pub use fs::Ext2;
 pub use inode::{FilePerm, Inode};

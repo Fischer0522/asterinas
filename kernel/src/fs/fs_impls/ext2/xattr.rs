@@ -43,7 +43,7 @@ impl From<XattrNamespace> for XattrNameIndex {
             XattrNamespace::Trusted => Self::Trusted,
             XattrNamespace::Security => Self::Security,
             XattrNamespace::System => {
-                // POSIX ACL xattrs are not implemented in Phase 10.1 yet.
+                // POSIX ACL xattrs are not implemented yet.
                 Self::PosixAclAccess
             }
         }
@@ -100,7 +100,7 @@ struct XattrEntryData {
     value: Vec<u8>,
 }
 
-// TODO: add a entry cache to avoid frequent parsing
+// TODO: Add an entry cache to avoid repeated parsing.
 #[derive(Debug)]
 pub(super) struct Xattr {
     block_buf: Option<USegment>,
@@ -111,7 +111,7 @@ pub(super) struct Xattr {
 }
 
 impl Xattr {
-    /// Creates a new xattr handle. `bid` comes from `InodeDesc.file_acl`.
+    /// Creates a new xattr handle for the block referenced by `InodeDesc.file_acl`.
     pub(super) fn new(bid: u32, inode: Weak<Inode>, fs: Weak<Ext2>) -> Self {
         Self {
             block_buf: None,
@@ -122,7 +122,7 @@ impl Xattr {
         }
     }
 
-    /// Returns the current xattr block number. Caller uses this to update `InodeDesc.file_acl`.
+    /// Returns the current xattr block number for `InodeDesc.file_acl`.
     pub(super) fn bid(&self) -> u32 {
         self.bid
     }
@@ -551,7 +551,9 @@ impl Xattr {
         Ok(())
     }
 
-    /// Creates or replaces one extended attribute. Allocates block if needed.
+    /// Creates or replaces one extended attribute.
+    ///
+    /// Allocates a block if needed.
     ///
     pub(super) fn set_xattr(
         &mut self,
@@ -601,14 +603,16 @@ impl Xattr {
         }
 
         let working_block = Self::build_block(&entries, block_size)?;
-        // TODO: maybe add a rollback?
+        // TODO: Add rollback if block allocation succeeds but the writeback fails.
         self.alloc_bid_if_needed()?;
         self.write_working_block(&working_block, block_size)?;
         self.dirty = true;
         self.flush()
     }
 
-    /// Reads one extended-attribute value. Size query if `vm_writer.avail() == 0`.
+    /// Reads one extended attribute value.
+    ///
+    /// Performs a size query if `vm_writer.avail() == 0`.
     ///
     pub(super) fn get_xattr(&mut self, name: XattrName, vm_writer: &mut VmWriter) -> Result<usize> {
         let (target_index, target_name) = Self::parse_target_name(name)?;
