@@ -1416,23 +1416,15 @@ impl PageCacheBackend for InodeBackend {
         let iblock = u32::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
 
-        // Fast path: bid is already allocated, only acquire read lock.
-        let mut bid = block_map.get_block(&fs, iblock)?;
-
-        // Slow path: bid is not allocated, acquire write lock and allocate.
-        // In the normal write path, the blocks should be already allocated by foreground write,
-        // but if we perform mmap then truncate and resize to the origin size,
-        // the blocks are already reclaimed and only holes left.
-        // In this case, we need to allocate new blocks for the mmaped pages when triggering writeback.
-        if bid.is_none() {
-            error!("failed to find a block mapping in PageCacheBackend, idx: {}",idx);
-            return_errno!(Errno::EIO);
-            // let mut block_map = block_map.upgrade();
-            // bid = block_map.get_or_alloc_block(&fs, iblock, true)?;
+        match block_map.get_block(&fs, iblock)? {
+            Some(bid) => {
+                fs.write_blocks_async(bid, bio_segment, complete_fn)
+            }
+            None => {
+                error!("faild to find a block mapping in PageCacheBackend, idx: {}",idx);
+                return_errno!(Errno::EIO);
+            },
         }
-        // The bid is guaranteed to be allocated.
-        let bid = bid.unwrap();
-        fs.write_blocks_async(bid, bio_segment, complete_fn)
     }
 
     fn npages(&self) -> usize {
