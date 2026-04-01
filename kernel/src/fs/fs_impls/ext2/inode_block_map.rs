@@ -122,20 +122,20 @@ impl RawBlockPtrs {
 /// Also handles block allocation, deallocation, and truncation.
 #[derive(Debug)]
 pub(super) struct BlockPtrTree {
-    pub(super) desc: Dirty<RawBlockPtrs>,
+    pub(super) raw_block_ptrs: Dirty<RawBlockPtrs>,
     pub(super) indirect_blocks: Mutex<IndirectBlockManager>,
 }
 
 impl BlockPtrTree {
     pub(super) fn new(desc: RawBlockPtrs, fs: Weak<Ext2>) -> Self {
         Self {
-            desc: Dirty::new(desc),
+            raw_block_ptrs: Dirty::new(desc),
             indirect_blocks: Mutex::new(IndirectBlockManager::new(fs)),
         }
     }
 
-    pub(super) fn desc(&self) -> &RawBlockPtrs {
-        &self.desc
+    pub(super) fn raw_block_ptrs(&self) -> &RawBlockPtrs {
+        &self.raw_block_ptrs
     }
 
     pub(super) fn sync_indirect_blocks(&self) -> Result<()> {
@@ -214,7 +214,7 @@ impl BlockPtrTree {
 
         let top_offset = path.offsets[0] as usize;
         let top_key =
-            *self.desc.block_ptrs.get(top_offset).ok_or_else(|| {
+            *self.raw_block_ptrs.block_ptrs.get(top_offset).ok_or_else(|| {
                 Error::with_message(Errno::EIO, "invalid top-level block pointer")
             })?;
 
@@ -298,7 +298,7 @@ impl BlockPtrTree {
                 let slot = start_slot
                     .checked_add(count as usize)
                     .ok_or_else(|| Error::with_message(Errno::EIO, "direct slot overflow"))?;
-                let Some(&next_bid) = self.desc.block_ptrs.get(slot) else {
+                let Some(&next_bid) = self.raw_block_ptrs.block_ptrs.get(slot) else {
                     break;
                 };
                 if next_bid == 0 || next_bid != first_bid.saturating_add(count) {
@@ -352,7 +352,7 @@ impl BlockPtrTree {
                 let slot = start_slot
                     .checked_add(count as usize)
                     .ok_or_else(|| Error::with_message(Errno::EIO, "direct slot overflow"))?;
-                let Some(&next_bid) = self.desc.block_ptrs.get(slot) else {
+                let Some(&next_bid) = self.raw_block_ptrs.block_ptrs.get(slot) else {
                     break;
                 };
                 if next_bid != 0 {
@@ -435,7 +435,7 @@ impl BlockPtrTree {
                 .checked_add(offset)
                 .ok_or_else(|| Error::with_message(Errno::EIO, "direct slot overflow"))?;
             let entry = self
-                .desc
+                .raw_block_ptrs
                 .block_ptrs
                 .get(slot)
                 .ok_or_else(|| Error::with_message(Errno::EIO, "direct slot out of bounds"))?;
@@ -449,7 +449,7 @@ impl BlockPtrTree {
                 .checked_add(offset)
                 .ok_or_else(|| Error::with_message(Errno::EIO, "direct slot overflow"))?;
             let entry = self
-                .desc
+                .raw_block_ptrs
                 .block_ptrs
                 .get_mut(slot)
                 .ok_or_else(|| Error::with_message(Errno::EIO, "direct slot out of bounds"))?;
@@ -507,7 +507,7 @@ impl BlockPtrTree {
                 );
                 return;
             }
-            self.desc.sector_count = self.desc.sector_count.saturating_sub(sectors_per_block);
+            self.raw_block_ptrs.sector_count = self.raw_block_ptrs.sector_count.saturating_sub(sectors_per_block);
             return;
         }
 
@@ -561,7 +561,7 @@ impl BlockPtrTree {
             );
             return;
         }
-        self.desc.sector_count = self.desc.sector_count.saturating_sub(sectors_per_block);
+        self.raw_block_ptrs.sector_count = self.raw_block_ptrs.sector_count.saturating_sub(sectors_per_block);
     }
 
     fn alloc_and_splice_branch(
@@ -591,7 +591,7 @@ impl BlockPtrTree {
         let alloc_goal = branch
             .chain
             .last()
-            .map_or(self.desc.block_ptrs[0], |entry| entry.key)
+            .map_or(self.raw_block_ptrs.block_ptrs[0], |entry| entry.key)
             .max(fs.super_block().first_data_block());
         let metadata_blocks = self.allocate_metadata_blocks(fs, indirect_blks, alloc_goal)?;
         let data_goal = metadata_blocks
@@ -620,7 +620,7 @@ impl BlockPtrTree {
             .checked_mul(sectors_per_block)
             .ok_or_else(|| Error::with_message(Errno::EIO, "inode block accounting overflow"))?;
         let new_block_count = self
-            .desc
+            .raw_block_ptrs
             .sector_count
             .checked_add(added_sectors)
             .ok_or_else(|| Error::with_message(Errno::EIO, "inode block count overflow"))?;
@@ -680,16 +680,16 @@ impl BlockPtrTree {
                 let splice_ptr = metadata_blocks[0];
                 if branch.partial_level == 0 {
                     let slot = path.offsets[0] as usize;
-                    if slot >= self.desc.block_ptrs.len() {
+                    if slot >= self.raw_block_ptrs.block_ptrs.len() {
                         return_errno_with_message!(Errno::EIO, "invalid inode block pointer slot");
                     }
-                    if self.desc.block_ptrs[slot] != 0 {
+                    if self.raw_block_ptrs.block_ptrs[slot] != 0 {
                         return_errno_with_message!(
                             Errno::EIO,
                             "block pointer changed during allocation"
                         );
                     }
-                    self.desc.block_ptrs[slot] = splice_ptr;
+                    self.raw_block_ptrs.block_ptrs[slot] = splice_ptr;
                 } else {
                     let parent_bid = branch
                         .chain
@@ -728,7 +728,7 @@ impl BlockPtrTree {
         }
 
         // SPEC: ext2_splice_branch-style inode accounting and ctime update.
-        self.desc.sector_count = new_block_count;
+        self.raw_block_ptrs.sector_count = new_block_count;
 
         Ok(data_range)
     }
@@ -838,13 +838,13 @@ impl BlockPtrTree {
             // Free direct blocks from `offsets[0]` through `block_ptrs[11]`.
             let start = (path.offsets[0] as usize).min(12);
             for idx in start..12 {
-                let ptr = self.desc.block_ptrs[idx];
+                let ptr = self.raw_block_ptrs.block_ptrs[idx];
                 if ptr == 0 {
                     continue;
                 }
                 fs.free_blocks(ptr, 1)?;
-                self.desc.block_ptrs[idx] = 0;
-                self.desc.sector_count = self.desc.sector_count.saturating_sub(sectors_per_block);
+                self.raw_block_ptrs.block_ptrs[idx] = 0;
+                self.raw_block_ptrs.sector_count = self.raw_block_ptrs.sector_count.saturating_sub(sectors_per_block);
             }
         } else {
             // === Case 2: Indirect blocks ===
@@ -923,11 +923,11 @@ impl BlockPtrTree {
             if partial == 0 {
                 // Detach from inode.block_ptrs directly.
                 let slot = path.offsets[0] as usize;
-                if slot >= self.desc.block_ptrs.len() {
+                if slot >= self.raw_block_ptrs.block_ptrs.len() {
                     return_errno_with_message!(Errno::EIO, "inode block pointer slot out of range");
                 }
-                detached_nr = self.desc.block_ptrs[slot];
-                self.desc.block_ptrs[slot] = 0;
+                detached_nr = self.raw_block_ptrs.block_ptrs[slot];
+                self.raw_block_ptrs.block_ptrs[slot] = 0;
             } else {
                 let parent_bid = branch
                     .chain
@@ -990,25 +990,25 @@ impl BlockPtrTree {
         // If in single indirect, free double and triple indirect trees, etc.
         if path.offsets[0] < 12 {
             // Truncation in direct blocks: free single, double, triple indirect.
-            let nr = self.desc.block_ptrs[12];
+            let nr = self.raw_block_ptrs.block_ptrs[12];
             if nr != 0 {
-                self.desc.block_ptrs[12] = 0;
+                self.raw_block_ptrs.block_ptrs[12] = 0;
                 self.free_branches(fs, nr, 1);
             }
         }
         if path.offsets[0] <= 12 {
             // Truncation in direct or single indirect: free double, triple indirect.
-            let nr = self.desc.block_ptrs[13];
+            let nr = self.raw_block_ptrs.block_ptrs[13];
             if nr != 0 {
-                self.desc.block_ptrs[13] = 0;
+                self.raw_block_ptrs.block_ptrs[13] = 0;
                 self.free_branches(fs, nr, 2);
             }
         }
         if path.offsets[0] <= 13 {
             // Truncation in direct, single, or double indirect: free triple indirect.
-            let nr = self.desc.block_ptrs[14];
+            let nr = self.raw_block_ptrs.block_ptrs[14];
             if nr != 0 {
-                self.desc.block_ptrs[14] = 0;
+                self.raw_block_ptrs.block_ptrs[14] = 0;
                 self.free_branches(fs, nr, 3);
             }
         }
@@ -1106,52 +1106,52 @@ mod test {
         block_ptrs[12] = indirect_bid;
         block_ptrs[13] = double_l1_bid;
         block_ptrs[14] = triple_l1_bid;
-        let block_map = make_block_map(block_ptrs, 0, &f.ext2);
+        let block_ptr_tree = make_block_map(block_ptrs, 0, &f.ext2);
 
         // Cover exact transition boundaries across all block-map levels.
-        let direct_path = block_map.logical_block_to_path(ext2, 0).unwrap();
+        let direct_path = block_ptr_tree.logical_block_to_path(ext2, 0).unwrap();
         assert_eq!(direct_path.depth, 1);
         assert_eq!(direct_path.offsets[0], 0);
         assert_eq!(direct_path.boundary, 11);
 
-        let direct_last_path = block_map.logical_block_to_path(ext2, 11).unwrap();
+        let direct_last_path = block_ptr_tree.logical_block_to_path(ext2, 11).unwrap();
         assert_eq!(direct_last_path.depth, 1);
         assert_eq!(direct_last_path.offsets[0], 11);
         assert_eq!(direct_last_path.boundary, 0);
 
-        let indirect_first_path = block_map.logical_block_to_path(ext2, 12).unwrap();
+        let indirect_first_path = block_ptr_tree.logical_block_to_path(ext2, 12).unwrap();
         assert_eq!(indirect_first_path.depth, 2);
         assert_eq!(indirect_first_path.offsets[0], 12);
         assert_eq!(indirect_first_path.offsets[1], 0);
 
-        let indirect_path = block_map.logical_block_to_path(ext2, 12 + indirect_index).unwrap();
+        let indirect_path = block_ptr_tree.logical_block_to_path(ext2, 12 + indirect_index).unwrap();
         assert_eq!(indirect_path.depth, 2);
         assert_eq!(indirect_path.offsets[0], 12);
         assert_eq!(indirect_path.offsets[1], indirect_index);
 
         let indirect_last_iblock = 12 + ptrs - 1;
-        let indirect_last_path = block_map.logical_block_to_path(ext2, indirect_last_iblock).unwrap();
+        let indirect_last_path = block_ptr_tree.logical_block_to_path(ext2, indirect_last_iblock).unwrap();
         assert_eq!(indirect_last_path.depth, 2);
         assert_eq!(indirect_last_path.offsets[0], 12);
         assert_eq!(indirect_last_path.offsets[1], ptrs - 1);
         assert_eq!(indirect_last_path.boundary, 0);
 
         let first_double_iblock = 12 + ptrs;
-        let first_double_path = block_map.logical_block_to_path(ext2, first_double_iblock).unwrap();
+        let first_double_path = block_ptr_tree.logical_block_to_path(ext2, first_double_iblock).unwrap();
         assert_eq!(first_double_path.depth, 3);
         assert_eq!(first_double_path.offsets[0], 13);
         assert_eq!(first_double_path.offsets[1], 0);
         assert_eq!(first_double_path.offsets[2], 0);
 
         let double_iblock = 12 + ptrs + (3 << ptrs_bits) + 4;
-        let double_path = block_map.logical_block_to_path(ext2, double_iblock).unwrap();
+        let double_path = block_ptr_tree.logical_block_to_path(ext2, double_iblock).unwrap();
         assert_eq!(double_path.depth, 3);
         assert_eq!(double_path.offsets[0], 13);
         assert_eq!(double_path.offsets[1], 3);
         assert_eq!(double_path.offsets[2], 4);
 
         let first_triple_iblock = 12 + ptrs + double_blocks;
-        let first_triple_path = block_map.logical_block_to_path(ext2, first_triple_iblock).unwrap();
+        let first_triple_path = block_ptr_tree.logical_block_to_path(ext2, first_triple_iblock).unwrap();
         assert_eq!(first_triple_path.depth, 4);
         assert_eq!(first_triple_path.offsets[0], 14);
         assert_eq!(first_triple_path.offsets[1], 0);
@@ -1160,7 +1160,7 @@ mod test {
 
         let triple_iblock =
             12 + ptrs + double_blocks + (2 << (ptrs_bits * 2)) + (3 << ptrs_bits) + 4;
-        let triple_path = block_map.logical_block_to_path(ext2, triple_iblock).unwrap();
+        let triple_path = block_ptr_tree.logical_block_to_path(ext2, triple_iblock).unwrap();
         assert_eq!(triple_path.depth, 4);
         assert_eq!(triple_path.offsets[0], 14);
         assert_eq!(triple_path.offsets[1], 2);
@@ -1168,18 +1168,18 @@ mod test {
         assert_eq!(triple_path.offsets[3], 4);
 
         // Verify block lookup resolves direct/indirect/double/triple chains.
-        assert_eq!(block_map.lookup_block(ext2, 0).unwrap(), Some(11));
-        assert_eq!(block_map.lookup_block(ext2, 1).unwrap(), None);
+        assert_eq!(block_ptr_tree.lookup_block(ext2, 0).unwrap(), Some(11));
+        assert_eq!(block_ptr_tree.lookup_block(ext2, 1).unwrap(), None);
         assert_eq!(
-            block_map.lookup_block(ext2, 12 + indirect_index).unwrap(),
+            block_ptr_tree.lookup_block(ext2, 12 + indirect_index).unwrap(),
             Some(mapped_bid)
         );
         assert_eq!(
-            block_map.lookup_block(ext2, double_iblock).unwrap(),
+            block_ptr_tree.lookup_block(ext2, double_iblock).unwrap(),
             Some(double_data_bid)
         );
         assert_eq!(
-            block_map.lookup_block(ext2, triple_iblock).unwrap(),
+            block_ptr_tree.lookup_block(ext2, triple_iblock).unwrap(),
             Some(triple_data_bid)
         );
     }
@@ -1200,19 +1200,19 @@ mod test {
         block_ptrs[1] = 12;
         block_ptrs[2] = 13;
         block_ptrs[12] = indirect_bid;
-        let block_map = make_block_map(block_ptrs, 0, &f.ext2);
+        let block_ptr_tree = make_block_map(block_ptrs, 0, &f.ext2);
 
-        assert_eq!(block_map.lookup_block_range(ext2, 0, 4).unwrap(), Some(11..14));
-        assert_eq!(block_map.lookup_block(ext2, 0).unwrap(), Some(11));
+        assert_eq!(block_ptr_tree.lookup_block_range(ext2, 0, 4).unwrap(), Some(11..14));
+        assert_eq!(block_ptr_tree.lookup_block(ext2, 0).unwrap(), Some(11));
         assert_eq!(
-            block_map.lookup_block_range(ext2, 12, 4).unwrap(),
+            block_ptr_tree.lookup_block_range(ext2, 12, 4).unwrap(),
             Some(70..73)
         );
         assert_eq!(
-            block_map.lookup_block_range(ext2, 15, 4).unwrap(),
+            block_ptr_tree.lookup_block_range(ext2, 15, 4).unwrap(),
             Some(90..91)
         );
-        assert_eq!(block_map.lookup_block_range(ext2, 3, 4).unwrap(), None);
+        assert_eq!(block_ptr_tree.lookup_block_range(ext2, 3, 4).unwrap(), None);
     }
 
     #[ktest]
@@ -1228,15 +1228,15 @@ mod test {
         let max_iblock = direct + indirect + double_blocks + triple_blocks - 1;
         let too_big = (max_iblock + 1) as u32;
 
-        let block_map = make_block_map([0; 15], 0, &f.ext2);
+        let block_ptr_tree = make_block_map([0; 15], 0, &f.ext2);
 
         // Accept the maximum valid logical block and reject the next one.
-        block_map.logical_block_to_path(ext2, max_iblock as u32).unwrap();
+        block_ptr_tree.logical_block_to_path(ext2, max_iblock as u32).unwrap();
 
-        let too_big_err = block_map.logical_block_to_path(ext2, too_big).unwrap_err();
+        let too_big_err = block_ptr_tree.logical_block_to_path(ext2, too_big).unwrap_err();
         assert_eq!(too_big_err.error(), Errno::EINVAL);
 
-        let get_too_big_err = block_map.lookup_block(ext2, too_big).unwrap_err();
+        let get_too_big_err = block_ptr_tree.lookup_block(ext2, too_big).unwrap_err();
         assert_eq!(get_too_big_err.error(), Errno::EINVAL);
 
         // Inject a deterministic read failure on the indirect block read path.
@@ -1308,20 +1308,20 @@ mod test {
         let ext2 = &f.ext2;
         let sectors_per_block = (ext2.block_size() / SECTOR_SIZE) as u32;
 
-        let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
-        assert_eq!(block_map.lookup_or_alloc_block(ext2, 0, false).unwrap(), None);
-        assert_eq!(block_map.desc.block_ptrs[0], 0);
+        let mut block_ptr_tree = make_block_map([0u32; 15], 0, &f.ext2);
+        assert_eq!(block_ptr_tree.lookup_or_alloc_block(ext2, 0, false).unwrap(), None);
+        assert_eq!(block_ptr_tree.raw_block_ptrs.block_ptrs[0], 0);
 
         let free_before = ext2.super_block().free_blocks_count();
-        let allocated = block_map
+        let allocated = block_ptr_tree
             .lookup_or_alloc_block(ext2, 0, true)
             .unwrap()
             .unwrap();
         let free_after = ext2.super_block().free_blocks_count();
 
-        assert_eq!(block_map.desc.block_ptrs[0], allocated);
-        assert_eq!(block_map.lookup_block(ext2, 0).unwrap(), Some(allocated));
-        assert_eq!(block_map.desc.sector_count, sectors_per_block);
+        assert_eq!(block_ptr_tree.raw_block_ptrs.block_ptrs[0], allocated);
+        assert_eq!(block_ptr_tree.lookup_block(ext2, 0).unwrap(), Some(allocated));
+        assert_eq!(block_ptr_tree.raw_block_ptrs.sector_count, sectors_per_block);
         assert_eq!(free_before.saturating_sub(free_after), 1);
     }
 
@@ -1334,28 +1334,28 @@ mod test {
         let ext2 = &f.ext2;
         let sectors_per_block = (ext2.block_size() / SECTOR_SIZE) as u32;
 
-        let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
+        let mut block_ptr_tree = make_block_map([0u32; 15], 0, &f.ext2);
         let free_before = ext2.super_block().free_blocks_count();
-        let allocated_range = block_map
+        let allocated_range = block_ptr_tree
             .lookup_or_alloc_block_range(ext2, 0, 3, true)
             .unwrap()
             .unwrap();
         let free_after = ext2.super_block().free_blocks_count();
 
         assert_eq!(allocated_range.end - allocated_range.start, 3);
-        assert_eq!(block_map.desc.block_ptrs[0], allocated_range.start);
-        assert_eq!(block_map.desc.block_ptrs[1], allocated_range.start + 1);
-        assert_eq!(block_map.desc.block_ptrs[2], allocated_range.start + 2);
+        assert_eq!(block_ptr_tree.raw_block_ptrs.block_ptrs[0], allocated_range.start);
+        assert_eq!(block_ptr_tree.raw_block_ptrs.block_ptrs[1], allocated_range.start + 1);
+        assert_eq!(block_ptr_tree.raw_block_ptrs.block_ptrs[2], allocated_range.start + 2);
         assert_eq!(
-            block_map.lookup_block_range(ext2, 0, 3).unwrap(),
+            block_ptr_tree.lookup_block_range(ext2, 0, 3).unwrap(),
             Some(allocated_range.clone())
         );
         assert_eq!(
-            block_map.lookup_or_alloc_block(ext2, 0, true).unwrap(),
+            block_ptr_tree.lookup_or_alloc_block(ext2, 0, true).unwrap(),
             Some(allocated_range.start)
         );
         assert_eq!(
-            block_map.desc.sector_count,
+            block_ptr_tree.raw_block_ptrs.sector_count,
             sectors_per_block.saturating_mul(3)
         );
         assert_eq!(free_before.saturating_sub(free_after), 3);
@@ -1370,18 +1370,18 @@ mod test {
         let ext2 = &f.ext2;
         let sectors_per_block = (ext2.block_size() / SECTOR_SIZE) as u32;
 
-        let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
+        let mut block_ptr_tree = make_block_map([0u32; 15], 0, &f.ext2);
         let free_before = ext2.super_block().free_blocks_count();
-        let allocated = block_map
+        let allocated = block_ptr_tree
             .lookup_or_alloc_block(ext2, 12, true)
             .unwrap()
             .unwrap();
         let free_after = ext2.super_block().free_blocks_count();
 
-        assert_ne!(block_map.desc.block_ptrs[12], 0);
-        assert_eq!(block_map.lookup_block(ext2, 12).unwrap(), Some(allocated));
+        assert_ne!(block_ptr_tree.raw_block_ptrs.block_ptrs[12], 0);
+        assert_eq!(block_ptr_tree.lookup_block(ext2, 12).unwrap(), Some(allocated));
         assert_eq!(
-            block_map.desc.sector_count,
+            block_ptr_tree.raw_block_ptrs.sector_count,
             sectors_per_block.saturating_mul(2)
         );
         assert_eq!(free_before.saturating_sub(free_after), 2);
@@ -1396,26 +1396,26 @@ mod test {
         let ext2 = &f.ext2;
         let sectors_per_block = (ext2.block_size() / SECTOR_SIZE) as u32;
 
-        let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
+        let mut block_ptr_tree = make_block_map([0u32; 15], 0, &f.ext2);
         let free_before = ext2.super_block().free_blocks_count();
-        let allocated_range = block_map
+        let allocated_range = block_ptr_tree
             .lookup_or_alloc_block_range(ext2, 12, 4, true)
             .unwrap()
             .unwrap();
         let free_after = ext2.super_block().free_blocks_count();
 
-        assert_ne!(block_map.desc.block_ptrs[12], 0);
+        assert_ne!(block_ptr_tree.raw_block_ptrs.block_ptrs[12], 0);
         assert_eq!(allocated_range.end - allocated_range.start, 4);
         assert_eq!(
-            block_map.lookup_block_range(ext2, 12, 4).unwrap(),
+            block_ptr_tree.lookup_block_range(ext2, 12, 4).unwrap(),
             Some(allocated_range.clone())
         );
         assert_eq!(
-            block_map.lookup_block(ext2, 12).unwrap(),
+            block_ptr_tree.lookup_block(ext2, 12).unwrap(),
             Some(allocated_range.start)
         );
         assert_eq!(
-            block_map.desc.sector_count,
+            block_ptr_tree.raw_block_ptrs.sector_count,
             sectors_per_block.saturating_mul(5)
         );
         assert_eq!(free_before.saturating_sub(free_after), 5);
@@ -1430,11 +1430,11 @@ mod test {
             .unwrap();
         let ext2 = &f.ext2;
 
-        let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
-        let err = block_map.lookup_or_alloc_block(ext2, 0, true).unwrap_err();
+        let mut block_ptr_tree = make_block_map([0u32; 15], 0, &f.ext2);
+        let err = block_ptr_tree.lookup_or_alloc_block(ext2, 0, true).unwrap_err();
         assert_eq!(err.error(), Errno::ENOSPC);
-        assert_eq!(block_map.desc.block_ptrs, [0u32; 15]);
-        assert_eq!(block_map.desc.sector_count, 0);
+        assert_eq!(block_ptr_tree.raw_block_ptrs.block_ptrs, [0u32; 15]);
+        assert_eq!(block_ptr_tree.raw_block_ptrs.sector_count, 0);
     }
 
     #[ktest]
@@ -1474,15 +1474,15 @@ mod test {
 
         let ptrs = (ext2.block_size() / size_of::<u32>()) as u32;
         let first_double_iblock = 12 + ptrs;
-        let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
+        let mut block_ptr_tree = make_block_map([0u32; 15], 0, &f.ext2);
 
-        let allocated_data = block_map
+        let allocated_data = block_ptr_tree
             .lookup_or_alloc_block(ext2, first_double_iblock, true)
             .unwrap()
             .unwrap();
-        assert_ne!(block_map.desc.block_ptrs[13], 0);
+        assert_ne!(block_ptr_tree.raw_block_ptrs.block_ptrs[13], 0);
         assert_eq!(
-            block_map.lookup_block(ext2, first_double_iblock).unwrap(),
+            block_ptr_tree.lookup_block(ext2, first_double_iblock).unwrap(),
             Some(allocated_data)
         );
 
@@ -1491,7 +1491,7 @@ mod test {
         assert_eq!(ext2.super_block().free_blocks_count(), 0);
         assert_eq!(f.ext2.block_group(0).free_blocks_count(), 0);
         assert_eq!(
-            block_map.desc.sector_count,
+            block_ptr_tree.raw_block_ptrs.sector_count,
             ((block_size / SECTOR_SIZE) as u32) * 3
         );
     }
@@ -1507,32 +1507,32 @@ mod test {
         let ptrs = (block_size / size_of::<u32>()) as u32;
         let first_double_iblock = 12 + ptrs;
 
-        let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
-        block_map
+        let mut block_ptr_tree = make_block_map([0u32; 15], 0, &f.ext2);
+        block_ptr_tree
             .lookup_or_alloc_block(ext2, first_double_iblock, true)
             .unwrap();
-        block_map
+        block_ptr_tree
             .lookup_or_alloc_block(ext2, first_double_iblock + 1, true)
             .unwrap();
-        block_map
+        block_ptr_tree
             .lookup_or_alloc_block(ext2, first_double_iblock + 2, true)
             .unwrap();
 
-        block_map
+        block_ptr_tree
             .truncate_blocks(ext2, (first_double_iblock as usize + 1) * block_size)
             .unwrap();
         assert!(
-            block_map
+            block_ptr_tree
                 .lookup_block(ext2, first_double_iblock)
                 .unwrap()
                 .is_some()
         );
         assert_eq!(
-            block_map.lookup_block(ext2, first_double_iblock + 1).unwrap(),
+            block_ptr_tree.lookup_block(ext2, first_double_iblock + 1).unwrap(),
             None
         );
         assert_eq!(
-            block_map.lookup_block(ext2, first_double_iblock + 2).unwrap(),
+            block_ptr_tree.lookup_block(ext2, first_double_iblock + 2).unwrap(),
             None
         );
     }
@@ -1549,32 +1549,32 @@ mod test {
         let first_double_iblock = 12 + ptrs;
         let first_triple_iblock = 12 + ptrs + (1u32 << (ptrs.trailing_zeros() * 2));
 
-        let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
-        block_map.lookup_or_alloc_block(ext2, 12, true).unwrap();
-        block_map
+        let mut block_ptr_tree = make_block_map([0u32; 15], 0, &f.ext2);
+        block_ptr_tree.lookup_or_alloc_block(ext2, 12, true).unwrap();
+        block_ptr_tree
             .lookup_or_alloc_block(ext2, first_double_iblock, true)
             .unwrap();
-        block_map
+        block_ptr_tree
             .lookup_or_alloc_block(ext2, first_triple_iblock, true)
             .unwrap();
-        assert_ne!(block_map.desc.block_ptrs[12], 0);
-        assert_ne!(block_map.desc.block_ptrs[13], 0);
-        assert_ne!(block_map.desc.block_ptrs[14], 0);
+        assert_ne!(block_ptr_tree.raw_block_ptrs.block_ptrs[12], 0);
+        assert_ne!(block_ptr_tree.raw_block_ptrs.block_ptrs[13], 0);
+        assert_ne!(block_ptr_tree.raw_block_ptrs.block_ptrs[14], 0);
 
-        block_map.truncate_blocks(ext2, 0).unwrap();
-        assert_eq!(block_map.desc.block_ptrs[12], 0);
-        assert_eq!(block_map.desc.block_ptrs[13], 0);
-        assert_eq!(block_map.desc.block_ptrs[14], 0);
-        assert_eq!(block_map.lookup_block(ext2, 12).unwrap(), None);
+        block_ptr_tree.truncate_blocks(ext2, 0).unwrap();
+        assert_eq!(block_ptr_tree.raw_block_ptrs.block_ptrs[12], 0);
+        assert_eq!(block_ptr_tree.raw_block_ptrs.block_ptrs[13], 0);
+        assert_eq!(block_ptr_tree.raw_block_ptrs.block_ptrs[14], 0);
+        assert_eq!(block_ptr_tree.lookup_block(ext2, 12).unwrap(), None);
         assert_eq!(
-            block_map.lookup_block(ext2, first_double_iblock).unwrap(),
+            block_ptr_tree.lookup_block(ext2, first_double_iblock).unwrap(),
             None
         );
         assert_eq!(
-            block_map.lookup_block(ext2, first_triple_iblock).unwrap(),
+            block_ptr_tree.lookup_block(ext2, first_triple_iblock).unwrap(),
             None
         );
-        assert_eq!(block_map.desc.sector_count, 0);
+        assert_eq!(block_ptr_tree.raw_block_ptrs.sector_count, 0);
     }
 
     #[ktest]
@@ -1589,23 +1589,23 @@ mod test {
         let ptrs = (block_size / size_of::<u32>()) as u32;
         let first_triple_iblock = 12 + ptrs + (1u32 << (ptrs.trailing_zeros() * 2));
 
-        let mut block_map = make_block_map([0u32; 15], 0, &f.ext2);
-        block_map
+        let mut block_ptr_tree = make_block_map([0u32; 15], 0, &f.ext2);
+        block_ptr_tree
             .lookup_or_alloc_block(ext2, first_triple_iblock, true)
             .unwrap();
-        let root = block_map.desc.block_ptrs[14];
+        let root = block_ptr_tree.raw_block_ptrs.block_ptrs[14];
         assert_ne!(root, 0);
         assert_eq!(
-            block_map.desc.sector_count,
+            block_ptr_tree.raw_block_ptrs.sector_count,
             sectors_per_block.saturating_mul(4)
         );
 
         let free_before = ext2.super_block().free_blocks_count();
-        block_map.free_branches(ext2, root, 3);
-        block_map.desc.block_ptrs[14] = 0;
+        block_ptr_tree.free_branches(ext2, root, 3);
+        block_ptr_tree.raw_block_ptrs.block_ptrs[14] = 0;
         let free_after = ext2.super_block().free_blocks_count();
 
         assert_eq!(free_after.saturating_sub(free_before), 4);
-        assert_eq!(block_map.desc.sector_count, 0);
+        assert_eq!(block_ptr_tree.raw_block_ptrs.sector_count, 0);
     }
 }

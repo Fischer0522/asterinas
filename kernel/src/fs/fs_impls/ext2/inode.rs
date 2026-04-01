@@ -196,11 +196,11 @@ impl Inode {
             return 0;
         }
 
-        // SPEC: i_block payload lives in the block_map domain.
+        // SPEC: i_block payload lives in the block_ptr_tree domain.
         let inner = self.inner.read();
         let backend = inner.backend();
-        let block_map = backend.block_map.read();
-        block_map.desc.decode_device_id()
+        let block_ptr_tree = backend.block_ptr_tree.read();
+        block_ptr_tree.raw_block_ptrs.decode_device_id()
     }
 
     /// Sets the encoded device ID for special files and persists it.
@@ -210,7 +210,7 @@ impl Inode {
             // SPEC: fail with EINVAL for non-device inodes; no lock/state mutation needed.
             return_errno!(Errno::EINVAL);
         }
-        // Lock order: inner -> block_map.
+        // Lock order: inner -> block_ptr_tree.
         let mut inner = self.inner.write();
         inner.encode_device_id(device_id)?;
         // Store the ext2 on-disk device encoding directly in `block_ptrs`
@@ -266,10 +266,10 @@ impl Inode {
     }
 
     pub(super) fn metadata(&self) -> Metadata {
-        // Lock order: inner -> block_map.
+        // Lock order: inner -> block_ptr_tree.
         let inner = self.inner.read();
         let backend = inner.backend();
-        let block_map = backend.block_map.read();
+        let block_ptr_tree = backend.block_ptr_tree.read();
 
         let (container_dev_id, optimal_block_size) = match self.fs.upgrade() {
             Some(fs) => (fs.block_device().id(), fs.block_size()),
@@ -278,7 +278,7 @@ impl Inode {
         let self_dev_id =
             if self.type_ == InodeType::CharDevice || self.type_ == InodeType::BlockDevice {
                 // SPEC: for device inodes, decode rdev from i_block old/new format.
-                DeviceId::from_encoded_u64(block_map.desc.decode_device_id())
+                DeviceId::from_encoded_u64(block_ptr_tree.raw_block_ptrs.decode_device_id())
             } else {
                 None
             };
@@ -286,7 +286,7 @@ impl Inode {
             ino: self.ino as u64,
             size: inner.file_size(),
             optimal_block_size,
-            nr_sectors_allocated: block_map.desc.sector_count as usize,
+            nr_sectors_allocated: block_ptr_tree.raw_block_ptrs.sector_count as usize,
             last_access_at: inner.atime(),
             last_modify_at: inner.mtime(),
             last_meta_change_at: inner.ctime(),
@@ -785,7 +785,7 @@ impl Inode {
 
         // SPEC: fsync step 2 flushes inode-local indirect metadata before
         // persisting inode-table state.
-        block_map_backend.block_map.write().sync_indirect_blocks()?;
+        block_map_backend.block_ptr_tree.write().sync_indirect_blocks()?;
 
         // SPEC: fsync step 3 persists inode metadata. The caller is
         // responsible for the final device-cache flush.
@@ -840,9 +840,9 @@ impl Inode {
         inner.set_file_size(0);
         inner.set_file_acl(0);
         if inner.desc.sector_count > 0 {
-            let mut block_map = block_map_backend.block_map.write();
-            block_map.truncate_blocks(&fs, 0)?;
-            inner.sync_desc_block_map_from_snapshot(*block_map.desc());
+            let mut block_ptr_tree = block_map_backend.block_ptr_tree.write();
+            block_ptr_tree.truncate_blocks(&fs, 0)?;
+            inner.sync_desc_block_map_from_snapshot(*block_ptr_tree.raw_block_ptrs());
         }
         inner.persist(self.ino, &fs)?;
 
@@ -862,7 +862,7 @@ impl Inode {
 
         // fdatasync must also persist dirty indirect metadata needed to reach
         // newly written data blocks before the final device flush.
-        backend.block_map.write().sync_indirect_blocks()?;
+        backend.block_ptr_tree.write().sync_indirect_blocks()?;
 
         // Persist metadata conservatively whenever the descriptor is dirty so
         // `fdatasync` does not miss file-size or block-mapping updates.
@@ -1348,7 +1348,7 @@ impl Inode {
 #[derive(Debug)]
 pub(super) struct InodeBackend {
     /// Serializes backend traversal vs foreground block-map mutations.
-    block_map: RwMutex<BlockPtrTree>,
+    block_ptr_tree: RwMutex<BlockPtrTree>,
     /// Cached `npages` bound for PageCache.
     npages: AtomicUsize,
     /// Filesystem handle for indirect I/O and BIO submission.
@@ -1371,9 +1371,9 @@ impl Drop for Inode {
 }
 
 impl InodeBackend {
-    pub(super) fn new(block_map: BlockPtrTree, fs: Weak<Ext2>, npages: usize) -> Arc<Self> {
+    pub(super) fn new(block_ptr_tree: BlockPtrTree, fs: Weak<Ext2>, npages: usize) -> Arc<Self> {
         Arc::new(Self {
-            block_map: RwMutex::new(block_map),
+            block_ptr_tree: RwMutex::new(block_ptr_tree),
             npages: AtomicUsize::new(npages),
             fs,
         })
@@ -1397,11 +1397,11 @@ impl PageCacheBackend for InodeBackend {
         bio_segment: BioSegment,
         complete_fn: Option<BioCompleteFn>,
     ) -> Result<BioWaiter> {
-        let block_map = self.block_map.read();
+        let block_ptr_tree = self.block_ptr_tree.read();
         let fs = self.fs()?;
         let iblock = u32::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
-        match block_map.lookup_block(&fs, iblock)? {
+        match block_ptr_tree.lookup_block(&fs, iblock)? {
             Some(bid) => fs.read_blocks_async(bid, bio_segment, complete_fn),
             None => {
                 // Found a hole, zero fill the page.
@@ -1423,12 +1423,12 @@ impl PageCacheBackend for InodeBackend {
         bio_segment: BioSegment,
         complete_fn: Option<BioCompleteFn>,
     ) -> Result<BioWaiter> {
-        let block_map = self.block_map.read();
+        let block_ptr_tree = self.block_ptr_tree.read();
         let fs = self.fs()?;
         let iblock = u32::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
 
-        match block_map.lookup_block(&fs, iblock)? {
+        match block_ptr_tree.lookup_block(&fs, iblock)? {
             Some(bid) => fs.write_blocks_async(bid, bio_segment, complete_fn),
             None => {
                 error!(
@@ -1649,9 +1649,9 @@ impl InodeInner {
 
     fn encode_device_id(&mut self, device_id: u64) -> Result<()> {
         let block_map_backend = self.backend().clone();
-        let mut block_map = block_map_backend.block_map.write();
-        block_map.desc.encode_device_id(device_id);
-        let snapshot = *block_map.desc();
+        let mut block_ptr_tree = block_map_backend.block_ptr_tree.write();
+        block_ptr_tree.raw_block_ptrs.encode_device_id(device_id);
+        let snapshot = *block_ptr_tree.raw_block_ptrs();
         self.sync_desc_block_map_from_snapshot(snapshot);
         Ok(())
     }
@@ -1684,8 +1684,8 @@ impl InodeInner {
         let block_size = fs.block_size();
 
         {
-            let block_map = self.backend().block_map.read();
-            if block_map.desc.block_ptrs[0] != 0 {
+            let block_ptr_tree = self.backend().block_ptr_tree.read();
+            if block_ptr_tree.raw_block_ptrs.block_ptrs[0] != 0 {
                 return_errno_with_message!(Errno::EIO, "dir block pointer already occupied");
             }
         }
@@ -1733,11 +1733,11 @@ impl InodeInner {
         writer: &mut VmWriter,
     ) -> Result<()> {
         let block_size = fs.block_size();
-        let block_map = self.backend.block_map.read();
+        let block_ptr_tree = self.backend.block_ptr_tree.read();
 
         let mut range_mapper = IoRangeMapper::new(
             (offset / block_size) as u32..(end.div_ceil(block_size)) as u32,
-            block_map,
+            block_ptr_tree,
             fs,
         );
         while let Some(range) = range_mapper.next()? {
@@ -1767,11 +1767,11 @@ impl InodeInner {
         debug_assert_eq!(write_len % block_size, 0);
         // end is already checked in `Inode::write_direct_at`.
         let end = offset + write_len;
-        let block_map = self.backend.block_map.read();
+        let block_ptr_tree = self.backend.block_ptr_tree.read();
 
         let mut range_mapper = IoRangeMapper::new(
             (offset / block_size) as u32..(end.div_ceil(block_size)) as u32,
-            block_map,
+            block_ptr_tree,
             fs,
         );
         while let Some(range) = range_mapper.next()? {
@@ -1873,13 +1873,13 @@ impl InodeInner {
         self.resize_page_cache_and_update_npages(new_size, old_size)?;
 
         let backend = self.backend.clone();
-        let mut block_map = backend.block_map.write();
+        let mut block_ptr_tree = backend.block_ptr_tree.write();
         // TODO: Roll back the page-cache state if block truncation fails.
-        block_map.truncate_blocks(&fs, new_size)?;
-        let snapshot = *block_map.desc();
+        block_ptr_tree.truncate_blocks(&fs, new_size)?;
+        let snapshot = *block_ptr_tree.raw_block_ptrs();
 
         // Drop the block map lock before fill zeros (might trigger PageCacheBackend.read_page_raw).
-        drop(block_map);
+        drop(block_ptr_tree);
 
         // Fill the partial tail of the new EOF block.
         self.zero_eof_tail(new_size, block_size)?;
@@ -2083,14 +2083,14 @@ impl InodeInner {
         // If the new start block is a hole and not aligned to block size,
         // we need to fill zeros to the partial block.
 
-        let block_map = self.backend().block_map.read();
+        let block_ptr_tree = self.backend().block_ptr_tree.read();
 
-        if !start.is_multiple_of(block_size) && block_map.lookup_block(fs, start_iblock)?.is_none() {
+        if !start.is_multiple_of(block_size) && block_ptr_tree.lookup_block(fs, start_iblock)?.is_none() {
             let new_start_block = start.align_down(block_size);
             self.page_cache().fill_zeros(new_start_block..start)?;
         }
 
-        if !end.is_multiple_of(block_size) && block_map.lookup_block(fs, end_iblock)?.is_none() {
+        if !end.is_multiple_of(block_size) && block_ptr_tree.lookup_block(fs, end_iblock)?.is_none() {
             let new_end_block = end.align_up(block_size);
             self.page_cache().fill_zeros(end..new_end_block)?;
         }
@@ -2118,7 +2118,7 @@ impl InodeInner {
 
         let (block_map_desc, new_blocks, alloc_result) = {
             let block_map_backend = self.backend().clone();
-            let mut block_map = block_map_backend.block_map.write();
+            let mut block_ptr_tree = block_map_backend.block_ptr_tree.write();
             let mut new_blocks = Vec::new();
             let alloc_result = (|| -> Result<()> {
                 let mut current_block = start_block;
@@ -2130,12 +2130,12 @@ impl InodeInner {
                         Error::with_message(Errno::EINVAL, "logical block range overflow")
                     })?;
 
-                    if let Some(mapped_range) = block_map.lookup_block_range(fs, iblock, remaining)? {
+                    if let Some(mapped_range) = block_ptr_tree.lookup_block_range(fs, iblock, remaining)? {
                         current_block +=
                             mapped_range.end.saturating_sub(mapped_range.start) as usize;
                         continue;
                     }
-                    let allocated_range = block_map
+                    let allocated_range = block_ptr_tree
                         .lookup_or_alloc_block_range(fs, iblock, remaining, true)?
                         .ok_or_else(|| {
                             Error::with_message(
@@ -2149,7 +2149,7 @@ impl InodeInner {
                 }
                 Ok(())
             })();
-            (*block_map.desc(), new_blocks, alloc_result)
+            (*block_ptr_tree.raw_block_ptrs(), new_blocks, alloc_result)
         };
         self.sync_desc_block_map_from_snapshot(block_map_desc);
 
@@ -2198,14 +2198,14 @@ impl InodeInner {
         }
 
         let backend = self.backend().clone();
-        let mut block_map = backend.block_map.write();
-        if let Err(err) = block_map.truncate_blocks(fs, old_size) {
+        let mut block_ptr_tree = backend.block_ptr_tree.write();
+        if let Err(err) = block_ptr_tree.truncate_blocks(fs, old_size) {
             error!(
                 "ext2: write_at cleanup truncate_blocks failed: old_size={}, err={:?}",
                 old_size, err
             );
         }
-        let desc = *block_map.desc();
+        let desc = *block_ptr_tree.raw_block_ptrs();
         self.sync_desc_block_map_from_snapshot(desc);
     }
 
@@ -2589,7 +2589,7 @@ impl TryFrom<&RawInode> for InodeDesc {
 
         let flags = FileFlags::from_bits(raw.flags)
             .ok_or_else(|| Error::with_message(Errno::EIO, "invalid inode flags"))?;
-        let block_map = RawBlockPtrs::from_raw(raw);
+        let block_ptr_tree = RawBlockPtrs::from_raw(raw);
 
         Ok(InodeDesc {
             type_,
@@ -2602,11 +2602,11 @@ impl TryFrom<&RawInode> for InodeDesc {
             mtime,
             dtime: Duration::from_secs(raw.dtime as u64),
             link_count: raw.link_count,
-            sector_count: block_map.sector_count,
+            sector_count: block_ptr_tree.sector_count,
             flags,
             file_acl: raw.file_acl,
             generation: raw.generation,
-            block_ptrs: block_map.block_ptrs,
+            block_ptrs: block_ptr_tree.block_ptrs,
         })
     }
 }

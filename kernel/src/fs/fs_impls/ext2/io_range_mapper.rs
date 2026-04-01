@@ -27,7 +27,7 @@ pub(super) struct MappedRange {
 /// into single BIO requests.
 pub(super) struct IoRangeMapper<'a> {
     range: Range<u32>,
-    block_map: RwMutexReadGuard<'a, BlockPtrTree>,
+    block_ptr_tree: RwMutexReadGuard<'a, BlockPtrTree>,
     fs: &'a Ext2,
 }
 
@@ -43,12 +43,12 @@ pub(super) enum IoRange {
 impl<'a> IoRangeMapper<'a> {
     pub(super) fn new(
         range: Range<Ext2Bid>,
-        block_map: RwMutexReadGuard<'a, BlockPtrTree>,
+        block_ptr_tree: RwMutexReadGuard<'a, BlockPtrTree>,
         fs: &'a Ext2,
     ) -> Self {
         Self {
             range: range.start..range.end,
-            block_map,
+            block_ptr_tree: block_ptr_tree,
             fs,
         }
     }
@@ -66,7 +66,7 @@ impl<'a> IoRangeMapper<'a> {
         let start_iblock = self.range.start;
         let max_blocks = self.range.end - self.range.start;
         if let Some(device_block_range) =
-            self.block_map
+            self.block_ptr_tree
                 .lookup_block_range(self.fs, start_iblock, max_blocks)?
         {
             let logical_end = start_iblock
@@ -86,7 +86,7 @@ impl<'a> IoRangeMapper<'a> {
             let iblock = self.range.start;
             let remaining = self.range.end - iblock;
             if self
-                .block_map
+                .block_ptr_tree
                 .lookup_block_range(self.fs, iblock, remaining)?
                 .is_some()
             {
@@ -124,9 +124,9 @@ mod test {
         block_ptrs[1] = 12;
         block_ptrs[2] = 20;
         block_ptrs[4] = 30;
-        let block_map = make_block_map(block_ptrs, &f.ext2);
+        let block_ptr_tree = make_block_map(block_ptrs, &f.ext2);
 
-        let binding = RwMutex::new(block_map);
+        let binding = RwMutex::new(block_ptr_tree);
         let mut mapper = IoRangeMapper::new(0..5, binding.read(), &f.ext2);
 
         assert_eq!(
