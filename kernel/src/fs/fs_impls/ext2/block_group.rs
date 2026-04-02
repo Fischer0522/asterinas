@@ -56,6 +56,29 @@ impl PageCacheBackend for InodeTableBackend {
     }
 }
 
+/// Combined metadata for a block group: descriptor and bitmaps.
+///
+/// Protected by a single `RwMutex` in `BlockGroup` to ensure
+/// consistent updates across the descriptor and its bitmaps.
+pub(super) struct BlockGroupMetadata {
+    /// Group descriptor with dirty tracking.
+    pub(super) desc: Dirty<GroupDesc>,
+    /// Block bitmap cached in memory.
+    pub(super) block_bitmap: Dirty<IdBitmap>,
+    /// Inode bitmap cached in memory.
+    pub(super) inode_bitmap: Dirty<IdBitmap>,
+}
+
+impl fmt::Debug for BlockGroupMetadata {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BlockGroupMetadata")
+            .field("desc", &self.desc)
+            .field("block_bitmap_dirty", &self.block_bitmap.is_dirty())
+            .field("inode_bitmap_dirty", &self.inode_bitmap.is_dirty())
+            .finish()
+    }
+}
+
 /// A single Ext2 block group.
 ///
 /// Owns all per-group state: descriptor, bitmaps, inode table cache,
@@ -65,12 +88,8 @@ impl PageCacheBackend for InodeTableBackend {
 pub(super) struct BlockGroup {
     /// Block group index (0-based).
     idx: usize,
-    /// Group descriptor with dirty tracking.
-    desc: RwMutex<Dirty<GroupDesc>>,
-    /// Block bitmap cached in memory.
-    block_bitmap: RwMutex<Dirty<IdBitmap>>,
-    /// Inode bitmap cached in memory.
-    inode_bitmap: RwMutex<Dirty<IdBitmap>>,
+    /// Group descriptor and bitmaps, protected by a single lock.
+    metadata: RwMutex<BlockGroupMetadata>,
     /// Backing block device (shared with Ext2 and other groups).
     block_device: Arc<dyn BlockDevice>,
     /// Cached geometry: first filesystem-wide block number of this group.
@@ -203,13 +222,15 @@ impl BlockGroup {
 
         Ok(Self {
             idx,
-            desc: RwMutex::new(Dirty::new(desc)),
-            block_bitmap: RwMutex::new(Dirty::new(block_bitmap)),
-            inode_bitmap: RwMutex::new(Dirty::new(inode_bitmap)),
+            metadata: RwMutex::new(BlockGroupMetadata {
+                desc: Dirty::new(desc),
+                block_bitmap: Dirty::new(block_bitmap),
+                inode_bitmap: Dirty::new(inode_bitmap),
+            }),
             block_device,
             first_block,
             last_block,
-            inode_table_blocks_per_group: inode_table_blocks_per_group,
+            inode_table_blocks_per_group,
             inodes_per_group,
             inode_size,
             _inode_table_backend: backend,
@@ -230,8 +251,8 @@ impl BlockGroup {
             .map_err(|_| Error::with_message(Errno::EINVAL, "inode index out of range"))?;
 
         {
-            let inode_bitmap = self.inode_bitmap.read();
-            if !inode_bitmap.is_allocated(inode_bit) {
+            let metadata = self.metadata.read();
+            if !metadata.inode_bitmap.is_allocated(inode_bit) {
                 return_errno!(Errno::ENOENT);
             }
         }
@@ -248,8 +269,8 @@ impl BlockGroup {
         }
 
         {
-            let inode_bitmap = self.inode_bitmap.read();
-            if !inode_bitmap.is_allocated(inode_bit) {
+            let metadata = self.metadata.read();
+            if !metadata.inode_bitmap.is_allocated(inode_bit) {
                 return_errno!(Errno::ENOENT);
             }
         }
@@ -312,20 +333,14 @@ impl BlockGroup {
         self.inode_table_cache.flush_range(range)
     }
 
-    pub(super) fn block_bitmap(&self) -> RwMutexReadGuard<'_, Dirty<IdBitmap>> {
-        self.block_bitmap.read()
+    /// Returns a read guard over the combined group metadata.
+    pub(super) fn metadata(&self) -> RwMutexReadGuard<'_, BlockGroupMetadata> {
+        self.metadata.read()
     }
 
-    pub(super) fn block_bitmap_mut(&self) -> RwMutexWriteGuard<'_, Dirty<IdBitmap>> {
-        self.block_bitmap.write()
-    }
-
-    pub(super) fn inode_bitmap(&self) -> RwMutexReadGuard<'_, Dirty<IdBitmap>> {
-        self.inode_bitmap.read()
-    }
-
-    pub(super) fn inode_bitmap_mut(&self) -> RwMutexWriteGuard<'_, Dirty<IdBitmap>> {
-        self.inode_bitmap.write()
+    /// Returns a write guard over the combined group metadata.
+    pub(super) fn metadata_mut(&self) -> RwMutexWriteGuard<'_, BlockGroupMetadata> {
+        self.metadata.write()
     }
 
     pub(super) fn idx(&self) -> usize {
@@ -333,15 +348,15 @@ impl BlockGroup {
     }
 
     pub(super) fn block_bitmap_bid(&self) -> Ext2Bid {
-        self.desc.read().block_bitmap
+        self.metadata.read().desc.block_bitmap
     }
 
     pub(super) fn inode_bitmap_bid(&self) -> Ext2Bid {
-        self.desc.read().inode_bitmap
+        self.metadata.read().desc.inode_bitmap
     }
 
     pub(super) fn inode_table_bid(&self) -> Ext2Bid {
-        self.desc.read().inode_table
+        self.metadata.read().desc.inode_table
     }
 
     /// Returns the first filesystem-wide block number of this group.
@@ -355,120 +370,101 @@ impl BlockGroup {
     }
 
     pub(super) fn free_blocks_count(&self) -> u16 {
-        self.desc.read().free_blocks_count
+        self.metadata.read().desc.free_blocks_count
     }
 
     pub(super) fn free_inodes_count(&self) -> u16 {
-        self.desc.read().free_inodes_count
+        self.metadata.read().desc.free_inodes_count
     }
 
     pub(super) fn used_dirs_count(&self) -> u16 {
-        self.desc.read().used_dirs_count
+        self.metadata.read().desc.used_dirs_count
     }
 
     /// Decreases the free-block counter for this group.
     pub(super) fn dec_free_blocks(&self, count: u16) {
-        let mut desc = self.desc.write();
-        desc.free_blocks_count = desc.free_blocks_count.saturating_sub(count);
+        let mut metadata = self.metadata.write();
+        metadata.desc.free_blocks_count = metadata.desc.free_blocks_count.saturating_sub(count);
     }
 
     /// Increases the free-block counter for this group.
     pub(super) fn inc_free_blocks(&self, count: u16) {
-        let mut desc = self.desc.write();
-        desc.free_blocks_count = desc.free_blocks_count.saturating_add(count);
+        let mut metadata = self.metadata.write();
+        metadata.desc.free_blocks_count = metadata.desc.free_blocks_count.saturating_add(count);
     }
 
     /// Decreases the free-inode counter for this group.
     pub(super) fn dec_free_inodes(&self, count: u16) {
-        let mut desc = self.desc.write();
-        desc.free_inodes_count = desc.free_inodes_count.saturating_sub(count);
+        let mut metadata = self.metadata.write();
+        metadata.desc.free_inodes_count = metadata.desc.free_inodes_count.saturating_sub(count);
     }
 
     /// Increases the free-inode counter for this group.
     pub(super) fn inc_free_inodes(&self, count: u16) {
-        let mut desc = self.desc.write();
-        desc.free_inodes_count = desc.free_inodes_count.saturating_add(count);
+        let mut metadata = self.metadata.write();
+        metadata.desc.free_inodes_count = metadata.desc.free_inodes_count.saturating_add(count);
     }
 
     /// Increases the used-dirs counter for this group.
     pub(super) fn inc_used_dirs(&self) {
-        let mut desc = self.desc.write();
-        desc.used_dirs_count = desc.used_dirs_count.saturating_add(1);
+        let mut metadata = self.metadata.write();
+        metadata.desc.used_dirs_count = metadata.desc.used_dirs_count.saturating_add(1);
     }
 
     /// Decreases the used-dirs counter for this group.
     pub(super) fn dec_used_dirs(&self) {
-        let mut desc = self.desc.write();
-        desc.used_dirs_count = desc.used_dirs_count.saturating_sub(1);
+        let mut metadata = self.metadata.write();
+        metadata.desc.used_dirs_count = metadata.desc.used_dirs_count.saturating_sub(1);
     }
 
     pub(super) fn is_desc_dirty(&self) -> bool {
-        self.desc.read().is_dirty()
+        self.metadata.read().desc.is_dirty()
     }
 
+    /// Syncs bitmaps and group descriptor to disk under a single lock.
     fn sync_metadata(&self, group_descs: &USegment) -> Result<()> {
-        self.sync_bitmaps()?;
-        self.sync_group_desc(group_descs)
-    }
+        let mut metadata = self.metadata.write();
 
-    fn sync_group_desc(&self, group_descs: &USegment) -> Result<()> {
-        if !self.desc.read().is_dirty() {
-            return Ok(());
-        }
-
-        let mut desc = self.desc.write();
-        if !desc.is_dirty() {
-            return Ok(());
-        }
-
-        let raw = RawGroupDesc::from(**desc);
-        let offset = self.idx * size_of::<RawGroupDesc>();
-        group_descs.write_val(offset, &raw)?;
-        desc.clear_dirty();
-        Ok(())
-    }
-
-    fn sync_bitmaps(&self) -> Result<()> {
-        let (block_bitmap_bid, inode_bitmap_bid) = {
-            // Read descriptor block addresses before bitmap locks to keep lock ordering.
-            let desc = self.desc.read();
-            (desc.block_bitmap, desc.inode_bitmap)
-        };
-
-        if self.block_bitmap.read().is_dirty() {
-            let mut block_bitmap = self.block_bitmap.write();
-            if block_bitmap.is_dirty() {
-                if self
-                    .block_device
-                    .write_bytes(
-                        Bid::new(block_bitmap_bid as u64).to_offset(),
-                        block_bitmap.as_bytes(),
-                    )
-                    .is_err()
-                {
-                    // Keep dirty bit set on writeback failure for retry.
-                    return_errno_with_message!(Errno::EIO, "failed to write block bitmap");
-                }
-                block_bitmap.clear_dirty();
+        // Sync block bitmap.
+        if metadata.block_bitmap.is_dirty() {
+            let bid = metadata.desc.block_bitmap;
+            if self
+                .block_device
+                .write_bytes(
+                    Bid::new(bid as u64).to_offset(),
+                    metadata.block_bitmap.as_bytes(),
+                )
+                .is_err()
+            {
+                // Keep dirty bit set on writeback failure for retry.
+                return_errno_with_message!(Errno::EIO, "failed to write block bitmap");
             }
+            metadata.block_bitmap.clear_dirty();
         }
 
-        if self.inode_bitmap.read().is_dirty() {
-            let mut inode_bitmap = self.inode_bitmap.write();
-            if inode_bitmap.is_dirty() {
-                if self
-                    .block_device
-                    .write_bytes(
-                        Bid::new(inode_bitmap_bid as u64).to_offset(),
-                        inode_bitmap.as_bytes(),
-                    )
-                    .is_err()
-                {
-                    // Keep dirty bit set on writeback failure for retry.
-                    return_errno_with_message!(Errno::EIO, "failed to write inode bitmap");
-                }
-                inode_bitmap.clear_dirty();
+        // Sync inode bitmap.
+        if metadata.inode_bitmap.is_dirty() {
+            let bid = metadata.desc.inode_bitmap;
+            if self
+                .block_device
+                .write_bytes(
+                    Bid::new(bid as u64).to_offset(),
+                    metadata.inode_bitmap.as_bytes(),
+                )
+                .is_err()
+            {
+                // Keep dirty bit set on writeback failure for retry.
+                return_errno_with_message!(Errno::EIO, "failed to write inode bitmap");
             }
+            metadata.inode_bitmap.clear_dirty();
+        }
+
+        // Sync group descriptor.
+        if metadata.desc.is_dirty() {
+            let raw = RawGroupDesc::from(*metadata.desc);
+            let offset = self.idx * size_of::<RawGroupDesc>();
+            group_descs.write_val(offset, &raw)?;
+            metadata.desc.clear_dirty();
         }
 
         Ok(())
@@ -604,12 +600,12 @@ impl BlockGroup {
 
         let mut saw_corruption = false;
 
-        let mut bitmap = self.block_bitmap.write();
+        let mut metadata = self.metadata.write();
 
         // Corruption check: descriptor says free blocks but bitmap disagrees.
-        if self.free_blocks_count() > 0 {
-            if let Some(range) = bitmap.alloc_consecutive(1) {
-                bitmap.free_consecutive(range);
+        if metadata.desc.free_blocks_count > 0 {
+            if let Some(range) = metadata.block_bitmap.alloc_consecutive(1) {
+                metadata.block_bitmap.free_consecutive(range);
             } else {
                 saw_corruption = true;
             }
@@ -618,14 +614,14 @@ impl BlockGroup {
         let mut rejected = Vec::new();
         let mut req = count
             .min(group_size)
-            .min(self.free_blocks_count() as u32)
+            .min(metadata.desc.free_blocks_count as u32)
             .min(sb_free_blocks) as u16;
         // TODO: Add a helper function in IdBitmap to find the first free block, making this
         //       loop more efficient.
         while req > 0 {
-            let Some(range) = bitmap.alloc_consecutive(req) else {
+            let Some(range) = metadata.block_bitmap.alloc_consecutive(req) else {
                 for rejected_range in rejected.drain(..) {
-                    bitmap.free_consecutive(rejected_range);
+                    metadata.block_bitmap.free_consecutive(rejected_range);
                 }
                 req -= 1;
                 continue;
@@ -634,16 +630,21 @@ impl BlockGroup {
             let run_start = range.start as u32;
             let ret_block = self.first_block + run_start;
 
-            if self.overlaps_system_zone(ret_block, alloc_len) {
+            if Self::overlaps_system_zone_with(
+                &metadata.desc,
+                ret_block,
+                alloc_len,
+                self.inode_table_blocks_per_group,
+            ) {
                 saw_corruption = true;
                 rejected.push(range);
                 continue;
             }
-            if self.free_blocks_count() < alloc_len as u16 || sb_free_blocks < alloc_len {
+            if (metadata.desc.free_blocks_count as u32) < alloc_len || sb_free_blocks < alloc_len {
                 saw_corruption = true;
-                bitmap.free_consecutive(range);
+                metadata.block_bitmap.free_consecutive(range);
                 for rejected_range in rejected.drain(..) {
-                    bitmap.free_consecutive(rejected_range);
+                    metadata.block_bitmap.free_consecutive(rejected_range);
                 }
                 req -= 1;
                 continue;
@@ -651,14 +652,15 @@ impl BlockGroup {
 
             // Restore any previously rejected ranges.
             for rejected_range in rejected.drain(..) {
-                bitmap.free_consecutive(rejected_range);
+                metadata.block_bitmap.free_consecutive(rejected_range);
             }
-
-            drop(bitmap);
 
             // Persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
 
-            self.dec_free_blocks(alloc_len as u16);
+            metadata.desc.free_blocks_count =
+                metadata.desc.free_blocks_count.saturating_sub(alloc_len as u16);
+
+            drop(metadata);
 
             let range = ret_block..ret_block + alloc_len;
             return Ok((Some(range), saw_corruption));
@@ -666,7 +668,7 @@ impl BlockGroup {
 
         // No allocation possible; restore any rejected ranges.
         for rejected_range in rejected.drain(..) {
-            bitmap.free_consecutive(rejected_range);
+            metadata.block_bitmap.free_consecutive(rejected_range);
         }
 
         Ok((None, saw_corruption))
@@ -680,33 +682,39 @@ impl BlockGroup {
     pub(super) fn free_blocks(&self, bit: u32, group_count: u32) -> Result<u32> {
         // Validate system zone overlap using filesystem-wide coordinates.
         let abs_start = self.first_block + bit;
-        if self.overlaps_system_zone(abs_start, group_count) {
+
+        let mut metadata = self.metadata.write();
+
+        if Self::overlaps_system_zone_with(
+            &metadata.desc,
+            abs_start,
+            group_count,
+            self.inode_table_blocks_per_group,
+        ) {
             return_errno_with_message!(Errno::EIO, "freeing blocks in system zone");
         }
-
-        let mut bitmap = self.block_bitmap.write();
 
         // Clear bits one by one and count only allocated-to-free transitions.
         let range_start = bit as u16;
         let range_end = (bit + group_count) as u16;
         let mut actually_freed: u32 = 0;
         for idx in range_start..range_end {
-            if !bitmap.is_allocated(idx) {
+            if !metadata.block_bitmap.is_allocated(idx) {
                 warn!(
                     "ext2_free_blocks: bit already cleared for block {}",
                     abs_start + (idx - range_start) as u32
                 );
             } else {
-                bitmap.free(idx);
+                metadata.block_bitmap.free(idx);
                 actually_freed += 1;
             }
         }
 
-        drop(bitmap);
-
         // Persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
 
-        self.inc_free_blocks(actually_freed as u16);
+        metadata.desc.free_blocks_count =
+            metadata.desc.free_blocks_count.saturating_add(actually_freed as u16);
+
         Ok(actually_freed)
     }
 
@@ -716,11 +724,10 @@ impl BlockGroup {
     /// or `Ok(None)` if no free inode. Does NOT update counters.
     ///
     pub(super) fn alloc_inode(&self) -> Result<Option<u16>> {
-        let mut bitmap = self.inode_bitmap.write();
-        let Some(inode_idx) = bitmap.alloc() else {
+        let mut metadata = self.metadata.write();
+        let Some(inode_idx) = metadata.inode_bitmap.alloc() else {
             return Ok(None);
         };
-        drop(bitmap);
 
         // Persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
 
@@ -730,17 +737,16 @@ impl BlockGroup {
     /// Frees one inode within this group.
     ///
     /// `bit` is the 0-based group-relative inode index.
-    /// Returns `true` if the bit transitioned allocated→free,
+    /// Returns `true` if the bit transitioned allocated->free,
     /// `false` if it was already free (logs warning). Does NOT update counters.
     ///
     pub(super) fn free_inode(&self, bit: u16) -> Result<bool> {
-        let mut bitmap = self.inode_bitmap.write();
-        if !bitmap.is_allocated(bit) {
+        let mut metadata = self.metadata.write();
+        if !metadata.inode_bitmap.is_allocated(bit) {
             warn!("ext2_free_inode: inode bit {} already freed", bit);
             return Ok(false);
         }
-        bitmap.free(bit);
-        drop(bitmap);
+        metadata.inode_bitmap.free(bit);
 
         // Persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
 
@@ -770,24 +776,25 @@ impl BlockGroup {
     /// Checks whether [start, start+count-1] overlaps any system metadata block
     /// (block bitmap, inode bitmap, inode table) of this group.
     ///
-    fn overlaps_system_zone(&self, start: u32, count: u32) -> bool {
+    /// This variant accepts a `GroupDesc` reference directly, allowing callers
+    /// that already hold the metadata lock to avoid re-acquiring it.
+    fn overlaps_system_zone_with(
+        desc: &GroupDesc,
+        start: u32,
+        count: u32,
+        inode_table_blocks_per_group: u32,
+    ) -> bool {
         let Some(end) = start.checked_add(count - 1) else {
             return true;
         };
 
-        let desc = self.desc.read();
-        let block_bitmap = desc.block_bitmap;
-        let inode_bitmap = desc.inode_bitmap;
-        let inode_table = desc.inode_table;
-        drop(desc);
-
-        if Self::ranges_overlap(start, end, block_bitmap, 1) {
+        if Self::ranges_overlap(start, end, desc.block_bitmap, 1) {
             return true;
         }
-        if Self::ranges_overlap(start, end, inode_bitmap, 1) {
+        if Self::ranges_overlap(start, end, desc.inode_bitmap, 1) {
             return true;
         }
-        if Self::ranges_overlap(start, end, inode_table, self.inode_table_blocks_per_group) {
+        if Self::ranges_overlap(start, end, desc.inode_table, inode_table_blocks_per_group) {
             return true;
         }
         false

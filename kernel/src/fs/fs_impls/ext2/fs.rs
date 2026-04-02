@@ -1256,9 +1256,9 @@ mod test {
         assert!(ino >= f.sb.first_ino() && ino <= f.sb.total_inodes());
 
         let bit = ((ino - 1) % f.sb.inodes_per_group()) as u16;
-        let bitmap = f.ext2.block_group(0).inode_bitmap();
-        assert!(bitmap.is_allocated(bit));
-        drop(bitmap);
+        let metadata = f.ext2.block_group(0).metadata();
+        assert!(metadata.inode_bitmap.is_allocated(bit));
+        drop(metadata);
         assert_eq!(f.ext2.super_block().free_inodes_count(), before_sb_free - 1);
         assert_eq!(
             f.ext2.block_group(0).free_inodes_count(),
@@ -1564,9 +1564,9 @@ mod test {
         drop(child);
         f.ext2.sync_all().unwrap();
 
-        let inode_bitmap = f.ext2.block_group(0).inode_bitmap();
-        assert!(inode_bitmap.is_allocated((child_ino - 1) as u16));
-        drop(inode_bitmap);
+        let metadata = f.ext2.block_group(0).metadata();
+        assert!(metadata.inode_bitmap.is_allocated((child_ino - 1) as u16));
+        drop(metadata);
 
         let reloaded = f.ext2.read_inode(child_ino).unwrap();
         assert_eq!(reloaded.ino(), child_ino);
@@ -1581,14 +1581,14 @@ mod test {
         let group = f.ext2.block_group(0);
         let first = f.sb.group_first_block_no(0);
 
-        let bitmap = group.block_bitmap();
+        let metadata = group.metadata();
         // Block bitmap, inode bitmap, and inode table blocks must be marked.
         let bb = (f.descs[0].block_bitmap - first) as u16;
         let ib = (f.descs[0].inode_bitmap - first) as u16;
         let it = (f.descs[0].inode_table - first) as u16;
-        assert!(bitmap.is_allocated(bb));
-        assert!(bitmap.is_allocated(ib));
-        assert!(bitmap.is_allocated(it));
+        assert!(metadata.block_bitmap.is_allocated(bb));
+        assert!(metadata.block_bitmap.is_allocated(ib));
+        assert!(metadata.block_bitmap.is_allocated(it));
     }
 
     #[ktest]
@@ -1617,13 +1617,13 @@ mod test {
             .unwrap();
 
         // Cached bitmap is loaded during mount; direct disk mutation should not affect cache.
-        let bitmap = group.block_bitmap();
+        let metadata = group.metadata();
         let bb = (f.descs[0].block_bitmap - first) as u16;
         let ib = (f.descs[0].inode_bitmap - first) as u16;
         let it = (f.descs[0].inode_table - first) as u16;
-        assert!(bitmap.is_allocated(bb));
-        assert!(bitmap.is_allocated(ib));
-        assert!(bitmap.is_allocated(it));
+        assert!(metadata.block_bitmap.is_allocated(bb));
+        assert!(metadata.block_bitmap.is_allocated(ib));
+        assert!(metadata.block_bitmap.is_allocated(it));
     }
 
     #[ktest]
@@ -1645,11 +1645,11 @@ mod test {
             )
             .unwrap();
 
-        let bitmap = group.inode_bitmap();
-        assert_eq!(bitmap.len(), f.sb.inodes_per_group() as u16);
-        assert!(bitmap.is_allocated(0));
-        assert!(bitmap.is_allocated(1));
-        assert!(!bitmap.is_allocated(31));
+        let metadata = group.metadata();
+        assert_eq!(metadata.inode_bitmap.len(), f.sb.inodes_per_group() as u16);
+        assert!(metadata.inode_bitmap.is_allocated(0));
+        assert!(metadata.inode_bitmap.is_allocated(1));
+        assert!(!metadata.inode_bitmap.is_allocated(31));
     }
 
     #[ktest]

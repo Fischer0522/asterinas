@@ -790,7 +790,7 @@ impl Inode {
         };
         let inode_bit = u16::try_from(inode_idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "inode index out of range"))?;
-        if !group.inode_bitmap().is_allocated(inode_bit) {
+        if !group.metadata().inode_bitmap.is_allocated(inode_bit) {
             return Ok(false);
         }
 
@@ -2879,7 +2879,8 @@ mod test {
         assert!(
             f.ext2
                 .block_group(0)
-                .inode_bitmap()
+                .metadata()
+                .inode_bitmap
                 .is_allocated((old_ino - 1) as u16)
         );
         f.ext2.sync_all().unwrap();
@@ -2897,7 +2898,8 @@ mod test {
         assert!(
             !f.ext2
                 .block_group(0)
-                .inode_bitmap()
+                .metadata()
+                .inode_bitmap
                 .is_allocated((old_ino - 1) as u16)
         );
         let raw_after_drop = read_raw_inode_from_disk(&f, old_ino);

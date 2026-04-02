@@ -1042,35 +1042,32 @@ mod test {
     fn reload_group0_cached_bitmaps_from_disk(f: &testkit::Ext2Fixture) {
         let group = f.ext2.block_group(0);
 
+        let block_bitmap_bid = group.block_bitmap_bid();
+        let inode_bitmap_bid = group.inode_bitmap_bid();
+
         let mut block_bitmap_buf = vec![0u8; BLOCK_SIZE];
         f.disk
             .segment()
             .read_bytes(
-                Bid::new(group.block_bitmap_bid() as u64).to_offset(),
+                Bid::new(block_bitmap_bid as u64).to_offset(),
                 &mut block_bitmap_buf,
             )
             .unwrap();
-        let block_len = {
-            let bitmap = group.block_bitmap();
-            bitmap.len()
-        };
-        let mut block_bitmap = group.block_bitmap_mut();
-        **block_bitmap = IdBitmap::from_buf(block_bitmap_buf.into_boxed_slice(), block_len);
 
         let mut inode_bitmap_buf = vec![0u8; BLOCK_SIZE];
         f.disk
             .segment()
             .read_bytes(
-                Bid::new(group.inode_bitmap_bid() as u64).to_offset(),
+                Bid::new(inode_bitmap_bid as u64).to_offset(),
                 &mut inode_bitmap_buf,
             )
             .unwrap();
-        let inode_len = {
-            let bitmap = group.inode_bitmap();
-            bitmap.len()
-        };
-        let mut inode_bitmap = group.inode_bitmap_mut();
-        **inode_bitmap = IdBitmap::from_buf(inode_bitmap_buf.into_boxed_slice(), inode_len);
+
+        let mut metadata = group.metadata_mut();
+        let block_len = metadata.block_bitmap.len();
+        *metadata.block_bitmap = IdBitmap::from_buf(block_bitmap_buf.into_boxed_slice(), block_len);
+        let inode_len = metadata.inode_bitmap.len();
+        *metadata.inode_bitmap = IdBitmap::from_buf(inode_bitmap_buf.into_boxed_slice(), inode_len);
     }
 
     #[ktest]
