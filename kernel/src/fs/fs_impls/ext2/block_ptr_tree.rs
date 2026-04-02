@@ -56,6 +56,60 @@ struct BranchChainWalkResult {
     chain: Vec<IndirectBlockEntry>,
 }
 
+/// Tracks allocated metadata/data blocks during block allocation and frees
+/// them on drop unless committed.
+#[derive(Debug)]
+struct BlockAllocGuard {
+    fs: Arc<Ext2>,
+    indirect_blocks: Vec<Ext2Bid>,
+    data_blocks: Range<Ext2Bid>,
+    committed: bool,
+}
+
+impl BlockAllocGuard {
+    fn new(fs: Arc<Ext2>) -> Self {
+        Self {
+            fs,
+            indirect_blocks: Vec::new(),
+            data_blocks: Range { start: 0, end: 0 },
+            committed: false,
+        }
+    }
+
+    fn track_indirect_blocks(&mut self, indirect_blocks: Vec<Ext2Bid>) {
+        self.indirect_blocks = indirect_blocks;
+    }
+
+    fn track_data_blocks(&mut self, data_blocks: Range<Ext2Bid>) {
+        self.data_blocks = data_blocks;
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for BlockAllocGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+
+        for &bid in self.indirect_blocks.iter() {
+            if let Err(err) = self.fs.free_blocks(bid, 1) {
+                error!("failed to free indirect block {} in rollback: {:?}", bid, err);
+            }
+        }
+
+        let data_count = self.data_blocks.end.saturating_sub(self.data_blocks.start);
+        if data_count > 0 {
+            if let Err(err) = self.fs.free_blocks(self.data_blocks.start, data_count) {
+                error!("failed to free data blocks in rollback: {:?}", err);
+            }
+        }
+    }
+}
+
 /// On-disk block pointer state copied from [`RawInode`].
 ///
 /// Holds `i_blocks` (sector count) and the 15-entry `i_block[]` array.
@@ -123,14 +177,14 @@ impl RawBlockPtrs {
 #[derive(Debug)]
 pub(super) struct BlockPtrTree {
     pub(super) raw_block_ptrs: Dirty<RawBlockPtrs>,
-    pub(super) indirect_blocks: Mutex<IndirectBlockManager>,
+    pub(super) indirect_blocks_manager: Mutex<IndirectBlockManager>,
 }
 
 impl BlockPtrTree {
     pub(super) fn new(desc: RawBlockPtrs, fs: Weak<Ext2>) -> Self {
         Self {
             raw_block_ptrs: Dirty::new(desc),
-            indirect_blocks: Mutex::new(IndirectBlockManager::new(fs)),
+            indirect_blocks_manager: Mutex::new(IndirectBlockManager::new(fs)),
         }
     }
 
@@ -139,7 +193,7 @@ impl BlockPtrTree {
     }
 
     pub(super) fn sync_indirect_blocks(&self) -> Result<()> {
-        self.indirect_blocks.lock().sync()
+        self.indirect_blocks_manager.lock().sync()
     }
 
     /// Translates a logical block number into a path of block pointer offsets.
@@ -207,16 +261,21 @@ impl BlockPtrTree {
 
     /// Traverses the existing block pointer chain for a block path.
     ///
-    fn walk_block_chain(&self, path: &BlockPointerPath, fs: &Ext2) -> Result<BranchChainWalkResult> {
+    fn walk_block_chain(
+        &self,
+        path: &BlockPointerPath,
+        fs: &Ext2,
+    ) -> Result<BranchChainWalkResult> {
         if path.depth == 0 || path.depth > path.offsets.len() {
             return_errno_with_message!(Errno::EIO, "invalid block path depth");
         }
 
         let top_offset = path.offsets[0] as usize;
-        let top_key =
-            *self.raw_block_ptrs.block_ptrs.get(top_offset).ok_or_else(|| {
-                Error::with_message(Errno::EIO, "invalid top-level block pointer")
-            })?;
+        let top_key = *self
+            .raw_block_ptrs
+            .block_ptrs
+            .get(top_offset)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "invalid top-level block pointer"))?;
 
         let mut chain = Vec::with_capacity(path.depth);
         chain.push(IndirectBlockEntry {
@@ -240,7 +299,7 @@ impl BlockPtrTree {
         for level in 1..path.depth {
             let parent_key = chain[level - 1].key;
             let next_key = self
-                .indirect_blocks
+                .indirect_blocks_manager
                 .lock()
                 .find(parent_key)?
                 .read_bid(path.offsets[level] as usize)?;
@@ -276,10 +335,13 @@ impl BlockPtrTree {
         if max_blocks == 0 {
             return_errno_with_message!(Errno::EINVAL, "zero block range requested");
         }
+        // A partial walk means the logical block lands in a hole, so there is
+        // no mapped physical range to report.
         if branch.partial_level < path.depth {
             return Ok(None);
         }
 
+        // The last chain entry is the first mapped data block for `iblock`.
         let first_bid = branch
             .chain
             .get(path.depth - 1)
@@ -294,6 +356,8 @@ impl BlockPtrTree {
         let start_slot = path.offsets[path.depth - 1] as usize;
 
         if path.depth == 1 {
+            // Direct blocks are stored inline in the inode, so scan forward in
+            // `i_block[]` while the next physical block stays contiguous.
             while count < max_count {
                 let slot = start_slot
                     .checked_add(count as usize)
@@ -307,12 +371,14 @@ impl BlockPtrTree {
                 count += 1;
             }
         } else {
+            // Indirect cases share the same contiguity rule, but the leaf slots
+            // live in the final indirect block reached by the walk.
             let leaf_bid = branch
                 .chain
                 .get(path.depth - 1)
                 .and_then(|entry| entry.bh)
                 .ok_or_else(|| Error::with_message(Errno::EIO, "missing indirect leaf block"))?;
-            let mut indirect_blocks = self.indirect_blocks.lock();
+            let mut indirect_blocks = self.indirect_blocks_manager.lock();
             let leaf_block = indirect_blocks.find(leaf_bid)?;
             while count < max_count {
                 let slot = start_slot
@@ -339,15 +405,24 @@ impl BlockPtrTree {
             return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
         }
 
+        // Missing branch levels correspond to indirect metadata blocks that
+        // must be allocated before any data block can be linked into the tree.
         let indirect_blks = (path.depth - 1 - branch.partial_level) as u32;
+        // Never allocate past the current leaf boundary even if the caller asks
+        // for a larger contiguous run.
         let max_data_blks = Self::max_blocks_in_run(path, max_blocks);
         if indirect_blks > 0 {
+            // If the branch is incomplete, the fresh leaf starts empty, so we
+            // can request the whole bounded data run immediately.
             return Ok((indirect_blks, max_data_blks));
         }
 
+        // The metadata path already exists, so only count how many consecutive
+        // empty slots remain in the current leaf.
         let start_slot = path.offsets[path.depth - 1] as usize;
         let mut count = 1u32;
         if path.depth == 1 {
+            // Direct blocks live inline in the inode's `i_block[]`.
             while count < max_data_blks {
                 let slot = start_slot
                     .checked_add(count as usize)
@@ -361,12 +436,13 @@ impl BlockPtrTree {
                 count += 1;
             }
         } else {
+            // Indirect cases use the final indirect block as the allocation leaf.
             let leaf_bid = branch
                 .chain
                 .get(path.depth - 1)
                 .and_then(|entry| entry.bh)
                 .ok_or_else(|| Error::with_message(Errno::EIO, "missing indirect leaf block"))?;
-            let mut indirect_blocks = self.indirect_blocks.lock();
+            let mut indirect_blocks = self.indirect_blocks_manager.lock();
             let leaf_block = indirect_blocks.find(leaf_bid)?;
             while count < max_data_blks {
                 let slot = start_slot
@@ -380,49 +456,6 @@ impl BlockPtrTree {
         }
 
         Ok((0, count))
-    }
-
-    fn rollback_allocated(
-        fs: &Ext2,
-        indirect_blocks: &Mutex<IndirectBlockManager>,
-        metadata_blocks: &[Ext2Bid],
-        data_range: Option<&Range<Ext2Bid>>,
-    ) {
-        let mut indirect_blocks = indirect_blocks.lock();
-        for bid in metadata_blocks {
-            indirect_blocks.remove(*bid);
-            let _ = fs.free_blocks(*bid, 1);
-        }
-        if let Some(data_range) = data_range {
-            let data_count = data_range.end.saturating_sub(data_range.start);
-            if data_count > 0 {
-                let _ = fs.free_blocks(data_range.start, data_count);
-            }
-        }
-    }
-
-    fn allocate_metadata_blocks(
-        &self,
-        fs: &Ext2,
-        count: u32,
-        goal: Ext2Bid,
-    ) -> Result<Vec<Ext2Bid>> {
-        let mut metadata_blocks = Vec::with_capacity(count as usize);
-        let mut alloc_goal = goal.max(fs.super_block().first_data_block());
-
-        while (metadata_blocks.len() as u32) < count {
-            let remain = count - metadata_blocks.len() as u32;
-            let allocated = fs.alloc_blocks(remain, alloc_goal)?;
-            let alloc_len = allocated.end.saturating_sub(allocated.start);
-            if alloc_len == 0 || alloc_len > remain {
-                return_errno_with_message!(Errno::EIO, "invalid metadata allocation result");
-            }
-
-            metadata_blocks.extend(allocated.clone());
-            alloc_goal = allocated.end;
-        }
-
-        Ok(metadata_blocks)
     }
 
     fn write_data_range_to_direct_slots(
@@ -507,21 +540,17 @@ impl BlockPtrTree {
                 );
                 return;
             }
-            self.raw_block_ptrs.sector_count = self.raw_block_ptrs.sector_count.saturating_sub(sectors_per_block);
+            self.raw_block_ptrs.sector_count = self
+                .raw_block_ptrs
+                .sector_count
+                .saturating_sub(sectors_per_block);
             return;
         }
 
         let ptrs_per_block = block_size / size_of::<u32>();
-        if ptrs_per_block == 0 {
-            error!(
-                "ext2: free_branches: invalid indirect fanout for block size {}",
-                block_size
-            );
-            return;
-        }
 
         let child_blocks = {
-            let mut indirect_blocks = self.indirect_blocks.lock();
+            let mut indirect_blocks = self.indirect_blocks_manager.lock();
             let child_blocks = {
                 let block = match indirect_blocks.find(block_nr) {
                     Ok(block) => block,
@@ -561,17 +590,20 @@ impl BlockPtrTree {
             );
             return;
         }
-        self.raw_block_ptrs.sector_count = self.raw_block_ptrs.sector_count.saturating_sub(sectors_per_block);
+        self.raw_block_ptrs.sector_count = self
+            .raw_block_ptrs
+            .sector_count
+            .saturating_sub(sectors_per_block);
     }
 
-    fn alloc_and_splice_branch(
-        &mut self,
-        fs: &Ext2,
+    fn allocate_blocks (
+        &self,
+        fs: &Arc<Ext2>,
         indirect_blks: u32,
         data_blks: u32,
         path: &BlockPointerPath,
         branch: &BranchChainWalkResult,
-    ) -> Result<Range<Ext2Bid>> {
+    ) -> Result<BlockAllocGuard> {
         if data_blks == 0 {
             return_errno_with_message!(Errno::EIO, "invalid zero data allocation");
         }
@@ -583,38 +615,65 @@ impl BlockPtrTree {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
         }
 
-        let block_size = fs.block_size();
-        let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
-        if sectors_per_block == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid sector accounting for block size");
-        }
+        // Prefer allocating near the existing branch tip so newly added
+        // metadata/data blocks are likely to stay close on disk.
         let alloc_goal = branch
             .chain
             .last()
             .map_or(self.raw_block_ptrs.block_ptrs[0], |entry| entry.key)
             .max(fs.super_block().first_data_block());
-        let metadata_blocks = self.allocate_metadata_blocks(fs, indirect_blks, alloc_goal)?;
-        let data_goal = metadata_blocks
+
+        let mut guard = BlockAllocGuard::new(fs.clone());
+        // Allocate the missing indirect metadata first, then place data blocks
+        // immediately after the metadata run when possible.
+                let mut indirect_blocks = Vec::with_capacity(indirect_blks as usize);
+        let mut alloc_goal = alloc_goal.max(fs.super_block().first_data_block());
+
+        while (indirect_blocks.len() as u32) < indirect_blks {
+            let remain = indirect_blks - indirect_blocks.len() as u32;
+            let allocated = fs.alloc_blocks(remain, alloc_goal)?;
+            let alloc_len = allocated.end.saturating_sub(allocated.start);
+            if alloc_len == 0 || alloc_len > remain {
+                return_errno_with_message!(Errno::EIO, "invalid metadata allocation result");
+            }
+
+            indirect_blocks.extend(allocated.clone());
+            alloc_goal = allocated.end;
+        }
+
+        let data_goal = indirect_blocks
             .last()
             .copied()
             .map_or(alloc_goal, |last_metadata| last_metadata.saturating_add(1));
-        let data_range = match fs.alloc_blocks(data_blks, data_goal) {
-            Ok(range) => {
-                let alloc_len = range.end.saturating_sub(range.start);
-                if alloc_len == 0 || alloc_len > data_blks {
-                    Self::rollback_allocated(fs, &self.indirect_blocks, &metadata_blocks, None);
-                    return_errno_with_message!(Errno::EIO, "invalid data allocation result");
-                }
-                range
-            }
-            Err(err) => {
-                Self::rollback_allocated(fs, &self.indirect_blocks, &metadata_blocks, None);
-                return Err(err);
-            }
-        };
+        guard.track_indirect_blocks(indirect_blocks);
 
-        let total = (metadata_blocks.len() as u32)
-            .checked_add(data_range.end.saturating_sub(data_range.start))
+        let data_blocks_range = fs.alloc_blocks(data_blks, data_goal)?;
+        let alloc_len = data_blocks_range.end.saturating_sub(data_blocks_range.start);
+        guard.track_data_blocks(data_blocks_range);
+
+        if alloc_len == 0 || alloc_len > data_blks {
+            return_errno_with_message!(Errno::EIO, "invalid data allocation result");
+        }
+
+        Ok(guard)
+    }
+
+    fn splice_branch(
+        &mut self,
+        fs: &Ext2,
+        guard: &BlockAllocGuard,
+        path: &BlockPointerPath,
+        branch: &BranchChainWalkResult,
+    ) -> Result<()> {
+
+        let indirect_blocks = &guard.indirect_blocks;
+        let data_blocks = &guard.data_blocks;
+
+        let block_size = fs.block_size();
+        let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
+
+        let total = (indirect_blocks.len() as u32)
+            .checked_add(data_blocks.end.saturating_sub(data_blocks.start))
             .ok_or_else(|| Error::with_message(Errno::EIO, "block allocation count overflow"))?;
         let added_sectors = total
             .checked_mul(sectors_per_block)
@@ -625,10 +684,35 @@ impl BlockPtrTree {
             .checked_add(added_sectors)
             .ok_or_else(|| Error::with_message(Errno::EIO, "inode block count overflow"))?;
 
-        let chain_build_result = (|| -> Result<()> {
-            if !metadata_blocks.is_empty() {
-                let mut indirect_blocks = self.indirect_blocks.lock();
-                for (i, new_bid) in metadata_blocks.iter().copied().enumerate() {
+        if indirect_blocks.is_empty() {
+            // The branch already exists; only fill data pointers into existing slots.
+            if branch.partial_level == 0 {
+                let slot = path.offsets[0] as usize;
+                self.write_data_range_to_direct_slots(slot, &data_blocks)?;
+            } else {
+                let parent_bid = branch
+                    .chain
+                    .get(branch.partial_level)
+                    .and_then(|entry| entry.bh)
+                    .ok_or_else(|| {
+                        Error::with_message(
+                            Errno::EIO,
+                            "missing parent indirect block for data splice",
+                        )
+                    })?;
+                let slot = path.offsets[branch.partial_level] as usize;
+                let mut mgr = self.indirect_blocks_manager.lock();
+                let parent_block = mgr.find_mut(parent_bid)?;
+                Self::write_data_range_to_indirect_block(parent_block, slot, &data_blocks)?;
+            }
+        } else {
+            let splice_ptr = indirect_blocks[0];
+            let mut mgr = self.indirect_blocks_manager.lock();
+
+            let result = (|| -> Result<()> {
+                // Build the indirect blocks chain: each block points to the next;
+                // the leaf block points to the allocated data range.
+                for (i, new_bid) in indirect_blocks.iter().copied().enumerate() {
                     let level = branch.partial_level + 1 + i;
                     if level >= path.depth {
                         return_errno_with_message!(
@@ -640,48 +724,26 @@ impl BlockPtrTree {
                     let mut block = IndirectBlock::alloc_new(new_bid)?;
                     block.clear();
                     let start_slot = path.offsets[level] as usize;
-                    if i + 1 == metadata_blocks.len() {
+                    if i + 1 == indirect_blocks.len() {
                         Self::write_data_range_to_indirect_block(
                             &mut block,
                             start_slot,
-                            &data_range,
+                            &data_blocks,
                         )?;
                     } else {
-                        let next_bid = metadata_blocks.get(i + 1).copied().ok_or_else(|| {
-                            Error::with_message(Errno::EIO, "allocated chain metadata mismatch")
-                        })?;
-                        block.write_bid(start_slot, next_bid)?;
+                        block.write_bid(start_slot, indirect_blocks[i + 1])?;
                     }
-                    indirect_blocks.insert_new(new_bid, block)?;
+                    mgr.insert_new(new_bid, block)?;
                 }
-            }
 
-            if metadata_blocks.is_empty() {
-                if branch.partial_level == 0 {
-                    let slot = path.offsets[0] as usize;
-                    self.write_data_range_to_direct_slots(slot, &data_range)?;
-                } else {
-                    let parent_bid = branch
-                        .chain
-                        .get(branch.partial_level)
-                        .and_then(|entry| entry.bh)
-                        .ok_or_else(|| {
-                            Error::with_message(
-                                Errno::EIO,
-                                "missing parent indirect block for data splice",
-                            )
-                        })?;
-                    let slot = path.offsets[branch.partial_level] as usize;
-                    let mut indirect_blocks = self.indirect_blocks.lock();
-                    let parent_block = indirect_blocks.find_mut(parent_bid)?;
-                    Self::write_data_range_to_indirect_block(parent_block, slot, &data_range)?;
-                }
-            } else {
-                let splice_ptr = metadata_blocks[0];
+                // Splice the chain root into the parent pointer.
                 if branch.partial_level == 0 {
                     let slot = path.offsets[0] as usize;
                     if slot >= self.raw_block_ptrs.block_ptrs.len() {
-                        return_errno_with_message!(Errno::EIO, "invalid inode block pointer slot");
+                        return_errno_with_message!(
+                            Errno::EIO,
+                            "invalid inode block pointer slot"
+                        );
                     }
                     if self.raw_block_ptrs.block_ptrs[slot] != 0 {
                         return_errno_with_message!(
@@ -701,8 +763,7 @@ impl BlockPtrTree {
                                 "missing parent indirect block for splice",
                             )
                         })?;
-                    let mut indirect_blocks = self.indirect_blocks.lock();
-                    let parent_block = indirect_blocks.find_mut(parent_bid)?;
+                    let parent_block = mgr.find_mut(parent_bid)?;
                     let slot = path.offsets[branch.partial_level] as usize;
                     if parent_block.read_bid(slot)? != 0 {
                         return_errno_with_message!(
@@ -712,25 +773,23 @@ impl BlockPtrTree {
                     }
                     parent_block.write_bid(slot, splice_ptr)?;
                 }
+
+                Ok(())
+            })();
+
+            if let Err(err) = result {
+                // Evict any indirect blocks already inserted into the cache.
+                // remove() is a no-op for non-existent keys, so sweep all.
+                for &bid in indirect_blocks.iter() {
+                    mgr.remove(bid);
+                }
+                // AllocGuard::drop will free the disk blocks.
+                return Err(err);
             }
-
-            Ok(())
-        })();
-
-        if let Err(err) = chain_build_result {
-            Self::rollback_allocated(
-                fs,
-                &self.indirect_blocks,
-                &metadata_blocks,
-                Some(&data_range),
-            );
-            return Err(err);
         }
 
-        // Ext2_splice_branch-style inode accounting and ctime update.
         self.raw_block_ptrs.sector_count = new_block_count;
-
-        Ok(data_range)
+        Ok(())
     }
 
     /// Resolves a logical block to a contiguous physical block range.
@@ -766,7 +825,7 @@ impl BlockPtrTree {
     ///
     pub(super) fn lookup_or_alloc_block_range(
         &mut self,
-        fs: &Ext2,
+        fs: &Arc<Ext2>,
         iblock: u32,
         max_blocks: u32,
         create: bool,
@@ -775,35 +834,31 @@ impl BlockPtrTree {
             return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
         }
 
+        // Convert the logical block into a direct/indirect traversal path.
         let path = self.logical_block_to_path(fs, iblock)?;
         if path.depth == 0 {
             return_errno_with_message!(Errno::EIO, "invalid block path depth");
         }
 
+        // Walk the existing branch until we either reach the target data slot or
+        // stop at the first hole in the pointer chain.
         let branch = self.walk_block_chain(&path, fs)?;
         if branch.partial_level == path.depth {
+            // The full mapping already exists, so only report the contiguous run.
             return self.mapped_range_from_branch(&path, &branch, max_blocks);
         }
         if !create {
             return Ok(None);
         }
 
+        // Allocate the missing indirect metadata blocks, plus as many contiguous
+        // data blocks as we can place into the current leaf run.
         let (indirect_blks, data_blks) = self.blks_to_allocate(&branch, &path, max_blocks)?;
-        let range = self.alloc_and_splice_branch(fs, indirect_blks, data_blks, &path, &branch)?;
-        Ok(Some(range))
-    }
 
-    /// Resolves a logical block to physical, optionally allocating missing branch.
-    ///
-    pub(super) fn lookup_or_alloc_block(
-        &mut self,
-        fs: &Ext2,
-        iblock: u32,
-        create: bool,
-    ) -> Result<Option<Ext2Bid>> {
-        Ok(self
-            .lookup_or_alloc_block_range(fs, iblock, 1, create)?
-            .map(|range| range.start))
+        let mut guard = self.allocate_blocks(fs, indirect_blks, data_blks, &path, &branch)?;
+        self.splice_branch(fs, &guard, &path, &branch)?;
+        guard.commit();
+        Ok(Some(guard.data_blocks.clone()))
     }
 
     /// Truncates all blocks beyond `new_size`.
@@ -844,7 +899,10 @@ impl BlockPtrTree {
                 }
                 fs.free_blocks(ptr, 1)?;
                 self.raw_block_ptrs.block_ptrs[idx] = 0;
-                self.raw_block_ptrs.sector_count = self.raw_block_ptrs.sector_count.saturating_sub(sectors_per_block);
+                self.raw_block_ptrs.sector_count = self
+                    .raw_block_ptrs
+                    .sector_count
+                    .saturating_sub(sectors_per_block);
             }
         } else {
             // === Case 2: Indirect blocks ===
@@ -897,7 +955,7 @@ impl BlockPtrTree {
                     })?;
 
                 let all_zero = {
-                    let mut indirect_blocks = self.indirect_blocks.lock();
+                    let mut indirect_blocks = self.indirect_blocks_manager.lock();
                     let block = indirect_blocks.find(current_bid)?;
                     let keep_entries = path.offsets[partial] as usize;
                     let mut all_zero = true;
@@ -937,7 +995,7 @@ impl BlockPtrTree {
                         Error::with_message(Errno::EIO, "missing parent indirect block")
                     })?;
                 let slot = path.offsets[partial] as usize;
-                let mut indirect_blocks = self.indirect_blocks.lock();
+                let mut indirect_blocks = self.indirect_blocks_manager.lock();
                 let parent_block = indirect_blocks.find_mut(parent_bid)?;
                 detached_nr = parent_block.read_bid(slot)?;
                 parent_block.write_bid(slot, 0)?;
@@ -966,7 +1024,7 @@ impl BlockPtrTree {
                 let start_idx = (path.offsets[level] as usize) + 1;
                 let child_depth = (path.depth - 1 - level) as u32;
                 let child_blocks = {
-                    let mut indirect_blocks = self.indirect_blocks.lock();
+                    let mut indirect_blocks = self.indirect_blocks_manager.lock();
                     let block = indirect_blocks.find_mut(current_bid)?;
                     let mut child_blocks = Vec::new();
                     for idx in start_idx..ptrs_per_block {
@@ -1031,6 +1089,17 @@ mod test {
         },
         prelude::*,
     };
+
+    fn alloc_single_block(
+        tree: &mut BlockPtrTree,
+        fs: &Arc<Ext2>,
+        iblock: u32,
+    ) -> Result<Ext2Bid> {
+        Ok(tree
+            .lookup_or_alloc_block_range(fs, iblock, 1, true)?
+            .unwrap()
+            .start)
+    }
 
     fn make_block_map(block_ptrs: [u32; 15], sector_count: u32, fs: &Arc<Ext2>) -> BlockPtrTree {
         BlockPtrTree::new(
@@ -1121,34 +1190,44 @@ mod test {
         assert_eq!(indirect_first_path.offsets[0], 12);
         assert_eq!(indirect_first_path.offsets[1], 0);
 
-        let indirect_path = block_ptr_tree.logical_block_to_path(ext2, 12 + indirect_index).unwrap();
+        let indirect_path = block_ptr_tree
+            .logical_block_to_path(ext2, 12 + indirect_index)
+            .unwrap();
         assert_eq!(indirect_path.depth, 2);
         assert_eq!(indirect_path.offsets[0], 12);
         assert_eq!(indirect_path.offsets[1], indirect_index);
 
         let indirect_last_iblock = 12 + ptrs - 1;
-        let indirect_last_path = block_ptr_tree.logical_block_to_path(ext2, indirect_last_iblock).unwrap();
+        let indirect_last_path = block_ptr_tree
+            .logical_block_to_path(ext2, indirect_last_iblock)
+            .unwrap();
         assert_eq!(indirect_last_path.depth, 2);
         assert_eq!(indirect_last_path.offsets[0], 12);
         assert_eq!(indirect_last_path.offsets[1], ptrs - 1);
         assert_eq!(indirect_last_path.boundary, 0);
 
         let first_double_iblock = 12 + ptrs;
-        let first_double_path = block_ptr_tree.logical_block_to_path(ext2, first_double_iblock).unwrap();
+        let first_double_path = block_ptr_tree
+            .logical_block_to_path(ext2, first_double_iblock)
+            .unwrap();
         assert_eq!(first_double_path.depth, 3);
         assert_eq!(first_double_path.offsets[0], 13);
         assert_eq!(first_double_path.offsets[1], 0);
         assert_eq!(first_double_path.offsets[2], 0);
 
         let double_iblock = 12 + ptrs + (3 << ptrs_bits) + 4;
-        let double_path = block_ptr_tree.logical_block_to_path(ext2, double_iblock).unwrap();
+        let double_path = block_ptr_tree
+            .logical_block_to_path(ext2, double_iblock)
+            .unwrap();
         assert_eq!(double_path.depth, 3);
         assert_eq!(double_path.offsets[0], 13);
         assert_eq!(double_path.offsets[1], 3);
         assert_eq!(double_path.offsets[2], 4);
 
         let first_triple_iblock = 12 + ptrs + double_blocks;
-        let first_triple_path = block_ptr_tree.logical_block_to_path(ext2, first_triple_iblock).unwrap();
+        let first_triple_path = block_ptr_tree
+            .logical_block_to_path(ext2, first_triple_iblock)
+            .unwrap();
         assert_eq!(first_triple_path.depth, 4);
         assert_eq!(first_triple_path.offsets[0], 14);
         assert_eq!(first_triple_path.offsets[1], 0);
@@ -1157,7 +1236,9 @@ mod test {
 
         let triple_iblock =
             12 + ptrs + double_blocks + (2 << (ptrs_bits * 2)) + (3 << ptrs_bits) + 4;
-        let triple_path = block_ptr_tree.logical_block_to_path(ext2, triple_iblock).unwrap();
+        let triple_path = block_ptr_tree
+            .logical_block_to_path(ext2, triple_iblock)
+            .unwrap();
         assert_eq!(triple_path.depth, 4);
         assert_eq!(triple_path.offsets[0], 14);
         assert_eq!(triple_path.offsets[1], 2);
@@ -1168,7 +1249,9 @@ mod test {
         assert_eq!(block_ptr_tree.lookup_block(ext2, 0).unwrap(), Some(11));
         assert_eq!(block_ptr_tree.lookup_block(ext2, 1).unwrap(), None);
         assert_eq!(
-            block_ptr_tree.lookup_block(ext2, 12 + indirect_index).unwrap(),
+            block_ptr_tree
+                .lookup_block(ext2, 12 + indirect_index)
+                .unwrap(),
             Some(mapped_bid)
         );
         assert_eq!(
@@ -1199,7 +1282,10 @@ mod test {
         block_ptrs[12] = indirect_bid;
         let block_ptr_tree = make_block_map(block_ptrs, 0, &f.ext2);
 
-        assert_eq!(block_ptr_tree.lookup_block_range(ext2, 0, 4).unwrap(), Some(11..14));
+        assert_eq!(
+            block_ptr_tree.lookup_block_range(ext2, 0, 4).unwrap(),
+            Some(11..14)
+        );
         assert_eq!(block_ptr_tree.lookup_block(ext2, 0).unwrap(), Some(11));
         assert_eq!(
             block_ptr_tree.lookup_block_range(ext2, 12, 4).unwrap(),
@@ -1228,9 +1314,13 @@ mod test {
         let block_ptr_tree = make_block_map([0; 15], 0, &f.ext2);
 
         // Accept the maximum valid logical block and reject the next one.
-        block_ptr_tree.logical_block_to_path(ext2, max_iblock as u32).unwrap();
+        block_ptr_tree
+            .logical_block_to_path(ext2, max_iblock as u32)
+            .unwrap();
 
-        let too_big_err = block_ptr_tree.logical_block_to_path(ext2, too_big).unwrap_err();
+        let too_big_err = block_ptr_tree
+            .logical_block_to_path(ext2, too_big)
+            .unwrap_err();
         assert_eq!(too_big_err.error(), Errno::EINVAL);
 
         let get_too_big_err = block_ptr_tree.lookup_block(ext2, too_big).unwrap_err();
@@ -1306,19 +1396,27 @@ mod test {
         let sectors_per_block = (ext2.block_size() / SECTOR_SIZE) as u32;
 
         let mut block_ptr_tree = make_block_map([0u32; 15], 0, &f.ext2);
-        assert_eq!(block_ptr_tree.lookup_or_alloc_block(ext2, 0, false).unwrap(), None);
+        assert_eq!(
+            block_ptr_tree
+                .lookup_or_alloc_block_range(ext2, 0, 1, false)
+                .unwrap(),
+            None
+        );
         assert_eq!(block_ptr_tree.raw_block_ptrs.block_ptrs[0], 0);
 
         let free_before = ext2.super_block().free_blocks_count();
-        let allocated = block_ptr_tree
-            .lookup_or_alloc_block(ext2, 0, true)
-            .unwrap()
-            .unwrap();
+        let allocated = alloc_single_block(&mut block_ptr_tree, ext2, 0).unwrap();
         let free_after = ext2.super_block().free_blocks_count();
 
         assert_eq!(block_ptr_tree.raw_block_ptrs.block_ptrs[0], allocated);
-        assert_eq!(block_ptr_tree.lookup_block(ext2, 0).unwrap(), Some(allocated));
-        assert_eq!(block_ptr_tree.raw_block_ptrs.sector_count, sectors_per_block);
+        assert_eq!(
+            block_ptr_tree.lookup_block(ext2, 0).unwrap(),
+            Some(allocated)
+        );
+        assert_eq!(
+            block_ptr_tree.raw_block_ptrs.sector_count,
+            sectors_per_block
+        );
         assert_eq!(free_before.saturating_sub(free_after), 1);
     }
 
@@ -1340,15 +1438,27 @@ mod test {
         let free_after = ext2.super_block().free_blocks_count();
 
         assert_eq!(allocated_range.end - allocated_range.start, 3);
-        assert_eq!(block_ptr_tree.raw_block_ptrs.block_ptrs[0], allocated_range.start);
-        assert_eq!(block_ptr_tree.raw_block_ptrs.block_ptrs[1], allocated_range.start + 1);
-        assert_eq!(block_ptr_tree.raw_block_ptrs.block_ptrs[2], allocated_range.start + 2);
+        assert_eq!(
+            block_ptr_tree.raw_block_ptrs.block_ptrs[0],
+            allocated_range.start
+        );
+        assert_eq!(
+            block_ptr_tree.raw_block_ptrs.block_ptrs[1],
+            allocated_range.start + 1
+        );
+        assert_eq!(
+            block_ptr_tree.raw_block_ptrs.block_ptrs[2],
+            allocated_range.start + 2
+        );
         assert_eq!(
             block_ptr_tree.lookup_block_range(ext2, 0, 3).unwrap(),
             Some(allocated_range.clone())
         );
         assert_eq!(
-            block_ptr_tree.lookup_or_alloc_block(ext2, 0, true).unwrap(),
+            block_ptr_tree
+                .lookup_or_alloc_block_range(ext2, 0, 1, true)
+                .unwrap()
+                .map(|r| r.start),
             Some(allocated_range.start)
         );
         assert_eq!(
@@ -1369,14 +1479,14 @@ mod test {
 
         let mut block_ptr_tree = make_block_map([0u32; 15], 0, &f.ext2);
         let free_before = ext2.super_block().free_blocks_count();
-        let allocated = block_ptr_tree
-            .lookup_or_alloc_block(ext2, 12, true)
-            .unwrap()
-            .unwrap();
+        let allocated = alloc_single_block(&mut block_ptr_tree, ext2, 12).unwrap();
         let free_after = ext2.super_block().free_blocks_count();
 
         assert_ne!(block_ptr_tree.raw_block_ptrs.block_ptrs[12], 0);
-        assert_eq!(block_ptr_tree.lookup_block(ext2, 12).unwrap(), Some(allocated));
+        assert_eq!(
+            block_ptr_tree.lookup_block(ext2, 12).unwrap(),
+            Some(allocated)
+        );
         assert_eq!(
             block_ptr_tree.raw_block_ptrs.sector_count,
             sectors_per_block.saturating_mul(2)
@@ -1428,7 +1538,9 @@ mod test {
         let ext2 = &f.ext2;
 
         let mut block_ptr_tree = make_block_map([0u32; 15], 0, &f.ext2);
-        let err = block_ptr_tree.lookup_or_alloc_block(ext2, 0, true).unwrap_err();
+        let err = block_ptr_tree
+            .lookup_or_alloc_block_range(ext2, 0, 1, true)
+            .unwrap_err();
         assert_eq!(err.error(), Errno::ENOSPC);
         assert_eq!(block_ptr_tree.raw_block_ptrs.block_ptrs, [0u32; 15]);
         assert_eq!(block_ptr_tree.raw_block_ptrs.sector_count, 0);
@@ -1473,13 +1585,13 @@ mod test {
         let first_double_iblock = 12 + ptrs;
         let mut block_ptr_tree = make_block_map([0u32; 15], 0, &f.ext2);
 
-        let allocated_data = block_ptr_tree
-            .lookup_or_alloc_block(ext2, first_double_iblock, true)
-            .unwrap()
-            .unwrap();
+        let allocated_data =
+            alloc_single_block(&mut block_ptr_tree, ext2, first_double_iblock).unwrap();
         assert_ne!(block_ptr_tree.raw_block_ptrs.block_ptrs[13], 0);
         assert_eq!(
-            block_ptr_tree.lookup_block(ext2, first_double_iblock).unwrap(),
+            block_ptr_tree
+                .lookup_block(ext2, first_double_iblock)
+                .unwrap(),
             Some(allocated_data)
         );
 
@@ -1505,15 +1617,9 @@ mod test {
         let first_double_iblock = 12 + ptrs;
 
         let mut block_ptr_tree = make_block_map([0u32; 15], 0, &f.ext2);
-        block_ptr_tree
-            .lookup_or_alloc_block(ext2, first_double_iblock, true)
-            .unwrap();
-        block_ptr_tree
-            .lookup_or_alloc_block(ext2, first_double_iblock + 1, true)
-            .unwrap();
-        block_ptr_tree
-            .lookup_or_alloc_block(ext2, first_double_iblock + 2, true)
-            .unwrap();
+        alloc_single_block(&mut block_ptr_tree, ext2, first_double_iblock).unwrap();
+        alloc_single_block(&mut block_ptr_tree, ext2, first_double_iblock + 1).unwrap();
+        alloc_single_block(&mut block_ptr_tree, ext2, first_double_iblock + 2).unwrap();
 
         block_ptr_tree
             .truncate_blocks(ext2, (first_double_iblock as usize + 1) * block_size)
@@ -1525,11 +1631,15 @@ mod test {
                 .is_some()
         );
         assert_eq!(
-            block_ptr_tree.lookup_block(ext2, first_double_iblock + 1).unwrap(),
+            block_ptr_tree
+                .lookup_block(ext2, first_double_iblock + 1)
+                .unwrap(),
             None
         );
         assert_eq!(
-            block_ptr_tree.lookup_block(ext2, first_double_iblock + 2).unwrap(),
+            block_ptr_tree
+                .lookup_block(ext2, first_double_iblock + 2)
+                .unwrap(),
             None
         );
     }
@@ -1547,13 +1657,9 @@ mod test {
         let first_triple_iblock = 12 + ptrs + (1u32 << (ptrs.trailing_zeros() * 2));
 
         let mut block_ptr_tree = make_block_map([0u32; 15], 0, &f.ext2);
-        block_ptr_tree.lookup_or_alloc_block(ext2, 12, true).unwrap();
-        block_ptr_tree
-            .lookup_or_alloc_block(ext2, first_double_iblock, true)
-            .unwrap();
-        block_ptr_tree
-            .lookup_or_alloc_block(ext2, first_triple_iblock, true)
-            .unwrap();
+        alloc_single_block(&mut block_ptr_tree, ext2, 12).unwrap();
+        alloc_single_block(&mut block_ptr_tree, ext2, first_double_iblock).unwrap();
+        alloc_single_block(&mut block_ptr_tree, ext2, first_triple_iblock).unwrap();
         assert_ne!(block_ptr_tree.raw_block_ptrs.block_ptrs[12], 0);
         assert_ne!(block_ptr_tree.raw_block_ptrs.block_ptrs[13], 0);
         assert_ne!(block_ptr_tree.raw_block_ptrs.block_ptrs[14], 0);
@@ -1564,11 +1670,15 @@ mod test {
         assert_eq!(block_ptr_tree.raw_block_ptrs.block_ptrs[14], 0);
         assert_eq!(block_ptr_tree.lookup_block(ext2, 12).unwrap(), None);
         assert_eq!(
-            block_ptr_tree.lookup_block(ext2, first_double_iblock).unwrap(),
+            block_ptr_tree
+                .lookup_block(ext2, first_double_iblock)
+                .unwrap(),
             None
         );
         assert_eq!(
-            block_ptr_tree.lookup_block(ext2, first_triple_iblock).unwrap(),
+            block_ptr_tree
+                .lookup_block(ext2, first_triple_iblock)
+                .unwrap(),
             None
         );
         assert_eq!(block_ptr_tree.raw_block_ptrs.sector_count, 0);
@@ -1587,9 +1697,7 @@ mod test {
         let first_triple_iblock = 12 + ptrs + (1u32 << (ptrs.trailing_zeros() * 2));
 
         let mut block_ptr_tree = make_block_map([0u32; 15], 0, &f.ext2);
-        block_ptr_tree
-            .lookup_or_alloc_block(ext2, first_triple_iblock, true)
-            .unwrap();
+        alloc_single_block(&mut block_ptr_tree, ext2, first_triple_iblock).unwrap();
         let root = block_ptr_tree.raw_block_ptrs.block_ptrs[14];
         assert_ne!(root, 0);
         assert_eq!(

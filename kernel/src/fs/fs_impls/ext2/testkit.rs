@@ -515,7 +515,11 @@ pub(super) fn write_block_bitmap(
     mark_block(sb.group_descriptors_bid(0));
     mark_block(desc.block_bitmap);
     mark_block(desc.inode_bitmap);
-    for block in desc.inode_table..desc.inode_table.saturating_add(sb.inode_table_blocks_per_group()) {
+    for block in desc.inode_table
+        ..desc
+            .inode_table
+            .saturating_add(sb.inode_table_blocks_per_group())
+    {
         mark_block(block);
     }
 

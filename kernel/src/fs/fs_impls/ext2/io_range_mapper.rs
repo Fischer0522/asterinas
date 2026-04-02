@@ -7,8 +7,8 @@ use core::ops::Range;
 use ostd::sync::RwMutexReadGuard;
 
 use super::{
+    block_ptr_tree::{BlockPtrTree, Ext2Bid},
     fs::Ext2,
-    block_ptr_tree::{Ext2Bid, BlockPtrTree},
     prelude::*,
 };
 

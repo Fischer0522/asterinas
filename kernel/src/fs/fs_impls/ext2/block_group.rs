@@ -8,9 +8,9 @@ use aster_block::bio::BioCompleteFn;
 use ostd::const_assert;
 
 use super::{
+    block_ptr_tree::Ext2Bid,
     fs::Ext2,
     inode::{Inode, InodeDesc, RawInode},
-    block_ptr_tree::Ext2Bid,
     prelude::*,
     super_block::SuperBlock,
 };
@@ -657,8 +657,10 @@ impl BlockGroup {
 
             // Persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
 
-            metadata.desc.free_blocks_count =
-                metadata.desc.free_blocks_count.saturating_sub(alloc_len as u16);
+            metadata.desc.free_blocks_count = metadata
+                .desc
+                .free_blocks_count
+                .saturating_sub(alloc_len as u16);
 
             drop(metadata);
 
@@ -712,8 +714,10 @@ impl BlockGroup {
 
         // Persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
 
-        metadata.desc.free_blocks_count =
-            metadata.desc.free_blocks_count.saturating_add(actually_freed as u16);
+        metadata.desc.free_blocks_count = metadata
+            .desc
+            .free_blocks_count
+            .saturating_add(actually_freed as u16);
 
         Ok(actually_freed)
     }

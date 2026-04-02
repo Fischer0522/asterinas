@@ -12,8 +12,8 @@ use device_id::DeviceId;
 
 use super::{
     block_group::{BlockGroup, RawGroupDesc},
-    inode::{FilePerm, Inode, InodeDesc, RawInode},
     block_ptr_tree::Ext2Bid,
+    inode::{FilePerm, Inode, InodeDesc, RawInode},
     prelude::*,
     super_block::{RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
     utils::{Dirty, now},

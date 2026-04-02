@@ -12,9 +12,9 @@ use device_id::DeviceId;
 use ostd::{const_assert, mm::io::util::HasVmReaderWriter};
 
 use super::{
+    block_ptr_tree::{BlockPtrTree, Ext2Bid, RawBlockPtrs},
     dir::{DirBlock, DirEntryHeader},
     fs::Ext2,
-    block_ptr_tree::{RawBlockPtrs, Ext2Bid, BlockPtrTree},
     io_range_mapper::{IoRange, IoRangeMapper},
     prelude::*,
     utils::now,
@@ -234,23 +234,22 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
+        let inner = self.inner.upread();
+        // Keep resize invalid for existing fast symlinks (inline payload), but
+        // allow empty newly-created symlink inodes to grow into slow symlinks.
+        if inner.desc.is_fast_symlink(block_size) && inner.file_size() != 0 {
+            return_errno!(Errno::EINVAL);
+        }
 
-            let inner = self.inner.upread();
-            // Keep resize invalid for existing fast symlinks (inline payload), but
-            // allow empty newly-created symlink inodes to grow into slow symlinks.
-            if inner.desc.is_fast_symlink(block_size) && inner.file_size() != 0 {
-                return_errno!(Errno::EINVAL);
-            }
+        if inner
+            .desc
+            .flags
+            .intersects(FileFlags::APPEND_ONLY | FileFlags::IMMUTABLE)
+        {
+            return_errno!(Errno::EPERM);
+        }
 
-            if inner
-                .desc
-                .flags
-                .intersects(FileFlags::APPEND_ONLY | FileFlags::IMMUTABLE)
-            {
-                return_errno!(Errno::EPERM);
-            }
-
-            let old_size = inner.file_size();
+        let old_size = inner.file_size();
 
         if new_size == old_size {
             return Ok(());
@@ -754,18 +753,17 @@ impl Inode {
 
         // Fsync step 2: flush inode-local indirect metadata before
         // persisting inode-table state.
-        block_map_backend.block_ptr_tree.write().sync_indirect_blocks()?;
+        block_map_backend
+            .block_ptr_tree
+            .write()
+            .sync_indirect_blocks()?;
 
         // Fsync step 3: persist inode metadata. The caller is
         // responsible for the final device-cache flush.
 
         let mut inner = inner.upgrade();
 
-        inner.sync_metadata(
-            self.ino,
-            self.block_group_idx,
-            sync_inode_table,
-        )
+        inner.sync_metadata(self.ino, self.block_group_idx, sync_inode_table)
     }
 
     /// Persists inode metadata without flushing the device write cache.
@@ -1050,12 +1048,7 @@ impl Inode {
         );
     }
 
-    fn do_rename_attempt(
-        &self,
-        target: &Inode,
-        old_name: &str,
-        new_name: &str,
-    ) -> Result<bool> {
+    fn do_rename_attempt(&self, target: &Inode, old_name: &str, new_name: &str) -> Result<bool> {
         // Step 1: read the current source/target snapshot without write locks.
         let ctx = self.prepare_rename_context(target, old_name, new_name)?;
 
@@ -1680,12 +1673,7 @@ impl InodeInner {
 
     /// Reads file data directly from data blocks into `writer`.
     ///
-    fn read_direct_at(
-        &self,
-        offset: usize,
-        end: usize,
-        writer: &mut VmWriter,
-    ) -> Result<()> {
+    fn read_direct_at(&self, offset: usize, end: usize, writer: &mut VmWriter) -> Result<()> {
         let fs = self.fs_arc()?;
         let block_size = fs.block_size();
         let block_ptr_tree = self.backend.block_ptr_tree.read();
@@ -1866,11 +1854,7 @@ impl InodeInner {
 
     /// Reads directory entries starting at byte offset and feeds visitor.
     ///
-    fn readdir_at(
-        &self,
-        offset: usize,
-        visitor: &mut dyn DirentVisitor,
-    ) -> Result<usize> {
+    fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize> {
         if self.inode_type() != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
@@ -1979,11 +1963,7 @@ impl InodeInner {
     // 2. Zero the partial head and tail for the current write.
     // 3. Allocate new blocks for the write range.
     // 4. Fill zeros for newly exposed partial ranges.
-    fn prepare_write(
-        &mut self,
-        offset: usize,
-        end: usize,
-    ) -> Result<()> {
+    fn prepare_write(&mut self, offset: usize, end: usize) -> Result<()> {
         let fs = self.fs_arc()?;
         let block_size = fs.block_size();
         if block_size == 0 {
@@ -2026,12 +2006,7 @@ impl InodeInner {
     // Conditionally fill zeros for:
     // 1. The partial start block when it is a hole.
     // 2. The partial end block when it is a hole.
-    fn zero_partial_writes(
-        &mut self,
-        start: usize,
-        end: usize,
-        block_size: usize,
-    ) -> Result<()> {
+    fn zero_partial_writes(&mut self, start: usize, end: usize, block_size: usize) -> Result<()> {
         let fs = self.fs_arc()?;
         let start_iblock = (start / block_size) as u32;
         let end_iblock = (end / block_size) as u32;
@@ -2041,12 +2016,16 @@ impl InodeInner {
 
         let block_ptr_tree = self.backend().block_ptr_tree.read();
 
-        if !start.is_multiple_of(block_size) && block_ptr_tree.lookup_block(&fs, start_iblock)?.is_none() {
+        if !start.is_multiple_of(block_size)
+            && block_ptr_tree.lookup_block(&fs, start_iblock)?.is_none()
+        {
             let new_start_block = start.align_down(block_size);
             self.page_cache().fill_zeros(new_start_block..start)?;
         }
 
-        if !end.is_multiple_of(block_size) && block_ptr_tree.lookup_block(&fs, end_iblock)?.is_none() {
+        if !end.is_multiple_of(block_size)
+            && block_ptr_tree.lookup_block(&fs, end_iblock)?.is_none()
+        {
             let new_end_block = end.align_up(block_size);
             self.page_cache().fill_zeros(end..new_end_block)?;
         }
@@ -2086,7 +2065,9 @@ impl InodeInner {
                         Error::with_message(Errno::EINVAL, "logical block range overflow")
                     })?;
 
-                    if let Some(mapped_range) = block_ptr_tree.lookup_block_range(&fs, iblock, remaining)? {
+                    if let Some(mapped_range) =
+                        block_ptr_tree.lookup_block_range(&fs, iblock, remaining)?
+                    {
                         current_block +=
                             mapped_range.end.saturating_sub(mapped_range.start) as usize;
                         continue;
@@ -2335,12 +2316,7 @@ impl InodeInner {
 
     /// Rewrites a located entry's inode/type.
     ///
-    fn set_link(
-        &self,
-        target: &DirEntryTarget,
-        new_ino: u32,
-        ft: DirEntryFileType,
-    ) -> Result<()> {
+    fn set_link(&self, target: &DirEntryTarget, new_ino: u32, ft: DirEntryFileType) -> Result<()> {
         let fs = self.fs_arc()?;
         let block_size = fs.block_size();
         let block_base = (target.dir_offset / block_size) * block_size;
@@ -2629,7 +2605,7 @@ pub(super) struct RawInode {
     pub mtime: u32,        // i_mtime
     pub dtime: u32,        // i_dtime
     pub gid: u16,          // i_gid (low 16 bits)
-    pub link_count: u16,  // i_link_count
+    pub link_count: u16,   // i_link_count
     pub sector_count: u32, // i_blocks (512-byte sectors)
     pub flags: u32,        // i_flags
     pub osd1: u32,         // osd1.linux1.l_i_reserved1

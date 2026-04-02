@@ -44,13 +44,13 @@ pub(super) fn init() {
     registry::register(&Ext2Type).unwrap();
 }
 mod block_group;
+mod block_ptr_tree;
 mod dir;
 mod fs;
 mod fs_type;
 mod impl_for_vfs;
 mod indirect_block_manager;
 mod inode;
-mod block_ptr_tree;
 mod io_range_mapper;
 mod prelude;
 mod super_block;
