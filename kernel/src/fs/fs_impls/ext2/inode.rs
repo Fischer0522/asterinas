@@ -595,7 +595,6 @@ impl Inode {
         let discard_end = end.min(old_size);
         if discard_start < discard_end {
             inner.page_cache().flush_range(discard_start..discard_end)?;
-
             inner.page_cache().evict_range(discard_start..discard_end)?;
         }
 
@@ -1721,7 +1720,11 @@ impl InodeInner {
                     fs.write_blocks(m.device_block_range.start, segment)?;
                 }
                 IoRange::Hole(_) => {
+                    // TODO: Should we align with Linux?
                     // The upper layer should have performed allocation for the write range.
+                    // Linux doesn;t allocate block in direct write paht, when encountering a hole here, 
+                    // it will fallback to buffer write to prevent stale read, but since we use an Inode 
+                    // level lock, the read will be serilized after this write, it's safe here.
                     return_errno_with_message!(Errno::EIO, "unexpected hole in direct write path");
                 }
             }
