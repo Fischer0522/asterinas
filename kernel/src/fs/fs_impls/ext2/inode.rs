@@ -62,6 +62,7 @@ impl FilePerm {
 pub struct Inode {
     ino: u32,
     type_: InodeType,
+    block_size: usize,
     inner: RwMutex<InodeInner>,
     block_group_idx: usize,
     fs: Weak<Ext2>,
@@ -70,7 +71,6 @@ pub struct Inode {
 }
 
 struct RenameContext<'a> {
-    fs: &'a Arc<Ext2>,
     source_dir: &'a Inode,
     target_dir: &'a Inode,
     old_name: &'a str,
@@ -132,12 +132,18 @@ impl Inode {
         block_group_idx: usize,
         fs: Weak<Ext2>,
     ) -> Arc<Self> {
+        let block_size = fs
+            .upgrade()
+            .expect("filesystem must be alive during inode creation")
+            .block_size();
+
         // Use `new_cyclic` so `InodeInner` can keep a weak self pointer for
         // inode-internal workflows that need to upgrade to `Arc<Inode>`.
 
         Arc::new_cyclic(|weak_self: &Weak<Self>| Self {
             ino,
             type_,
+            block_size,
             block_group_idx,
 
             xattr: match type_ {
@@ -164,6 +170,10 @@ impl Inode {
 
     pub(super) fn block_group_idx(&self) -> usize {
         self.block_group_idx
+    }
+
+    pub(super) fn block_size(&self) -> usize {
+        self.block_size
     }
 
     pub(super) fn link_count(&self) -> u16 {
@@ -220,11 +230,7 @@ impl Inode {
     }
 
     pub(super) fn resize(&self, new_size: usize) -> Result<()> {
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
-        if block_size == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
-        }
+        let block_size = self.block_size;
         if self.type_ != InodeType::File
             && self.type_ != InodeType::Dir
             && self.type_ != InodeType::SymLink
@@ -232,8 +238,8 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        let old_size = {
-            let inner = self.inner.read();
+
+            let mut inner = self.inner.upread();
             // Keep resize invalid for existing fast symlinks (inline payload), but
             // allow empty newly-created symlink inodes to grow into slow symlinks.
             if inner.desc.is_fast_symlink(block_size) && inner.file_size() != 0 {
@@ -248,14 +254,13 @@ impl Inode {
                 return_errno!(Errno::EPERM);
             }
 
-            inner.file_size()
-        };
+            let old_size = inner.file_size();
 
         if new_size == old_size {
             return Ok(());
         }
 
-        let mut inner = self.inner.write();
+        let mut inner = inner.upgrade();
         if new_size < old_size {
             inner.shrink(new_size)?;
         } else {
@@ -271,9 +276,9 @@ impl Inode {
         let backend = inner.backend();
         let block_ptr_tree = backend.block_ptr_tree.read();
 
-        let (container_dev_id, optimal_block_size) = match self.fs.upgrade() {
-            Some(fs) => (fs.block_device().id(), fs.block_size()),
-            None => (DeviceId::null(), BLOCK_SIZE),
+        let container_dev_id = match self.fs.upgrade() {
+            Some(fs) => fs.block_device().id(),
+            None => DeviceId::null(),
         };
         let self_dev_id =
             if self.type_ == InodeType::CharDevice || self.type_ == InodeType::BlockDevice {
@@ -285,7 +290,7 @@ impl Inode {
         Metadata {
             ino: self.ino as u64,
             size: inner.file_size(),
-            optimal_block_size,
+            optimal_block_size: self.block_size,
             nr_sectors_allocated: block_ptr_tree.raw_block_ptrs.sector_count as usize,
             last_access_at: inner.atime(),
             last_modify_at: inner.mtime(),
@@ -447,12 +452,6 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
-        if block_size == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
-        }
-
         let inner = self.inner.read();
         inner.read_link()
     }
@@ -464,18 +463,12 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
-        if block_size == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
-        }
-
         let target_len = target.len();
         let with_nul = target_len.checked_add(1).ok_or_else(|| {
             Error::with_message(Errno::ENAMETOOLONG, "symlink target length overflow")
         })?;
 
-        if with_nul > block_size {
+        if with_nul > self.block_size {
             return_errno!(Errno::ENAMETOOLONG);
         }
         let mut inner = self.inner.write();
@@ -515,12 +508,6 @@ impl Inode {
             return Ok(0);
         }
 
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
-        if block_size == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
-        }
-
         let end = offset
             .checked_add(write_len)
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
@@ -529,13 +516,13 @@ impl Inode {
         let old_size = inner.file_size();
 
         // Zero the partial blocks and allocate new blocks
-        if let Err(err) = inner.prepare_write(&fs, offset, end, block_size) {
-            inner.rollback_write(fs.as_ref(), old_size, end);
+        if let Err(err) = inner.prepare_write(offset, end) {
+            inner.rollback_write(old_size, end);
             return Err(err);
         }
 
         if let Err(err) = inner.page_cache().write(offset, reader) {
-            inner.rollback_write(fs.as_ref(), old_size, end);
+            inner.rollback_write(old_size, end);
             return Err(err);
         }
 
@@ -554,11 +541,7 @@ impl Inode {
             return_errno!(Errno::EISDIR);
         }
 
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
-        if block_size == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
-        }
+        let block_size = self.block_size;
         if !offset.is_multiple_of(block_size) || !writer.avail().is_multiple_of(block_size) {
             return_errno_with_message!(Errno::EINVAL, "not block-aligned");
         }
@@ -578,7 +561,7 @@ impl Inode {
 
         // Flush the dirty pages in the read range to make sure the read data is up to date.
         inner.page_cache().flush_range(offset..end)?;
-        inner.read_direct_at(&fs, offset, end, writer)?;
+        inner.read_direct_at(offset, end, writer)?;
         inner.upgrade().set_atime(now());
         Ok(read_len)
     }
@@ -590,11 +573,7 @@ impl Inode {
             return_errno!(Errno::EISDIR);
         }
 
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
-        if block_size == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
-        }
+        let block_size = self.block_size;
         if !offset.is_multiple_of(block_size) || !reader.remain().is_multiple_of(block_size) {
             return_errno_with_message!(Errno::EINVAL, "not block-aligned");
         }
@@ -611,8 +590,8 @@ impl Inode {
 
         // Preallocate direct-write blocks up front so the data path does not
         // need to fall back when it encounters a hole.
-        if let Err(err) = inner.prepare_write(&fs, offset, end, block_size) {
-            inner.rollback_write(fs.as_ref(), old_size, end);
+        if let Err(err) = inner.prepare_write(offset, end) {
+            inner.rollback_write(old_size, end);
             return Err(err);
         }
 
@@ -625,8 +604,8 @@ impl Inode {
             inner.page_cache().evict_range(discard_start..discard_end)?;
         }
 
-        if let Err(err) = inner.write_direct_at(&fs, offset, reader) {
-            inner.rollback_write(fs.as_ref(), old_size, end);
+        if let Err(err) = inner.write_direct_at(offset, reader) {
+            inner.rollback_write(old_size, end);
             return Err(err);
         }
 
@@ -643,9 +622,9 @@ impl Inode {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let fs = self.fs()?;
         let inner = self.inner.read();
-        let ino = inner.find_entry(&fs, name)?;
+        let ino = inner.find_entry(name)?;
+        let fs = self.fs()?;
         fs.read_inode(ino)
     }
 
@@ -658,9 +637,8 @@ impl Inode {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let fs = self.fs()?;
         let inner = self.inner.read();
-        inner.readdir_at(&fs, offset, visitor)
+        inner.readdir_at(offset, visitor)
     }
 
     pub(super) fn rmdir(&self, name: &str) -> Result<()> {
@@ -672,19 +650,19 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs()?;
         const RMDIR_RETRY_LIMIT: usize = 8;
         for _ in 0..RMDIR_RETRY_LIMIT {
             let child_ino = {
                 let parent_inner = self.inner.read();
-                parent_inner.find_entry(&fs, name)?
+                parent_inner.find_entry(name)?
             };
+            let fs = self.fs()?;
             let child = fs.read_inode(child_ino)?;
             let lock_targets = [self, child.as_ref()];
             let mut guards = MultiInodeInnerGuards::lock(&lock_targets);
 
             let parent_inner = guards.inner(self.ino())?;
-            let rechecked_child_ino = parent_inner.find_entry(&fs, name)?;
+            let rechecked_child_ino = parent_inner.find_entry(name)?;
             if rechecked_child_ino != child_ino {
                 continue;
             }
@@ -693,7 +671,7 @@ impl Inode {
             if child_inner.inode_type() != InodeType::Dir {
                 return_errno!(Errno::ENOTDIR);
             }
-            if !child_inner.empty_dir(&fs, child.ino()) {
+            if !child_inner.empty_dir(child.ino())? {
                 return_errno!(Errno::ENOTEMPTY);
             }
 
@@ -701,14 +679,14 @@ impl Inode {
             child_inner.sub_link_count_saturating(2);
 
             if child_inner.link_count() == 0 {
-                child_inner.persist(child_ino, &fs)?;
+                child_inner.persist(child_ino)?;
                 let _ = fs.remove_inode_cache(child_ino);
             }
 
             let parent_inner = guards.inner_mut(self.ino())?;
 
-            let target_entry = parent_inner.find_entry_target(&fs, name)?;
-            parent_inner.delete_entry(&fs, &target_entry)?;
+            let target_entry = parent_inner.find_entry_target(name)?;
+            parent_inner.delete_entry(&target_entry)?;
             parent_inner.sub_link_count_saturating(1);
             parent_inner.touch_mtime_ctime(now());
 
@@ -729,37 +707,32 @@ impl Inode {
                     return Ok(());
                 }
 
-                let fs = self.fs()?;
-                let block_size = fs.block_size();
-                if block_size == 0 {
-                    return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
-                }
-
                 let end = offset.checked_add(len).ok_or_else(|| {
                     Error::with_message(Errno::EINVAL, "fallocate range overflow")
                 })?;
                 let mut inner = self.inner.write();
                 let old_size = inner.file_size();
                 if end > old_size {
-                    inner.ensure_size_within_limit(&fs, end)?;
+                    inner.ensure_size_within_limit(end)?;
                 }
 
-                let new_blocks = match inner.allocate_range_blocks(&fs, offset, end, block_size) {
+                let block_size = self.block_size;
+                let new_blocks = match inner.allocate_range_blocks(offset, end, block_size) {
                     Ok(new_blocks) => new_blocks,
                     Err(err) => {
-                        inner.rollback_write(&fs, old_size, end);
+                        inner.rollback_write(old_size, end);
                         return Err(err);
                     }
                 };
 
-                if let Err(err) = inner.zero_new_blocks(&fs, &new_blocks, block_size) {
-                    inner.rollback_write(&fs, old_size, end);
+                if let Err(err) = inner.zero_new_blocks(&new_blocks) {
+                    inner.rollback_write(old_size, end);
                     return Err(err);
                 }
 
                 if end > old_size {
                     if let Err(err) = inner.expand(end) {
-                        inner.rollback_write(&fs, old_size, end);
+                        inner.rollback_write(old_size, end);
                         return Err(err);
                     }
                 }
@@ -790,12 +763,10 @@ impl Inode {
         // SPEC: fsync step 3 persists inode metadata. The caller is
         // responsible for the final device-cache flush.
 
-        let fs = self.fs()?;
         let mut inner = inner.upgrade();
 
         inner.sync_metadata(
             self.ino,
-            fs.as_ref(),
             self.block_group_idx,
             sync_inode_table,
         )
@@ -804,18 +775,18 @@ impl Inode {
     /// Persists inode metadata without flushing the device write cache.
     ///
     pub(super) fn sync_metadata(&self, sync_inode_table: bool) -> Result<()> {
-        let fs = self.fs()?;
         let mut inner = self.inner.write();
-        inner.sync_metadata(self.ino, &fs, self.block_group_idx, sync_inode_table)?;
+        inner.sync_metadata(self.ino, self.block_group_idx, sync_inode_table)?;
         Ok(())
     }
 
     /// Attempts final reclaim for a deleted inode.
-    pub(super) fn try_reclaim_deleted_inode(&self, fs: &Ext2) -> Result<bool> {
+    pub(super) fn try_reclaim_deleted_inode(&self) -> Result<bool> {
         if self.link_count() != 0 {
             return Ok(false);
         }
 
+        let fs = self.fs()?;
         let group = fs.block_group(self.block_group_idx);
         let inode_idx = {
             let inodes_per_group = fs.super_block().inodes_per_group();
@@ -831,7 +802,6 @@ impl Inode {
             xattr.write().delete_xattr_block()?;
         }
 
-        let fs = self.fs()?;
         let mut inner = self.inner.write();
         let old_size = inner.file_size();
         inner.resize_page_cache_and_update_npages(0, old_size)?;
@@ -844,15 +814,13 @@ impl Inode {
             block_ptr_tree.truncate_blocks(&fs, 0)?;
             inner.sync_desc_block_map_from_snapshot(*block_ptr_tree.raw_block_ptrs());
         }
-        inner.persist(self.ino, &fs)?;
+        inner.persist(self.ino)?;
 
         fs.free_inode(self.ino, self.type_ == InodeType::Dir)?;
         Ok(true)
     }
 
     pub(super) fn sync_data(&self) -> Result<()> {
-        let fs = self.fs()?;
-
         let inner = self.inner.upread();
         let backend = inner.backend();
 
@@ -868,7 +836,7 @@ impl Inode {
         // `fdatasync` does not miss file-size or block-mapping updates.
         let mut inner = inner.upgrade();
         if inner.is_dirty() {
-            inner.persist(self.ino, &fs)?;
+            inner.persist(self.ino)?;
         }
         Ok(())
     }
@@ -902,26 +870,26 @@ impl Inode {
         }
 
         let is_dir = type_ == InodeType::Dir;
-        let fs = self.fs()?;
         let dir_ft = DirEntryFileType::from(type_);
 
         // Scan for a slot before creating the child inode to avoid wasting
         // an inode allocation when the name already exists (EEXIST).
         let mut parent_inner = self.inner.write();
-        let slot = match parent_inner.scan_dir_for_slot(&fs, name)? {
+        let slot = match parent_inner.scan_dir_for_slot(name)? {
             Some(slot) => slot,
-            None => parent_inner.grow_dir_block(&fs)?,
+            None => parent_inner.grow_dir_block()?,
         };
 
+        let fs = self.fs()?;
         let child = fs.create_inode(self.ino, type_, perm)?;
         let child_ino = child.ino();
 
         if is_dir {
             let mut child_inner = child.inner.write();
-            child_inner.make_empty(child_ino, self.ino, &fs)?;
+            child_inner.make_empty(child_ino, self.ino)?;
         }
 
-        parent_inner.add_entry(&fs, &slot, name, child_ino, dir_ft)?;
+        parent_inner.add_entry(&slot, name, child_ino, dir_ft)?;
 
         // Link the child dir's `..` to parent dir.
         if is_dir {
@@ -967,11 +935,11 @@ impl Inode {
         old_inner.add_link_count_saturating(1);
 
         let add_result = (|| -> Result<()> {
-            let slot = match dir_inner.scan_dir_for_slot(&fs, name)? {
+            let slot = match dir_inner.scan_dir_for_slot(name)? {
                 Some(slot) => slot,
-                None => dir_inner.grow_dir_block(&fs)?,
+                None => dir_inner.grow_dir_block()?,
             };
-            dir_inner.add_entry(&fs, &slot, name, old.ino, dir_ft)?;
+            dir_inner.add_entry(&slot, name, old.ino, dir_ft)?;
             dir_inner.touch_mtime_ctime(now());
             Ok(())
         })();
@@ -996,19 +964,19 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs()?;
         const UNLINK_RETRY_LIMIT: usize = 8;
         for _ in 0..UNLINK_RETRY_LIMIT {
             let child_ino = {
                 let parent_inner = self.inner.read();
-                parent_inner.find_entry(&fs, name)?
+                parent_inner.find_entry(name)?
             };
+            let fs = self.fs()?;
             let child = fs.read_inode(child_ino)?;
             let lock_targets = [self, child.as_ref()];
             let mut guards = MultiInodeInnerGuards::lock(&lock_targets);
 
             let parent_inner = guards.inner(self.ino())?;
-            let rechecked_child_ino = parent_inner.find_entry(&fs, name)?;
+            let rechecked_child_ino = parent_inner.find_entry(name)?;
             if rechecked_child_ino != child_ino {
                 continue;
             }
@@ -1020,8 +988,8 @@ impl Inode {
 
             let parent_inner = guards.inner_mut(self.ino())?;
 
-            let target_entry = parent_inner.find_entry_target(&fs, name)?;
-            parent_inner.delete_entry(&fs, &target_entry)?;
+            let target_entry = parent_inner.find_entry_target(name)?;
+            parent_inner.delete_entry(&target_entry)?;
 
             // Update timestamps before dropping the target link count.
             let child_inner = guards.inner_mut(child.ino())?;
@@ -1029,7 +997,7 @@ impl Inode {
             child_inner.sub_link_count_saturating(1);
 
             if child_inner.link_count() == 0 {
-                child_inner.persist(child_ino, &fs)?;
+                child_inner.persist(child_ino)?;
                 let _ = fs.remove_inode_cache(child_ino);
             }
             return Ok(());
@@ -1075,7 +1043,7 @@ impl Inode {
         for _ in 0..RENAME_RETRY_LIMIT {
             // Snapshot-then-lock can race with concurrent directory updates.
             // Retry when post-lock recheck detects stale snapshot state.
-            if self.do_rename_attempt(target, old_name, new_name, &fs)? {
+            if self.do_rename_attempt(target, old_name, new_name)? {
                 return Ok(());
             }
         }
@@ -1091,10 +1059,9 @@ impl Inode {
         target: &Inode,
         old_name: &str,
         new_name: &str,
-        fs: &Arc<Ext2>,
     ) -> Result<bool> {
         // Step 1: read the current source/target snapshot without write locks.
-        let ctx = self.prepare_rename_context(target, old_name, new_name, fs)?;
+        let ctx = self.prepare_rename_context(target, old_name, new_name)?;
 
         // Step 2: lock all participating inode inner domains in global inode-number order.
         let lock_targets = self.rename_lock_targets(&ctx);
@@ -1112,7 +1079,8 @@ impl Inode {
         if let Some(existing) = ctx.existing_inode.as_ref() {
             let mut inner = existing.inner.write();
             if inner.link_count() == 0 {
-                inner.persist(existing.ino(), fs)?;
+                inner.persist(existing.ino())?;
+                let fs = self.fs()?;
                 let _ = fs.remove_inode_cache(existing.ino());
             }
         }
@@ -1124,16 +1092,16 @@ impl Inode {
         target: &'a Inode,
         old_name: &'a str,
         new_name: &'a str,
-        fs: &'a Arc<Ext2>,
     ) -> Result<RenameContext<'a>> {
         let old_ino = {
             let source_inner = self.inner.read();
-            source_inner.find_entry(fs, old_name)?
+            source_inner.find_entry(old_name)?
         };
+        let fs = self.fs()?;
         let old_inode = fs.read_inode(old_ino)?;
         let existing_ino = {
             let target_inner = target.inner.read();
-            target_inner.find_entry(fs, new_name).ok()
+            target_inner.find_entry(new_name).ok()
         };
         let existing_inode = if let Some(ino) = existing_ino {
             Some(fs.read_inode(ino)?)
@@ -1144,7 +1112,6 @@ impl Inode {
         let old_is_dir = old_inode.type_ == InodeType::Dir;
         let moved_ft = DirEntryFileType::from(old_inode.type_);
         Ok(RenameContext {
-            fs,
             source_dir: self,
             target_dir: target,
             old_name,
@@ -1182,14 +1149,14 @@ impl Inode {
         guards: &MultiInodeInnerGuards<'_>,
     ) -> Result<bool> {
         let source_inner = guards.inner(ctx.source_dir.ino)?;
-        let rechecked_old_ino = source_inner.find_entry(ctx.fs, ctx.old_name)?;
+        let rechecked_old_ino = source_inner.find_entry(ctx.old_name)?;
         if rechecked_old_ino != ctx.old_ino {
             // Source entry changed after snapshot; caller should retry.
             return Ok(false);
         }
 
         let target_inner = guards.inner(ctx.target_dir.ino)?;
-        let rechecked_existing_ino = target_inner.find_entry(ctx.fs, ctx.new_name).ok();
+        let rechecked_existing_ino = target_inner.find_entry(ctx.new_name).ok();
         if rechecked_existing_ino != ctx.existing_ino {
             // Destination state changed after snapshot; caller should retry.
             return Ok(false);
@@ -1197,7 +1164,7 @@ impl Inode {
 
         if ctx.old_is_dir {
             let old_inner = guards.inner(ctx.old_inode.ino())?;
-            let dotdot_ino = old_inner.find_entry(ctx.fs, "..")?;
+            let dotdot_ino = old_inner.find_entry("..")?;
             if dotdot_ino != ctx.source_dir.ino {
                 return_errno_with_message!(Errno::EIO, "failed to update dotdot entry");
             }
@@ -1224,7 +1191,7 @@ impl Inode {
         }
         if existing_is_dir {
             let existing_inner = guards.inner(existing.ino())?;
-            if !existing_inner.empty_dir(ctx.fs, existing.ino()) {
+            if !existing_inner.empty_dir(existing.ino())? {
                 return_errno!(Errno::ENOTEMPTY);
             }
         }
@@ -1240,16 +1207,14 @@ impl Inode {
             // Same directory: replace/add target name then delete old name in one directory lock.
             let dir_inner = guards.inner_mut(ctx.source_dir.ino)?;
             Self::apply_rename_target_locked(
-                ctx.target_dir,
                 dir_inner,
-                ctx.fs,
                 ctx.new_name,
                 ctx.old_ino,
                 ctx.moved_ft,
                 ctx.existing_inode.is_some(),
             )?;
-            let old_target = dir_inner.find_entry_target(ctx.fs, ctx.old_name)?;
-            dir_inner.delete_entry(ctx.fs, &old_target)?;
+            let old_target = dir_inner.find_entry_target(ctx.old_name)?;
+            dir_inner.delete_entry(&old_target)?;
             if ctx.old_is_dir {
                 if ctx.existing_inode.is_none() {
                     dir_inner.add_link_count_saturating(1);
@@ -1262,9 +1227,7 @@ impl Inode {
             {
                 let target_inner = guards.inner_mut(ctx.target_dir.ino)?;
                 Self::apply_rename_target_locked(
-                    ctx.target_dir,
                     target_inner,
-                    ctx.fs,
                     ctx.new_name,
                     ctx.old_ino,
                     ctx.moved_ft,
@@ -1277,8 +1240,8 @@ impl Inode {
             }
             {
                 let source_inner = guards.inner_mut(ctx.source_dir.ino)?;
-                let source_de = source_inner.find_entry_target(ctx.fs, ctx.old_name)?;
-                source_inner.delete_entry(ctx.fs, &source_de)?;
+                let source_de = source_inner.find_entry_target(ctx.old_name)?;
+                source_inner.delete_entry(&source_de)?;
                 if ctx.old_is_dir {
                     source_inner.sub_link_count_saturating(1);
                 }
@@ -1299,17 +1262,15 @@ impl Inode {
         let old_inner = guards.inner_mut(ctx.old_inode.ino())?;
         old_inner.set_ctime(now());
         if ctx.old_is_dir && !ctx.is_same_dir() {
-            let dotdot = old_inner.find_entry_target(ctx.fs, "..")?;
-            old_inner.set_link(ctx.fs, &dotdot, ctx.target_dir.ino, DirEntryFileType::Dir)?;
+            let dotdot = old_inner.find_entry_target("..")?;
+            old_inner.set_link(&dotdot, ctx.target_dir.ino, DirEntryFileType::Dir)?;
             old_inner.remove_flags(FileFlags::INDEX_DIR);
         }
         Ok(())
     }
 
     fn apply_rename_target_locked(
-        _target: &Inode,
         target_inner: &mut InodeInner,
-        fs: &Arc<Ext2>,
         new_name: &str,
         old_ino: u32,
         moved_ft: DirEntryFileType,
@@ -1317,17 +1278,17 @@ impl Inode {
     ) -> Result<()> {
         if has_existing {
             // Existing destination entry: ext2_set_link semantics.
-            let target_de = target_inner.find_entry_target(fs, new_name)?;
-            target_inner.set_link(fs, &target_de, old_ino, moved_ft)?;
+            let target_de = target_inner.find_entry_target(new_name)?;
+            target_inner.set_link(&target_de, old_ino, moved_ft)?;
             return Ok(());
         }
 
         // No destination entry: ext2_add_link semantics.
-        let slot = match target_inner.scan_dir_for_slot(fs, new_name)? {
+        let slot = match target_inner.scan_dir_for_slot(new_name)? {
             Some(slot) => slot,
-            None => target_inner.grow_dir_block(fs)?,
+            None => target_inner.grow_dir_block()?,
         };
-        target_inner.add_entry(fs, &slot, new_name, old_ino, moved_ft)?;
+        target_inner.add_entry(&slot, new_name, old_ino, moved_ft)?;
         Ok(())
     }
 
@@ -1357,11 +1318,7 @@ pub(super) struct InodeBackend {
 
 impl Drop for Inode {
     fn drop(&mut self) {
-        let Some(fs) = self.fs.upgrade() else {
-            return;
-        };
-
-        if let Err(err) = self.try_reclaim_deleted_inode(fs.as_ref()) {
+        if let Err(err) = self.try_reclaim_deleted_inode() {
             debug!(
                 "ext2: failed to reclaim deleted inode {} during drop: {:?}",
                 self.ino, err
@@ -1631,16 +1588,16 @@ impl InodeInner {
     }
 
     /// Returns the maximum on-disk size supported for this inode.
-    fn max_size(&self, fs: &Ext2) -> usize {
+    fn max_size(&self) -> Result<usize> {
         match self.inode_type() {
-            InodeType::File => fs.max_file_size(),
-            _ => u32::MAX as usize,
+            InodeType::File => Ok(self.fs_arc()?.max_file_size()),
+            _ => Ok(u32::MAX as usize),
         }
     }
 
     /// Rejects growth beyond the ext2-representable size limit before mutating state.
-    fn ensure_size_within_limit(&self, fs: &Ext2, new_size: usize) -> Result<()> {
-        if new_size > self.max_size(fs) {
+    fn ensure_size_within_limit(&self, new_size: usize) -> Result<()> {
+        if new_size > self.max_size()? {
             return_errno_with_message!(Errno::EFBIG, "inode size exceeds ext2 maximum");
         }
 
@@ -1656,7 +1613,8 @@ impl InodeInner {
         Ok(())
     }
 
-    fn persist(&mut self, ino: u32, fs: &Ext2) -> Result<()> {
+    fn persist(&mut self, ino: u32) -> Result<()> {
+        let fs = self.fs_arc()?;
         let raw = RawInode::from(&*self.desc);
         fs.write_inode_desc(ino, &raw)?;
         self.clear_dirty();
@@ -1666,12 +1624,12 @@ impl InodeInner {
     fn sync_metadata(
         &mut self,
         ino: u32,
-        fs: &Ext2,
         block_group_idx: usize,
         sync_inode_table: bool,
     ) -> Result<()> {
-        self.persist(ino, fs)?;
+        self.persist(ino)?;
         if sync_inode_table {
+            let fs = self.fs_arc()?;
             let block_group = fs.block_group(block_group_idx);
             block_group.sync_inode_table()?;
         }
@@ -1680,7 +1638,8 @@ impl InodeInner {
 
     /// Initializes an empty directory with `.` and `..` entries.
     ///
-    fn make_empty(&mut self, ino: u32, parent_ino: u32, fs: &Ext2) -> Result<()> {
+    fn make_empty(&mut self, ino: u32, parent_ino: u32) -> Result<()> {
+        let fs = self.fs_arc()?;
         let block_size = fs.block_size();
 
         {
@@ -1691,7 +1650,7 @@ impl InodeInner {
         }
 
         // Allocate one block for the directory.
-        self.prepare_write(fs, 0, block_size, block_size)?;
+        self.prepare_write(0, block_size)?;
 
         let block = DirBlock::new(self.page_cache(), 0, block_size);
         let dot_len = DirEntryHeader::dir_rec_len(1) as usize;
@@ -1714,7 +1673,7 @@ impl InodeInner {
         })();
 
         if let Err(err) = write_result {
-            self.rollback_write(fs, 0, block_size);
+            self.rollback_write(0, block_size);
             return Err(err);
         }
 
@@ -1727,18 +1686,18 @@ impl InodeInner {
     ///
     fn read_direct_at(
         &self,
-        fs: &Ext2,
         offset: usize,
         end: usize,
         writer: &mut VmWriter,
     ) -> Result<()> {
+        let fs = self.fs_arc()?;
         let block_size = fs.block_size();
         let block_ptr_tree = self.backend.block_ptr_tree.read();
 
         let mut range_mapper = IoRangeMapper::new(
             (offset / block_size) as u32..(end.div_ceil(block_size)) as u32,
             block_ptr_tree,
-            fs,
+            &fs,
         );
         while let Some(range) = range_mapper.next()? {
             match range {
@@ -1761,7 +1720,8 @@ impl InodeInner {
 
     /// Writes file data directly to already-allocated data blocks.
     ///
-    fn write_direct_at(&self, fs: &Ext2, offset: usize, reader: &mut VmReader) -> Result<()> {
+    fn write_direct_at(&self, offset: usize, reader: &mut VmReader) -> Result<()> {
+        let fs = self.fs_arc()?;
         let block_size = fs.block_size();
         let write_len = reader.remain();
         debug_assert_eq!(write_len % block_size, 0);
@@ -1772,7 +1732,7 @@ impl InodeInner {
         let mut range_mapper = IoRangeMapper::new(
             (offset / block_size) as u32..(end.div_ceil(block_size)) as u32,
             block_ptr_tree,
-            fs,
+            &fs,
         );
         while let Some(range) = range_mapper.next()? {
             match range {
@@ -1794,11 +1754,12 @@ impl InodeInner {
 
     /// Checks whether this directory contains only `.` and `..` as live entries.
     ///
-    fn empty_dir(&self, fs: &Ext2, self_ino: u32) -> bool {
+    fn empty_dir(&self, self_ino: u32) -> Result<bool> {
         if self.inode_type() != InodeType::Dir {
-            return false;
+            return Ok(false);
         }
 
+        let fs = self.fs_arc()?;
         let block_size = fs.block_size();
         let file_size = self.file_size();
         let data_blocks = file_size.div_ceil(block_size);
@@ -1812,7 +1773,7 @@ impl InodeInner {
                 let (_entry_offset, entry) = match iter.next_entry(block_offset) {
                     Ok(Some(pair)) => pair,
                     Ok(None) => break,
-                    Err(_) => return false,
+                    Err(_) => return Ok(false),
                 };
 
                 if entry.header.inode == 0 {
@@ -1822,27 +1783,28 @@ impl InodeInner {
                 let name = entry.name.as_bytes();
                 if name == b"." {
                     if u32::from_le(entry.header.inode) != self_ino {
-                        return false;
+                        return Ok(false);
                     }
                     continue;
                 }
                 if name == b".." {
                     continue;
                 }
-                return false;
+                return Ok(false);
             }
         }
 
-        true
+        Ok(true)
     }
 
     /// Finds a directory entry by name and returns its inode number.
     ///
-    fn find_entry(&self, fs: &Ext2, name: &str) -> Result<u32> {
+    fn find_entry(&self, name: &str) -> Result<u32> {
         if self.inode_type() != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
 
+        let fs = self.fs_arc()?;
         let block_size = fs.block_size();
         let file_size = self.file_size();
         let name_bytes = name.as_bytes();
@@ -1896,7 +1858,7 @@ impl InodeInner {
         if new_size <= old_size {
             return Ok(());
         }
-        self.ensure_size_within_limit(&fs, new_size)?;
+        self.ensure_size_within_limit(new_size)?;
         self.resize_page_cache_and_update_npages(new_size, old_size)?;
 
         // Zero the partial tail of the old EOF block and the new EOF block.
@@ -1910,7 +1872,6 @@ impl InodeInner {
     ///
     fn readdir_at(
         &self,
-        fs: &Ext2,
         offset: usize,
         visitor: &mut dyn DirentVisitor,
     ) -> Result<usize> {
@@ -1924,6 +1885,7 @@ impl InodeInner {
             return Ok(0);
         }
 
+        let fs = self.fs_arc()?;
         let block_size = fs.block_size();
 
         let start_block = offset / block_size;
@@ -1985,10 +1947,8 @@ impl InodeInner {
             // Fast path.
             self.desc.block_ptrs.as_mut_bytes()[..target_len].copy_from_slice(target.as_bytes());
         } else {
-            let fs = self.fs_arc()?;
-            let block_size = fs.block_size();
             // Slow path: write through the page cache.
-            self.prepare_write(&fs, 0, target_len, block_size)?;
+            self.prepare_write(0, target_len)?;
             self.page_cache().write_bytes(0, target.as_bytes())?;
         }
 
@@ -2025,17 +1985,17 @@ impl InodeInner {
     // 4. Fill zeros for newly exposed partial ranges.
     fn prepare_write(
         &mut self,
-        fs: &Ext2,
         offset: usize,
         end: usize,
-        block_size: usize,
     ) -> Result<()> {
+        let fs = self.fs_arc()?;
+        let block_size = fs.block_size();
         if block_size == 0 {
             return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
         }
         let old_size = self.file_size();
         if end > old_size {
-            self.ensure_size_within_limit(fs, end)?;
+            self.ensure_size_within_limit(end)?;
             self.resize_page_cache_and_update_npages(end, old_size)?;
         }
 
@@ -2049,8 +2009,8 @@ impl InodeInner {
         }
 
         // Treat the write end as the new partial EOF boundary.
-        self.zero_partial_writes(fs, offset, end, block_size)?;
-        self.allocate_range_blocks(fs, offset, end, block_size)?;
+        self.zero_partial_writes(offset, end, block_size)?;
+        self.allocate_range_blocks(offset, end, block_size)?;
         Ok(())
     }
     // NOTE: Make sure the page cache is already resized before calling this function.
@@ -2072,11 +2032,11 @@ impl InodeInner {
     // 2. The partial end block when it is a hole.
     fn zero_partial_writes(
         &mut self,
-        fs: &Ext2,
         start: usize,
         end: usize,
         block_size: usize,
     ) -> Result<()> {
+        let fs = self.fs_arc()?;
         let start_iblock = (start / block_size) as u32;
         let end_iblock = (end / block_size) as u32;
 
@@ -2085,12 +2045,12 @@ impl InodeInner {
 
         let block_ptr_tree = self.backend().block_ptr_tree.read();
 
-        if !start.is_multiple_of(block_size) && block_ptr_tree.lookup_block(fs, start_iblock)?.is_none() {
+        if !start.is_multiple_of(block_size) && block_ptr_tree.lookup_block(&fs, start_iblock)?.is_none() {
             let new_start_block = start.align_down(block_size);
             self.page_cache().fill_zeros(new_start_block..start)?;
         }
 
-        if !end.is_multiple_of(block_size) && block_ptr_tree.lookup_block(fs, end_iblock)?.is_none() {
+        if !end.is_multiple_of(block_size) && block_ptr_tree.lookup_block(&fs, end_iblock)?.is_none() {
             let new_end_block = end.align_up(block_size);
             self.page_cache().fill_zeros(end..new_end_block)?;
         }
@@ -2101,7 +2061,6 @@ impl InodeInner {
     ///
     fn allocate_range_blocks(
         &mut self,
-        fs: &Ext2,
         offset: usize,
         end: usize,
         block_size: usize,
@@ -2113,6 +2072,7 @@ impl InodeInner {
             return Ok(Vec::new());
         }
 
+        let fs = self.fs_arc()?;
         let start_block = offset / block_size;
         let end_block = end.div_ceil(block_size);
 
@@ -2130,13 +2090,13 @@ impl InodeInner {
                         Error::with_message(Errno::EINVAL, "logical block range overflow")
                     })?;
 
-                    if let Some(mapped_range) = block_ptr_tree.lookup_block_range(fs, iblock, remaining)? {
+                    if let Some(mapped_range) = block_ptr_tree.lookup_block_range(&fs, iblock, remaining)? {
                         current_block +=
                             mapped_range.end.saturating_sub(mapped_range.start) as usize;
                         continue;
                     }
                     let allocated_range = block_ptr_tree
-                        .lookup_or_alloc_block_range(fs, iblock, remaining, true)?
+                        .lookup_or_alloc_block_range(&fs, iblock, remaining, true)?
                         .ok_or_else(|| {
                             Error::with_message(
                                 Errno::EIO,
@@ -2160,14 +2120,13 @@ impl InodeInner {
     // TODO: Maybe zeroing only the page cache is sufficient here.
     /// Zeroes newly allocated data blocks before exposing them via mapped reads.
     ///
-    fn zero_new_blocks(&self, fs: &Ext2, blocks: &[Ext2Bid], block_size: usize) -> Result<()> {
+    fn zero_new_blocks(&self, blocks: &[Ext2Bid]) -> Result<()> {
         if blocks.is_empty() {
             return Ok(());
         }
-        if block_size == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
-        }
 
+        let fs = self.fs_arc()?;
+        let block_size = fs.block_size();
         let zero_block = vec![0u8; block_size];
         for &bid in blocks {
             let bio_segment = BioSegment::alloc(1, BioDirection::ToDevice);
@@ -2186,7 +2145,7 @@ impl InodeInner {
     }
 
     // Truncate page cache and blocks after a failed write.
-    fn rollback_write(&mut self, fs: &Ext2, old_size: usize, end: usize) {
+    fn rollback_write(&mut self, old_size: usize, end: usize) {
         if end <= old_size {
             return;
         }
@@ -2197,9 +2156,13 @@ impl InodeInner {
             );
         }
 
+        let Ok(fs) = self.fs_arc() else {
+            error!("ext2: rollback_write: filesystem already dropped");
+            return;
+        };
         let backend = self.backend().clone();
         let mut block_ptr_tree = backend.block_ptr_tree.write();
-        if let Err(err) = block_ptr_tree.truncate_blocks(fs, old_size) {
+        if let Err(err) = block_ptr_tree.truncate_blocks(&fs, old_size) {
             error!(
                 "ext2: write_at cleanup truncate_blocks failed: old_size={}, err={:?}",
                 old_size, err
@@ -2211,7 +2174,7 @@ impl InodeInner {
 
     /// Scans directory blocks for a reusable slot or a duplicate entry.
     ///
-    fn scan_dir_for_slot(&self, fs: &Ext2, name: &str) -> Result<Option<DirSlotInfo>> {
+    fn scan_dir_for_slot(&self, name: &str) -> Result<Option<DirSlotInfo>> {
         if self.inode_type() != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
@@ -2221,6 +2184,7 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
+        let fs = self.fs_arc()?;
         let block_size = fs.block_size();
         let reclen = DirEntryHeader::dir_rec_len(name_bytes.len()) as usize;
         if reclen > block_size {
@@ -2268,11 +2232,12 @@ impl InodeInner {
 
     /// Grows the directory by one data block.
     ///
-    fn grow_dir_block(&mut self, fs: &Ext2) -> Result<DirSlotInfo> {
+    fn grow_dir_block(&mut self) -> Result<DirSlotInfo> {
+        let fs = self.fs_arc()?;
         let block_size = fs.block_size();
         let old_size = self.file_size();
 
-        self.prepare_write(fs, old_size, old_size + block_size, block_size)?;
+        self.prepare_write(old_size, old_size + block_size)?;
         let new_size = old_size.saturating_add(block_size);
         self.set_file_size(new_size);
 
@@ -2287,12 +2252,12 @@ impl InodeInner {
     ///
     fn add_entry(
         &self,
-        fs: &Ext2,
         slot: &DirSlotInfo,
         name: &str,
         ino: u32,
         ft: DirEntryFileType,
     ) -> Result<()> {
+        let fs = self.fs_arc()?;
         let max_inumber = fs.super_block().total_inodes();
         if ino == 0 || ino > max_inumber {
             return_errno!(Errno::EINVAL);
@@ -2330,7 +2295,8 @@ impl InodeInner {
 
     /// Locate a target entry by name for delete/set_link operations.
     ///
-    fn find_entry_target(&self, fs: &Ext2, name: &str) -> Result<DirEntryTarget> {
+    fn find_entry_target(&self, name: &str) -> Result<DirEntryTarget> {
+        let fs = self.fs_arc()?;
         let block_size = fs.block_size();
         let file_size = self.file_size();
         let name_bytes = name.as_bytes();
@@ -2358,7 +2324,8 @@ impl InodeInner {
 
     /// Deletes a located entry by zeroing inode and merging rec_len.
     ///
-    fn delete_entry(&self, fs: &Ext2, target: &DirEntryTarget) -> Result<()> {
+    fn delete_entry(&self, target: &DirEntryTarget) -> Result<()> {
+        let fs = self.fs_arc()?;
         let block_size = fs.block_size();
         let block_base = (target.dir_offset / block_size) * block_size;
         let block_idx = block_base / block_size;
@@ -2374,11 +2341,11 @@ impl InodeInner {
     ///
     fn set_link(
         &self,
-        fs: &Ext2,
         target: &DirEntryTarget,
         new_ino: u32,
         ft: DirEntryFileType,
     ) -> Result<()> {
+        let fs = self.fs_arc()?;
         let block_size = fs.block_size();
         let block_base = (target.dir_offset / block_size) * block_size;
         let block_idx = block_base / block_size;
