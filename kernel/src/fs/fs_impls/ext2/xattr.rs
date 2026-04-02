@@ -4,7 +4,7 @@
 
 use core::{cmp::Ordering, mem::size_of};
 
-use super::{fs::Ext2, inode::Inode, inode_block_map::Ext2Bid, prelude::*};
+use super::{fs::Ext2, inode::Inode, block_ptr_tree::Ext2Bid, prelude::*};
 use crate::fs::vfs::xattr::{XattrName, XattrNamespace, XattrSetFlags};
 
 pub(super) const XATTR_NBLOCKS: usize = 1;

@@ -10,7 +10,7 @@ use ostd::const_assert;
 use super::{
     fs::Ext2,
     inode::{Inode, InodeDesc, RawInode},
-    inode_block_map::Ext2Bid,
+    block_ptr_tree::Ext2Bid,
     prelude::*,
     super_block::SuperBlock,
 };

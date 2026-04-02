@@ -14,7 +14,7 @@ use ostd::{const_assert, mm::io::util::HasVmReaderWriter};
 use super::{
     dir::{DirBlock, DirEntryHeader},
     fs::Ext2,
-    inode_block_map::{RawBlockPtrs, Ext2Bid, BlockPtrTree},
+    block_ptr_tree::{RawBlockPtrs, Ext2Bid, BlockPtrTree},
     io_range_mapper::{IoRange, IoRangeMapper},
     prelude::*,
     utils::now,

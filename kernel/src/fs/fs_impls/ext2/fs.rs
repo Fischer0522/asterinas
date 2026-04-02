@@ -13,7 +13,7 @@ use device_id::DeviceId;
 use super::{
     block_group::{BlockGroup, RawGroupDesc},
     inode::{FilePerm, Inode, InodeDesc, RawInode},
-    inode_block_map::Ext2Bid,
+    block_ptr_tree::Ext2Bid,
     prelude::*,
     super_block::{RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
     utils::{Dirty, now},

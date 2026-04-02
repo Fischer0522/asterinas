@@ -50,7 +50,7 @@ mod fs_type;
 mod impl_for_vfs;
 mod indirect_block_manager;
 mod inode;
-mod inode_block_map;
+mod block_ptr_tree;
 mod io_range_mapper;
 mod prelude;
 mod super_block;

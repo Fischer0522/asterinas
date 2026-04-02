@@ -8,7 +8,7 @@ use ostd::sync::RwMutexReadGuard;
 
 use super::{
     fs::Ext2,
-    inode_block_map::{Ext2Bid, BlockPtrTree},
+    block_ptr_tree::{Ext2Bid, BlockPtrTree},
     prelude::*,
 };
 
@@ -105,7 +105,7 @@ mod test {
 
     use super::*;
     use crate::{
-        fs::fs_impls::ext2::{inode_block_map::RawBlockPtrs, testkit::Ext2FixtureBuilder},
+        fs::fs_impls::ext2::{block_ptr_tree::RawBlockPtrs, testkit::Ext2FixtureBuilder},
         prelude::*,
         time::clocks,
     };

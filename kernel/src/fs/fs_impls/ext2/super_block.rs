@@ -4,7 +4,7 @@ use core::mem::size_of;
 
 use ostd::const_assert;
 
-use super::{block_group::RawGroupDesc, inode_block_map::Ext2Bid, prelude::*};
+use super::{block_group::RawGroupDesc, block_ptr_tree::Ext2Bid, prelude::*};
 
 /// The magic number of Ext2.
 pub const MAGIC_NUM: u16 = 0xef53;
