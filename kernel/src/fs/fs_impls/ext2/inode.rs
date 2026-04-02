@@ -925,24 +925,17 @@ impl Inode {
         if old_inner.link_count() >= MAX_LINK_COUNT {
             return_errno!(Errno::EOVERFLOW);
         }
+
+
+        let slot = match dir_inner.scan_dir_for_slot(name)? {
+            Some(slot) => slot,
+            None => dir_inner.grow_dir_block()?,
+        };
+        dir_inner.add_entry(&slot, name, old.ino, dir_ft)?;
+        dir_inner.touch_mtime_ctime(now());
+
         old_inner.set_ctime(now());
         old_inner.add_link_count_saturating(1);
-
-        let add_result = (|| -> Result<()> {
-            let slot = match dir_inner.scan_dir_for_slot(name)? {
-                Some(slot) => slot,
-                None => dir_inner.grow_dir_block()?,
-            };
-            dir_inner.add_entry(&slot, name, old.ino, dir_ft)?;
-            dir_inner.touch_mtime_ctime(now());
-            Ok(())
-        })();
-
-        if let Err(err) = add_result {
-            // Rollback link count on add_entry failure.
-            old_inner.sub_link_count_saturating(1);
-            return Err(err);
-        }
         Ok(())
     }
 

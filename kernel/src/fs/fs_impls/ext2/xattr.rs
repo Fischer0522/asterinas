@@ -531,7 +531,7 @@ impl Xattr {
         Ok(())
     }
 
-    fn alloc_bid_if_needed(&mut self) -> Result<()> {
+    fn alloc_bid_if_need(&mut self) -> Result<()> {
         if self.bid != 0 {
             return Ok(());
         }
@@ -621,7 +621,7 @@ impl Xattr {
 
         let working_block = Self::build_block(&entries, block_size)?;
         // TODO: Add rollback if block allocation succeeds but the writeback fails.
-        self.alloc_bid_if_needed()?;
+        self.alloc_bid_if_need()?;
         self.write_working_block(&working_block, block_size)?;
         self.dirty = true;
         self.flush()
