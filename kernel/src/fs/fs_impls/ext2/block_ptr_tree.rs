@@ -84,11 +84,11 @@ impl RawBlockPtrs {
     pub(super) fn decode_device_id(&self) -> u64 {
         let (major, minor) = if self.block_ptrs[0] != 0 {
             let val = self.block_ptrs[0];
-            // SPEC: old_decode_dev((major << 8) | minor) with 8-bit major/minor.
+            // Old_decode_dev: (major << 8) | minor with 8-bit major/minor.
             (((val >> 8) & 0xFF), (val & 0xFF))
         } else {
             let dev = self.block_ptrs[1];
-            // SPEC: decode the extended major/minor bit layout.
+            // Decode the extended major/minor bit layout.
             (
                 ((dev & 0xFFF00) >> 8),
                 ((dev & 0xFF) | ((dev >> 12) & 0xFFF00)),
@@ -102,7 +102,7 @@ impl RawBlockPtrs {
     pub(super) fn encode_device_id(&mut self, device_id: u64) {
         let (major, minor) = decode_device_numbers(device_id);
 
-        // SPEC: old_valid_dev => MAJOR/MINOR must both fit in 8 bits.
+        // Old_valid_dev: MAJOR/MINOR must both fit in 8 bits.
         if major < 256 && minor < 256 {
             self.block_ptrs[0] = (major << 8) | minor;
             self.block_ptrs[1] = 0;
@@ -224,7 +224,7 @@ impl BlockPtrTree {
             bh: None,
         });
         if top_key == 0 {
-            // SPEC: zero pointer means the chain is broken at level 0.
+            // Zero pointer means the chain is broken at level 0.
             return Ok(BranchChainWalkResult {
                 partial_level: 0,
                 chain,
@@ -249,7 +249,7 @@ impl BlockPtrTree {
                 bh: Some(parent_key),
             });
             if next_key == 0 {
-                // SPEC: include the zero-key entry and report break level.
+                // Include the zero-key entry and report break level.
                 return Ok(BranchChainWalkResult {
                     partial_level: level,
                     chain,
@@ -500,7 +500,7 @@ impl BlockPtrTree {
 
         if depth == 0 {
             if let Err(err) = fs.free_blocks(block_nr, 1) {
-                // SPEC: best-effort free path logs errors and proceeds.
+                // Best-effort free path logs errors and proceeds.
                 error!(
                     "ext2: free_branches: failed to free data block {}: {:?}",
                     block_nr, err
@@ -727,7 +727,7 @@ impl BlockPtrTree {
             return Err(err);
         }
 
-        // SPEC: ext2_splice_branch-style inode accounting and ctime update.
+        // Ext2_splice_branch-style inode accounting and ctime update.
         self.raw_block_ptrs.sector_count = new_block_count;
 
         Ok(data_range)
@@ -818,7 +818,7 @@ impl BlockPtrTree {
             return_errno_with_message!(Errno::EIO, "invalid sector accounting for block size");
         }
 
-        // SPEC: first logical block to free = ceil(new_size / block_size).
+        // First logical block to free = ceil(new_size / block_size).
         let iblock = u32::try_from(new_size.div_ceil(block_size))
             .map_err(|_| Error::with_message(Errno::EINVAL, "truncate size exceeds ext2 limits"))?;
 
@@ -850,7 +850,7 @@ impl BlockPtrTree {
             // === Case 2: Indirect blocks ===
 
             // --- Step 1: Adjust depth for boundary case ---
-            // SPEC: ext2_find_shared-style partial branch handling.
+            // Ext2_find_shared-style partial branch handling.
             // If truncation point is at the start of an indirect block (offset = 0),
             // we can handle it at a higher level without reading that indirect block.
             let mut k = path.depth;
@@ -880,7 +880,7 @@ impl BlockPtrTree {
             };
 
             // --- Step 3: all_zeroes optimization ---
-            // SPEC: walk upward to the highest indirect block that can be fully
+            // Walk upward to the highest indirect block that can be fully
             // detached when the preserved left side is all zeros.
             // If the left side (to be kept) of an indirect block is all zeros,
             // we can free the entire indirect block and handle it at a higher level.
@@ -945,13 +945,13 @@ impl BlockPtrTree {
 
             // Recursively free the detached subtree.
             if detached_nr != 0 {
-                // SPEC: free detached subtree root.
+                // Free detached subtree root.
                 let subtree_depth = (path.depth - 1 - partial) as u32;
                 self.free_branches(fs, detached_nr, subtree_depth);
             }
 
             // --- Step 5: Clear right side of partially shared indirect blocks ---
-            // SPEC: clear right side of each partially shared indirect block.
+            // Clear right side of each partially shared indirect block.
             // For each level from partial down to 1, free all pointers to the right
             // of offsets[level].
             for level in (1..=partial).rev() {

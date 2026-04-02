@@ -181,7 +181,7 @@ impl BlockGroup {
         let inodes_per_group = sb.inodes_per_group();
         let inode_size = sb.inode_size();
 
-        // SPEC: load and validate bitmaps once during mount, keep them cached in memory.
+        // Load and validate bitmaps once during mount, keep them cached in memory.
         let block_bitmap = Self::load_block_bitmap(
             block_device.as_ref(),
             first_block,
@@ -430,7 +430,7 @@ impl BlockGroup {
 
     fn sync_bitmaps(&self) -> Result<()> {
         let (block_bitmap_bid, inode_bitmap_bid) = {
-            // SPEC: read descriptor block addresses before bitmap locks to keep lock ordering.
+            // Read descriptor block addresses before bitmap locks to keep lock ordering.
             let desc = self.desc.read();
             (desc.block_bitmap, desc.inode_bitmap)
         };
@@ -446,7 +446,7 @@ impl BlockGroup {
                     )
                     .is_err()
                 {
-                    // SPEC: keep dirty bit set on writeback failure for retry.
+                    // Keep dirty bit set on writeback failure for retry.
                     return_errno_with_message!(Errno::EIO, "failed to write block bitmap");
                 }
                 block_bitmap.clear_dirty();
@@ -464,7 +464,7 @@ impl BlockGroup {
                     )
                     .is_err()
                 {
-                    // SPEC: keep dirty bit set on writeback failure for retry.
+                    // Keep dirty bit set on writeback failure for retry.
                     return_errno_with_message!(Errno::EIO, "failed to write inode bitmap");
                 }
                 inode_bitmap.clear_dirty();
@@ -656,7 +656,7 @@ impl BlockGroup {
 
             drop(bitmap);
 
-            // SPEC: persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
+            // Persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
 
             self.dec_free_blocks(alloc_len as u16);
 
@@ -704,7 +704,7 @@ impl BlockGroup {
 
         drop(bitmap);
 
-        // SPEC: persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
+        // Persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
 
         self.inc_free_blocks(actually_freed as u16);
         Ok(actually_freed)
@@ -722,7 +722,7 @@ impl BlockGroup {
         };
         drop(bitmap);
 
-        // SPEC: persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
+        // Persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
 
         Ok(Some(inode_idx))
     }
@@ -742,7 +742,7 @@ impl BlockGroup {
         bitmap.free(bit);
         drop(bitmap);
 
-        // SPEC: persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
+        // Persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
 
         Ok(true)
     }

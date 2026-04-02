@@ -255,7 +255,7 @@ impl Ext2 {
         block_groups: &[BlockGroup],
         ino: u32,
     ) -> Result<InodeDesc> {
-        // SPEC: apply ext2 inode-number validity rules before indexing groups.
+        // Apply ext2 inode-number validity rules before indexing groups.
         if (ino != ROOT_INO && ino < sb.first_ino()) || ino > sb.total_inodes() {
             return_errno_with_message!(Errno::EINVAL, "inode number out of valid range");
         }
@@ -275,7 +275,7 @@ impl Ext2 {
     pub(super) fn write_inode_desc(&self, ino: u32, raw: &RawInode) -> Result<()> {
         let sb = self.super_block.read();
 
-        // SPEC: apply ext2 inode-number validity rules before indexing groups.
+        // Apply ext2 inode-number validity rules before indexing groups.
         if (ino != ROOT_INO && ino < sb.first_ino()) || ino > sb.total_inodes() {
             return_errno_with_message!(Errno::EINVAL, "inode number out of valid range");
         }
@@ -619,7 +619,7 @@ impl Ext2 {
         }
 
         let ino = self.alloc_inode(parent_ino, inode_type)?;
-        // SPEC: initialize a valid on-disk inode before publishing it.
+        // Initialize a valid on-disk inode before publishing it.
         let mode = (inode_type as u16) | (perm.bits() & 0o07777);
         let link_count = if inode_type.is_directory() { 2 } else { 1 };
         let (uid, gid) = if let Some(thread) = Thread::current() {
@@ -668,7 +668,7 @@ impl Ext2 {
         };
 
         if let Err(err) = self.write_inode_desc(ino, &raw) {
-            // SPEC: cleanup inode allocation if descriptor initialization failed.
+            // Cleanup inode allocation if descriptor initialization failed.
             let _ = self.free_inode(ino, inode_type.is_directory());
             return Err(err);
         }

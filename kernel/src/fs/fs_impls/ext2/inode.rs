@@ -172,10 +172,6 @@ impl Inode {
         self.block_group_idx
     }
 
-    pub(super) fn block_size(&self) -> usize {
-        self.block_size
-    }
-
     pub(super) fn link_count(&self) -> u16 {
         self.inner.read().link_count()
     }
@@ -201,12 +197,12 @@ impl Inode {
     /// Returns the encoded device ID for special files.
     ///
     pub(super) fn device_id(&self) -> u64 {
-        // SPEC: non-device inodes report rdev = 0.
+        // Non-device inodes report rdev = 0.
         if self.type_ != InodeType::CharDevice && self.type_ != InodeType::BlockDevice {
             return 0;
         }
 
-        // SPEC: i_block payload lives in the block_ptr_tree domain.
+        // The `i_block` payload lives in the block_ptr_tree domain.
         let inner = self.inner.read();
         let backend = inner.backend();
         let block_ptr_tree = backend.block_ptr_tree.read();
@@ -217,7 +213,7 @@ impl Inode {
     ///
     pub(super) fn set_device_id(&self, device_id: u64) -> Result<()> {
         if self.type_ != InodeType::CharDevice && self.type_ != InodeType::BlockDevice {
-            // SPEC: fail with EINVAL for non-device inodes; no lock/state mutation needed.
+            // Fail with EINVAL for non-device inodes; no lock/state mutation needed.
             return_errno!(Errno::EINVAL);
         }
         // Lock order: inner -> block_ptr_tree.
@@ -239,7 +235,7 @@ impl Inode {
         }
 
 
-            let mut inner = self.inner.upread();
+            let inner = self.inner.upread();
             // Keep resize invalid for existing fast symlinks (inline payload), but
             // allow empty newly-created symlink inodes to grow into slow symlinks.
             if inner.desc.is_fast_symlink(block_size) && inner.file_size() != 0 {
@@ -282,7 +278,7 @@ impl Inode {
         };
         let self_dev_id =
             if self.type_ == InodeType::CharDevice || self.type_ == InodeType::BlockDevice {
-                // SPEC: for device inodes, decode rdev from i_block old/new format.
+                // For device inodes, decode rdev from i_block old/new format.
                 DeviceId::from_encoded_u64(block_ptr_tree.raw_block_ptrs.decode_device_id())
             } else {
                 None
@@ -750,17 +746,17 @@ impl Inode {
     }
 
     pub(super) fn sync_all(&self, sync_inode_table: bool) -> Result<()> {
-        // SPEC: fsync step 1 flushes dirty data pages before metadata writeback.
+        // Fsync step 1: flush dirty data pages before metadata writeback.
         let inner = self.inner.upread();
         let block_map_backend = inner.backend();
 
         inner.sync_data_pages()?;
 
-        // SPEC: fsync step 2 flushes inode-local indirect metadata before
+        // Fsync step 2: flush inode-local indirect metadata before
         // persisting inode-table state.
         block_map_backend.block_ptr_tree.write().sync_indirect_blocks()?;
 
-        // SPEC: fsync step 3 persists inode metadata. The caller is
+        // Fsync step 3: persist inode metadata. The caller is
         // responsible for the final device-cache flush.
 
         let mut inner = inner.upgrade();
@@ -824,7 +820,7 @@ impl Inode {
         let inner = self.inner.upread();
         let backend = inner.backend();
 
-        // SPEC: fdatasync writes back dirty data pages first. The caller is
+        // Fdatasync writes back dirty data pages first. The caller is
         // responsible for the final device-cache flush.
         inner.sync_data_pages()?;
 
@@ -904,12 +900,12 @@ impl Inode {
     /// Adds a hard link in this directory to an existing non-directory inode.
     ///
     pub(super) fn link(&self, old: &Inode, name: &str) -> Result<()> {
-        // SPEC: self must be a directory.
+        // Self must be a directory.
         if self.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
 
-        // SPEC: hard links to directories are not allowed.
+        // Hard links to directories are not allowed.
         if old.type_ == InodeType::Dir {
             return_errno!(Errno::EPERM);
         }
@@ -918,7 +914,7 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        // SPEC: cross-filesystem rename check.
+        // Cross-filesystem check.
         let fs = self.fs()?;
         let old_fs = old.fs()?;
         if !Arc::ptr_eq(&fs, &old_fs) {
@@ -945,7 +941,7 @@ impl Inode {
         })();
 
         if let Err(err) = add_result {
-            // SPEC: rollback link count on add_entry failure.
+            // Rollback link count on add_entry failure.
             old_inner.sub_link_count_saturating(1);
             return Err(err);
         }
@@ -955,7 +951,7 @@ impl Inode {
     /// Removes a non-directory entry from this directory.
     ///
     pub(super) fn unlink(&self, name: &str) -> Result<()> {
-        // SPEC: self must be a directory.
+        // Self must be a directory.
         if self.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
@@ -1012,7 +1008,7 @@ impl Inode {
     /// Renames or moves an entry from this directory to `target` directory.
     ///
     pub(super) fn rename(&self, old_name: &str, target: &Inode, new_name: &str) -> Result<()> {
-        // SPEC: both self and target must be directories.
+        // Both self and target must be directories.
         if self.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
@@ -1027,7 +1023,7 @@ impl Inode {
             return_errno!(Errno::EISDIR);
         }
 
-        // SPEC: cross-filesystem rename check.
+        // Cross-filesystem check.
         let fs = self.fs()?;
         let target_fs = target.fs()?;
         if !Arc::ptr_eq(&fs, &target_fs) {
@@ -2359,13 +2355,13 @@ impl InodeInner {
     }
 
     fn sync_data_pages(&self) -> Result<()> {
-        // SPEC: file_write_and_wait_range on an empty file is a no-op.
+        // A file_write_and_wait_range on an empty file is a no-op.
         let file_size = self.file_size();
         if file_size == 0 {
             return Ok(());
         }
 
-        // SPEC: evict_range writes back dirty pages in [0, file_size), waits for
+        // The evict_range writes back dirty pages in [0, file_size), waits for
         // completion, and keeps pages cached as UpToDate.
         self.page_cache.flush_range(0..file_size)
     }

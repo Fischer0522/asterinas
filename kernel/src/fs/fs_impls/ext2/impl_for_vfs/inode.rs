@@ -159,7 +159,7 @@ impl VfsInode for Inode {
     }
 
     fn mknod(&self, name: &str, mode: InodeMode, type_: MknodType) -> Result<Arc<dyn VfsInode>> {
-        // SPEC: map mknod request to ext2 inode type plus optional encoded device id.
+        // Map mknod request to ext2 inode type plus optional encoded device id.
         let (inode_type, device_id) = match type_ {
             MknodType::CharDevice(dev_id) => (InodeType::CharDevice, Some(dev_id)),
             MknodType::BlockDevice(dev_id) => (InodeType::BlockDevice, Some(dev_id)),
@@ -168,7 +168,7 @@ impl VfsInode for Inode {
 
         let new_inode = Inode::create(self, name, inode_type, mode.into())?;
         if let Some(device_id) = device_id {
-            // SPEC: persist the ext2 special-file device encoding in `i_block`.
+            // Persist the ext2 special-file device encoding in `i_block`.
             new_inode.set_device_id(device_id)?;
         }
 
@@ -240,7 +240,7 @@ impl VfsInode for Inode {
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        // SPEC: the inode must belong to a live filesystem instance.
+        // The inode must belong to a live filesystem instance.
         Inode::fs(self).unwrap()
     }
 
