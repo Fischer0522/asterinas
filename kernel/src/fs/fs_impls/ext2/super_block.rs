@@ -278,42 +278,6 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
     }
 }
 
-/// Reads and validates the on-disk superblock.
-///
-fn load_super_block(device: &dyn BlockDevice, read_only: bool) -> Result<SuperBlock> {
-    let raw = device.read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)?;
-    let mut sb = SuperBlock::try_from(raw)?;
-
-    let device_bytes = (device.metadata().nr_sectors as u64) * (SECTOR_SIZE as u64);
-    let device_blocks = device_bytes / (BLOCK_SIZE as u64);
-    if device_blocks < raw.blocks_count as u64 {
-        return_errno_with_message!(Errno::EINVAL, "device size is too small");
-    }
-
-    let allowed_ro_compat =
-        FeatureRoCompatSet::SPARSE_SUPER.bits() | FeatureRoCompatSet::LARGE_FILE.bits();
-    if !read_only && (raw.feature_ro_compat & !allowed_ro_compat) != 0 {
-        return_errno_with_message!(Errno::EINVAL, "unsupported ro compat feature");
-    }
-
-    if !read_only {
-        // Writable mounts update the superblock state immediately.
-        sb.mnt_count = sb.mnt_count.saturating_add(1);
-        sb.state.remove(FsState::VALID);
-        sb.set_wtime(super::utils::now());
-
-        let raw_sb = RawSuperBlock::from(&sb);
-        if device
-            .write_bytes(SUPER_BLOCK_OFFSET, raw_sb.as_bytes())
-            .is_err()
-        {
-            return_errno_with_message!(Errno::EIO, "failed to write superblock on mount");
-        }
-    }
-
-    Ok(sb)
-}
-
 impl SuperBlock {
     /// Returns the block size.
     pub(super) fn block_size(&self) -> usize {
@@ -875,63 +839,23 @@ mod test {
     use ostd::prelude::*;
 
     use super::*;
-    use crate::fs::fs_impls::ext2::testkit::{Ext2MemoryDisk, make_valid_raw_super_block};
+    use crate::fs::fs_impls::ext2::testkit::make_valid_raw_super_block;
 
     #[ktest]
     fn try_from_valid_raw_ok() {
         let raw = make_valid_raw_super_block(2);
-        let disk_size_blocks = raw.blocks_count as usize;
-        let disk = Ext2MemoryDisk::new(disk_size_blocks);
-        disk.write_super_block(&raw);
-
-        let sb = load_super_block(&disk, false).unwrap();
+        let sb = SuperBlock::try_from(raw).unwrap();
         assert_eq!(sb.total_blocks(), raw.blocks_count);
         assert_eq!(sb.total_inodes(), raw.inodes_count);
         assert_eq!(sb.block_groups_count(), 2);
     }
 
     #[ktest]
-    fn try_from_invalid_fields_returns_einval() {
-        {
-            let mut raw = make_valid_raw_super_block(1);
-            raw.magic = 0;
-
-            let disk = Ext2MemoryDisk::new(raw.blocks_count as usize);
-            disk.write_super_block(&raw);
-
-            let err = load_super_block(&disk, false).unwrap_err();
-            assert_eq!(err.error(), Errno::EINVAL);
-        }
-
-        {
-            let mut raw = make_valid_raw_super_block(1);
-            raw.feature_ro_compat = FeatureRoCompatSet::BTREE_DIR.bits();
-
-            let disk = Ext2MemoryDisk::new(raw.blocks_count as usize);
-            disk.write_super_block(&raw);
-
-            let err = load_super_block(&disk, false).unwrap_err();
-            assert_eq!(err.error(), Errno::EINVAL);
-        }
-
-        {
-            let raw = make_valid_raw_super_block(2);
-            let disk = Ext2MemoryDisk::new((raw.blocks_count as usize).saturating_sub(1));
-            disk.write_super_block(&raw);
-
-            let err = load_super_block(&disk, false).unwrap_err();
-            assert_eq!(err.error(), Errno::EINVAL);
-        }
-    }
-
-    #[ktest]
-    fn try_from_bad_compat_allows_read_only() {
+    fn try_from_bad_magic_returns_einval() {
         let mut raw = make_valid_raw_super_block(1);
-        raw.feature_ro_compat = FeatureRoCompatSet::BTREE_DIR.bits();
+        raw.magic = 0;
 
-        let disk = Ext2MemoryDisk::new(raw.blocks_count as usize);
-        disk.write_super_block(&raw);
-
-        assert!(load_super_block(&disk, true).is_ok());
+        let err = SuperBlock::try_from(raw).unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
     }
 }

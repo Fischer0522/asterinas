@@ -686,24 +686,24 @@ impl Inode {
     }
 
     pub(super) fn sync_all(&self, sync_inode_table: bool) -> Result<()> {
-        // Fsync step 1: flush dirty data pages before metadata writeback.
+        // Fsync step 1: flush the xattr.
+        if let Some(xattr) = &self.xattr {
+            xattr.write().flush()?;
+        }
+        // Fsync step 2: flush dirty data pages before metadata writeback.
         let inner = self.inner.upread();
         let block_manager = inner.block_manager();
         inner.sync_data_pages()?;
 
-        // Fsync step 2: flush inode-local indirect metadata before
+        // Fsync step 3: flush inode-local indirect metadata before
         // persisting inode-table state.
         block_manager.sync_indirect_blocks()?;
 
-        // Fsync step 3: persist inode metadata. The caller is
+        // Fsync step 4: persist inode metadata. The caller is
         // responsible for the final device-cache flush.
         let mut inner = inner.upgrade();
         inner.sync_metadata(self.ino, self.block_group_idx, sync_inode_table)?;
 
-        // Fsync step 4: flush the xattr.
-        if let Some(xattr) = &self.xattr {
-            xattr.write().flush()?;
-        }
         Ok(())
     }
 
@@ -995,10 +995,9 @@ impl Inode {
         // Step 4: apply the rename mutations and persist the metadata.
         self.validate_rename_overwrite(&ctx, &guards)?;
         self.apply_rename_with_locks(&ctx, &mut guards)?;
-        drop(guards);
 
         if let Some(existing) = ctx.existing_inode.as_ref() {
-            let mut inner = existing.inner.write();
+            let inner = guards.inner_mut(existing.ino)?;
             if inner.link_count() == 0 {
                 inner.persist(existing.ino())?;
                 let fs = self.fs()?;
@@ -1601,7 +1600,7 @@ impl PageCacheBackend for InodeBlockManager {
             }
             None => {
                 error!(
-                    "faild to find a block mapping in PageCacheBackend, idx: {}",
+                    "failed to find a block mapping in PageCacheBackend, idx: {}",
                     idx
                 );
                 return_errno!(Errno::EIO);
@@ -2497,80 +2496,6 @@ impl InodeInner {
     }
 }
 
-/// Acquires `inner.read()` locks on two inodes in ascending ino order.
-/// Returns guards in `(a, b)` order regardless of which ino is smaller.
-fn _read_lock_two_inodes<'a>(
-    a: &'a Inode,
-    b: &'a Inode,
-) -> (
-    RwMutexReadGuard<'a, InodeInner>,
-    RwMutexReadGuard<'a, InodeInner>,
-) {
-    if a.ino <= b.ino {
-        let ga = a.inner.read();
-        let gb = b.inner.read();
-        (ga, gb)
-    } else {
-        let gb = b.inner.read();
-        let ga = a.inner.read();
-        (ga, gb)
-    }
-}
-
-/// Acquires `inner.write()` locks on two inodes in ascending ino order.
-/// Returns guards in `(a, b)` order regardless of which ino is smaller.
-fn write_lock_two_inodes<'a>(
-    a: &'a Inode,
-    b: &'a Inode,
-) -> (
-    RwMutexWriteGuard<'a, InodeInner>,
-    RwMutexWriteGuard<'a, InodeInner>,
-) {
-    if a.ino <= b.ino {
-        let ga = a.inner.write();
-        let gb = b.inner.write();
-        (ga, gb)
-    } else {
-        let gb = b.inner.write();
-        let ga = a.inner.write();
-        (ga, gb)
-    }
-}
-
-/// Acquires `inner.write()` locks on an arbitrary number of inodes in ascending ino order.
-/// Returns guards in the same order as the input slice.
-fn write_lock_multiple_inodes<'a>(inodes: &[&'a Inode]) -> Vec<RwMutexWriteGuard<'a, InodeInner>> {
-    use alloc::rc::Rc;
-    use core::cell::RefCell;
-
-    // Build (original_index, ino, inode_ref) and sort by ino.
-    let mut indexed: Vec<(usize, u32, &'a Inode)> = inodes
-        .iter()
-        .enumerate()
-        .map(|(i, inode)| (i, inode.ino, *inode))
-        .collect();
-    indexed.sort_by_key(|&(_, ino, _)| ino);
-
-    // Acquire locks in sorted (ascending ino) order, wrapping in Rc so we can
-    // later move them into the output vec in original order.
-    let mut slots: Vec<Option<Rc<RefCell<Option<RwMutexWriteGuard<'a, InodeInner>>>>>> =
-        vec![None; inodes.len()];
-    for &(orig_idx, _, inode) in &indexed {
-        let guard = inode.inner.write();
-        slots[orig_idx] = Some(Rc::new(RefCell::new(Some(guard))));
-    }
-
-    // Extract guards in original input order.
-    slots
-        .into_iter()
-        .map(|slot| {
-            slot.expect("all slots filled")
-                .borrow_mut()
-                .take()
-                .expect("guard not yet taken")
-        })
-        .collect()
-}
 
 bitflags! {
     struct FileFlags: u32 {
@@ -2626,14 +2551,15 @@ struct MultiInodeInnerGuards<'a> {
 }
 
 impl<'a> MultiInodeInnerGuards<'a> {
-    // `inodes` must already be deduplicated by inode number.
+    /// Acquires `inner.write()` locks on deduplicated inodes in ascending ino order.
     fn lock(inodes: &[&'a Inode]) -> Self {
-        let guards = write_lock_multiple_inodes(inodes);
-        let entries = inodes
-            .iter()
-            .map(|inode| inode.ino)
-            .zip(guards)
-            .collect::<Vec<_>>();
+        let mut sorted: Vec<&'a Inode> = inodes.to_vec();
+        sorted.sort_by_key(|inode| inode.ino);
+
+        let entries = sorted
+            .into_iter()
+            .map(|inode| (inode.ino, inode.inner.write()))
+            .collect();
         Self { entries }
     }
 
@@ -2656,6 +2582,25 @@ impl<'a> MultiInodeInnerGuards<'a> {
     }
 }
 
+/// Acquires `inner.write()` locks on two inodes in ascending ino order.
+/// Returns guards in `(a, b)` order regardless of which ino is smaller.
+fn write_lock_two_inodes<'a>(
+    a: &'a Inode,
+    b: &'a Inode,
+) -> (
+    RwMutexWriteGuard<'a, InodeInner>,
+    RwMutexWriteGuard<'a, InodeInner>,
+) {
+    if a.ino <= b.ino {
+        let ga = a.inner.write();
+        let gb = b.inner.write();
+        (ga, gb)
+    } else {
+        let gb = b.inner.write();
+        let ga = a.inner.write();
+        (ga, gb)
+    }
+}
 
 
 #[cfg(ktest)]

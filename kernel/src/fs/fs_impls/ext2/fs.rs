@@ -98,10 +98,9 @@ impl Ext2 {
             SuperBlock::try_from(raw_super_block)?
         };
         let block_size = super_block.block_size();
-        assert_eq!(
-            block_size, BLOCK_SIZE,
-            "currently only 4096-byte block size"
-        );
+        if block_size != BLOCK_SIZE {
+            return_errno_with_message!(Errno::EINVAL, "currently only 4096-byte block size");
+        }
 
         let mount_options = Ext2MountOptions::parse(data);
 

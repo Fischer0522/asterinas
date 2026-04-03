@@ -221,6 +221,8 @@ impl BlockPtrTree {
         let boundary;
         let mut block = iblock;
 
+        // NOTE: Each `else if` arm subtracts the preceding region's size from `block`
+        // inside the condition expression, so the branches MUST stay in this exact order.
         if block < direct_blocks {
             offsets[0] = block;
             depth = 1usize;

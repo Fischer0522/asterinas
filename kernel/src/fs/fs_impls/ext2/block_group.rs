@@ -788,6 +788,9 @@ impl BlockGroup {
         count: u32,
         inode_table_blocks_per_group: u32,
     ) -> bool {
+        if count == 0 {
+            return false;
+        }
         let Some(end) = start.checked_add(count - 1) else {
             return true;
         };
