@@ -103,7 +103,7 @@ impl DirEntryHeader {
     }
 
     /// Validates a directory entry layout.
-    pub(super) fn validate(
+    fn validate(
         rec_len: u16,
         name_len: u8,
         offset: usize,

@@ -70,60 +70,6 @@ pub struct Inode {
     extension: Extension,
 }
 
-struct RenameContext<'a> {
-    source_dir: &'a Inode,
-    target_dir: &'a Inode,
-    old_name: &'a str,
-    new_name: &'a str,
-    old_ino: u32,
-    old_inode: Arc<Inode>,
-    existing_ino: Option<u32>,
-    existing_inode: Option<Arc<Inode>>,
-    old_is_dir: bool,
-    moved_ft: DirEntryFileType,
-}
-
-impl RenameContext<'_> {
-    fn is_same_dir(&self) -> bool {
-        self.source_dir.ino == self.target_dir.ino
-    }
-}
-
-struct MultiInodeInnerGuards<'a> {
-    entries: Vec<(u32, RwMutexWriteGuard<'a, InodeInner>)>,
-}
-
-impl<'a> MultiInodeInnerGuards<'a> {
-    // `inodes` must already be deduplicated by inode number.
-    fn lock(inodes: &[&'a Inode]) -> Self {
-        let guards = write_lock_multiple_inodes(inodes);
-        let entries = inodes
-            .iter()
-            .map(|inode| inode.ino)
-            .zip(guards)
-            .collect::<Vec<_>>();
-        Self { entries }
-    }
-
-    fn inner(&self, ino: u32) -> Result<&InodeInner> {
-        let (_, guard) = self
-            .entries
-            .iter()
-            .find(|(entry_ino, _)| *entry_ino == ino)
-            .ok_or_else(|| Error::with_message(Errno::EIO, "missing inode inner lock"))?;
-        Ok(&*guard)
-    }
-
-    fn inner_mut(&mut self, ino: u32) -> Result<&mut InodeInner> {
-        let (_, guard) = self
-            .entries
-            .iter_mut()
-            .find(|(entry_ino, _)| *entry_ino == ino)
-            .ok_or_else(|| Error::with_message(Errno::EIO, "missing inode inner lock"))?;
-        Ok(&mut *guard)
-    }
-}
-
 impl Inode {
     pub(super) fn new(
         ino: u32,
@@ -920,7 +866,6 @@ impl Inode {
             return_errno!(Errno::EOVERFLOW);
         }
 
-
         let slot = match dir_inner.scan_dir_for_slot(name)? {
             Some(slot) => slot,
             None => dir_inner.grow_dir_block()?,
@@ -1277,6 +1222,194 @@ impl Inode {
     }
 }
 
+impl Drop for Inode {
+    fn drop(&mut self) {
+        if let Err(err) = self.try_reclaim_deleted_inode() {
+            debug!(
+                "ext2: failed to reclaim deleted inode {} during drop: {:?}",
+                self.ino, err
+            );
+        }
+    }
+}
+
+
+/// Parsed in-memory mirror of an on-disk inode's metadata fields.
+///
+/// Unlike [`RawInode`], fields are decoded into Rust types
+/// (e.g., `Duration` for timestamps, [`InodeType`] for file type).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct InodeDesc {
+    type_: InodeType,
+    perm: FilePerm,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    atime: Duration,
+    ctime: Duration,
+    mtime: Duration,
+    dtime: Duration,
+    link_count: u16,
+    sector_count: u32,
+    flags: FileFlags,
+    file_acl: u32,
+    generation: u32,
+    block_ptrs: [u32; 15],
+}
+
+impl InodeDesc {
+    pub(super) fn type_(&self) -> InodeType {
+        self.type_
+    }
+
+    /// Determines whether the symlink payload is stored inline in `i_block[15]`.
+    ///
+    fn is_fast_symlink(&self, block_size: usize) -> bool {
+        let ea_blocks = if self.file_acl != 0 {
+            (block_size / SECTOR_SIZE) as u32
+        } else {
+            0
+        };
+
+        self.type_ == InodeType::SymLink && self.sector_count.checked_sub(ea_blocks) == Some(0)
+    }
+}
+
+impl TryFrom<&RawInode> for InodeDesc {
+    type Error = Error;
+    fn try_from(raw: &RawInode) -> Result<Self> {
+        if raw.link_count == 0 {
+            return_errno_with_message!(Errno::ESTALE, "inode has been deleted");
+        }
+
+        let mode = raw.mode;
+        let type_ = InodeType::from_raw_mode(mode)?;
+        let perm = FilePerm::from_bits_truncate(mode & 0o7777);
+        let uid = (raw.uid as u32) | ((raw.uid_high as u32) << 16);
+        let gid = (raw.gid as u32) | ((raw.gid_high as u32) << 16);
+        let atime = Duration::from_secs(raw.atime as u64);
+        let ctime = Duration::from_secs(raw.ctime as u64);
+        let mtime = Duration::from_secs(raw.mtime as u64);
+
+        let mut size = raw.size_lo as u64;
+        if type_ == InodeType::File {
+            size |= (raw.size_high as u64) << 32;
+        }
+        if size > i64::MAX as u64 {
+            return_errno_with_message!(Errno::EUCLEAN, "corrupted inode on disk");
+        }
+
+        let flags = FileFlags::from_bits(raw.flags)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "invalid inode flags"))?;
+        let block_ptr_tree = RawBlockPtrs::from_raw(raw);
+
+        Ok(InodeDesc {
+            type_,
+            perm,
+            uid,
+            gid,
+            size,
+            atime,
+            ctime,
+            mtime,
+            dtime: Duration::from_secs(raw.dtime as u64),
+            link_count: raw.link_count,
+            sector_count: block_ptr_tree.sector_count,
+            flags,
+            file_acl: raw.file_acl,
+            generation: raw.generation,
+            block_ptrs: block_ptr_tree.block_ptrs,
+        })
+    }
+}
+
+impl From<&InodeDesc> for RawInode {
+    fn from(desc: &InodeDesc) -> Self {
+        let mode = (desc.type_ as u16) | (desc.perm.0 & 0o7777);
+        let uid = desc.uid as u16;
+        let gid = desc.gid as u16;
+        let uid_high = (desc.uid >> 16) as u16;
+        let gid_high = (desc.gid >> 16) as u16;
+
+        let (size_lo, size_high) = if desc.type_ == InodeType::File {
+            (desc.size as u32, (desc.size >> 32) as u32)
+        } else {
+            (desc.size as u32, 0)
+        };
+
+        Self {
+            mode,
+            uid,
+            size_lo,
+            atime: desc.atime.as_secs() as u32,
+            ctime: desc.ctime.as_secs() as u32,
+            mtime: desc.mtime.as_secs() as u32,
+            dtime: desc.dtime.as_secs() as u32,
+            gid,
+            link_count: desc.link_count,
+            sector_count: desc.sector_count,
+            flags: desc.flags.bits(),
+            osd1: 0,
+            block: desc.block_ptrs,
+            generation: desc.generation,
+            file_acl: desc.file_acl,
+            size_high,
+            faddr: 0,
+            frag: 0,
+            fsize: 0,
+            pad1: 0,
+            uid_high,
+            gid_high,
+            reserved2: 0,
+        }
+    }
+}
+
+/// On-disk inode structure (128 bytes for GOOD_OLD_REV).
+///
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod)]
+pub(super) struct RawInode {
+    pub mode: u16,         // i_mode
+    pub uid: u16,          // i_uid (low 16 bits)
+    pub size_lo: u32,      // i_size
+    pub atime: u32,        // i_atime
+    pub ctime: u32,        // i_ctime
+    pub mtime: u32,        // i_mtime
+    pub dtime: u32,        // i_dtime
+    pub gid: u16,          // i_gid (low 16 bits)
+    pub link_count: u16,   // i_link_count
+    pub sector_count: u32, // i_blocks (512-byte sectors)
+    pub flags: u32,        // i_flags
+    pub osd1: u32,         // osd1.linux1.l_i_reserved1
+    pub block: [u32; 15],  // i_block
+    pub generation: u32,   // i_generation
+    pub file_acl: u32,     // i_file_acl
+    pub size_high: u32,    // i_dir_acl (size high)
+    pub faddr: u32,        // i_faddr
+    pub frag: u8,          // osd2.linux2.l_i_frag
+    pub fsize: u8,         // osd2.linux2.l_i_fsize
+    pub pad1: u16,         // osd2.linux2.i_pad1
+    pub uid_high: u16,     // osd2.linux2.l_i_uid_high
+    pub gid_high: u16,     // osd2.linux2.l_i_gid_high
+    pub reserved2: u32,    // osd2.linux2.l_i_reserved2
+}
+
+const_assert!(size_of::<RawInode>() == 128);
+
+
+struct RenameContext<'a> {
+    source_dir: &'a Inode,
+    target_dir: &'a Inode,
+    old_name: &'a str,
+    new_name: &'a str,
+    old_ino: u32,
+    old_inode: Arc<Inode>,
+    existing_ino: Option<u32>,
+    existing_inode: Option<Arc<Inode>>,
+    old_is_dir: bool,
+    moved_ft: DirEntryFileType,
+}
 /// [`PageCacheBackend`] implementation for inode data.
 ///
 /// Translates logical page indices to physical device blocks
@@ -1290,17 +1423,6 @@ struct InodeBlockManager {
     npages: AtomicUsize,
     /// Filesystem handle for indirect I/O and BIO submission.
     fs: Weak<Ext2>,
-}
-
-impl Drop for Inode {
-    fn drop(&mut self) {
-        if let Err(err) = self.try_reclaim_deleted_inode() {
-            debug!(
-                "ext2: failed to reclaim deleted inode {} during drop: {:?}",
-                self.ino, err
-            );
-        }
-    }
 }
 
 impl InodeBlockManager {
@@ -1407,7 +1529,6 @@ impl InodeBlockManager {
         end: usize,
         block_size: usize,
     ) -> Result<(RawBlockPtrs, Vec<Ext2Bid>)> {
-
         let fs = self.fs()?;
         let start_block = offset / block_size;
         let end_block = end.div_ceil(block_size);
@@ -1421,17 +1542,14 @@ impl InodeBlockManager {
 
             let mapped_range = tree.lookup_block_range(&fs, iblock, remaining)?;
             if !mapped_range.is_empty() {
-                current_block +=
-                    mapped_range.end.saturating_sub(mapped_range.start) as usize;
+                current_block += mapped_range.end.saturating_sub(mapped_range.start) as usize;
                 continue;
             }
-            let allocated_range = tree
-                .lookup_or_alloc_block_range(&fs, iblock, remaining, true)?;
+            let allocated_range = tree.lookup_or_alloc_block_range(&fs, iblock, remaining, true)?;
             if allocated_range.is_empty() {
                 return_errno_with_message!(Errno::EIO, "missing block mapping after allocation");
             }
-            current_block +=
-                allocated_range.end.saturating_sub(allocated_range.start) as usize;
+            current_block += allocated_range.end.saturating_sub(allocated_range.start) as usize;
             new_blocks.extend(allocated_range);
         }
         let snapshot = *tree.raw_block_ptrs();
@@ -1539,8 +1657,7 @@ impl InodeInner {
             fs.clone(),
             num_pages,
         );
-        let page_cache_backend: Weak<dyn PageCacheBackend> =
-            Arc::downgrade(&block_manager) as _;
+        let page_cache_backend: Weak<dyn PageCacheBackend> = Arc::downgrade(&block_manager) as _;
         // Keep page-cache capacity aligned with inode size so `npages`/VMO window
         // and on-disk data extent stay consistent from mount time.
         let page_cache = PageCacheOps::with_capacity(num_page_bytes, page_cache_backend)
@@ -1784,12 +1901,8 @@ impl InodeInner {
                     IoRange::Mapped(mapped_range) => {
                         let nblocks = mapped_range.device_block_range.end
                             - mapped_range.device_block_range.start;
-                        let segment =
-                            BioSegment::alloc(nblocks as usize, BioDirection::FromDevice);
-                        fs.read_blocks(
-                            mapped_range.device_block_range.start,
-                            segment.clone(),
-                        )?;
+                        let segment = BioSegment::alloc(nblocks as usize, BioDirection::FromDevice);
+                        fs.read_blocks(mapped_range.device_block_range.start, segment.clone())?;
                         let mut segment_reader = segment.reader()?;
                         segment_reader.read_fallible(writer)?;
                     }
@@ -2119,16 +2232,13 @@ impl InodeInner {
         let end_iblock = (end / block_size) as u32;
         let block_manager = self.block_manager();
 
-        if !start.is_multiple_of(block_size)
-            && block_manager.lookup_block(start_iblock)?.is_none()
+        if !start.is_multiple_of(block_size) && block_manager.lookup_block(start_iblock)?.is_none()
         {
             let new_start_block = start.align_down(block_size);
             self.page_cache().fill_zeros(new_start_block..start)?;
         }
 
-        if !end.is_multiple_of(block_size)
-            && block_manager.lookup_block(end_iblock)?.is_none()
-        {
+        if !end.is_multiple_of(block_size) && block_manager.lookup_block(end_iblock)?.is_none() {
             let new_end_block = end.align_up(block_size);
             self.page_cache().fill_zeros(end..new_end_block)?;
         }
@@ -2505,168 +2615,48 @@ bitflags! {
     }
 }
 
-/// Parsed in-memory mirror of an on-disk inode's metadata fields.
-///
-/// Unlike [`RawInode`], fields are decoded into Rust types
-/// (e.g., `Duration` for timestamps, [`InodeType`] for file type).
-#[derive(Clone, Copy, Debug)]
-pub(super) struct InodeDesc {
-    type_: InodeType,
-    perm: FilePerm,
-    uid: u32,
-    gid: u32,
-    size: u64,
-    atime: Duration,
-    ctime: Duration,
-    mtime: Duration,
-    dtime: Duration,
-    link_count: u16,
-    sector_count: u32,
-    flags: FileFlags,
-    file_acl: u32,
-    generation: u32,
-    block_ptrs: [u32; 15],
-}
-
-impl InodeDesc {
-    pub(super) fn type_(&self) -> InodeType {
-        self.type_
-    }
-
-    /// Determines whether the symlink payload is stored inline in `i_block[15]`.
-    ///
-    fn is_fast_symlink(&self, block_size: usize) -> bool {
-        let ea_blocks = if self.file_acl != 0 {
-            (block_size / SECTOR_SIZE) as u32
-        } else {
-            0
-        };
-
-        self.type_ == InodeType::SymLink && self.sector_count.checked_sub(ea_blocks) == Some(0)
+impl RenameContext<'_> {
+    fn is_same_dir(&self) -> bool {
+        self.source_dir.ino == self.target_dir.ino
     }
 }
 
-impl TryFrom<&RawInode> for InodeDesc {
-    type Error = Error;
-    fn try_from(raw: &RawInode) -> Result<Self> {
-        if raw.link_count == 0 {
-            return_errno_with_message!(Errno::ESTALE, "inode has been deleted");
-        }
+struct MultiInodeInnerGuards<'a> {
+    entries: Vec<(u32, RwMutexWriteGuard<'a, InodeInner>)>,
+}
 
-        let mode = raw.mode;
-        let type_ = InodeType::from_raw_mode(mode)?;
-        let perm = FilePerm::from_bits_truncate(mode & 0o7777);
-        let uid = (raw.uid as u32) | ((raw.uid_high as u32) << 16);
-        let gid = (raw.gid as u32) | ((raw.gid_high as u32) << 16);
-        let atime = Duration::from_secs(raw.atime as u64);
-        let ctime = Duration::from_secs(raw.ctime as u64);
-        let mtime = Duration::from_secs(raw.mtime as u64);
+impl<'a> MultiInodeInnerGuards<'a> {
+    // `inodes` must already be deduplicated by inode number.
+    fn lock(inodes: &[&'a Inode]) -> Self {
+        let guards = write_lock_multiple_inodes(inodes);
+        let entries = inodes
+            .iter()
+            .map(|inode| inode.ino)
+            .zip(guards)
+            .collect::<Vec<_>>();
+        Self { entries }
+    }
 
-        let mut size = raw.size_lo as u64;
-        if type_ == InodeType::File {
-            size |= (raw.size_high as u64) << 32;
-        }
-        if size > i64::MAX as u64 {
-            return_errno_with_message!(Errno::EUCLEAN, "corrupted inode on disk");
-        }
+    fn inner(&self, ino: u32) -> Result<&InodeInner> {
+        let (_, guard) = self
+            .entries
+            .iter()
+            .find(|(entry_ino, _)| *entry_ino == ino)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "missing inode inner lock"))?;
+        Ok(&*guard)
+    }
 
-        let flags = FileFlags::from_bits(raw.flags)
-            .ok_or_else(|| Error::with_message(Errno::EIO, "invalid inode flags"))?;
-        let block_ptr_tree = RawBlockPtrs::from_raw(raw);
-
-        Ok(InodeDesc {
-            type_,
-            perm,
-            uid,
-            gid,
-            size,
-            atime,
-            ctime,
-            mtime,
-            dtime: Duration::from_secs(raw.dtime as u64),
-            link_count: raw.link_count,
-            sector_count: block_ptr_tree.sector_count,
-            flags,
-            file_acl: raw.file_acl,
-            generation: raw.generation,
-            block_ptrs: block_ptr_tree.block_ptrs,
-        })
+    fn inner_mut(&mut self, ino: u32) -> Result<&mut InodeInner> {
+        let (_, guard) = self
+            .entries
+            .iter_mut()
+            .find(|(entry_ino, _)| *entry_ino == ino)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "missing inode inner lock"))?;
+        Ok(&mut *guard)
     }
 }
 
-impl From<&InodeDesc> for RawInode {
-    fn from(desc: &InodeDesc) -> Self {
-        let mode = (desc.type_ as u16) | (desc.perm.0 & 0o7777);
-        let uid = desc.uid as u16;
-        let gid = desc.gid as u16;
-        let uid_high = (desc.uid >> 16) as u16;
-        let gid_high = (desc.gid >> 16) as u16;
 
-        let (size_lo, size_high) = if desc.type_ == InodeType::File {
-            (desc.size as u32, (desc.size >> 32) as u32)
-        } else {
-            (desc.size as u32, 0)
-        };
-
-        Self {
-            mode,
-            uid,
-            size_lo,
-            atime: desc.atime.as_secs() as u32,
-            ctime: desc.ctime.as_secs() as u32,
-            mtime: desc.mtime.as_secs() as u32,
-            dtime: desc.dtime.as_secs() as u32,
-            gid,
-            link_count: desc.link_count,
-            sector_count: desc.sector_count,
-            flags: desc.flags.bits(),
-            osd1: 0,
-            block: desc.block_ptrs,
-            generation: desc.generation,
-            file_acl: desc.file_acl,
-            size_high,
-            faddr: 0,
-            frag: 0,
-            fsize: 0,
-            pad1: 0,
-            uid_high,
-            gid_high,
-            reserved2: 0,
-        }
-    }
-}
-
-/// On-disk inode structure (128 bytes for GOOD_OLD_REV).
-///
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Pod)]
-pub(super) struct RawInode {
-    pub mode: u16,         // i_mode
-    pub uid: u16,          // i_uid (low 16 bits)
-    pub size_lo: u32,      // i_size
-    pub atime: u32,        // i_atime
-    pub ctime: u32,        // i_ctime
-    pub mtime: u32,        // i_mtime
-    pub dtime: u32,        // i_dtime
-    pub gid: u16,          // i_gid (low 16 bits)
-    pub link_count: u16,   // i_link_count
-    pub sector_count: u32, // i_blocks (512-byte sectors)
-    pub flags: u32,        // i_flags
-    pub osd1: u32,         // osd1.linux1.l_i_reserved1
-    pub block: [u32; 15],  // i_block
-    pub generation: u32,   // i_generation
-    pub file_acl: u32,     // i_file_acl
-    pub size_high: u32,    // i_dir_acl (size high)
-    pub faddr: u32,        // i_faddr
-    pub frag: u8,          // osd2.linux2.l_i_frag
-    pub fsize: u8,         // osd2.linux2.l_i_fsize
-    pub pad1: u16,         // osd2.linux2.i_pad1
-    pub uid_high: u16,     // osd2.linux2.l_i_uid_high
-    pub gid_high: u16,     // osd2.linux2.l_i_gid_high
-    pub reserved2: u32,    // osd2.linux2.l_i_reserved2
-}
-
-const_assert!(size_of::<RawInode>() == 128);
 
 #[cfg(ktest)]
 mod test {

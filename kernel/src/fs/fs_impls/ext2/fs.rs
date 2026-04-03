@@ -93,13 +93,6 @@ pub struct Ext2 {
 impl Ext2 {
     /// Opens and loads an Ext2 filesystem from a block device.
     pub(super) fn open(device: Arc<dyn BlockDevice>, data: Option<&CStr>) -> Result<Arc<Self>> {
-        Self::open_with_mount_options(device, Ext2MountOptions::parse(data))
-    }
-
-    fn open_with_mount_options(
-        device: Arc<dyn BlockDevice>,
-        mount_options: Ext2MountOptions,
-    ) -> Result<Arc<Self>> {
         let super_block = {
             let raw_super_block = device.read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)?;
             SuperBlock::try_from(raw_super_block)?
@@ -109,6 +102,8 @@ impl Ext2 {
             block_size, BLOCK_SIZE,
             "currently only 4096-byte block size"
         );
+
+        let mount_options = Ext2MountOptions::parse(data);
 
         let group_descriptors_segment = Self::load_group_desc_table(device.as_ref(), &super_block)?;
         Ext2::check_group_desc_table(&super_block, &group_descriptors_segment)?;
@@ -249,28 +244,6 @@ impl Ext2 {
         Self::read_inode_desc_from_parts(&sb, &self.block_groups, ino)
     }
 
-    /// Reads an inode descriptor from preloaded superblock and block groups.
-    fn read_inode_desc_from_parts(
-        sb: &SuperBlock,
-        block_groups: &[BlockGroup],
-        ino: u32,
-    ) -> Result<InodeDesc> {
-        // Apply ext2 inode-number validity rules before indexing groups.
-        if (ino != ROOT_INO && ino < sb.first_ino()) || ino > sb.total_inodes() {
-            return_errno_with_message!(Errno::EINVAL, "inode number out of valid range");
-        }
-
-        let inodes_per_group = sb.inodes_per_group();
-        let group_idx = ((ino - 1) / inodes_per_group) as usize;
-        let index_in_group = (ino - 1) % inodes_per_group;
-
-        let group = block_groups
-            .get(group_idx)
-            .ok_or_else(|| Error::with_message(Errno::EIO, "block group index out of range"))?;
-
-        group.read_inode_desc(index_in_group)
-    }
-
     /// Writes an inode descriptor to the group's `PageCache`.
     pub(super) fn write_inode_desc(&self, ino: u32, raw: &RawInode) -> Result<()> {
         let sb = self.super_block.read();
@@ -368,59 +341,6 @@ impl Ext2 {
             groups.push(group);
         }
         Ok(groups)
-    }
-
-    /// Checks whether the current caller may allocate blocks.
-    ///
-    /// Non-privileged users are denied when free blocks fall below the reserved
-    /// threshold, unless they have `CAP_SYS_RESOURCE` or match `s_resuid`/`s_resgid`.
-    ///
-    fn has_free_blocks(
-        &self,
-        free_blocks: u32,
-        reserved_blocks: u32,
-        resuid: u32,
-        resgid: u32,
-    ) -> bool {
-        if free_blocks >= reserved_blocks + 1 {
-            return true;
-        }
-
-        // In ktest or kernel-internal contexts there is no thread — treat as root.
-        let Some(thread) = Thread::current() else {
-            return true;
-        };
-        let Some(posix_thread) = thread.as_posix_thread() else {
-            return true;
-        };
-
-        let credentials = posix_thread.credentials();
-
-        // Treat `CAP_SYS_RESOURCE` as bypass permission for reserved blocks.
-        if credentials
-            .effective_capset()
-            .contains(CapSet::SYS_RESOURCE)
-        {
-            return true;
-        }
-
-        // Allow the reserved-block owner to bypass the quota.
-        if u32::from(credentials.fsuid()) == resuid {
-            return true;
-        }
-
-        // Allow the reserved-block group to bypass the quota when configured.
-        let resgid_val = Gid::from(resgid);
-        if !resgid_val.is_root() {
-            if credentials.fsgid() == resgid_val {
-                return true;
-            }
-            if credentials.groups().contains(&resgid_val) {
-                return true;
-            }
-        }
-
-        false
     }
 
     /// Allocates up to `count` contiguous blocks.
@@ -723,105 +643,6 @@ impl Ext2 {
         Ok(())
     }
 
-    /// Writes back superblock and group descriptor table if dirty.
-    fn sync_metadata(&self) -> Result<()> {
-        let sb_dirty = self.super_block.read().is_dirty();
-        let mut any_group_dirty = false;
-        for group in &self.block_groups {
-            if group.is_desc_dirty() {
-                any_group_dirty = true;
-                break;
-            }
-        }
-
-        if !sb_dirty && !any_group_dirty {
-            return Ok(());
-        }
-
-        let groups_count = {
-            let sb_guard = self.super_block.read();
-            sb_guard.block_groups_count() as usize
-        };
-        if groups_count == 0 || self.block_groups.len() < groups_count {
-            return_errno_with_message!(Errno::EIO, "inconsistent block group count");
-        }
-
-        let desc_bytes = groups_count * size_of::<RawGroupDesc>();
-        // Group descriptor table is stored in whole filesystem blocks on disk.
-        // `write_bytes` requires sector-aligned length, so flush a block-aligned span.
-        let desc_disk_bytes = desc_bytes.div_ceil(BLOCK_SIZE) * BLOCK_SIZE;
-        let mut desc_buf = vec![0u8; desc_disk_bytes];
-        if self
-            .group_descriptors_segment
-            .read_bytes(0, &mut desc_buf)
-            .is_err()
-        {
-            return_errno_with_message!(Errno::EIO, "failed to read group descriptor segment");
-        }
-        let mut sb_guard = self.super_block.write();
-
-        // Recompute free counters from group descriptors — they are the source of truth.
-        let mut total_free_blocks: u32 = 0;
-        let mut total_free_inodes: u32 = 0;
-        for group in &self.block_groups {
-            total_free_blocks += group.free_blocks_count() as u32;
-            total_free_inodes += group.free_inodes_count() as u32;
-        }
-        sb_guard.set_free_blocks_count(total_free_blocks);
-        sb_guard.set_free_inodes_count(total_free_inodes);
-
-        sb_guard.set_wtime(now());
-        if self
-            .block_device
-            .write_bytes(
-                Bid::new(sb_guard.group_descriptors_bid(0) as u64).to_offset(),
-                &desc_buf,
-            )
-            .is_err()
-        {
-            return_errno_with_message!(Errno::EIO, "failed to write group descriptor table");
-        }
-
-        let mut raw_sb = RawSuperBlock::from(&**sb_guard);
-        if self
-            .block_device
-            .write_bytes(SUPER_BLOCK_OFFSET, raw_sb.as_bytes())
-            .is_err()
-        {
-            return_errno_with_message!(Errno::EIO, "failed to write superblock");
-        }
-
-        for idx in 1..groups_count {
-            if !sb_guard.is_backup_group(idx) {
-                continue;
-            }
-            raw_sb.block_group_idx = idx as u16;
-            if self
-                .block_device
-                .write_bytes(
-                    Bid::new(sb_guard.bid(idx) as u64).to_offset(),
-                    raw_sb.as_bytes(),
-                )
-                .is_err()
-            {
-                return_errno_with_message!(Errno::EIO, "failed to write backup superblock");
-            }
-            if self
-                .block_device
-                .write_bytes(
-                    Bid::new(sb_guard.group_descriptors_bid(idx) as u64).to_offset(),
-                    &desc_buf,
-                )
-                .is_err()
-            {
-                return_errno_with_message!(Errno::EIO, "failed to write backup group descriptors");
-            }
-        }
-
-        sb_guard.clear_dirty();
-        Ok(())
-    }
-
     pub(super) fn read_blocks_async(
         &self,
         bid: Ext2Bid,
@@ -877,6 +698,175 @@ impl Ext2 {
         }
 
         self.sync_metadata()
+    }
+
+    /// Reads an inode descriptor from preloaded superblock and block groups.
+    fn read_inode_desc_from_parts(
+        sb: &SuperBlock,
+        block_groups: &[BlockGroup],
+        ino: u32,
+    ) -> Result<InodeDesc> {
+        if (ino != ROOT_INO && ino < sb.first_ino()) || ino > sb.total_inodes() {
+            return_errno_with_message!(Errno::EINVAL, "inode number out of valid range");
+        }
+
+        let inodes_per_group = sb.inodes_per_group();
+        let group_idx = ((ino - 1) / inodes_per_group) as usize;
+        let index_in_group = (ino - 1) % inodes_per_group;
+
+        let group = block_groups
+            .get(group_idx)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "block group index out of range"))?;
+
+        group.read_inode_desc(index_in_group)
+    }
+
+    /// Checks whether the current caller may allocate blocks.
+    ///
+    /// Non-privileged users are denied when free blocks fall below the reserved
+    /// threshold, unless they have `CAP_SYS_RESOURCE` or match `s_resuid`/`s_resgid`.
+    fn has_free_blocks(
+        &self,
+        free_blocks: u32,
+        reserved_blocks: u32,
+        resuid: u32,
+        resgid: u32,
+    ) -> bool {
+        if free_blocks >= reserved_blocks + 1 {
+            return true;
+        }
+
+        // In ktest or kernel-internal contexts there is no thread — treat as root.
+        let Some(thread) = Thread::current() else {
+            return true;
+        };
+        let Some(posix_thread) = thread.as_posix_thread() else {
+            return true;
+        };
+
+        let credentials = posix_thread.credentials();
+
+        if credentials
+            .effective_capset()
+            .contains(CapSet::SYS_RESOURCE)
+        {
+            return true;
+        }
+
+        if u32::from(credentials.fsuid()) == resuid {
+            return true;
+        }
+
+        let resgid_val = Gid::from(resgid);
+        if !resgid_val.is_root() {
+            if credentials.fsgid() == resgid_val {
+                return true;
+            }
+            if credentials.groups().contains(&resgid_val) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Writes back superblock and group descriptor table if dirty.
+    fn sync_metadata(&self) -> Result<()> {
+        let sb_dirty = self.super_block.read().is_dirty();
+        let mut any_group_dirty = false;
+        for group in &self.block_groups {
+            if group.is_desc_dirty() {
+                any_group_dirty = true;
+                break;
+            }
+        }
+
+        if !sb_dirty && !any_group_dirty {
+            return Ok(());
+        }
+
+        let groups_count = {
+            let sb_guard = self.super_block.read();
+            sb_guard.block_groups_count() as usize
+        };
+        if groups_count == 0 || self.block_groups.len() < groups_count {
+            return_errno_with_message!(Errno::EIO, "inconsistent block group count");
+        }
+
+        let desc_bytes = groups_count * size_of::<RawGroupDesc>();
+        let desc_disk_bytes = desc_bytes.div_ceil(BLOCK_SIZE) * BLOCK_SIZE;
+        let mut desc_buf = vec![0u8; desc_disk_bytes];
+        if self
+            .group_descriptors_segment
+            .read_bytes(0, &mut desc_buf)
+            .is_err()
+        {
+            return_errno_with_message!(Errno::EIO, "failed to read group descriptor segment");
+        }
+        let mut sb_guard = self.super_block.write();
+
+        let mut total_free_blocks: u32 = 0;
+        let mut total_free_inodes: u32 = 0;
+        for group in &self.block_groups {
+            total_free_blocks += group.free_blocks_count() as u32;
+            total_free_inodes += group.free_inodes_count() as u32;
+        }
+        sb_guard.set_free_blocks_count(total_free_blocks);
+        sb_guard.set_free_inodes_count(total_free_inodes);
+
+        sb_guard.set_wtime(now());
+        if self
+            .block_device
+            .write_bytes(
+                Bid::new(sb_guard.group_descriptors_bid(0) as u64).to_offset(),
+                &desc_buf,
+            )
+            .is_err()
+        {
+            return_errno_with_message!(Errno::EIO, "failed to write group descriptor table");
+        }
+
+        let mut raw_sb = RawSuperBlock::from(&**sb_guard);
+        if self
+            .block_device
+            .write_bytes(SUPER_BLOCK_OFFSET, raw_sb.as_bytes())
+            .is_err()
+        {
+            return_errno_with_message!(Errno::EIO, "failed to write superblock");
+        }
+
+        for idx in 1..groups_count {
+            if !sb_guard.is_backup_group(idx) {
+                continue;
+            }
+            raw_sb.block_group_idx = idx as u16;
+            if self
+                .block_device
+                .write_bytes(
+                    Bid::new(sb_guard.bid(idx) as u64).to_offset(),
+                    raw_sb.as_bytes(),
+                )
+                .is_err()
+            {
+                return_errno_with_message!(Errno::EIO, "failed to write backup superblock");
+            }
+            if self
+                .block_device
+                .write_bytes(
+                    Bid::new(sb_guard.group_descriptors_bid(idx) as u64).to_offset(),
+                    &desc_buf,
+                )
+                .is_err()
+            {
+                return_errno_with_message!(
+                    Errno::EIO,
+                    "failed to write backup group descriptors"
+                );
+            }
+        }
+
+        sb_guard.clear_dirty();
+        Ok(())
     }
 }
 

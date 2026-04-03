@@ -144,6 +144,228 @@ impl Xattr {
         self.bid
     }
 
+    /// Creates or replaces one extended attribute.
+    ///
+    /// Allocates a block if needed.
+    ///
+    pub(super) fn set_xattr(
+        &mut self,
+        name: XattrName,
+        value_reader: &mut VmReader,
+        flags: XattrSetFlags,
+    ) -> Result<()> {
+        let (target_index, target_name) = Self::parse_target_name(name)?;
+        let block_size = self.fs()?.block_size();
+        let value_len = value_reader.remain();
+        if value_len > block_size {
+            return_errno_with_message!(Errno::ERANGE, "xattr value is too large");
+        }
+
+        self.ensure_loaded()?;
+        let mut entries = if self.bid == 0 {
+            Vec::new()
+        } else {
+            self.read_loaded_entries(block_size)?
+        };
+
+        let (found, insert_at) = Self::find_entry_position(&entries, target_index, &target_name);
+        if found.is_some() {
+            if flags.contains(XattrSetFlags::CREATE_ONLY) {
+                return_errno_with_message!(Errno::EEXIST, "the target xattr already exists");
+            }
+        } else if flags.contains(XattrSetFlags::REPLACE_ONLY) {
+            return_errno_with_message!(Errno::ENODATA, "the target xattr does not exist");
+        }
+
+        let mut value = vec![0u8; value_len];
+        if value_len > 0 {
+            value_reader.read_fallible(&mut VmWriter::from(value.as_mut_slice()))?;
+        }
+
+        if let Some(idx) = found {
+            entries[idx].value = value;
+        } else {
+            entries.insert(
+                insert_at,
+                XattrEntryData {
+                    name_index: target_index,
+                    name: target_name,
+                    value,
+                },
+            );
+        }
+
+        let working_block = Self::build_block(&entries, block_size)?;
+        // TODO: Add rollback if block allocation succeeds but the writeback fails.
+        self.alloc_bid_if_need()?;
+        self.write_working_block(&working_block, block_size)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Reads one extended attribute value.
+    ///
+    /// Performs a size query if `vm_writer.avail() == 0`.
+    ///
+    pub(super) fn get_xattr(&mut self, name: XattrName, vm_writer: &mut VmWriter) -> Result<usize> {
+        let (target_index, target_name) = Self::parse_target_name(name)?;
+
+        self.ensure_loaded()?;
+        if self.bid == 0 {
+            return_errno_with_message!(Errno::ENODATA, "the target xattr does not exist");
+        }
+
+        let block_size = self.fs()?.block_size();
+        let entries = self.read_loaded_entries(block_size)?;
+        let value = entries
+            .iter()
+            .find(|entry| {
+                Self::cmp_entry_key(entry.name_index, &entry.name, target_index, &target_name)
+                    == Ordering::Equal
+            })
+            .map(|entry| entry.value.as_slice())
+            .ok_or_else(|| {
+                Error::with_message(Errno::ENODATA, "the target xattr does not exist")
+            })?;
+
+        if vm_writer.avail() == 0 {
+            return Ok(value.len());
+        }
+        if value.len() > vm_writer.avail() {
+            return_errno_with_message!(Errno::ERANGE, "the xattr value buffer is too small");
+        }
+
+        vm_writer.write_fallible(&mut VmReader::from(value))?;
+        Ok(value.len())
+    }
+
+    /// Lists extended-attribute names in one namespace. Size query if `list_writer.avail() == 0`.
+    ///
+    pub(super) fn list_xattr(
+        &mut self,
+        namespace: XattrNamespace,
+        list_writer: &mut VmWriter,
+    ) -> Result<usize> {
+        self.ensure_loaded()?;
+        if self.bid == 0 {
+            return Ok(0);
+        }
+
+        let block_size = self.fs()?.block_size();
+        let entries = self.read_loaded_entries(block_size)?;
+
+        let mut listed_names = Vec::new();
+        let mut total_size = 0usize;
+        for entry in entries {
+            if Self::namespace_for_index(entry.name_index) != namespace {
+                continue;
+            }
+
+            let prefix = entry.name_index.prefix().as_bytes();
+            let name_size = prefix
+                .len()
+                .checked_add(entry.name.len())
+                .and_then(|v| v.checked_add(1))
+                .ok_or_else(|| Error::with_message(Errno::ERANGE, "xattr list size overflow"))?;
+            total_size = total_size
+                .checked_add(name_size)
+                .ok_or_else(|| Error::with_message(Errno::ERANGE, "xattr list size overflow"))?;
+
+            let mut full_name = Vec::with_capacity(name_size);
+            full_name.extend_from_slice(prefix);
+            full_name.extend_from_slice(&entry.name);
+            full_name.push(0);
+            listed_names.push(full_name);
+        }
+
+        if list_writer.avail() == 0 {
+            return Ok(total_size);
+        }
+        if total_size > list_writer.avail() {
+            return_errno_with_message!(Errno::ERANGE, "the xattr list buffer is too small");
+        }
+
+        for full_name in listed_names {
+            list_writer.write_fallible(&mut VmReader::from(full_name.as_slice()))?;
+        }
+        Ok(total_size)
+    }
+
+    /// Removes one extended attribute. Frees block if last entry removed.
+    ///
+    pub(super) fn remove_xattr(&mut self, name: XattrName) -> Result<()> {
+        let (target_index, target_name) = Self::parse_target_name(name)?;
+
+        self.ensure_loaded()?;
+        if self.bid == 0 {
+            return_errno_with_message!(Errno::ENODATA, "the target xattr does not exist");
+        }
+
+        let block_size = self.fs()?.block_size();
+        let mut entries = self.read_loaded_entries(block_size)?;
+        let (found, _) = Self::find_entry_position(&entries, target_index, &target_name);
+        let Some(found_idx) = found else {
+            return_errno_with_message!(Errno::ENODATA, "the target xattr does not exist");
+        };
+        entries.remove(found_idx);
+
+        if entries.is_empty() {
+            let fs = self.fs()?;
+            fs.free_blocks(self.bid, 1)?;
+            self.bid = 0;
+            self.block_buf = None;
+            self.dirty = false;
+            return Ok(());
+        }
+
+        let working_block = Self::build_block(&entries, block_size)?;
+        self.write_working_block(&working_block, block_size)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Frees the xattr block entirely (called during inode eviction).
+    ///
+    pub(super) fn delete_xattr_block(&mut self) -> Result<()> {
+        if self.bid == 0 {
+            self.block_buf = None;
+            self.dirty = false;
+            return Ok(());
+        }
+
+        let fs = self.fs()?;
+        fs.free_blocks(self.bid, 1)?;
+        self.bid = 0;
+        self.block_buf = None;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Writes the dirty xattr block back to disk.
+    pub(super) fn flush(&mut self) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        if self.bid == 0 {
+            self.dirty = false;
+            return Ok(());
+        }
+
+        let block_buf = match &self.block_buf {
+            Some(block_buf) => block_buf.clone(),
+            None => {
+                self.dirty = false;
+                return Ok(());
+            }
+        };
+
+        let fs = self.fs()?;
+        let bio_segment = BioSegment::new_from_segment(block_buf, BioDirection::ToDevice);
+        fs.write_blocks(self.bid, bio_segment)?;
+        self.dirty = false;
+        Ok(())
+    }
+
     fn fs(&self) -> Result<Arc<Ext2>> {
         self.fs
             .upgrade()
@@ -565,228 +787,6 @@ impl Xattr {
 
         Self::validate_block(&block_buf, block_size)?;
         self.block_buf = Some(block_buf);
-        Ok(())
-    }
-
-    /// Creates or replaces one extended attribute.
-    ///
-    /// Allocates a block if needed.
-    ///
-    pub(super) fn set_xattr(
-        &mut self,
-        name: XattrName,
-        value_reader: &mut VmReader,
-        flags: XattrSetFlags,
-    ) -> Result<()> {
-        let (target_index, target_name) = Self::parse_target_name(name)?;
-        let block_size = self.fs()?.block_size();
-        let value_len = value_reader.remain();
-        if value_len > block_size {
-            return_errno_with_message!(Errno::ERANGE, "xattr value is too large");
-        }
-
-        self.ensure_loaded()?;
-        let mut entries = if self.bid == 0 {
-            Vec::new()
-        } else {
-            self.read_loaded_entries(block_size)?
-        };
-
-        let (found, insert_at) = Self::find_entry_position(&entries, target_index, &target_name);
-        if found.is_some() {
-            if flags.contains(XattrSetFlags::CREATE_ONLY) {
-                return_errno_with_message!(Errno::EEXIST, "the target xattr already exists");
-            }
-        } else if flags.contains(XattrSetFlags::REPLACE_ONLY) {
-            return_errno_with_message!(Errno::ENODATA, "the target xattr does not exist");
-        }
-
-        let mut value = vec![0u8; value_len];
-        if value_len > 0 {
-            value_reader.read_fallible(&mut VmWriter::from(value.as_mut_slice()))?;
-        }
-
-        if let Some(idx) = found {
-            entries[idx].value = value;
-        } else {
-            entries.insert(
-                insert_at,
-                XattrEntryData {
-                    name_index: target_index,
-                    name: target_name,
-                    value,
-                },
-            );
-        }
-
-        let working_block = Self::build_block(&entries, block_size)?;
-        // TODO: Add rollback if block allocation succeeds but the writeback fails.
-        self.alloc_bid_if_need()?;
-        self.write_working_block(&working_block, block_size)?;
-        self.dirty = true;
-        Ok(())
-    }
-
-    /// Reads one extended attribute value.
-    ///
-    /// Performs a size query if `vm_writer.avail() == 0`.
-    ///
-    pub(super) fn get_xattr(&mut self, name: XattrName, vm_writer: &mut VmWriter) -> Result<usize> {
-        let (target_index, target_name) = Self::parse_target_name(name)?;
-
-        self.ensure_loaded()?;
-        if self.bid == 0 {
-            return_errno_with_message!(Errno::ENODATA, "the target xattr does not exist");
-        }
-
-        let block_size = self.fs()?.block_size();
-        let entries = self.read_loaded_entries(block_size)?;
-        let value = entries
-            .iter()
-            .find(|entry| {
-                Self::cmp_entry_key(entry.name_index, &entry.name, target_index, &target_name)
-                    == Ordering::Equal
-            })
-            .map(|entry| entry.value.as_slice())
-            .ok_or_else(|| {
-                Error::with_message(Errno::ENODATA, "the target xattr does not exist")
-            })?;
-
-        if vm_writer.avail() == 0 {
-            return Ok(value.len());
-        }
-        if value.len() > vm_writer.avail() {
-            return_errno_with_message!(Errno::ERANGE, "the xattr value buffer is too small");
-        }
-
-        vm_writer.write_fallible(&mut VmReader::from(value))?;
-        Ok(value.len())
-    }
-
-    /// Lists extended-attribute names in one namespace. Size query if `list_writer.avail() == 0`.
-    ///
-    pub(super) fn list_xattr(
-        &mut self,
-        namespace: XattrNamespace,
-        list_writer: &mut VmWriter,
-    ) -> Result<usize> {
-        self.ensure_loaded()?;
-        if self.bid == 0 {
-            return Ok(0);
-        }
-
-        let block_size = self.fs()?.block_size();
-        let entries = self.read_loaded_entries(block_size)?;
-
-        let mut listed_names = Vec::new();
-        let mut total_size = 0usize;
-        for entry in entries {
-            if Self::namespace_for_index(entry.name_index) != namespace {
-                continue;
-            }
-
-            let prefix = entry.name_index.prefix().as_bytes();
-            let name_size = prefix
-                .len()
-                .checked_add(entry.name.len())
-                .and_then(|v| v.checked_add(1))
-                .ok_or_else(|| Error::with_message(Errno::ERANGE, "xattr list size overflow"))?;
-            total_size = total_size
-                .checked_add(name_size)
-                .ok_or_else(|| Error::with_message(Errno::ERANGE, "xattr list size overflow"))?;
-
-            let mut full_name = Vec::with_capacity(name_size);
-            full_name.extend_from_slice(prefix);
-            full_name.extend_from_slice(&entry.name);
-            full_name.push(0);
-            listed_names.push(full_name);
-        }
-
-        if list_writer.avail() == 0 {
-            return Ok(total_size);
-        }
-        if total_size > list_writer.avail() {
-            return_errno_with_message!(Errno::ERANGE, "the xattr list buffer is too small");
-        }
-
-        for full_name in listed_names {
-            list_writer.write_fallible(&mut VmReader::from(full_name.as_slice()))?;
-        }
-        Ok(total_size)
-    }
-
-    /// Removes one extended attribute. Frees block if last entry removed.
-    ///
-    pub(super) fn remove_xattr(&mut self, name: XattrName) -> Result<()> {
-        let (target_index, target_name) = Self::parse_target_name(name)?;
-
-        self.ensure_loaded()?;
-        if self.bid == 0 {
-            return_errno_with_message!(Errno::ENODATA, "the target xattr does not exist");
-        }
-
-        let block_size = self.fs()?.block_size();
-        let mut entries = self.read_loaded_entries(block_size)?;
-        let (found, _) = Self::find_entry_position(&entries, target_index, &target_name);
-        let Some(found_idx) = found else {
-            return_errno_with_message!(Errno::ENODATA, "the target xattr does not exist");
-        };
-        entries.remove(found_idx);
-
-        if entries.is_empty() {
-            let fs = self.fs()?;
-            fs.free_blocks(self.bid, 1)?;
-            self.bid = 0;
-            self.block_buf = None;
-            self.dirty = false;
-            return Ok(());
-        }
-
-        let working_block = Self::build_block(&entries, block_size)?;
-        self.write_working_block(&working_block, block_size)?;
-        self.dirty = true;
-        Ok(())
-    }
-
-    /// Frees the xattr block entirely (called during inode eviction).
-    ///
-    pub(super) fn delete_xattr_block(&mut self) -> Result<()> {
-        if self.bid == 0 {
-            self.block_buf = None;
-            self.dirty = false;
-            return Ok(());
-        }
-
-        let fs = self.fs()?;
-        fs.free_blocks(self.bid, 1)?;
-        self.bid = 0;
-        self.block_buf = None;
-        self.dirty = false;
-        Ok(())
-    }
-
-    /// Writes the dirty xattr block back to disk.
-    pub(super) fn flush(&mut self) -> Result<()> {
-        if !self.dirty {
-            return Ok(());
-        }
-        if self.bid == 0 {
-            self.dirty = false;
-            return Ok(());
-        }
-
-        let block_buf = match &self.block_buf {
-            Some(block_buf) => block_buf.clone(),
-            None => {
-                self.dirty = false;
-                return Ok(());
-            }
-        };
-
-        let fs = self.fs()?;
-        let bio_segment = BioSegment::new_from_segment(block_buf, BioDirection::ToDevice);
-        fs.write_blocks(self.bid, bio_segment)?;
-        self.dirty = false;
         Ok(())
     }
 }

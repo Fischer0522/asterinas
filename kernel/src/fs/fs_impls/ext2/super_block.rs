@@ -471,36 +471,6 @@ impl SuperBlock {
         descriptor_bytes.div_ceil(self.block_size) as u32
     }
 
-    /// Returns the filesystem state.
-    #[expect(dead_code)]
-    fn state(&self) -> FsState {
-        self.state
-    }
-
-    /// Returns the revision level.
-    #[expect(dead_code)]
-    fn rev_level(&self) -> RevLevel {
-        self.rev_level
-    }
-
-    /// Returns the compatible feature set.
-    #[expect(dead_code)]
-    fn feature_compat(&self) -> FeatureCompatSet {
-        self.feature_compat
-    }
-
-    /// Returns the incompatible feature set.
-    #[expect(dead_code)]
-    fn feature_incompat(&self) -> FeatureInCompatSet {
-        self.feature_incompat
-    }
-
-    /// Returns the readonly-compatible feature set.
-    #[expect(dead_code)]
-    fn feature_ro_compat(&self) -> FeatureRoCompatSet {
-        self.feature_ro_compat
-    }
-
     /// Returns the number of free blocks.
     pub(super) fn free_blocks_count(&self) -> u32 {
         self.free_blocks_count
@@ -636,6 +606,32 @@ impl SuperBlock {
     pub(super) fn group_descriptors_bid(&self, block_group_idx: usize) -> Ext2Bid {
         let super_block_bid = self.bid(block_group_idx);
         super_block_bid + (SUPER_BLOCK_SIZE.div_ceil(self.block_size) as u32)
+    }
+
+
+    #[expect(dead_code)]
+    fn state(&self) -> FsState {
+        self.state
+    }
+
+    #[expect(dead_code)]
+    fn rev_level(&self) -> RevLevel {
+        self.rev_level
+    }
+
+    #[expect(dead_code)]
+    fn feature_compat(&self) -> FeatureCompatSet {
+        self.feature_compat
+    }
+
+    #[expect(dead_code)]
+    fn feature_incompat(&self) -> FeatureInCompatSet {
+        self.feature_incompat
+    }
+
+    #[expect(dead_code)]
+    fn feature_ro_compat(&self) -> FeatureRoCompatSet {
+        self.feature_ro_compat
     }
 }
 
