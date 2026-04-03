@@ -1599,11 +1599,12 @@ impl PageCacheBackend for InodeBlockManager {
                 fs.write_blocks_async(bid, bio_segment, complete_fn)
             }
             None => {
+                // TODO: no-op success, wait for generic_file_mmap_prepare()
                 error!(
                     "failed to find a block mapping in PageCacheBackend, idx: {}",
                     idx
                 );
-                return_errno!(Errno::EIO);
+                Ok(BioWaiter::new())
             }
         }
     }
@@ -1861,6 +1862,7 @@ impl InodeInner {
         let block = DirBlock::new(self.page_cache(), 0, block_size);
         let dot_len = DirEntryHeader::dir_rec_len(1) as usize;
         let write_result = (|| -> Result<()> {
+            self.page_cache().fill_zeros(0..block_size)?;
             block.write_entry(
                 0,
                 ino,
@@ -2607,6 +2609,7 @@ fn write_lock_two_inodes<'a>(
 mod test {
     use core::time::Duration;
 
+    use aster_block::id::Bid;
     use ostd::{mm::VmIo, prelude::ktest};
 
     use super::*;
@@ -2617,7 +2620,7 @@ mod test {
                 fs::ROOT_INO,
                 testkit::{
                     self, CollectDirentVisitor, ErrorBioDisk, Ext2FixtureBuilder, RawInodeBuilder,
-                    StopAfterVisitor, encode_dir_entry,
+                    StopAfterVisitor, encode_dir_entry, group0_layout,
                 },
             },
             vfs::{
@@ -3397,6 +3400,46 @@ mod test {
         assert_eq!(visitor.entries[1].0, "..");
         assert_eq!(visitor.entries[1].1, root.ino() as u64);
         assert_eq!(visitor.entries[1].2, InodeType::Dir);
+    }
+
+    #[ktest]
+    fn dir_make_empty_clears_stale_bytes() {
+        clocks::init_for_ktest();
+        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+        let block_size = f.ext2.block_size();
+        let layout = group0_layout(&f.sb);
+        let root_bid = layout.first_data.saturating_add(1);
+        let group_last = f.sb.group_last_block_no(0);
+
+        // Regression test for xfstests generic/002: creating a fresh directory
+        // must not expose stale bytes from a reused data block.
+        let stale_block = vec![0xAB; block_size];
+        for bid in layout.first_data..=group_last {
+            if bid == root_bid {
+                continue;
+            }
+            f.disk
+                .segment()
+                .write_bytes(Bid::new(bid as u64).to_offset(), &stale_block)
+                .unwrap();
+        }
+
+        let dir = root
+            .create("stale", InodeType::Dir, FilePerm::from_bits_truncate(0o755))
+            .unwrap();
+        f.ext2.sync_all().unwrap();
+
+        let dir_bid = dir.inner.read().lookup_block(0).unwrap().unwrap();
+        let mut raw_block = vec![0u8; block_size];
+        f.disk
+            .segment()
+            .read_bytes(Bid::new(dir_bid as u64).to_offset(), &mut raw_block)
+            .unwrap();
+
+        assert_eq!(&raw_block[8..12], b".\0\0\0");
+        assert_eq!(&raw_block[20..22], b"..");
+        assert!(raw_block[22..].iter().all(|byte| *byte == 0));
     }
 
     struct RmdirTestEnv {
