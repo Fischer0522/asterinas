@@ -888,7 +888,8 @@ mod test {
         fs::{
             fs_impls::ext2::testkit::{
                 self, ErrorBioDisk, Ext2FixtureBuilder, Ext2MemoryDisk, RawInodeBuilder,
-                build_group_desc_segment, make_valid_group_desc, make_valid_super_block,
+                assert_errno, build_group_desc_segment, create_file, make_valid_group_desc,
+                make_valid_super_block, namei_fixture,
             },
             vfs::file_system::FileSystem as FileSystemTrait,
         },
@@ -932,7 +933,7 @@ mod test {
     }
 
     #[ktest]
-    fn filesystem_statfs_defaults_to_bsddf_overhead() {
+    fn statfs_bsddf_subtracts_overhead() {
         let f = Ext2FixtureBuilder::new(3, 512).build().unwrap();
 
         let stat = FileSystemTrait::sb(f.ext2.as_ref());
@@ -946,7 +947,7 @@ mod test {
     }
 
     #[ktest]
-    fn filesystem_statfs_minixdf_reports_total_blocks() {
+    fn statfs_minixdf_reports_total() {
         let f = Ext2FixtureBuilder::new(3, 512).build().unwrap();
         let minixdf = CString::new("minixdf").unwrap();
 
@@ -961,7 +962,7 @@ mod test {
     }
 
     #[ktest]
-    fn filesystem_statfs_bavail_still_saturates_reserved_blocks() {
+    fn statfs_bavail_saturates_reserved() {
         let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let mut raw = f
             .disk
@@ -983,17 +984,10 @@ mod test {
     }
 
     #[ktest]
-    fn filesystem_sync_flushes_once_and_persists_root_updates() {
-        clocks::init_for_ktest();
-        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
-        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+    fn sync_flushes_and_persists() {
+        let (f, root) = namei_fixture();
 
-        root.create(
-            "persisted",
-            InodeType::File,
-            FilePerm::from_bits_truncate(0o644),
-        )
-        .unwrap();
+        create_file(&root, "persisted");
 
         FileSystemTrait::sync(f.ext2.as_ref()).unwrap();
         assert_eq!(f.disk.flush_count(), 1);
@@ -1007,21 +1001,13 @@ mod test {
     }
 
     #[ktest]
-    fn filesystem_sync_propagates_flush_error() {
-        clocks::init_for_ktest();
-        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
-        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+    fn sync_propagates_flush_error() {
+        let (f, root) = namei_fixture();
 
-        root.create(
-            "flush_err",
-            InodeType::File,
-            FilePerm::from_bits_truncate(0o644),
-        )
-        .unwrap();
+        create_file(&root, "flush_err");
 
         f.disk.set_flush_error(true);
-        let err = FileSystemTrait::sync(f.ext2.as_ref()).unwrap_err();
-        assert_eq!(err.error(), Errno::EIO);
+        assert_errno!(FileSystemTrait::sync(f.ext2.as_ref()), Errno::EIO);
         assert_eq!(f.disk.flush_count(), 1);
     }
 
@@ -1147,20 +1133,16 @@ mod test {
             .with_metadata_block_bitmap()
             .build()
             .unwrap();
-        assert_eq!(
+        assert_errno!(
             f_nospc
                 .ext2
-                .alloc_blocks(1, f_nospc.sb.first_data_block())
-                .unwrap_err()
-                .error(),
+                .alloc_blocks(1, f_nospc.sb.first_data_block()),
             Errno::ENOSPC
         );
-        assert_eq!(
+        assert_errno!(
             f_nospc
                 .ext2
-                .alloc_blocks(0, f_nospc.sb.first_data_block())
-                .unwrap_err()
-                .error(),
+                .alloc_blocks(0, f_nospc.sb.first_data_block()),
             Errno::EINVAL
         );
 
@@ -1170,12 +1152,10 @@ mod test {
             .with_filled_block_bitmap(true)
             .build()
             .unwrap();
-        assert_eq!(
+        assert_errno!(
             f_corrupt
                 .ext2
-                .alloc_blocks(1, f_corrupt.sb.first_data_block())
-                .unwrap_err()
-                .error(),
+                .alloc_blocks(1, f_corrupt.sb.first_data_block()),
             Errno::EIO
         );
 
@@ -1186,18 +1166,11 @@ mod test {
             .build()
             .unwrap();
         assert!(f_free.ext2.free_blocks(10, 0).is_ok());
-        assert_eq!(
-            f_free.ext2.free_blocks(1, 1).unwrap_err().error(),
-            Errno::EIO
-        );
+        assert_errno!(f_free.ext2.free_blocks(1, 1), Errno::EIO);
 
         let inode_bitmap_bid = f_free.ext2.block_group(0).inode_bitmap_bid();
-        assert_eq!(
-            f_free
-                .ext2
-                .free_blocks(inode_bitmap_bid, 1)
-                .unwrap_err()
-                .error(),
+        assert_errno!(
+            f_free.ext2.free_blocks(inode_bitmap_bid, 1),
             Errno::EIO
         );
     }
@@ -1275,20 +1248,14 @@ mod test {
             .with_reserved_inode_bitmap()
             .build()
             .unwrap();
-        assert_eq!(
-            f_nospc
-                .ext2
-                .alloc_inode(ROOT_INO, InodeType::File)
-                .unwrap_err()
-                .error(),
+        assert_errno!(
+            f_nospc.ext2.alloc_inode(ROOT_INO, InodeType::File),
             Errno::ENOSPC
         );
-        assert_eq!(
+        assert_errno!(
             f_nospc
                 .ext2
-                .alloc_inode(f_nospc.sb.total_inodes() + 1, InodeType::File)
-                .unwrap_err()
-                .error(),
+                .alloc_inode(f_nospc.sb.total_inodes() + 1, InodeType::File),
             Errno::EIO
         );
 
@@ -1298,12 +1265,8 @@ mod test {
             .with_filled_inode_bitmap(true)
             .build()
             .unwrap();
-        assert_eq!(
-            f_full
-                .ext2
-                .alloc_inode(ROOT_INO, InodeType::File)
-                .unwrap_err()
-                .error(),
+        assert_errno!(
+            f_full.ext2.alloc_inode(ROOT_INO, InodeType::File),
             Errno::ENOSPC
         );
 
@@ -1312,12 +1275,10 @@ mod test {
             .with_reserved_inode_bitmap()
             .build()
             .unwrap();
-        assert_eq!(
+        assert_errno!(
             f_free
                 .ext2
-                .free_inode(f_free.sb.first_ino() - 1, false)
-                .unwrap_err()
-                .error(),
+                .free_inode(f_free.sb.first_ino() - 1, false),
             Errno::EIO
         );
 
@@ -1360,16 +1321,12 @@ mod test {
         assert_eq!(raw.sector_count, 0);
         assert_eq!(raw.block, [0; 15]);
 
-        assert_eq!(
-            fixture
-                .ext2
-                .create_inode(
-                    ROOT_INO,
-                    InodeType::Unknown,
-                    FilePerm::from_bits_truncate(0o644)
-                )
-                .unwrap_err()
-                .error(),
+        assert_errno!(
+            fixture.ext2.create_inode(
+                ROOT_INO,
+                InodeType::Unknown,
+                FilePerm::from_bits_truncate(0o644)
+            ),
             Errno::EINVAL
         );
     }
@@ -1399,8 +1356,10 @@ mod test {
         descs[0].block_bitmap = sb.group_first_block_no(0).saturating_sub(1);
 
         let group_descs = build_group_desc_segment(&sb, &descs);
-        let err = Ext2::check_group_desc_table(&sb, &group_descs).unwrap_err();
-        assert_eq!(err.error(), Errno::EINVAL);
+        assert_errno!(
+            Ext2::check_group_desc_table(&sb, &group_descs),
+            Errno::EINVAL
+        );
     }
 
     #[ktest]
@@ -1417,8 +1376,10 @@ mod test {
         assert!(descs[0].inode_table >= first);
 
         let group_descs = build_group_desc_segment(&sb, &descs);
-        let err = Ext2::check_group_desc_table(&sb, &group_descs).unwrap_err();
-        assert_eq!(err.error(), Errno::EINVAL);
+        assert_errno!(
+            Ext2::check_group_desc_table(&sb, &group_descs),
+            Errno::EINVAL
+        );
     }
 
     #[ktest]
@@ -1443,8 +1404,7 @@ mod test {
         let sb = make_valid_super_block(1);
         let disk = ErrorBioDisk::new(BioStatus::IoError, 64 * BLOCK_SIZE / SECTOR_SIZE);
 
-        let err = Ext2::load_group_desc_table(&disk, &sb).unwrap_err();
-        assert_eq!(err.error(), Errno::EIO);
+        assert_errno!(Ext2::load_group_desc_table(&disk, &sb), Errno::EIO);
     }
 
     #[ktest]
@@ -1458,8 +1418,7 @@ mod test {
         let disk = Ext2MemoryDisk::new(64);
         disk.write_group_desc_table(&sb, &descs);
 
-        let err = Ext2::load_group_desc_table(&disk, &sb).unwrap_err();
-        assert_eq!(err.error(), Errno::EINVAL);
+        assert_errno!(Ext2::load_group_desc_table(&disk, &sb), Errno::EINVAL);
     }
 
     #[ktest]
@@ -1481,17 +1440,14 @@ mod test {
     fn read_inode_desc_deleted_ino_returns_err() {
         // Out-of-range group index.
         let f = Ext2FixtureBuilder::new(2, 128).build().unwrap();
-        let group_err = f.ext2.inode_table_block(2, 0).unwrap_err();
-        assert_eq!(group_err.error(), Errno::EIO);
+        assert_errno!(f.ext2.inode_table_block(2, 0), Errno::EIO);
 
         // Invalid inode numbers (too low / too high).
-        let invalid_low = f.ext2.read_inode_desc(1).unwrap_err();
-        assert_eq!(invalid_low.error(), Errno::EINVAL);
-        let invalid_high = f
-            .ext2
-            .read_inode_desc(f.sb.total_inodes().saturating_add(1))
-            .unwrap_err();
-        assert_eq!(invalid_high.error(), Errno::EINVAL);
+        assert_errno!(f.ext2.read_inode_desc(1), Errno::EINVAL);
+        assert_errno!(
+            f.ext2.read_inode_desc(f.sb.total_inodes().saturating_add(1)),
+            Errno::EINVAL
+        );
 
         // I/O error from block device: fail group-1 inode-table reads so mount
         // (which reads ROOT_INO from group 0) still succeeds.
@@ -1507,16 +1463,14 @@ mod test {
             .build()
             .unwrap();
         let group1_ino = f_io.sb.inodes_per_group().saturating_add(1);
-        let io_err = f_io.ext2.read_inode_desc(group1_ino).unwrap_err();
-        assert_eq!(io_err.error(), Errno::EIO);
+        assert_errno!(f_io.ext2.read_inode_desc(group1_ino), Errno::EIO);
 
         // Deleted inode (dtime != 0, mode == 0) → ESTALE.
         let f_parse = Ext2FixtureBuilder::new(2, 128).build().unwrap();
         let ino = f_parse.sb.first_ino();
         let raw = make_raw_inode(0, 0, 1);
         f_parse.ext2.write_inode_desc(ino, &raw).unwrap();
-        let parse_err = f_parse.ext2.read_inode_desc(ino).unwrap_err();
-        assert_eq!(parse_err.error(), Errno::ESTALE);
+        assert_errno!(f_parse.ext2.read_inode_desc(ino), Errno::ESTALE);
     }
 
     #[ktest]
@@ -1528,22 +1482,14 @@ mod test {
         assert!(Arc::ptr_eq(&first, &second));
 
         let unallocated_ino = f.sb.first_ino();
-        let err = f.ext2.read_inode(unallocated_ino).unwrap_err();
-        assert_eq!(err.error(), Errno::ENOENT);
+        assert_errno!(f.ext2.read_inode(unallocated_ino), Errno::ENOENT);
     }
 
     #[ktest]
-    fn create_inserts_inode_cache_and_sync_eviction_keeps_linked_inode() {
-        let f = Ext2FixtureBuilder::namei_env().build().unwrap();
-        let root = f.ext2.read_inode(ROOT_INO).unwrap();
+    fn inode_cache_survives_sync_eviction() {
+        let (f, root) = namei_fixture();
 
-        let child = root
-            .create(
-                "cache_file",
-                InodeType::File,
-                FilePerm::from_bits_truncate(0o644),
-            )
-            .unwrap();
+        let child = create_file(&root, "cache_file");
         let child_ino = child.ino();
 
         let cached = f.ext2.read_inode(child_ino).unwrap();
@@ -1650,8 +1596,9 @@ mod test {
             .unwrap();
         let group_descs: USegment = segment.into();
 
-        let err = Ext2::load_block_groups(&sb, &group_descs, Arc::new(Ext2MemoryDisk::new(64)))
-            .unwrap_err();
-        assert_eq!(err.error(), Errno::EINVAL);
+        assert_errno!(
+            Ext2::load_block_groups(&sb, &group_descs, Arc::new(Ext2MemoryDisk::new(64))),
+            Errno::EINVAL
+        );
     }
 }

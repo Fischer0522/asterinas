@@ -2,7 +2,7 @@
 
 #![cfg(ktest)]
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::{
     fmt,
     mem::size_of,
@@ -23,17 +23,21 @@ use ostd::{
 use super::{
     block_group::RawGroupDesc,
     fs::{Ext2, ROOT_INO},
-    inode::RawInode,
+    inode::{FilePerm, Inode, RawInode},
     super_block::{
         ErrorsBehavior, FsState, MAGIC_NUM, OsId, RawSuperBlock, RevLevel, SUPER_BLOCK_OFFSET,
     },
 };
 use crate::{
     fs::{
-        ext2::dir::DirEntryHeader, file::InodeType, fs_impls::ext2::super_block::SuperBlock,
+        ext2::dir::DirEntryHeader,
+        file::{InodeType, StatusFlags},
+        fs_impls::ext2::super_block::SuperBlock,
         utils::DirentVisitor,
+        vfs::inode::InodeIo,
     },
     prelude::{Errno, Result, return_errno_with_message, *},
+    time::clocks,
 };
 
 // ---------------------------------------------------------------------------
@@ -704,6 +708,13 @@ pub(super) struct Ext2Fixture {
     pub descs: Vec<RawGroupDesc>,
 }
 
+impl Ext2Fixture {
+    /// Returns the root inode (ino 2).
+    pub(super) fn root(&self) -> Arc<Inode> {
+        self.ext2.read_inode(ROOT_INO).unwrap()
+    }
+}
+
 pub(super) struct Ext2FixtureBuilder {
     groups: u32,
     nblocks: usize,
@@ -980,4 +991,93 @@ impl Ext2FixtureBuilder {
             descs,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Assertion helpers
+// ---------------------------------------------------------------------------
+
+/// Asserts that an expression returns `Err` with the expected `Errno`.
+macro_rules! assert_errno {
+    ($expr:expr, $errno:expr) => {
+        assert_eq!($expr.unwrap_err().error(), $errno)
+    };
+    ($expr:expr, $errno:expr, $($msg:tt)+) => {
+        assert_eq!($expr.unwrap_err().error(), $errno, $($msg)+)
+    };
+}
+pub(super) use assert_errno;
+
+// ---------------------------------------------------------------------------
+// Convenience test helpers
+// ---------------------------------------------------------------------------
+
+/// Creates a regular file (mode 0o644) inside `dir`.
+pub(super) fn create_file(dir: &Arc<Inode>, name: &str) -> Arc<Inode> {
+    dir.create(name, InodeType::File, FilePerm::from_bits_truncate(0o644))
+        .unwrap()
+}
+
+/// Creates a directory (mode 0o755) inside `dir`.
+pub(super) fn create_dir(dir: &Arc<Inode>, name: &str) -> Arc<Inode> {
+    dir.create(name, InodeType::Dir, FilePerm::from_bits_truncate(0o755))
+        .unwrap()
+}
+
+/// Creates a symlink (mode 0o777) inside `dir`.
+pub(super) fn create_symlink(dir: &Arc<Inode>, name: &str) -> Arc<Inode> {
+    dir.create(
+        name,
+        InodeType::SymLink,
+        FilePerm::from_bits_truncate(0o777),
+    )
+    .unwrap()
+}
+
+/// Builds a `namei_env` fixture and returns `(fixture, root_inode)` with clocks initialized.
+pub(super) fn namei_fixture() -> (Ext2Fixture, Arc<Inode>) {
+    clocks::init_for_ktest();
+    let f = Ext2FixtureBuilder::namei_env().build().unwrap();
+    let root = f.root();
+    (f, root)
+}
+
+/// Writes `data` to `inode` at `offset` with the given status flags.
+pub(super) fn write_file_at(
+    inode: &Arc<Inode>,
+    offset: usize,
+    data: &[u8],
+    flags: StatusFlags,
+) -> Result<usize> {
+    let mut reader = VmReader::from(data).to_fallible();
+    InodeIo::write_at(inode.as_ref(), offset, &mut reader, flags)
+}
+
+/// Reads `len` bytes from `inode` at `offset` with the given status flags.
+pub(super) fn read_file_at(
+    inode: &Arc<Inode>,
+    offset: usize,
+    len: usize,
+    flags: StatusFlags,
+) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+    let n = InodeIo::read_at(inode.as_ref(), offset, &mut writer, flags)?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+/// Returns the `ino` field of the inode found by `dir.lookup(name)`.
+pub(super) fn lookup_ino(dir: &Arc<Inode>, name: &str) -> Result<u32> {
+    Ok(dir.lookup(name)?.ino())
+}
+
+/// Returns the VFS-visible file size of `inode`.
+pub(super) fn inode_size(inode: &Arc<Inode>) -> usize {
+    crate::fs::vfs::inode::Inode::size(inode.as_ref())
+}
+
+/// Returns the VFS-visible hard-link count of `inode`.
+pub(super) fn inode_nlinks(inode: &Arc<Inode>) -> usize {
+    crate::fs::vfs::inode::Inode::metadata(inode.as_ref()).nr_hard_links
 }
