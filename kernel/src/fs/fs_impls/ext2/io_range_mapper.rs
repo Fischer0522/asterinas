@@ -4,8 +4,6 @@
 
 use core::ops::Range;
 
-use ostd::sync::RwMutexReadGuard;
-
 use super::{
     block_ptr_tree::{BlockPtrTree, Ext2Bid},
     fs::Ext2,
@@ -48,7 +46,7 @@ impl<'a> IoRangeMapper<'a> {
     ) -> Self {
         Self {
             range: range.start..range.end,
-            block_ptr_tree: block_ptr_tree,
+            block_ptr_tree,
             fs,
         }
     }
@@ -65,10 +63,10 @@ impl<'a> IoRangeMapper<'a> {
 
         let start_iblock = self.range.start;
         let max_blocks = self.range.end - self.range.start;
-        if let Some(device_block_range) =
+        let device_block_range =
             self.block_ptr_tree
-                .lookup_block_range(self.fs, start_iblock, max_blocks)?
-        {
+                .lookup_block_range(self.fs, start_iblock, max_blocks)?;
+        if !device_block_range.is_empty() {
             let logical_end = start_iblock
                 + device_block_range
                     .end
@@ -85,10 +83,10 @@ impl<'a> IoRangeMapper<'a> {
         while self.range.start < self.range.end {
             let iblock = self.range.start;
             let remaining = self.range.end - iblock;
-            if self
+            if !self
                 .block_ptr_tree
                 .lookup_block_range(self.fs, iblock, remaining)?
-                .is_some()
+                .is_empty()
             {
                 break;
             }

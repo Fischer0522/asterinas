@@ -114,6 +114,7 @@ impl Drop for BlockAllocGuard {
 ///
 /// Holds `i_blocks` (sector count) and the 15-entry `i_block[]` array.
 #[derive(Clone, Copy, Debug)]
+#[must_use = "RawBlockPtrs snapshot must be synced back to InodeDesc"]
 pub(super) struct RawBlockPtrs {
     pub(super) sector_count: u32,
     pub(super) block_ptrs: [u32; 15],
@@ -331,14 +332,14 @@ impl BlockPtrTree {
         path: &BlockPointerPath,
         branch: &BranchChainWalkResult,
         max_blocks: u32,
-    ) -> Result<Option<Range<Ext2Bid>>> {
+    ) -> Result<Range<Ext2Bid>> {
         if max_blocks == 0 {
             return_errno_with_message!(Errno::EINVAL, "zero block range requested");
         }
         // A partial walk means the logical block lands in a hole, so there is
         // no mapped physical range to report.
         if branch.partial_level < path.depth {
-            return Ok(None);
+            return Ok(0..0);
         }
 
         // The last chain entry is the first mapped data block for `iblock`.
@@ -348,7 +349,7 @@ impl BlockPtrTree {
             .ok_or_else(|| Error::with_message(Errno::EIO, "incomplete branch result"))?
             .key;
         if first_bid == 0 {
-            return Ok(None);
+            return Ok(0..0);
         }
 
         let max_count = Self::max_blocks_in_run(path, max_blocks);
@@ -392,7 +393,7 @@ impl BlockPtrTree {
             }
         }
 
-        Ok(Some(first_bid..first_bid.saturating_add(count)))
+        Ok(first_bid..first_bid.saturating_add(count))
     }
 
     fn blks_to_allocate(
@@ -799,14 +800,14 @@ impl BlockPtrTree {
         fs: &Ext2,
         iblock: u32,
         max_blocks: u32,
-    ) -> Result<Option<Range<Ext2Bid>>> {
+    ) -> Result<Range<Ext2Bid>> {
         if max_blocks == 0 {
             return_errno_with_message!(Errno::EINVAL, "zero block range requested");
         }
 
         let path = self.logical_block_to_path(fs, iblock)?;
         if path.depth == 0 {
-            return Ok(None);
+            return Ok(0..0);
         }
 
         let branch = self.walk_block_chain(&path, fs)?;
@@ -816,9 +817,12 @@ impl BlockPtrTree {
     /// Resolves a logical block to physical block (read-only).
     ///
     pub(super) fn lookup_block(&self, fs: &Ext2, iblock: u32) -> Result<Option<Ext2Bid>> {
-        Ok(self
-            .lookup_block_range(fs, iblock, 1)?
-            .map(|range| range.start))
+        let range = self.lookup_block_range(fs, iblock, 1)?;
+        Ok(if range.is_empty() {
+            None
+        } else {
+            Some(range.start)
+        })
     }
 
     /// Resolves a logical block to a contiguous physical block range, allocating if needed.
@@ -829,7 +833,7 @@ impl BlockPtrTree {
         iblock: u32,
         max_blocks: u32,
         create: bool,
-    ) -> Result<Option<Range<Ext2Bid>>> {
+    ) -> Result<Range<Ext2Bid>> {
         if max_blocks == 0 {
             return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
         }
@@ -848,7 +852,7 @@ impl BlockPtrTree {
             return self.mapped_range_from_branch(&path, &branch, max_blocks);
         }
         if !create {
-            return Ok(None);
+            return Ok(0..0);
         }
 
         // Allocate the missing indirect metadata blocks, plus as many contiguous
@@ -858,7 +862,7 @@ impl BlockPtrTree {
         let mut guard = self.allocate_blocks(fs, indirect_blks, data_blks, &path, &branch)?;
         self.splice_branch(fs, &guard, &path, &branch)?;
         guard.commit();
-        Ok(Some(guard.data_blocks.clone()))
+        Ok(guard.data_blocks.clone())
     }
 
     /// Truncates all blocks beyond `new_size`.
@@ -1095,10 +1099,9 @@ mod test {
         fs: &Arc<Ext2>,
         iblock: u32,
     ) -> Result<Ext2Bid> {
-        Ok(tree
-            .lookup_or_alloc_block_range(fs, iblock, 1, true)?
-            .unwrap()
-            .start)
+        let range = tree.lookup_or_alloc_block_range(fs, iblock, 1, true)?;
+        assert!(!range.is_empty());
+        Ok(range.start)
     }
 
     fn make_block_map(block_ptrs: [u32; 15], sector_count: u32, fs: &Arc<Ext2>) -> BlockPtrTree {
@@ -1284,18 +1287,18 @@ mod test {
 
         assert_eq!(
             block_ptr_tree.lookup_block_range(ext2, 0, 4).unwrap(),
-            Some(11..14)
+            11..14
         );
         assert_eq!(block_ptr_tree.lookup_block(ext2, 0).unwrap(), Some(11));
         assert_eq!(
             block_ptr_tree.lookup_block_range(ext2, 12, 4).unwrap(),
-            Some(70..73)
+            70..73
         );
         assert_eq!(
             block_ptr_tree.lookup_block_range(ext2, 15, 4).unwrap(),
-            Some(90..91)
+            90..91
         );
-        assert_eq!(block_ptr_tree.lookup_block_range(ext2, 3, 4).unwrap(), None);
+        assert!(block_ptr_tree.lookup_block_range(ext2, 3, 4).unwrap().is_empty());
     }
 
     #[ktest]
@@ -1396,11 +1399,11 @@ mod test {
         let sectors_per_block = (ext2.block_size() / SECTOR_SIZE) as u32;
 
         let mut block_ptr_tree = make_block_map([0u32; 15], 0, &f.ext2);
-        assert_eq!(
+        assert!(
             block_ptr_tree
                 .lookup_or_alloc_block_range(ext2, 0, 1, false)
-                .unwrap(),
-            None
+                .unwrap()
+                .is_empty()
         );
         assert_eq!(block_ptr_tree.raw_block_ptrs.block_ptrs[0], 0);
 
@@ -1433,7 +1436,6 @@ mod test {
         let free_before = ext2.super_block().free_blocks_count();
         let allocated_range = block_ptr_tree
             .lookup_or_alloc_block_range(ext2, 0, 3, true)
-            .unwrap()
             .unwrap();
         let free_after = ext2.super_block().free_blocks_count();
 
@@ -1452,14 +1454,14 @@ mod test {
         );
         assert_eq!(
             block_ptr_tree.lookup_block_range(ext2, 0, 3).unwrap(),
-            Some(allocated_range.clone())
+            allocated_range.clone()
         );
         assert_eq!(
             block_ptr_tree
                 .lookup_or_alloc_block_range(ext2, 0, 1, true)
                 .unwrap()
-                .map(|r| r.start),
-            Some(allocated_range.start)
+                .start,
+            allocated_range.start
         );
         assert_eq!(
             block_ptr_tree.raw_block_ptrs.sector_count,
@@ -1507,7 +1509,6 @@ mod test {
         let free_before = ext2.super_block().free_blocks_count();
         let allocated_range = block_ptr_tree
             .lookup_or_alloc_block_range(ext2, 12, 4, true)
-            .unwrap()
             .unwrap();
         let free_after = ext2.super_block().free_blocks_count();
 
@@ -1515,7 +1516,7 @@ mod test {
         assert_eq!(allocated_range.end - allocated_range.start, 4);
         assert_eq!(
             block_ptr_tree.lookup_block_range(ext2, 12, 4).unwrap(),
-            Some(allocated_range.clone())
+            allocated_range.clone()
         );
         assert_eq!(
             block_ptr_tree.lookup_block(ext2, 12).unwrap(),
