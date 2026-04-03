@@ -144,7 +144,7 @@ impl Xattr {
         self.bid
     }
 
-    fn fs_arc(&self) -> Result<Arc<Ext2>> {
+    fn fs(&self) -> Result<Arc<Ext2>> {
         self.fs
             .upgrade()
             .ok_or_else(|| Error::with_message(Errno::EIO, "ext2 instance is unavailable"))
@@ -536,7 +536,7 @@ impl Xattr {
             return Ok(());
         }
 
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         let inode = self.inode_arc()?;
         let goal = {
             let sb = fs.super_block();
@@ -556,7 +556,7 @@ impl Xattr {
             return Ok(());
         }
 
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         let block_size = fs.block_size();
         let block_buf = Self::alloc_block_buffer(block_size)?;
 
@@ -579,7 +579,7 @@ impl Xattr {
         flags: XattrSetFlags,
     ) -> Result<()> {
         let (target_index, target_name) = Self::parse_target_name(name)?;
-        let block_size = self.fs_arc()?.block_size();
+        let block_size = self.fs()?.block_size();
         let value_len = value_reader.remain();
         if value_len > block_size {
             return_errno_with_message!(Errno::ERANGE, "xattr value is too large");
@@ -624,7 +624,7 @@ impl Xattr {
         self.alloc_bid_if_need()?;
         self.write_working_block(&working_block, block_size)?;
         self.dirty = true;
-        self.flush()
+        Ok(())
     }
 
     /// Reads one extended attribute value.
@@ -639,7 +639,7 @@ impl Xattr {
             return_errno_with_message!(Errno::ENODATA, "the target xattr does not exist");
         }
 
-        let block_size = self.fs_arc()?.block_size();
+        let block_size = self.fs()?.block_size();
         let entries = self.read_loaded_entries(block_size)?;
         let value = entries
             .iter()
@@ -675,7 +675,7 @@ impl Xattr {
             return Ok(0);
         }
 
-        let block_size = self.fs_arc()?.block_size();
+        let block_size = self.fs()?.block_size();
         let entries = self.read_loaded_entries(block_size)?;
 
         let mut listed_names = Vec::new();
@@ -725,7 +725,7 @@ impl Xattr {
             return_errno_with_message!(Errno::ENODATA, "the target xattr does not exist");
         }
 
-        let block_size = self.fs_arc()?.block_size();
+        let block_size = self.fs()?.block_size();
         let mut entries = self.read_loaded_entries(block_size)?;
         let (found, _) = Self::find_entry_position(&entries, target_index, &target_name);
         let Some(found_idx) = found else {
@@ -734,7 +734,7 @@ impl Xattr {
         entries.remove(found_idx);
 
         if entries.is_empty() {
-            let fs = self.fs_arc()?;
+            let fs = self.fs()?;
             fs.free_blocks(self.bid, 1)?;
             self.bid = 0;
             self.block_buf = None;
@@ -745,7 +745,7 @@ impl Xattr {
         let working_block = Self::build_block(&entries, block_size)?;
         self.write_working_block(&working_block, block_size)?;
         self.dirty = true;
-        self.flush()
+        Ok(())
     }
 
     /// Frees the xattr block entirely (called during inode eviction).
@@ -757,7 +757,7 @@ impl Xattr {
             return Ok(());
         }
 
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         fs.free_blocks(self.bid, 1)?;
         self.bid = 0;
         self.block_buf = None;
@@ -783,7 +783,7 @@ impl Xattr {
             }
         };
 
-        let fs = self.fs_arc()?;
+        let fs = self.fs()?;
         let bio_segment = BioSegment::new_from_segment(block_buf, BioDirection::ToDevice);
         fs.write_blocks(self.bid, bio_segment)?;
         self.dirty = false;
