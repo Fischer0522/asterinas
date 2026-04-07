@@ -857,10 +857,7 @@ impl Ext2 {
                 )
                 .is_err()
             {
-                return_errno_with_message!(
-                    Errno::EIO,
-                    "failed to write backup group descriptors"
-                );
+                return_errno_with_message!(Errno::EIO, "failed to write backup group descriptors");
             }
         }
 
@@ -1134,15 +1131,11 @@ mod test {
             .build()
             .unwrap();
         assert_errno!(
-            f_nospc
-                .ext2
-                .alloc_blocks(1, f_nospc.sb.first_data_block()),
+            f_nospc.ext2.alloc_blocks(1, f_nospc.sb.first_data_block()),
             Errno::ENOSPC
         );
         assert_errno!(
-            f_nospc
-                .ext2
-                .alloc_blocks(0, f_nospc.sb.first_data_block()),
+            f_nospc.ext2.alloc_blocks(0, f_nospc.sb.first_data_block()),
             Errno::EINVAL
         );
 
@@ -1169,10 +1162,7 @@ mod test {
         assert_errno!(f_free.ext2.free_blocks(1, 1), Errno::EIO);
 
         let inode_bitmap_bid = f_free.ext2.block_group(0).inode_bitmap_bid();
-        assert_errno!(
-            f_free.ext2.free_blocks(inode_bitmap_bid, 1),
-            Errno::EIO
-        );
+        assert_errno!(f_free.ext2.free_blocks(inode_bitmap_bid, 1), Errno::EIO);
     }
 
     #[ktest]
@@ -1276,9 +1266,7 @@ mod test {
             .build()
             .unwrap();
         assert_errno!(
-            f_free
-                .ext2
-                .free_inode(f_free.sb.first_ino() - 1, false),
+            f_free.ext2.free_inode(f_free.sb.first_ino() - 1, false),
             Errno::EIO
         );
 
@@ -1445,7 +1433,8 @@ mod test {
         // Invalid inode numbers (too low / too high).
         assert_errno!(f.ext2.read_inode_desc(1), Errno::EINVAL);
         assert_errno!(
-            f.ext2.read_inode_desc(f.sb.total_inodes().saturating_add(1)),
+            f.ext2
+                .read_inode_desc(f.sb.total_inodes().saturating_add(1)),
             Errno::EINVAL
         );
 

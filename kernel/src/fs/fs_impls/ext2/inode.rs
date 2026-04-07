@@ -24,6 +24,7 @@ use crate::{
     fs::{
         ext2::dir::DirEntryFileType,
         file::InodeMode,
+        utils::CachePageExt,
         vfs::{
             inode::{Extension, FallocMode, Metadata},
             xattr::{XattrName, XattrNamespace, XattrSetFlags},
@@ -212,7 +213,7 @@ impl Inode {
     pub(super) fn metadata(&self) -> Metadata {
         let inner = self.inner.read();
         let block_manager = inner.block_manager();
-        let block_meta = block_manager.block_metadata_snapshot();
+        let block_meta = block_manager.raw_block_ptrs();
 
         let container_dev_id = match self.fs.upgrade() {
             Some(fs) => fs.block_device().id(),
@@ -745,8 +746,7 @@ impl Inode {
         inner.set_file_size(0);
         inner.set_file_acl(0);
         if inner.desc.sector_count > 0 {
-            let snapshot = block_manager.truncate_blocks(0)?;
-            inner.sync_desc_block_map_from_snapshot(snapshot);
+            block_manager.truncate_blocks(0)?;
         }
         inner.persist(self.ino)?;
 
@@ -1232,7 +1232,6 @@ impl Drop for Inode {
     }
 }
 
-
 /// Parsed in-memory mirror of an on-disk inode's metadata fields.
 ///
 /// Unlike [`RawInode`], fields are decoded into Rust types
@@ -1396,7 +1395,6 @@ pub(super) struct RawInode {
 
 const_assert!(size_of::<RawInode>() == 128);
 
-
 struct RenameContext<'a> {
     source_dir: &'a Inode,
     target_dir: &'a Inode,
@@ -1456,7 +1454,7 @@ impl InodeBlockManager {
     }
 
     /// Returns a snapshot of the raw block pointer state (read lock).
-    fn block_metadata_snapshot(&self) -> RawBlockPtrs {
+    fn raw_block_ptrs(&self) -> RawBlockPtrs {
         *self.block_ptr_tree.read().raw_block_ptrs()
     }
 
@@ -1482,35 +1480,29 @@ impl InodeBlockManager {
     }
 
     /// Truncates blocks and returns a snapshot of the resulting state (write lock).
-    fn truncate_blocks(&self, new_size: usize) -> Result<RawBlockPtrs> {
+    fn truncate_blocks(&self, new_size: usize) -> Result<()> {
         let fs = self.fs()?;
         let mut tree = self.block_ptr_tree.write();
         tree.truncate_blocks(&fs, new_size)?;
-        Ok(*tree.raw_block_ptrs())
-    }
-
-    /// Best-effort truncation for shrink/rollback paths (write lock).
-    /// Returns snapshot even on truncation error.
-    fn truncate_blocks_best_effort(&self, new_size: usize) -> RawBlockPtrs {
-        let Ok(fs) = self.fs() else {
-            error!("ext2: truncate_blocks_best_effort: filesystem already dropped");
-            return self.block_metadata_snapshot();
-        };
-        let mut tree = self.block_ptr_tree.write();
-        if let Err(err) = tree.truncate_blocks(&fs, new_size) {
-            error!(
-                "ext2: truncate_blocks_best_effort failed: new_size={}, err={:?}",
-                new_size, err
-            );
-        }
-        *tree.raw_block_ptrs()
+        Ok(())
     }
 
     /// Encodes a device ID and returns a snapshot (write lock).
-    fn encode_device_id(&self, device_id: u64) -> RawBlockPtrs {
+    fn encode_device_id(&self, device_id: u64) {
         let mut tree = self.block_ptr_tree.write();
         tree.raw_block_ptrs.encode_device_id(device_id);
-        *tree.raw_block_ptrs()
+    }
+
+    /// Writes a fast symlink target into the raw block pointer bytes (write lock).
+    fn write_fast_symlink(&self, target: &[u8]) {
+        let mut tree = self.block_ptr_tree.write();
+        tree.raw_block_ptrs.block_ptrs.as_mut_bytes()[..target.len()].copy_from_slice(target);
+    }
+
+    /// Reads fast symlink bytes from the raw block pointer area (read lock).
+    fn read_fast_symlink(&self, len: usize) -> Vec<u8> {
+        let tree = self.block_ptr_tree.read();
+        tree.raw_block_ptrs.block_ptrs.as_bytes()[..len].to_vec()
     }
 
     /// Syncs dirty indirect block metadata to disk (write lock).
@@ -1522,16 +1514,8 @@ impl InodeBlockManager {
     ///
     /// Returns `(snapshot, new_block_ids)` on success. On failure,
     /// `RawBlockPtrs` is unchanged so no descriptor sync is needed.
-    fn allocate_range_blocks(
-        &self,
-        offset: usize,
-        end: usize,
-        block_size: usize,
-    ) -> Result<(RawBlockPtrs, Vec<Ext2Bid>)> {
+    fn allocate_range_blocks(&self, start_block: usize, end_block: usize) -> Result<Vec<Ext2Bid>> {
         let fs = self.fs()?;
-        let start_block = offset / block_size;
-        let end_block = end.div_ceil(block_size);
-
         let mut tree = self.block_ptr_tree.write();
         let mut new_blocks = Vec::new();
         let mut current_block = start_block;
@@ -1551,8 +1535,7 @@ impl InodeBlockManager {
             current_block += allocated_range.end.saturating_sub(allocated_range.start) as usize;
             new_blocks.extend(allocated_range);
         }
-        let snapshot = *tree.raw_block_ptrs();
-        Ok((snapshot, new_blocks))
+        Ok(new_blocks)
     }
 }
 
@@ -1571,7 +1554,7 @@ impl PageCacheBackend for InodeBlockManager {
                 fs.read_blocks_async(bid, bio_segment, complete_fn)
             }
             None => {
-                // Found a hole, zero fill the page.
+                // Encountered a hole, zero fill the page.
                 let mut segment_writer = bio_segment.inner_dma_slice().writer().map_err(|_| {
                     Error::with_message(Errno::EIO, "failed to access zero-fill bio segment")
                 })?;
@@ -1592,21 +1575,18 @@ impl PageCacheBackend for InodeBlockManager {
     ) -> Result<BioWaiter> {
         let iblock = u32::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
-
-        match self.lookup_block(iblock)? {
-            Some(bid) => {
-                let fs = self.fs()?;
-                fs.write_blocks_async(bid, bio_segment, complete_fn)
-            }
-            None => {
-                // TODO: no-op success, wait for generic_file_mmap_prepare()
-                error!(
-                    "failed to find a block mapping in PageCacheBackend, idx: {}",
-                    idx
-                );
-                Ok(BioWaiter::new())
-            }
+        let fs = self.fs()?;
+        // The block is already allocated, write it directly.
+        if let Some(bid) = self.lookup_block(iblock)? {
+            return fs.write_blocks_async(bid, bio_segment, complete_fn);
         }
+        // Encounter a hole, allocate block here.
+
+        let bids = self.allocate_range_blocks(idx, idx + 1)?;
+        assert_eq!(bids.len(), 1);
+        let bid = bids[0];
+
+        fs.write_blocks_async(bid, bio_segment, complete_fn)
     }
 
     fn npages(&self) -> usize {
@@ -1677,11 +1657,6 @@ impl InodeInner {
 
     fn block_manager(&self) -> &Arc<InodeBlockManager> {
         &self.block_manager
-    }
-
-    fn sync_desc_block_map_from_snapshot(&mut self, block_map_desc: RawBlockPtrs) {
-        self.desc.sector_count = block_map_desc.sector_count;
-        self.desc.block_ptrs = block_map_desc.block_ptrs;
     }
 
     fn resize_page_cache_and_update_npages(
@@ -1818,13 +1793,15 @@ impl InodeInner {
 
     fn encode_device_id(&mut self, device_id: u64) -> Result<()> {
         let block_manager = self.block_manager().clone();
-        let snapshot = block_manager.encode_device_id(device_id);
-        self.sync_desc_block_map_from_snapshot(snapshot);
+        block_manager.encode_device_id(device_id);
         Ok(())
     }
 
     fn persist(&mut self, ino: u32) -> Result<()> {
         let fs = self.fs()?;
+        let raw_block_ptrs = self.block_manager.raw_block_ptrs();
+        self.desc.block_ptrs = raw_block_ptrs.block_ptrs;
+        self.desc.sector_count = raw_block_ptrs.sector_count;
         let raw = RawInode::from(&*self.desc);
         fs.write_inode_desc(ino, &raw)?;
         self.clear_dirty();
@@ -2039,16 +2016,16 @@ impl InodeInner {
         self.resize_page_cache_and_update_npages(new_size, old_size)?;
 
         let block_manager = self.block_manager.clone();
-        // Block truncation is best-effort, matching Linux ext2 where
-        // ext2_truncate_blocks() returns void. Leaked blocks from partial
+        // Block truncation is best-effort. Leaked blocks from partial
         // failures are recoverable by e2fsck. Page cache and i_size are
         // already committed, so propagating an error here would leave the
         // inode in a worse inconsistent state.
-        let snapshot = block_manager.truncate_blocks_best_effort(new_size);
+        if let Err(err) = block_manager.truncate_blocks(new_size) {
+            error!("ext2 truncate_blocks failed during resize, err: {:?}", err)
+        }
 
         // Fill the partial tail of the new EOF block.
         self.zero_eof_tail(new_size, block_size)?;
-        self.sync_desc_block_map_from_snapshot(snapshot);
         self.set_file_size(new_size);
         Ok(())
     }
@@ -2143,8 +2120,8 @@ impl InodeInner {
         // Linux stores symlink targets as C-style strings with a trailing NUL,
         // so reserve one byte for the trailing NUL.
         if target.len() < MAX_FAST_SYMLINK_LEN {
-            // Fast path.
-            self.desc.block_ptrs.as_mut_bytes()[..target_len].copy_from_slice(target.as_bytes());
+            // Fast path: store target inline in the block pointer area.
+            self.block_manager().write_fast_symlink(target.as_bytes());
         } else {
             // Slow path: write through the page cache.
             self.prepare_write(0, target_len)?;
@@ -2160,12 +2137,12 @@ impl InodeInner {
         let fs = self.fs()?;
         let block_size = fs.block_size();
 
-        if self.desc.is_fast_symlink(block_size) {
+        if self.is_fast_symlink(block_size) {
             // Linux stores symlink targets as C-style strings with a trailing NUL,
             // so reserve one byte for the trailing NUL.
             let read_len = link_size.min(MAX_FAST_SYMLINK_LEN - 1);
-            let raw = self.desc.block_ptrs.as_bytes();
-            return String::from_utf8(raw[..read_len].to_vec())
+            let raw = self.block_manager().read_fast_symlink(read_len);
+            return String::from_utf8(raw)
                 .map_err(|_| Error::with_message(Errno::EIO, "symlink target is not valid UTF-8"));
         }
 
@@ -2176,6 +2153,16 @@ impl InodeInner {
 
         String::from_utf8(target)
             .map_err(|_| Error::with_message(Errno::EIO, "symlink target is not valid UTF-8"))
+    }
+
+    fn is_fast_symlink(&self, block_size: usize) -> bool {
+        let ea_blocks = if self.desc.file_acl != 0 {
+            (block_size / SECTOR_SIZE) as u32
+        } else {
+            0
+        };
+        let sector_count = self.block_manager.raw_block_ptrs().sector_count;
+        self.desc.type_ == InodeType::SymLink && sector_count.checked_sub(ea_blocks) == Some(0)
     }
 
     // 1. Zero the old partial tail if the write extends EOF.
@@ -2236,12 +2223,20 @@ impl InodeInner {
         if !start.is_multiple_of(block_size) && block_manager.lookup_block(start_iblock)?.is_none()
         {
             let new_start_block = start.align_down(block_size);
-            self.page_cache().fill_zeros(new_start_block..start)?;
+            let page_idx = new_start_block / PAGE_SIZE;
+            let page = self.page_cache.commit_on(page_idx)?;
+            if !page.is_dirty() {
+                self.page_cache().fill_zeros(new_start_block..start)?;
+            }
         }
 
         if !end.is_multiple_of(block_size) && block_manager.lookup_block(end_iblock)?.is_none() {
             let new_end_block = end.align_up(block_size);
-            self.page_cache().fill_zeros(end..new_end_block)?;
+            let end_page_idx = end / PAGE_SIZE;
+            let page = self.page_cache.commit_on(end_page_idx)?;
+            if !page.is_dirty() {
+                self.page_cache().fill_zeros(end..new_end_block)?;
+            }
         }
         Ok(())
     }
@@ -2253,10 +2248,10 @@ impl InodeInner {
         end: usize,
         block_size: usize,
     ) -> Result<Vec<Ext2Bid>> {
+        let start_block = offset / block_size;
+        let end_block = end.div_ceil(block_size);
         let block_manager = self.block_manager().clone();
-        let (snapshot, new_blocks) =
-            block_manager.allocate_range_blocks(offset, end, block_size)?;
-        self.sync_desc_block_map_from_snapshot(snapshot);
+        let new_blocks = block_manager.allocate_range_blocks(start_block, end_block)?;
         Ok(new_blocks)
     }
 
@@ -2300,8 +2295,12 @@ impl InodeInner {
         }
 
         let block_manager = self.block_manager().clone();
-        let snapshot = block_manager.truncate_blocks_best_effort(old_size);
-        self.sync_desc_block_map_from_snapshot(snapshot);
+        if let Err(err) = block_manager.truncate_blocks(old_size) {
+            error!(
+                "ext2 truncate_blocks failed during rollback, err: {:?}",
+                err
+            )
+        }
     }
 
     /// Scans directory blocks for a reusable slot or a duplicate entry.
@@ -2498,7 +2497,6 @@ impl InodeInner {
     }
 }
 
-
 bitflags! {
     struct FileFlags: u32 {
         /// Secure deletion.
@@ -2603,7 +2601,6 @@ fn write_lock_two_inodes<'a>(
         (ga, gb)
     }
 }
-
 
 #[cfg(ktest)]
 mod test {
@@ -2751,13 +2748,14 @@ mod test {
         create_file(&root, "alpha");
         let free_inodes_before = f.ext2.super_block().free_inodes_count();
         assert_errno!(
-            root.create("alpha", InodeType::File, FilePerm::from_bits_truncate(0o644)),
+            root.create(
+                "alpha",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644)
+            ),
             Errno::EEXIST
         );
-        assert_eq!(
-            f.ext2.super_block().free_inodes_count(),
-            free_inodes_before
-        );
+        assert_eq!(f.ext2.super_block().free_inodes_count(), free_inodes_before);
     }
 
     #[ktest]
@@ -2765,7 +2763,11 @@ mod test {
         let (_f, root) = namei_fixture();
 
         assert_errno!(
-            root.create("sock", InodeType::Socket, FilePerm::from_bits_truncate(0o644)),
+            root.create(
+                "sock",
+                InodeType::Socket,
+                FilePerm::from_bits_truncate(0o644)
+            ),
             Errno::EINVAL
         );
     }
@@ -3318,7 +3320,13 @@ mod test {
         let dir = create_dir(&root, "stale");
         f.ext2.sync_all().unwrap();
 
-        let dir_bid = dir.inner.read().block_manager.lookup_block(0).unwrap().unwrap();
+        let dir_bid = dir
+            .inner
+            .read()
+            .block_manager
+            .lookup_block(0)
+            .unwrap()
+            .unwrap();
         let mut raw_block = vec![0u8; block_size];
         f.disk
             .segment()
@@ -3965,17 +3973,10 @@ mod test {
         VfsInodeTrait::resize(file.as_ref(), block_size + keep_in_tail).unwrap();
         let free_after_resize = f.ext2.super_block().free_blocks_count();
 
-        let kept =
-            read_file_at(&file, block_size, keep_in_tail, StatusFlags::empty()).unwrap();
+        let kept = read_file_at(&file, block_size, keep_in_tail, StatusFlags::empty()).unwrap();
         assert!(kept.iter().all(|b| *b == 0xab));
 
-        let eof = read_file_at(
-            &file,
-            block_size + keep_in_tail,
-            32,
-            StatusFlags::empty(),
-        )
-        .unwrap();
+        let eof = read_file_at(&file, block_size + keep_in_tail, 32, StatusFlags::empty()).unwrap();
         assert_eq!(eof.len(), 0);
 
         assert_eq!(inode_size(&file), block_size + keep_in_tail);
