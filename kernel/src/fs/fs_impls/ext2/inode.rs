@@ -799,6 +799,7 @@ impl Inode {
                 | InodeType::CharDevice
                 | InodeType::BlockDevice
                 | InodeType::NamedPipe
+                | InodeType::Socket
         ) {
             return_errno!(Errno::EINVAL);
         }
