@@ -176,10 +176,6 @@ impl Ext2 {
     /// Reads an inode via per-block-group inode cache.
     ///
     pub(super) fn read_inode(&self, ino: u32) -> Result<Arc<Inode>> {
-        if self.self_ref.upgrade().is_none() {
-            return_errno_with_message!(Errno::EIO, "filesystem already dropped");
-        }
-
         let sb = self.super_block.read();
         if ino == 0 || ((ino != ROOT_INO && ino < sb.first_ino()) || ino > sb.total_inodes()) {
             return_errno_with_message!(Errno::EINVAL, "inode number out of valid range");
