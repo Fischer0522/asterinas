@@ -14,6 +14,13 @@ stdenvNoCC.mkDerivation {
         cat > $out/xfstests/run_xfstests.sh << 'EOF'
     #!/bin/sh
     set -e
+
+    # Create /dev/fd symlinks (should be done by init system, not kernel)
+    ln -sf /proc/self/fd /dev/fd 2>/dev/null || true
+    ln -sf /proc/self/fd/0 /dev/stdin 2>/dev/null || true
+    ln -sf /proc/self/fd/1 /dev/stdout 2>/dev/null || true
+    ln -sf /proc/self/fd/2 /dev/stderr 2>/dev/null || true
+    
     export PATH=\
     ${pkgs.perl}/bin:\
     ${pkgs.bash}/bin:\
