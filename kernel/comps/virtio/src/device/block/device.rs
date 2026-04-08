@@ -493,7 +493,7 @@ impl DeviceInner {
             resp_slice
         };
 
-        let num_used_descs = 1;
+        let num_used_descs = 2;
         loop {
             let mut queue = self.queue.disable_irq().lock();
             if num_used_descs > queue.available_desc() {
