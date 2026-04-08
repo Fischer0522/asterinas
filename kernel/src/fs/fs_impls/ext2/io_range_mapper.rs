@@ -67,10 +67,8 @@ impl<'a> IoRangeMapper<'a> {
             self.block_ptr_tree
                 .lookup_block_range(self.fs, start_iblock, max_blocks)?;
         if !device_block_range.is_empty() {
-            let logical_end = start_iblock
-                + device_block_range
-                    .end
-                    .saturating_sub(device_block_range.start);
+            debug_assert!(device_block_range.end >= device_block_range.start);
+            let logical_end = start_iblock + device_block_range.end - device_block_range.start;
             self.range.start = logical_end;
             return Ok(Some(IoRange::Mapped(MappedRange {
                 logical_block_range: start_iblock..logical_end,

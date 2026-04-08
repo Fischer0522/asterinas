@@ -469,13 +469,13 @@ impl SuperBlock {
 
     /// Decreases the number of free blocks.
     pub(super) fn dec_free_blocks(&mut self, count: u32) {
-        if self.free_blocks_count < count {
-            warn!(
-                "free block counter underflow detected: free_blocks_count={}, count={}",
-                self.free_blocks_count, count
-            );
-        }
-        self.free_blocks_count = self.free_blocks_count.saturating_sub(count);
+        debug_assert!(
+            self.free_blocks_count >= count,
+            "free block counter underflow: free_blocks_count={}, count={}",
+            self.free_blocks_count,
+            count
+        );
+        self.free_blocks_count -= count;
     }
 
     /// Returns the number of free inodes.
@@ -500,7 +500,7 @@ impl SuperBlock {
     /// Decreases the number of free inodes.
     pub(super) fn dec_free_inodes(&mut self) {
         debug_assert!(self.free_inodes_count > 0);
-        self.free_inodes_count = self.free_inodes_count.saturating_sub(1);
+        self.free_inodes_count -= 1;
     }
 
     /// Checks if the block group will backup the super block.

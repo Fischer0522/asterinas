@@ -104,7 +104,8 @@ impl Drop for BlockAllocGuard {
             }
         }
 
-        let data_count = self.data_blocks.end.saturating_sub(self.data_blocks.start);
+        debug_assert!(self.data_blocks.end >= self.data_blocks.start);
+        let data_count = self.data_blocks.end - self.data_blocks.start;
         if data_count > 0 {
             if let Err(err) = self.fs.free_blocks(self.data_blocks.start, data_count) {
                 error!("failed to free data blocks in rollback: {:?}", err);
@@ -375,10 +376,8 @@ impl BlockPtrTree {
                 }
                 fs.free_blocks(ptr, 1)?;
                 self.raw_block_ptrs.block_ptrs[idx] = 0;
-                self.raw_block_ptrs.sector_count = self
-                    .raw_block_ptrs
-                    .sector_count
-                    .saturating_sub(sectors_per_block);
+                debug_assert!(self.raw_block_ptrs.sector_count >= sectors_per_block);
+                self.raw_block_ptrs.sector_count -= sectors_per_block;
             }
         } else {
             // === Case 2: Indirect blocks ===
@@ -831,10 +830,8 @@ impl BlockPtrTree {
                 );
                 return;
             }
-            self.raw_block_ptrs.sector_count = self
-                .raw_block_ptrs
-                .sector_count
-                .saturating_sub(sectors_per_block);
+            debug_assert!(self.raw_block_ptrs.sector_count >= sectors_per_block);
+            self.raw_block_ptrs.sector_count -= sectors_per_block;
             return;
         }
 
@@ -881,10 +878,8 @@ impl BlockPtrTree {
             );
             return;
         }
-        self.raw_block_ptrs.sector_count = self
-            .raw_block_ptrs
-            .sector_count
-            .saturating_sub(sectors_per_block);
+        debug_assert!(self.raw_block_ptrs.sector_count >= sectors_per_block);
+        self.raw_block_ptrs.sector_count -= sectors_per_block;
     }
 
     fn allocate_blocks(
@@ -923,7 +918,8 @@ impl BlockPtrTree {
         while (indirect_blocks.len() as u32) < indirect_blks {
             let remain = indirect_blks - indirect_blocks.len() as u32;
             let allocated = fs.alloc_blocks(remain, alloc_goal)?;
-            let alloc_len = allocated.end.saturating_sub(allocated.start);
+            debug_assert!(allocated.end >= allocated.start);
+            let alloc_len = allocated.end - allocated.start;
             if alloc_len == 0 || alloc_len > remain {
                 return_errno_with_message!(Errno::EIO, "invalid metadata allocation result");
             }
@@ -939,9 +935,8 @@ impl BlockPtrTree {
         guard.track_indirect_blocks(indirect_blocks);
 
         let data_blocks_range = fs.alloc_blocks(data_blks, data_goal)?;
-        let alloc_len = data_blocks_range
-            .end
-            .saturating_sub(data_blocks_range.start);
+        debug_assert!(data_blocks_range.end >= data_blocks_range.start);
+        let alloc_len = data_blocks_range.end - data_blocks_range.start;
         guard.track_data_blocks(data_blocks_range);
 
         if alloc_len == 0 || alloc_len > data_blks {
@@ -964,8 +959,9 @@ impl BlockPtrTree {
         let block_size = fs.block_size();
         let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
 
+        debug_assert!(data_blocks.end >= data_blocks.start);
         let total = (indirect_blocks.len() as u32)
-            .checked_add(data_blocks.end.saturating_sub(data_blocks.start))
+            .checked_add(data_blocks.end - data_blocks.start)
             .ok_or_else(|| Error::with_message(Errno::EIO, "block allocation count overflow"))?;
         let added_sectors = total
             .checked_mul(sectors_per_block)

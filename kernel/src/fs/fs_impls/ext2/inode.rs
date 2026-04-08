@@ -613,7 +613,7 @@ impl Inode {
             }
 
             child_inner.set_ctime(now());
-            child_inner.sub_link_count_saturating(2);
+            child_inner.dec_link_count(2);
 
             if child_inner.link_count() == 0 {
                 child_inner.persist(child_ino)?;
@@ -624,7 +624,7 @@ impl Inode {
 
             let target_entry = parent_inner.find_entry_target(name)?;
             parent_inner.delete_entry(&target_entry)?;
-            parent_inner.sub_link_count_saturating(1);
+            parent_inner.dec_link_count(1);
             parent_inner.touch_mtime_ctime(now());
 
             return Ok(());
@@ -827,7 +827,7 @@ impl Inode {
 
         // Link the child dir's `..` to parent dir.
         if is_dir {
-            parent_inner.add_link_count_saturating(1);
+            parent_inner.inc_link_count(1);
         }
         parent_inner.touch_mtime_ctime(now());
 
@@ -874,7 +874,7 @@ impl Inode {
         dir_inner.touch_mtime_ctime(now());
 
         old_inner.set_ctime(now());
-        old_inner.add_link_count_saturating(1);
+        old_inner.inc_link_count(1);
         Ok(())
     }
 
@@ -920,7 +920,7 @@ impl Inode {
             // Update timestamps before dropping the target link count.
             let child_inner = guards.inner_mut(child.ino())?;
             child_inner.set_ctime(now());
-            child_inner.sub_link_count_saturating(1);
+            child_inner.dec_link_count(1);
 
             if child_inner.link_count() == 0 {
                 child_inner.persist(child_ino)?;
@@ -1137,9 +1137,9 @@ impl Inode {
             dir_inner.delete_entry(&old_target)?;
             if ctx.old_is_dir {
                 if ctx.existing_inode.is_none() {
-                    dir_inner.add_link_count_saturating(1);
+                    dir_inner.inc_link_count(1);
                 }
-                dir_inner.sub_link_count_saturating(1);
+                dir_inner.dec_link_count(1);
             }
             dir_inner.touch_mtime_ctime(now());
         } else {
@@ -1154,7 +1154,7 @@ impl Inode {
                     ctx.existing_inode.is_some(),
                 )?;
                 if ctx.old_is_dir && ctx.existing_inode.is_none() {
-                    target_inner.add_link_count_saturating(1);
+                    target_inner.inc_link_count(1);
                 }
                 target_inner.touch_mtime_ctime(now());
             }
@@ -1163,7 +1163,7 @@ impl Inode {
                 let source_de = source_inner.find_entry_target(ctx.old_name)?;
                 source_inner.delete_entry(&source_de)?;
                 if ctx.old_is_dir {
-                    source_inner.sub_link_count_saturating(1);
+                    source_inner.dec_link_count(1);
                 }
                 source_inner.touch_mtime_ctime(now());
             }
@@ -1174,9 +1174,9 @@ impl Inode {
             let existing_inner = guards.inner_mut(existing.ino())?;
             existing_inner.set_ctime(now());
             if ctx.old_is_dir {
-                existing_inner.sub_link_count_saturating(1);
+                existing_inner.dec_link_count(1);
             }
-            existing_inner.sub_link_count_saturating(1);
+            existing_inner.dec_link_count(1);
         }
 
         let old_inner = guards.inner_mut(ctx.old_inode.ino())?;
@@ -1525,14 +1525,16 @@ impl InodeBlockManager {
 
             let mapped_range = tree.lookup_block_range(&fs, iblock, remaining)?;
             if !mapped_range.is_empty() {
-                current_block += mapped_range.end.saturating_sub(mapped_range.start) as usize;
+                debug_assert!(mapped_range.end >= mapped_range.start);
+                current_block += (mapped_range.end - mapped_range.start) as usize;
                 continue;
             }
             let allocated_range = tree.lookup_or_alloc_block_range(&fs, iblock, remaining, true)?;
             if allocated_range.is_empty() {
                 return_errno_with_message!(Errno::EIO, "missing block mapping after allocation");
             }
-            current_block += allocated_range.end.saturating_sub(allocated_range.start) as usize;
+            debug_assert!(allocated_range.end >= allocated_range.start);
+            current_block += (allocated_range.end - allocated_range.start) as usize;
             new_blocks.extend(allocated_range);
         }
         Ok(new_blocks)
@@ -1752,12 +1754,14 @@ impl InodeInner {
         self.desc.link_count
     }
 
-    fn add_link_count_saturating(&mut self, delta: u16) {
-        self.desc.link_count = self.desc.link_count.saturating_add(delta);
+    fn inc_link_count(&mut self, delta: u16) {
+        debug_assert!(self.desc.link_count.checked_add(delta).is_some());
+        self.desc.link_count += delta;
     }
 
-    fn sub_link_count_saturating(&mut self, delta: u16) {
-        self.desc.link_count = self.desc.link_count.saturating_sub(delta);
+    fn dec_link_count(&mut self, delta: u16) {
+        debug_assert!(self.desc.link_count >= delta);
+        self.desc.link_count -= delta;
     }
 
     fn remove_flags(&mut self, flags: FileFlags) {

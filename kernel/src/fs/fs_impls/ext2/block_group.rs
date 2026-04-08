@@ -384,37 +384,43 @@ impl BlockGroup {
     /// Decreases the free-block counter for this group.
     pub(super) fn dec_free_blocks(&self, count: u16) {
         let mut metadata = self.metadata.write();
-        metadata.desc.free_blocks_count = metadata.desc.free_blocks_count.saturating_sub(count);
+        debug_assert!(metadata.desc.free_blocks_count >= count);
+        metadata.desc.free_blocks_count -= count;
     }
 
     /// Increases the free-block counter for this group.
     pub(super) fn inc_free_blocks(&self, count: u16) {
         let mut metadata = self.metadata.write();
-        metadata.desc.free_blocks_count = metadata.desc.free_blocks_count.saturating_add(count);
+        debug_assert!(metadata.desc.free_blocks_count.checked_add(count).is_some());
+        metadata.desc.free_blocks_count += count;
     }
 
     /// Decreases the free-inode counter for this group.
     pub(super) fn dec_free_inodes(&self, count: u16) {
         let mut metadata = self.metadata.write();
-        metadata.desc.free_inodes_count = metadata.desc.free_inodes_count.saturating_sub(count);
+        debug_assert!(metadata.desc.free_inodes_count >= count);
+        metadata.desc.free_inodes_count -= count;
     }
 
     /// Increases the free-inode counter for this group.
     pub(super) fn inc_free_inodes(&self, count: u16) {
         let mut metadata = self.metadata.write();
-        metadata.desc.free_inodes_count = metadata.desc.free_inodes_count.saturating_add(count);
+        debug_assert!(metadata.desc.free_inodes_count.checked_add(count).is_some());
+        metadata.desc.free_inodes_count += count;
     }
 
     /// Increases the used-dirs counter for this group.
     pub(super) fn inc_used_dirs(&self) {
         let mut metadata = self.metadata.write();
-        metadata.desc.used_dirs_count = metadata.desc.used_dirs_count.saturating_add(1);
+        debug_assert!(metadata.desc.used_dirs_count.checked_add(1).is_some());
+        metadata.desc.used_dirs_count += 1;
     }
 
     /// Decreases the used-dirs counter for this group.
     pub(super) fn dec_used_dirs(&self) {
         let mut metadata = self.metadata.write();
-        metadata.desc.used_dirs_count = metadata.desc.used_dirs_count.saturating_sub(1);
+        debug_assert!(metadata.desc.used_dirs_count > 0);
+        metadata.desc.used_dirs_count -= 1;
     }
 
     pub(super) fn is_desc_dirty(&self) -> bool {
@@ -508,10 +514,10 @@ impl BlockGroup {
             let inode_bitmap = desc.inode_bitmap;
             let inode_table = desc.inode_table;
 
-            let mut offset = block_bitmap.wrapping_sub(first_block);
-            if block_bitmap < first_block || offset > max_bit {
+            if block_bitmap < first_block || block_bitmap - first_block > max_bit {
                 return_errno_with_message!(Errno::EINVAL, "block bitmap block out of group range");
             }
+            let mut offset = block_bitmap - first_block;
             if !bitmap.is_allocated(offset as u16) {
                 return_errno_with_message!(
                     Errno::EINVAL,
@@ -519,10 +525,10 @@ impl BlockGroup {
                 );
             }
 
-            offset = inode_bitmap.wrapping_sub(first_block);
-            if inode_bitmap < first_block || offset > max_bit {
+            if inode_bitmap < first_block || inode_bitmap - first_block > max_bit {
                 return_errno_with_message!(Errno::EINVAL, "inode bitmap block out of group range");
             }
+            offset = inode_bitmap - first_block;
             if !bitmap.is_allocated(offset as u16) {
                 return_errno_with_message!(
                     Errno::EINVAL,
@@ -530,10 +536,10 @@ impl BlockGroup {
                 );
             }
 
-            offset = inode_table.wrapping_sub(first_block);
-            if inode_table < first_block || offset > max_bit {
+            if inode_table < first_block || inode_table - first_block > max_bit {
                 return_errno_with_message!(Errno::EINVAL, "inode table start out of group range");
             }
+            offset = inode_table - first_block;
             let table_last = offset + inode_table_blocks_per_group - 1;
             if table_last > max_bit {
                 return_errno_with_message!(Errno::EINVAL, "inode table extends beyond group");
@@ -657,10 +663,8 @@ impl BlockGroup {
 
             // Persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
 
-            metadata.desc.free_blocks_count = metadata
-                .desc
-                .free_blocks_count
-                .saturating_sub(alloc_len as u16);
+            debug_assert!(metadata.desc.free_blocks_count >= alloc_len as u16);
+            metadata.desc.free_blocks_count -= alloc_len as u16;
 
             drop(metadata);
 
@@ -714,10 +718,12 @@ impl BlockGroup {
 
         // Persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
 
-        metadata.desc.free_blocks_count = metadata
+        debug_assert!(metadata
             .desc
             .free_blocks_count
-            .saturating_add(actually_freed as u16);
+            .checked_add(actually_freed as u16)
+            .is_some());
+        metadata.desc.free_blocks_count += actually_freed as u16;
 
         Ok(actually_freed)
     }
