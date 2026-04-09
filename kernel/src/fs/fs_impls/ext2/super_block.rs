@@ -235,7 +235,7 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             blocks_per_group: sb.blocks_per_group,
             frags_per_group: sb.frags_per_group,
             inodes_per_group: sb.inodes_per_group,
-            inode_table_blocks_per_group: inode_table_blocks_per_group,
+            inode_table_blocks_per_group,
             mtime: Duration::from(sb.mtime),
             wtime: Duration::from(sb.wtime),
             mnt_count: sb.mnt_count,

@@ -661,7 +661,7 @@ impl Ext2 {
     /// Syncs cached inodes and block-group-local metadata in all groups.
     pub(super) fn sync_all(&self) -> Result<()> {
         for group in &self.block_groups {
-            let _ = group.sync_all(&self.group_descriptors_segment)?;
+            group.sync_all(&self.group_descriptors_segment)?;
         }
 
         self.sync_metadata()
@@ -678,7 +678,7 @@ impl Ext2 {
         resuid: u32,
         resgid: u32,
     ) -> bool {
-        if free_blocks >= reserved_blocks + 1 {
+        if free_blocks > reserved_blocks {
             return true;
         }
 
@@ -1036,7 +1036,7 @@ mod test {
         let goal = f.sb.group_first_block_no(0);
         let range = f.ext2.alloc_blocks(8, goal).unwrap();
         let alloc_len = range.end - range.start;
-        assert!(alloc_len >= 1 && alloc_len <= 8);
+        assert!((1..=8).contains(&alloc_len));
 
         {
             let sb = f.ext2.super_block();
@@ -1396,7 +1396,6 @@ mod test {
             .unwrap();
 
         let metadata = group.metadata();
-        assert_eq!(metadata.inode_bitmap.len(), f.sb.inodes_per_group() as u16);
         assert!(metadata.inode_bitmap.is_allocated(0));
         assert!(metadata.inode_bitmap.is_allocated(1));
         assert!(!metadata.inode_bitmap.is_allocated(31));

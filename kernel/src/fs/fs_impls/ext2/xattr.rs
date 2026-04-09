@@ -68,7 +68,7 @@ impl XattrNameIndex {
         }
     }
 
-    pub(super) fn strip_prefix<'a>(self, full_name: &'a str) -> Result<&'a str> {
+    pub(super) fn strip_prefix(self, full_name: &str) -> Result<&str> {
         full_name.strip_prefix(self.prefix()).ok_or_else(|| {
             Error::with_message(
                 Errno::EINVAL,
@@ -522,9 +522,8 @@ impl Xattr {
             block_buf.read_bytes(offset + XATTR_ENTRY_HEADER_SIZE, &mut name)?;
 
             if let Some(prev) = entries.last() {
-                if Self::cmp_entry_key(prev.name_index, &prev.name, name_index, &name)
-                    != Ordering::Less
-                {
+                let ordering = Self::cmp_entry_key(prev.name_index, &prev.name, name_index, &name);
+                if ordering != Ordering::Less {
                     return_errno_with_message!(Errno::EIO, "xattr entries are not strictly sorted");
                 }
             }

@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![cfg(ktest)]
-
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::{
     fmt,
@@ -707,6 +705,14 @@ pub(super) struct Ext2Fixture {
     pub descs: Vec<RawGroupDesc>,
 }
 
+type PreparedFixture = (
+    RawSuperBlock,
+    SuperBlock,
+    Vec<RawGroupDesc>,
+    Arc<Ext2MemoryDisk>,
+    Group0Layout,
+);
+
 impl Ext2Fixture {
     /// Returns the root inode (ino 2).
     pub(super) fn root(&self) -> Arc<Inode> {
@@ -812,15 +818,7 @@ impl Ext2FixtureBuilder {
     }
 
     /// Common setup: creates raw superblock, descriptors, and disk.
-    fn prepare(
-        &self,
-    ) -> Result<(
-        RawSuperBlock,
-        SuperBlock,
-        Vec<RawGroupDesc>,
-        Arc<Ext2MemoryDisk>,
-        Group0Layout,
-    )> {
+    fn prepare(&self) -> Result<PreparedFixture> {
         let mut raw_sb = make_valid_raw_super_block(self.groups);
         if let Some(sb_free_blocks) = self.sb_free_blocks {
             raw_sb.free_blocks_count = sb_free_blocks;

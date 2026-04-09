@@ -107,7 +107,8 @@ impl Drop for BlockAllocGuard {
         debug_assert!(self.data_blocks.end >= self.data_blocks.start);
         let data_count = self.data_blocks.end - self.data_blocks.start;
         if data_count > 0 {
-            if let Err(err) = self.fs.free_blocks(self.data_blocks.start, data_count) {
+            let free_result = self.fs.free_blocks(self.data_blocks.start, data_count);
+            if let Err(err) = free_result {
                 error!("failed to free data blocks in rollback: {:?}", err);
             }
         }
@@ -221,41 +222,41 @@ impl BlockPtrTree {
         let boundary;
         let mut block = iblock;
 
-        // NOTE: Each `else if` arm subtracts the preceding region's size from `block`
-        // inside the condition expression, so the branches MUST stay in this exact order.
+        // NOTE: Each branch subtracts the preceding region's size from `block`,
+        // so the branches MUST stay in this exact order.
         if block < direct_blocks {
             offsets[0] = block;
             depth = 1usize;
             boundary = direct_blocks - 1 - block;
-        } else if {
-            block -= direct_blocks;
-            block < indirect_blocks
-        } {
-            offsets[0] = 12;
-            offsets[1] = block;
-            depth = 2usize;
-            boundary = ptrs - 1 - (block & (ptrs - 1));
-        } else if {
-            block -= indirect_blocks;
-            block < double_blocks
-        } {
-            offsets[0] = 13;
-            offsets[1] = block >> ptrs_bits;
-            offsets[2] = block & (ptrs - 1);
-            depth = 3usize;
-            boundary = ptrs - 1 - (block & (ptrs - 1));
-        } else if {
-            block -= double_blocks;
-            (block >> (ptrs_bits * 2)) < ptrs
-        } {
-            offsets[0] = 14;
-            offsets[1] = block >> (ptrs_bits * 2);
-            offsets[2] = (block >> ptrs_bits) & (ptrs - 1);
-            offsets[3] = block & (ptrs - 1);
-            depth = 4usize;
-            boundary = ptrs - 1 - (block & (ptrs - 1));
         } else {
-            return_errno_with_message!(Errno::EINVAL, "block number exceeds maximum");
+            block -= direct_blocks;
+            if block < indirect_blocks {
+                offsets[0] = 12;
+                offsets[1] = block;
+                depth = 2usize;
+                boundary = ptrs - 1 - (block & (ptrs - 1));
+            } else {
+                block -= indirect_blocks;
+                if block < double_blocks {
+                    offsets[0] = 13;
+                    offsets[1] = block >> ptrs_bits;
+                    offsets[2] = block & (ptrs - 1);
+                    depth = 3usize;
+                    boundary = ptrs - 1 - (block & (ptrs - 1));
+                } else {
+                    block -= double_blocks;
+                    if (block >> (ptrs_bits * 2)) < ptrs {
+                        offsets[0] = 14;
+                        offsets[1] = block >> (ptrs_bits * 2);
+                        offsets[2] = (block >> ptrs_bits) & (ptrs - 1);
+                        offsets[3] = block & (ptrs - 1);
+                        depth = 4usize;
+                        boundary = ptrs - 1 - (block & (ptrs - 1));
+                    } else {
+                        return_errno_with_message!(Errno::EINVAL, "block number exceeds maximum");
+                    }
+                }
+            }
         }
 
         Ok(BlockPointerPath {
@@ -944,7 +945,7 @@ impl BlockPtrTree {
             // The branch already exists; only fill data pointers into existing slots.
             if branch.partial_level == 0 {
                 let slot = path.offsets[0] as usize;
-                self.write_data_range_to_direct_slots(slot, &data_blocks)?;
+                self.write_data_range_to_direct_slots(slot, data_blocks)?;
             } else {
                 let parent_bid = branch
                     .chain
@@ -959,7 +960,7 @@ impl BlockPtrTree {
                 let slot = path.offsets[branch.partial_level] as usize;
                 let mut mgr = self.indirect_blocks_manager.lock();
                 let parent_block = mgr.find_mut(parent_bid)?;
-                Self::write_data_range_to_indirect_block(parent_block, slot, &data_blocks)?;
+                Self::write_data_range_to_indirect_block(parent_block, slot, data_blocks)?;
             }
         } else {
             let splice_ptr = indirect_blocks[0];
@@ -984,7 +985,7 @@ impl BlockPtrTree {
                         Self::write_data_range_to_indirect_block(
                             &mut block,
                             start_slot,
-                            &data_blocks,
+                            data_blocks,
                         )?;
                     } else {
                         block.write_bid(start_slot, indirect_blocks[i + 1])?;
@@ -1050,7 +1051,7 @@ impl BlockPtrTree {
 mod test {
     use core::mem::size_of;
 
-    use ostd::{mm::VmIo, prelude::ktest};
+    use ostd::prelude::ktest;
 
     use super::*;
     use crate::{

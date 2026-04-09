@@ -665,7 +665,8 @@ impl Inode {
                 }
 
                 if end > old_size {
-                    if let Err(err) = inner.expand(end) {
+                    let expand_result = inner.expand(end);
+                    if let Err(err) = expand_result {
                         inner.rollback_write(old_size, end);
                         return Err(err);
                     }
@@ -1684,7 +1685,7 @@ impl InodeInner {
     }
 
     fn set_mode(&mut self, mode: InodeMode) {
-        self.desc.perm = FilePerm::from_bits_truncate(mode.bits() as u16);
+        self.desc.perm = FilePerm::from_bits_truncate(mode.bits());
     }
 
     fn uid(&self) -> u32 {
@@ -2050,7 +2051,7 @@ impl InodeInner {
         let mut current_offset = offset;
         let mut advanced = 0usize;
 
-        let total_blocks = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        let total_blocks = size.div_ceil(BLOCK_SIZE);
         for block_idx in start_block..total_blocks {
             let block_offset = block_idx * BLOCK_SIZE;
             if block_offset >= size {
@@ -2526,7 +2527,7 @@ impl<'a> MultiInodeInnerGuards<'a> {
             .iter()
             .find(|(entry_ino, _)| *entry_ino == ino)
             .ok_or_else(|| Error::with_message(Errno::EIO, "missing inode inner lock"))?;
-        Ok(&*guard)
+        Ok(guard)
     }
 
     fn inner_mut(&mut self, ino: u32) -> Result<&mut InodeInner> {
@@ -2560,7 +2561,7 @@ fn write_lock_two_inodes<'a>(
 }
 
 fn is_block_aligned(offset: usize) -> bool {
-    return offset.is_multiple_of(BLOCK_SIZE);
+    offset.is_multiple_of(BLOCK_SIZE)
 }
 
 #[cfg(ktest)]
@@ -2969,7 +2970,7 @@ mod test {
         assert_eq!(desc.sector_count, 99);
         assert_eq!(desc.block_ptrs[0], 42);
 
-        let dtime: Duration = desc.dtime.into();
+        let dtime: Duration = desc.dtime;
         assert_eq!(dtime.as_secs(), 123);
 
         let mut raw_dir = make_raw_inode(0o040755);
@@ -3011,10 +3012,10 @@ mod test {
     fn dir_lookup_ok() {
         let (_f, root) = namei_fixture();
 
-        let foo = create_file(&root, "foo");
+        let foo_file = create_file(&root, "foo");
         let subdir = create_dir(&root, "subdir");
 
-        assert_eq!(lookup_ino(&root, "foo").unwrap(), foo.ino());
+        assert_eq!(lookup_ino(&root, "foo").unwrap(), foo_file.ino());
         assert_eq!(lookup_ino(&root, "subdir").unwrap(), subdir.ino());
         assert_errno!(lookup_ino(&root, "missing"), Errno::ENOENT);
     }
@@ -3151,8 +3152,8 @@ mod test {
         let bar = create_file(&root, "bar");
         assert_eq!(lookup_ino(&root, "bar").unwrap(), bar.ino());
 
-        let foo = create_file(&root, "foo");
-        assert_eq!(lookup_ino(&root, "foo").unwrap(), foo.ino());
+        let foo_file = create_file(&root, "foo");
+        assert_eq!(lookup_ino(&root, "foo").unwrap(), foo_file.ino());
 
         assert_errno!(
             root.create("foo", InodeType::File, FilePerm::from_bits_truncate(0o644)),
