@@ -8,22 +8,23 @@ use core::{
 };
 
 use aster_block::{
-    BLOCK_SIZE, BlockDevice, BlockDeviceMeta, SECTOR_SIZE,
     bio::{BioEnqueueError, BioStatus, BioType, SubmittedBio},
     id::Bid,
+    BlockDevice, BlockDeviceMeta, BLOCK_SIZE, SECTOR_SIZE,
 };
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::{
-    mm::{FrameAllocOptions, PAGE_SIZE, Segment, USegment, VmIo, io::util::HasVmReaderWriter},
+    mm::{io::util::HasVmReaderWriter, FrameAllocOptions, Segment, USegment, VmIo, PAGE_SIZE},
     prelude::*,
 };
 
 use super::{
     block_group::RawGroupDesc,
+    dir::{DOT_BYTE, DOT_DOT_BYTE},
     fs::{Ext2, ROOT_INO},
     inode::{FilePerm, Inode, RawInode},
     super_block::{
-        ErrorsBehavior, FsState, MAGIC_NUM, OsId, RawSuperBlock, RevLevel, SUPER_BLOCK_OFFSET,
+        ErrorsBehavior, FsState, OsId, RawSuperBlock, RevLevel, MAGIC_NUM, SUPER_BLOCK_OFFSET,
     },
 };
 use crate::{
@@ -34,7 +35,7 @@ use crate::{
         utils::DirentVisitor,
         vfs::inode::InodeIo,
     },
-    prelude::{Errno, Result, return_errno_with_message, *},
+    prelude::{return_errno_with_message, Errno, Result, *},
     time::clocks,
 };
 
@@ -679,15 +680,14 @@ pub(super) fn write_simple_root_dir_block(disk: &Ext2MemoryDisk, root_bid: u32) 
     block[4..6].copy_from_slice(&(12u16).to_le_bytes());
     block[6] = 1;
     block[7] = 2;
-    block[8] = b'.';
+    block[8] = DOT_BYTE[0];
 
     // '..'
     block[12..16].copy_from_slice(&ROOT_INO.to_le_bytes());
     block[16..18].copy_from_slice(&((BLOCK_SIZE - 12) as u16).to_le_bytes());
     block[18] = 2;
     block[19] = 2;
-    block[20] = b'.';
-    block[21] = b'.';
+    block[20..22].copy_from_slice(DOT_DOT_BYTE);
 
     disk.segment()
         .write_bytes(Bid::new(root_bid as u64).to_offset(), &block)

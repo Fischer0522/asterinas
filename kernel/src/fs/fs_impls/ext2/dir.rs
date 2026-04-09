@@ -8,6 +8,9 @@ use ostd::const_assert;
 
 use super::prelude::*;
 
+pub(super) const DOT_BYTE: &[u8] = b".";
+pub(super) const DOT_DOT_BYTE: &[u8] = b"..";
+
 /// On-disk directory entry header.
 ///
 #[repr(C)]

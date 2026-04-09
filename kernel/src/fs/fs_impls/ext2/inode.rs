@@ -13,7 +13,7 @@ use ostd::{const_assert, mm::io::util::HasVmReaderWriter};
 
 use super::{
     block_ptr_tree::{BlockPtrTree, Ext2Bid, RawBlockPtrs},
-    dir::{DirBlock, DirEntryHeader},
+    dir::{DirBlock, DirEntryHeader, DOT_BYTE, DOT_DOT_BYTE},
     fs::Ext2,
     io_range_mapper::{IoRange, IoRangeMapper},
     prelude::*,
@@ -126,8 +126,8 @@ impl Inode {
         let name_bytes = name.as_bytes();
         name_bytes.is_empty()
             || name_bytes.len() > u8::MAX as usize
-            || name_bytes == b"."
-            || name_bytes == b".."
+            || name_bytes == DOT_BYTE
+            || name_bytes == DOT_DOT_BYTE
     }
 
     pub(super) fn file_size(&self) -> usize {
@@ -1769,14 +1769,14 @@ impl InodeInner {
                 0,
                 ino,
                 DirEntryHeader::dir_rec_len(1),
-                b".",
+                DOT_BYTE,
                 DirEntryFileType::Dir,
             )?;
             block.write_entry(
                 dot_len,
                 parent_ino,
                 (BLOCK_SIZE - dot_len) as u16,
-                b"..",
+                DOT_DOT_BYTE,
                 DirEntryFileType::Dir,
             )?;
             Ok(())
@@ -1883,13 +1883,13 @@ impl InodeInner {
                 }
 
                 let name = entry.name.as_bytes();
-                if name == b"." {
+                if name == DOT_BYTE {
                     if u32::from_le(entry.header.inode) != self_ino {
                         return Ok(false);
                     }
                     continue;
                 }
-                if name == b".." {
+                if name == DOT_DOT_BYTE {
                     continue;
                 }
                 return Ok(false);
@@ -3020,7 +3020,7 @@ mod test {
         let (disk, ext2) = (&f.disk, &f.ext2);
 
         let mut one_block = vec![0u8; BLOCK_SIZE];
-        encode_dir_entry(&mut one_block, 0, 2, 12, b".", 2);
+        encode_dir_entry(&mut one_block, 0, 2, 12, DOT_BYTE, 2);
         encode_dir_entry(&mut one_block, 12, 0, (BLOCK_SIZE - 12) as u16, b"", 0);
         let data_bid = 81u32;
         disk.segment()
@@ -3202,7 +3202,7 @@ mod test {
             .unwrap();
 
         assert_eq!(&raw_block[8..12], b".\0\0\0");
-        assert_eq!(&raw_block[20..22], b"..");
+        assert_eq!(&raw_block[20..22], DOT_DOT_BYTE);
         assert!(raw_block[22..].iter().all(|byte| *byte == 0));
     }
 
