@@ -2578,10 +2578,10 @@ mod test {
             fs_impls::ext2::{
                 fs::ROOT_INO,
                 testkit::{
-                    self, CollectDirentVisitor, ErrorBioDisk, Ext2FixtureBuilder, RawInodeBuilder,
-                    StopAfterVisitor, assert_errno, create_dir, create_file, create_symlink,
-                    encode_dir_entry, group0_layout, inode_nlinks, inode_size, lookup_ino,
-                    namei_fixture, read_file_at, write_file_at,
+                    self, assert_errno, create_dir, create_file, create_symlink, encode_dir_entry,
+                    group0_layout, inode_nlinks, inode_size, lookup_ino, namei_fixture,
+                    read_file_at, write_file_at, CollectDirentVisitor, ErrorBioDisk,
+                    Ext2FixtureBuilder, RawInodeBuilder, StopAfterVisitor,
                 },
             },
             vfs::{
@@ -2785,13 +2785,12 @@ mod test {
         let free_blocks_before = f.ext2.super_block().free_blocks_count();
         root.unlink("old").unwrap();
         assert_errno!(f.ext2.read_inode(old_ino), Errno::ESTALE);
-        assert!(
-            f.ext2
-                .block_group(0)
-                .metadata()
-                .inode_bitmap
-                .is_allocated((old_ino - 1) as u16)
-        );
+        assert!(f
+            .ext2
+            .block_group(0)
+            .metadata()
+            .inode_bitmap
+            .is_allocated((old_ino - 1) as u16));
 
         f.ext2.sync_all().unwrap();
         let raw_before_drop = read_raw_inode_from_disk(&f, old_ino);
@@ -2802,13 +2801,12 @@ mod test {
         drop(old);
         f.ext2.sync_all().unwrap();
         assert_errno!(f.ext2.read_inode(old_ino), Errno::ENOENT);
-        assert!(
-            !f.ext2
-                .block_group(0)
-                .metadata()
-                .inode_bitmap
-                .is_allocated((old_ino - 1) as u16)
-        );
+        assert!(!f
+            .ext2
+            .block_group(0)
+            .metadata()
+            .inode_bitmap
+            .is_allocated((old_ino - 1) as u16));
         let raw_after_drop = read_raw_inode_from_disk(&f, old_ino);
         assert_eq!(raw_after_drop.link_count, 0);
         assert_eq!(raw_after_drop.sector_count, 0);
@@ -3169,7 +3167,7 @@ mod test {
 
     #[ktest]
     fn dir_grow_lookup_ok() {
-        let (_, root) = namei_fixture();
+        let (_f, root) = namei_fixture();
 
         let size_before = inode_size(&root);
         let name_pad = "x".repeat(240);
@@ -3221,7 +3219,7 @@ mod test {
 
     #[ktest]
     fn dir_make_empty_ok() {
-        let (_, root) = namei_fixture();
+        let (_f, root) = namei_fixture();
 
         let dir = create_dir(&root, "empty");
         assert_eq!(inode_size(&dir), BLOCK_SIZE);
@@ -3480,7 +3478,7 @@ mod test {
 
     #[ktest]
     fn file_write_partial_ok() {
-        let (_, root) = namei_fixture();
+        let (_f, root) = namei_fixture();
         let file = create_file(&root, "partial");
         let original = vec![0x11u8; BLOCK_SIZE];
         let patch = vec![0x7cu8; 257];
@@ -3500,7 +3498,7 @@ mod test {
 
     #[ktest]
     fn file_write_cross_block_ok() {
-        let (_, root) = namei_fixture();
+        let (_f, root) = namei_fixture();
         let file = create_file(&root, "cross");
         let crossing_off = BLOCK_SIZE - 64;
         let crossing_data = (0..128)
@@ -3691,7 +3689,7 @@ mod test {
 
     #[ktest]
     fn file_resize_then_write_read_ok() {
-        let (_, root) = namei_fixture();
+        let (_f, root) = namei_fixture();
         let file = create_file(&root, "resize_then_write");
         let target_size = BLOCK_SIZE * 2 + 64;
         VfsInodeTrait::resize(file.as_ref(), target_size).unwrap();
@@ -3716,7 +3714,7 @@ mod test {
 
     #[ktest]
     fn file_sparse_shrink_discards_dirty_truncated_pages() {
-        let (_, root) = namei_fixture();
+        let (_f, root) = namei_fixture();
         let file = create_file(&root, "sparse_shrink");
         let sparse_size = BLOCK_SIZE * 3;
 
@@ -3892,7 +3890,7 @@ mod test {
 
     #[ktest]
     fn page_cache_vmo_size_ok() {
-        let (_, root) = namei_fixture();
+        let (_f, root) = namei_fixture();
         let file = create_file(&root, "pcache");
 
         let vmo = VfsInodeTrait::page_cache(file.as_ref()).unwrap();
