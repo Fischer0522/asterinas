@@ -913,14 +913,12 @@ impl Inode {
     /// Renames or moves an entry from this directory to `target` directory.
     ///
     pub(super) fn rename(&self, old_name: &str, target: &Inode, new_name: &str) -> Result<()> {
-        // Both self and target must be directories.
         if self.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
         if target.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
-
         if Self::is_invalid_child_name(old_name) {
             return_errno!(Errno::EISDIR);
         }
@@ -928,195 +926,133 @@ impl Inode {
             return_errno!(Errno::EISDIR);
         }
 
-        // Cross-filesystem check.
         let fs = self.fs()?;
         let target_fs = target.fs()?;
         if !Arc::ptr_eq(&fs, &target_fs) {
             return_errno!(Errno::EINVAL);
         }
 
-        // Rename to itself is a no-op.
-        if self.ino == target.ino && old_name == new_name {
+        let is_same_dir = self.ino == target.ino;
+        if is_same_dir && old_name == new_name {
             return Ok(());
         }
 
-        // Step 1: read the current source/target snapshot without write locks.
-        let ctx = self.prepare_rename_context(target, old_name, new_name)?;
-
-        // Step 2: lock all participating inode inner domains in global inode-number order.
-        let lock_targets = self.rename_lock_targets(&ctx);
-        let mut guards = MultiInodeInnerGuards::lock(&lock_targets);
-
-        // Step 3: validate dotdot consistency for directory moves.
-        if ctx.old_is_dir {
-            let old_inner = guards.inner(ctx.old_inode.ino())?;
-            let dotdot_ino = old_inner.find_entry("..")?;
-            if dotdot_ino != ctx.source_dir.ino {
-                return_errno_with_message!(Errno::EIO, "failed to update dotdot entry");
-            }
-        }
-
-        // Step 4: apply the rename mutations and persist the metadata.
-        self.validate_rename_overwrite(&ctx, &guards)?;
-        self.apply_rename_with_locks(&ctx, &mut guards)?;
-
-        if let Some(replaced) = ctx.replaced_inode.as_ref() {
-            let inner = guards.inner_mut(replaced.ino)?;
-            if inner.link_count() == 0 {
-                inner.persist(replaced.ino())?;
-                let _ = fs.remove_inode_cache(replaced.ino());
-            }
-        }
-        Ok(())
-    }
-
-    fn prepare_rename_context<'a>(
-        &'a self,
-        target: &'a Inode,
-        old_name: &'a str,
-        new_name: &'a str,
-    ) -> Result<RenameContext<'a>> {
+        // Step 1: read inode numbers without write locks so we know which
+        // inodes to lock.
         let old_ino = {
             let source_inner = self.inner.read();
             source_inner.find_entry(old_name)?
         };
-        let fs = self.fs()?;
         let old_inode = fs.read_inode(old_ino)?;
-        let replaced_ino = {
+        let replaced_inode = {
             let target_inner = target.inner.read();
-            target_inner.find_entry(new_name).ok()
-        };
-        let replaced_inode = if let Some(ino) = replaced_ino {
-            Some(fs.read_inode(ino)?)
-        } else {
-            None
+            target_inner
+                .find_entry(new_name)
+                .ok()
+                .map(|ino| fs.read_inode(ino))
+                .transpose()?
         };
 
         let old_is_dir = old_inode.type_ == InodeType::Dir;
         let moved_ft = DirEntryFileType::from(old_inode.type_);
-        Ok(RenameContext {
-            source_dir: self,
-            target_dir: target,
-            old_name,
-            new_name,
-            old_ino,
-            old_inode,
-            replaced_inode,
-            old_is_dir,
-            moved_ft,
-        })
-    }
 
-    fn rename_lock_targets<'a>(&'a self, ctx: &'a RenameContext<'a>) -> Vec<&'a Inode> {
-        let mut targets = Vec::new();
-        Self::add_unique_inode_lock_target(&mut targets, ctx.source_dir);
-        Self::add_unique_inode_lock_target(&mut targets, ctx.target_dir);
-        Self::add_unique_inode_lock_target(&mut targets, ctx.old_inode.as_ref());
-        if let Some(replaced) = ctx.replaced_inode.as_ref() {
-            Self::add_unique_inode_lock_target(&mut targets, replaced.as_ref());
-        }
-        targets
-    }
-
-    fn add_unique_inode_lock_target<'a>(targets: &mut Vec<&'a Inode>, inode: &'a Inode) {
-        if targets.iter().any(|target| target.ino == inode.ino) {
-            return;
-        }
-        targets.push(inode);
-    }
-
-    fn validate_rename_overwrite(
-        &self,
-        ctx: &RenameContext<'_>,
-        guards: &MultiInodeInnerGuards<'_>,
-    ) -> Result<()> {
-        let Some(replaced) = ctx.replaced_inode.as_ref() else {
-            return Ok(());
-        };
-
-        let replaced_is_dir = replaced.type_ == InodeType::Dir;
-        if ctx.old_is_dir && !replaced_is_dir {
-            return_errno!(Errno::ENOTDIR);
-        }
-        if !ctx.old_is_dir && replaced_is_dir {
-            return_errno!(Errno::EISDIR);
-        }
-        if replaced_is_dir {
-            let replaced_inner = guards.inner(replaced.ino())?;
-            if !replaced_inner.empty_dir(replaced.ino())? {
-                return_errno!(Errno::ENOTEMPTY);
+        // Step 2: lock all participating inodes in global ino order.
+        let mut lock_targets: Vec<&Inode> = Vec::new();
+        for inode in [self as &Inode, target, old_inode.as_ref()]
+            .into_iter()
+            .chain(replaced_inode.as_deref())
+        {
+            if !lock_targets.iter().any(|t| t.ino == inode.ino) {
+                lock_targets.push(inode);
             }
         }
-        Ok(())
-    }
+        let mut guards = MultiInodeInnerGuards::lock(&lock_targets);
 
-    fn apply_rename_with_locks(
-        &self,
-        ctx: &RenameContext<'_>,
-        guards: &mut MultiInodeInnerGuards<'_>,
-    ) -> Result<()> {
-        if ctx.is_same_dir() {
-            // Same directory: replace/add target name then delete old name in one directory lock.
-            let dir_inner = guards.inner_mut(ctx.source_dir.ino)?;
-            Self::apply_rename_target_locked(
-                dir_inner,
-                ctx.new_name,
-                ctx.old_ino,
-                ctx.moved_ft,
-                ctx.replaced_inode.is_some(),
-            )?;
-            let old_target = dir_inner.find_entry_target(ctx.old_name)?;
-            dir_inner.delete_entry(&old_target)?;
-            if ctx.old_is_dir {
-                if ctx.replaced_inode.is_none() {
-                    dir_inner.inc_link_count(1);
+        // Step 3: validate dotdot consistency for directory moves.
+        if old_is_dir {
+            let old_inner = guards.inner(old_inode.ino())?;
+            let dotdot_ino = old_inner.find_entry("..")?;
+            if dotdot_ino != self.ino {
+                return_errno_with_message!(Errno::EIO, "failed to update dotdot entry");
+            }
+        }
+
+        // Step 4: validate overwrite constraints.
+        if let Some(replaced) = replaced_inode.as_ref() {
+            let replaced_is_dir = replaced.type_ == InodeType::Dir;
+            if old_is_dir && !replaced_is_dir {
+                return_errno!(Errno::ENOTDIR);
+            }
+            if !old_is_dir && replaced_is_dir {
+                return_errno!(Errno::EISDIR);
+            }
+            if replaced_is_dir {
+                let replaced_inner = guards.inner(replaced.ino())?;
+                if !replaced_inner.empty_dir(replaced.ino())? {
+                    return_errno!(Errno::ENOTEMPTY);
                 }
+            }
+        }
+
+        // Step 5: apply directory entry mutations.
+        let has_replaced = replaced_inode.is_some();
+        if is_same_dir {
+            let dir_inner = guards.inner_mut(self.ino)?;
+            Self::apply_rename_target_locked(
+                dir_inner, new_name, old_ino, moved_ft, has_replaced,
+            )?;
+            let old_target = dir_inner.find_entry_target(old_name)?;
+            dir_inner.delete_entry(&old_target)?;
+            if old_is_dir && has_replaced {
                 dir_inner.dec_link_count(1);
             }
             dir_inner.touch_mtime_ctime(now());
         } else {
-            // Cross-directory: publish destination first, then remove source entry.
             {
-                let target_inner = guards.inner_mut(ctx.target_dir.ino)?;
+                let target_inner = guards.inner_mut(target.ino)?;
                 Self::apply_rename_target_locked(
-                    target_inner,
-                    ctx.new_name,
-                    ctx.old_ino,
-                    ctx.moved_ft,
-                    ctx.replaced_inode.is_some(),
+                    target_inner, new_name, old_ino, moved_ft, has_replaced,
                 )?;
-                if ctx.old_is_dir && ctx.replaced_inode.is_none() {
+                if old_is_dir && !has_replaced {
                     target_inner.inc_link_count(1);
                 }
                 target_inner.touch_mtime_ctime(now());
             }
             {
-                let source_inner = guards.inner_mut(ctx.source_dir.ino)?;
-                let source_de = source_inner.find_entry_target(ctx.old_name)?;
+                let source_inner = guards.inner_mut(self.ino)?;
+                let source_de = source_inner.find_entry_target(old_name)?;
                 source_inner.delete_entry(&source_de)?;
-                if ctx.old_is_dir {
+                if old_is_dir {
                     source_inner.dec_link_count(1);
                 }
                 source_inner.touch_mtime_ctime(now());
             }
         }
 
-        if let Some(replaced) = ctx.replaced_inode.as_ref() {
+        // Step 6: update replaced inode link count.
+        if let Some(replaced) = replaced_inode.as_ref() {
             let replaced_inner = guards.inner_mut(replaced.ino())?;
             replaced_inner.set_ctime(now());
-            if ctx.old_is_dir {
+            if old_is_dir {
                 replaced_inner.dec_link_count(1);
             }
             replaced_inner.dec_link_count(1);
+
+            if replaced_inner.link_count() == 0 {
+                replaced_inner.persist(replaced.ino())?;
+                let _ = fs.remove_inode_cache(replaced.ino());
+            }
         }
 
-        let old_inner = guards.inner_mut(ctx.old_inode.ino())?;
+        // Step 7: update moved inode metadata.
+        let old_inner = guards.inner_mut(old_inode.ino())?;
         old_inner.set_ctime(now());
-        if ctx.old_is_dir && !ctx.is_same_dir() {
+        if old_is_dir && !is_same_dir {
             let dotdot = old_inner.find_entry_target("..")?;
-            old_inner.set_link(&dotdot, ctx.target_dir.ino, DirEntryFileType::Dir)?;
+            old_inner.set_link(&dotdot, target.ino, DirEntryFileType::Dir)?;
             old_inner.remove_flags(FileFlags::INDEX_DIR);
         }
+
         Ok(())
     }
 
@@ -1128,13 +1064,11 @@ impl Inode {
         has_replaced: bool,
     ) -> Result<()> {
         if has_replaced {
-            // Replaced destination entry: ext2_set_link semantics.
             let target_de = target_inner.find_entry_target(new_name)?;
             target_inner.set_link(&target_de, old_ino, moved_ft)?;
             return Ok(());
         }
 
-        // No destination entry: ext2_add_link semantics.
         let slot = match target_inner.scan_dir_for_slot(new_name)? {
             Some(slot) => slot,
             None => target_inner.grow_dir_block()?,
@@ -1326,17 +1260,6 @@ pub(super) struct RawInode {
 
 const_assert!(size_of::<RawInode>() == 128);
 
-struct RenameContext<'a> {
-    source_dir: &'a Inode,
-    target_dir: &'a Inode,
-    old_name: &'a str,
-    new_name: &'a str,
-    old_ino: u32,
-    old_inode: Arc<Inode>,
-    replaced_inode: Option<Arc<Inode>>,
-    old_is_dir: bool,
-    moved_ft: DirEntryFileType,
-}
 /// [`PageCacheBackend`] implementation for inode data.
 ///
 /// Translates logical page indices to physical device blocks
@@ -2424,12 +2347,6 @@ bitflags! {
         const TOP_DIR = 1 << 17;
         /// Reserved for the ext2 library.
         const RESERVED = 1 << 31;
-    }
-}
-
-impl RenameContext<'_> {
-    fn is_same_dir(&self) -> bool {
-        self.source_dir.ino == self.target_dir.ino
     }
 }
 
