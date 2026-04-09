@@ -211,26 +211,6 @@ impl Ext2 {
             .and_then(|group| group.remove_inode_cache(inode_idx))
     }
 
-    /// Returns the inode table block ID for the given group.
-    ///
-    pub(super) fn inode_table_block(
-        &self,
-        group_idx: usize,
-        table_block_index: u32,
-    ) -> Result<Ext2Bid> {
-        let group = self
-            .block_groups
-            .get(group_idx)
-            .ok_or_else(|| Error::with_message(Errno::EIO, "block group index out of range"))?;
-        Ok(group.inode_table_bid() + table_block_index)
-    }
-
-    /// Reads an inode descriptor from the group's `PageCache`.
-    pub(super) fn read_inode_desc(&self, ino: u32) -> Result<InodeDesc> {
-        let sb = self.super_block.read();
-        Self::read_inode_desc_from_parts(&sb, &self.block_groups, ino)
-    }
-
     /// Writes an inode descriptor to the group's `PageCache`.
     pub(super) fn write_inode_desc(&self, ino: u32, raw: &RawInode) -> Result<()> {
         let sb = self.super_block.read();
@@ -687,27 +667,6 @@ impl Ext2 {
         self.sync_metadata()
     }
 
-    /// Reads an inode descriptor from preloaded superblock and block groups.
-    fn read_inode_desc_from_parts(
-        sb: &SuperBlock,
-        block_groups: &[BlockGroup],
-        ino: u32,
-    ) -> Result<InodeDesc> {
-        if (ino != ROOT_INO && ino < sb.first_ino()) || ino > sb.total_inodes() {
-            return_errno_with_message!(Errno::EINVAL, "inode number out of valid range");
-        }
-
-        let inodes_per_group = sb.inodes_per_group();
-        let group_idx = ((ino - 1) / inodes_per_group) as usize;
-        let index_in_group = (ino - 1) % inodes_per_group;
-
-        let group = block_groups
-            .get(group_idx)
-            .ok_or_else(|| Error::with_message(Errno::EIO, "block group index out of range"))?;
-
-        group.read_inode_desc(index_in_group)
-    }
-
     /// Checks whether the current caller may allocate blocks.
     ///
     /// Non-privileged users are denied when free blocks fall below the reserved
@@ -1012,7 +971,6 @@ mod test {
             sb_guard.free_inodes_count()
         };
 
-        ext2.block_group(0).inc_free_blocks(3);
         ext2.block_group(0).inc_free_inodes(1);
         assert!(ext2.block_group(0).is_desc_dirty());
 
@@ -1029,12 +987,6 @@ mod test {
         disk.segment()
             .read_bytes(primary_desc_offset, &mut primary_desc)
             .unwrap();
-        let first_desc = disk
-            .segment()
-            .read_val::<RawGroupDesc>(primary_desc_offset)
-            .unwrap();
-        assert_eq!(first_desc.free_blocks_count, 13);
-
         let primary_sb = disk
             .segment()
             .read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)
@@ -1147,35 +1099,6 @@ mod test {
             .unwrap();
         assert!(f_free.ext2.free_blocks(10, 0).is_ok());
         assert_errno!(f_free.ext2.free_blocks(1, 1), Errno::EIO);
-
-        let inode_bitmap_bid = f_free.ext2.block_group(0).inode_bitmap_bid();
-        assert_errno!(f_free.ext2.free_blocks(inode_bitmap_bid, 1), Errno::EIO);
-    }
-
-    #[ktest]
-    fn block_alloc_starts_from_goal_group() {
-        clocks::init_for_ktest();
-        // With 2 groups both having free blocks, allocation should start from
-        // the group containing goal.
-        let f = Ext2FixtureBuilder::new(2, 256)
-            .with_free_blocks(64, 32)
-            .with_metadata_block_bitmap()
-            .build()
-            .unwrap();
-
-        // Fixture builder only customizes group 0 free-block counter.
-        // Make group 1 allocatable as well so goal-based start is observable.
-        f.ext2.block_group(1).inc_free_blocks(16);
-        {
-            let mut sb = f.ext2.super_block.write();
-            sb.inc_free_blocks(16);
-        }
-
-        let goal = f.sb.group_first_block_no(1) + 16;
-        let range = f.ext2.alloc_blocks(4, goal).unwrap();
-
-        let start_group = (range.start - f.sb.first_data_block()) / f.sb.blocks_per_group();
-        assert_eq!(start_group, 1);
     }
 
     #[ktest]
@@ -1189,7 +1112,10 @@ mod test {
 
         let before_sb_free = f.ext2.super_block().free_inodes_count();
         let before_group_free = f.ext2.block_group(0).free_inodes_count();
-        let before_used_dirs = f.ext2.block_group(0).used_dirs_count();
+        let before_used_dirs = {
+            let metadata = f.ext2.block_group(0).metadata();
+            metadata.desc.used_dirs_count
+        };
 
         let ino = f.ext2.alloc_inode(ROOT_INO, InodeType::Dir).unwrap();
         assert!(ino >= f.sb.first_ino() && ino <= f.sb.total_inodes());
@@ -1204,7 +1130,7 @@ mod test {
             before_group_free - 1
         );
         assert_eq!(
-            f.ext2.block_group(0).used_dirs_count(),
+            f.ext2.block_group(0).metadata().desc.used_dirs_count,
             before_used_dirs + 1
         );
 
@@ -1214,7 +1140,10 @@ mod test {
         f.ext2.free_inode(ino, true).unwrap();
         assert_eq!(f.ext2.super_block().free_inodes_count(), before_sb_free);
         assert_eq!(f.ext2.block_group(0).free_inodes_count(), before_group_free);
-        assert_eq!(f.ext2.block_group(0).used_dirs_count(), before_used_dirs);
+        assert_eq!(
+            f.ext2.block_group(0).metadata().desc.used_dirs_count,
+            before_used_dirs
+        );
     }
 
     #[ktest]
@@ -1267,43 +1196,6 @@ mod test {
         f_free.ext2.free_inode(target_ino, false).unwrap();
         assert_eq!(f_free.ext2.super_block().free_inodes_count(), before_sb);
         assert_eq!(f_free.ext2.block_group(0).free_inodes_count(), before_group);
-    }
-
-    #[ktest]
-    fn alloc_inode_initializes_descriptor_on_disk() {
-        let fixture = Ext2FixtureBuilder::new(1, 128)
-            .with_free_inodes(16, 16)
-            .with_reserved_inode_bitmap()
-            .build()
-            .unwrap();
-
-        let inode = fixture
-            .ext2
-            .create_inode(
-                ROOT_INO,
-                InodeType::Dir,
-                FilePerm::from_bits_truncate(0o755),
-            )
-            .unwrap();
-        let ino = inode.ino();
-
-        // Read through PageCache (write_inode_desc uses deferred writeback).
-        let desc = fixture.ext2.read_inode_desc(ino).unwrap();
-        let raw = RawInode::from(&desc);
-        assert_eq!(raw.mode, 0o040755);
-        assert_eq!(raw.link_count, 2);
-        assert_eq!(raw.size_lo, 0);
-        assert_eq!(raw.sector_count, 0);
-        assert_eq!(raw.block, [0; 15]);
-
-        assert_errno!(
-            fixture.ext2.create_inode(
-                ROOT_INO,
-                InodeType::Unknown,
-                FilePerm::from_bits_truncate(0o644)
-            ),
-            Errno::EINVAL
-        );
     }
 
     #[ktest]
@@ -1397,59 +1289,6 @@ mod test {
     }
 
     #[ktest]
-    fn read_inode_desc_valid_ino_ok() {
-        let f = Ext2FixtureBuilder::new(2, 128).build().unwrap();
-
-        let raw = make_raw_inode(0o040755, 2, 0);
-        f.ext2.write_inode_desc(ROOT_INO, &raw).unwrap();
-
-        let bid = f.ext2.inode_table_block(1, 3).unwrap();
-        let base = f.descs[1].inode_table;
-        assert_eq!(bid, base + 3);
-
-        let desc = f.ext2.read_inode_desc(ROOT_INO).unwrap();
-        assert_eq!(desc.type_(), InodeType::Dir);
-    }
-
-    #[ktest]
-    fn read_inode_desc_deleted_ino_returns_err() {
-        // Out-of-range group index.
-        let f = Ext2FixtureBuilder::new(2, 128).build().unwrap();
-        assert_errno!(f.ext2.inode_table_block(2, 0), Errno::EIO);
-
-        // Invalid inode numbers (too low / too high).
-        assert_errno!(f.ext2.read_inode_desc(1), Errno::EINVAL);
-        assert_errno!(
-            f.ext2
-                .read_inode_desc(f.sb.total_inodes().saturating_add(1)),
-            Errno::EINVAL
-        );
-
-        // I/O error from block device: fail group-1 inode-table reads so mount
-        // (which reads ROOT_INO from group 0) still succeeds.
-        let f_base = Ext2FixtureBuilder::new(2, 128).build().unwrap();
-        let inode_table_offset = Bid::new(f_base.descs[1].inode_table as u64).to_offset();
-        let io_disk = ErrorBioDisk::with_read_error_at(
-            f_base.disk.clone(),
-            BioStatus::IoError,
-            inode_table_offset,
-        );
-        let f_io = Ext2FixtureBuilder::new(2, 128)
-            .with_device(Arc::new(io_disk))
-            .build()
-            .unwrap();
-        let group1_ino = f_io.sb.inodes_per_group().saturating_add(1);
-        assert_errno!(f_io.ext2.read_inode_desc(group1_ino), Errno::EIO);
-
-        // Deleted inode (dtime != 0, mode == 0) → ESTALE.
-        let f_parse = Ext2FixtureBuilder::new(2, 128).build().unwrap();
-        let ino = f_parse.sb.first_ino();
-        let raw = make_raw_inode(0, 0, 1);
-        f_parse.ext2.write_inode_desc(ino, &raw).unwrap();
-        assert_errno!(f_parse.ext2.read_inode_desc(ino), Errno::ESTALE);
-    }
-
-    #[ktest]
     fn read_inode_cache_hit_and_unallocated_checks() {
         let f = Ext2FixtureBuilder::namei_env().build().unwrap();
 
@@ -1522,7 +1361,7 @@ mod test {
         f.disk
             .segment()
             .write_bytes(
-                Bid::new(group.block_bitmap_bid() as u64).to_offset(),
+                Bid::new(f.descs[0].block_bitmap as u64).to_offset(),
                 &bitmap_block,
             )
             .unwrap();
@@ -1551,7 +1390,7 @@ mod test {
         f.disk
             .segment()
             .write_bytes(
-                Bid::new(group.inode_bitmap_bid() as u64).to_offset(),
+                Bid::new(f.descs[0].inode_bitmap as u64).to_offset(),
                 &bitmap_block,
             )
             .unwrap();

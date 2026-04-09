@@ -6,7 +6,6 @@ use core::ops::Range;
 
 use super::{
     block_ptr_tree::{BlockPtrTree, Ext2Bid},
-    fs::Ext2,
     prelude::*,
 };
 
@@ -98,7 +97,10 @@ mod test {
 
     use super::*;
     use crate::{
-        fs::fs_impls::ext2::{block_ptr_tree::RawBlockPtrs, testkit::Ext2FixtureBuilder},
+        fs::{
+            ext2::Ext2,
+            fs_impls::ext2::{block_ptr_tree::RawBlockPtrs, testkit::Ext2FixtureBuilder},
+        },
         prelude::*,
         time::clocks,
     };

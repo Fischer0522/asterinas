@@ -338,27 +338,6 @@ impl BlockGroup {
         self.metadata.read()
     }
 
-    /// Returns a write guard over the combined group metadata.
-    pub(super) fn metadata_mut(&self) -> RwMutexWriteGuard<'_, BlockGroupMetadata> {
-        self.metadata.write()
-    }
-
-    pub(super) fn idx(&self) -> usize {
-        self.idx
-    }
-
-    pub(super) fn block_bitmap_bid(&self) -> Ext2Bid {
-        self.metadata.read().desc.block_bitmap
-    }
-
-    pub(super) fn inode_bitmap_bid(&self) -> Ext2Bid {
-        self.metadata.read().desc.inode_bitmap
-    }
-
-    pub(super) fn inode_table_bid(&self) -> Ext2Bid {
-        self.metadata.read().desc.inode_table
-    }
-
     /// Returns the first filesystem-wide block number of this group.
     pub(super) fn first_block(&self) -> u32 {
         self.first_block
@@ -375,24 +354,6 @@ impl BlockGroup {
 
     pub(super) fn free_inodes_count(&self) -> u16 {
         self.metadata.read().desc.free_inodes_count
-    }
-
-    pub(super) fn used_dirs_count(&self) -> u16 {
-        self.metadata.read().desc.used_dirs_count
-    }
-
-    /// Decreases the free-block counter for this group.
-    pub(super) fn dec_free_blocks(&self, count: u16) {
-        let mut metadata = self.metadata.write();
-        debug_assert!(metadata.desc.free_blocks_count >= count);
-        metadata.desc.free_blocks_count -= count;
-    }
-
-    /// Increases the free-block counter for this group.
-    pub(super) fn inc_free_blocks(&self, count: u16) {
-        let mut metadata = self.metadata.write();
-        debug_assert!(metadata.desc.free_blocks_count.checked_add(count).is_some());
-        metadata.desc.free_blocks_count += count;
     }
 
     /// Decreases the free-inode counter for this group.
@@ -851,34 +812,9 @@ mod test {
             .unwrap();
         let group = fixture.ext2.block_group(1);
 
-        assert_eq!(group.idx(), 1);
-        assert_eq!(group.block_bitmap_bid(), descs[1].block_bitmap);
-        assert_eq!(group.inode_bitmap_bid(), descs[1].inode_bitmap);
-        assert_eq!(group.inode_table_bid(), descs[1].inode_table);
+        assert_eq!(group.first_block(), sb.group_first_block_no(1));
+        assert_eq!(group.last_block(), sb.group_last_block_no(1));
         assert_eq!(group.free_blocks_count(), descs[1].free_blocks_count);
         assert_eq!(group.free_inodes_count(), descs[1].free_inodes_count);
-        assert_eq!(group.used_dirs_count(), descs[1].used_dirs_count);
-    }
-
-    #[ktest]
-    fn free_block_counter_update_marks_dirty() {
-        // Counter update helpers should adjust value and mark descriptor dirty.
-        let fixture = Ext2FixtureBuilder::new(2, 256)
-            .with_metadata_block_bitmap()
-            .with_free_blocks(20, 20)
-            .with_free_inodes(64, 64)
-            .build()
-            .unwrap();
-        let group = fixture.ext2.block_group(0);
-        assert_eq!(group.free_blocks_count(), 20);
-        assert!(!group.is_desc_dirty());
-
-        group.dec_free_blocks(3);
-        assert_eq!(group.free_blocks_count(), 17);
-        assert!(group.is_desc_dirty());
-
-        group.inc_free_blocks(2);
-        assert_eq!(group.free_blocks_count(), 19);
-        assert!(group.is_desc_dirty());
     }
 }

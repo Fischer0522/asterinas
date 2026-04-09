@@ -7,7 +7,6 @@ use core::mem::size_of;
 use ostd::const_assert;
 
 use super::prelude::*;
-use crate::fs::utils::NAME_MAX;
 
 /// On-disk directory entry header.
 ///
@@ -100,54 +99,6 @@ impl DirEntryHeader {
     /// Returns the minimal record length for a given name length.
     pub(super) fn dir_rec_len(name_len: usize) -> u16 {
         ((name_len + 8 + 3) & !3) as u16
-    }
-
-    /// Validates a directory entry layout.
-    fn validate(
-        rec_len: u16,
-        name_len: u8,
-        offset: usize,
-        limit: usize,
-        max_inumber: u32,
-        inode: u32,
-    ) -> Result<()> {
-        let rec_len_usize = rec_len as usize;
-        let min_rec_len = Self::dir_rec_len(1) as usize;
-        if rec_len_usize < min_rec_len {
-            return_errno_with_message!(
-                Errno::EIO,
-                "invalid record length: `rec_len` is smaller than the minimum"
-            );
-        }
-        if (rec_len & 3) != 0 {
-            return_errno_with_message!(
-                Errno::EIO,
-                "invalid record length: `rec_len` is not aligned"
-            );
-        }
-        if name_len as usize > NAME_MAX {
-            return_errno_with_message!(Errno::EIO, "invalid name length: `name_len` is too large");
-        }
-        let need = Self::dir_rec_len(name_len as usize) as usize;
-        if rec_len_usize < need {
-            return_errno_with_message!(
-                Errno::EIO,
-                "invalid record length: `rec_len` is smaller than required"
-            );
-        }
-        if offset.saturating_add(rec_len_usize) > limit {
-            return_errno_with_message!(
-                Errno::EIO,
-                "invalid offset: `offset + rec_len` is out of bounds"
-            );
-        }
-        if inode > max_inumber {
-            return_errno_with_message!(
-                Errno::EIO,
-                "invalid inode number: `inode` exceeds the maximum"
-            );
-        }
-        Ok(())
     }
 }
 
@@ -346,49 +297,9 @@ mod test {
     use crate::fs::utils::NAME_MAX;
 
     #[ktest]
-    fn dir_rec_len_and_validate() {
+    fn dir_rec_len_ok() {
         assert_eq!(DirEntryHeader::dir_rec_len(0), 8);
         assert_eq!(DirEntryHeader::dir_rec_len(1), 12);
         assert_eq!(DirEntryHeader::dir_rec_len(NAME_MAX), 264);
-
-        // Valid entries pass validation.
-        DirEntryHeader::validate(12, 1, 0, 64, 128, 1).unwrap();
-        DirEntryHeader::validate(264, NAME_MAX as u8, 0, 512, 1024, 9).unwrap();
-
-        // Short rec_len.
-        assert_eq!(
-            DirEntryHeader::validate(8, 1, 0, 64, 128, 1)
-                .unwrap_err()
-                .error(),
-            Errno::EIO
-        );
-        // Unaligned rec_len.
-        assert_eq!(
-            DirEntryHeader::validate(14, 1, 0, 64, 128, 1)
-                .unwrap_err()
-                .error(),
-            Errno::EIO
-        );
-        // name_len exceeds NAME_MAX.
-        assert_eq!(
-            DirEntryHeader::validate(12, 10, 0, 64, 128, 1)
-                .unwrap_err()
-                .error(),
-            Errno::EIO
-        );
-        // Record spans beyond limit.
-        assert_eq!(
-            DirEntryHeader::validate(16, 4, 56, 64, 128, 1)
-                .unwrap_err()
-                .error(),
-            Errno::EIO
-        );
-        // Inode out of range.
-        assert_eq!(
-            DirEntryHeader::validate(12, 1, 0, 64, 8, 9)
-                .unwrap_err()
-                .error(),
-            Errno::EIO
-        );
     }
 }

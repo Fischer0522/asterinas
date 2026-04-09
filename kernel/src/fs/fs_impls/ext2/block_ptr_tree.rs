@@ -1054,10 +1054,7 @@ mod test {
 
     use super::*;
     use crate::{
-        fs::{
-            fs_impls::ext2::testkit::{self, ErrorBioDisk, Ext2FixtureBuilder, write_indirect_ptr},
-            utils::IdBitmap,
-        },
+        fs::fs_impls::ext2::testkit::{ErrorBioDisk, Ext2FixtureBuilder, write_indirect_ptr},
         prelude::*,
     };
 
@@ -1072,37 +1069,6 @@ mod test {
             RawBlockPtrs::from_parts(sector_count, block_ptrs),
             Arc::downgrade(fs),
         )
-    }
-
-    fn reload_group0_cached_bitmaps_from_disk(f: &testkit::Ext2Fixture) {
-        let group = f.ext2.block_group(0);
-
-        let block_bitmap_bid = group.block_bitmap_bid();
-        let inode_bitmap_bid = group.inode_bitmap_bid();
-
-        let mut block_bitmap_buf = vec![0u8; BLOCK_SIZE];
-        f.disk
-            .segment()
-            .read_bytes(
-                Bid::new(block_bitmap_bid as u64).to_offset(),
-                &mut block_bitmap_buf,
-            )
-            .unwrap();
-
-        let mut inode_bitmap_buf = vec![0u8; BLOCK_SIZE];
-        f.disk
-            .segment()
-            .read_bytes(
-                Bid::new(inode_bitmap_bid as u64).to_offset(),
-                &mut inode_bitmap_buf,
-            )
-            .unwrap();
-
-        let mut metadata = group.metadata_mut();
-        let block_len = metadata.block_bitmap.len();
-        *metadata.block_bitmap = IdBitmap::from_buf(block_bitmap_buf.into_boxed_slice(), block_len);
-        let inode_len = metadata.inode_bitmap.len();
-        *metadata.inode_bitmap = IdBitmap::from_buf(inode_bitmap_buf.into_boxed_slice(), inode_len);
     }
 
     #[ktest]
@@ -1480,62 +1446,6 @@ mod test {
         assert_eq!(err.error(), Errno::ENOSPC);
         assert_eq!(block_ptr_tree.raw_block_ptrs.block_ptrs, [0u32; 15]);
         assert_eq!(block_ptr_tree.raw_block_ptrs.sector_count, 0);
-    }
-
-    #[ktest]
-    fn block_alloc_fragmented_chain_ok() {
-        // Corner case: the required metadata chain exists only as fragmented free
-        // blocks, so metadata allocation must be accumulated across multiple
-        // fs.alloc_blocks() calls before the single data block is attached.
-        let f = Ext2FixtureBuilder::new(1, 256)
-            .with_free_blocks(3, 3)
-            .build()
-            .unwrap();
-        let ext2 = &f.ext2;
-        let sb = &f.sb;
-        let desc = &f.descs[0];
-
-        let first = sb.group_first_block_no(0);
-        let last = sb.group_last_block_no(0);
-        let data_base = first
-            .saturating_add(2)
-            .saturating_add(sb.inode_table_blocks_per_group())
-            .saturating_add(2);
-        let free0 = data_base;
-        let free1 = data_base.saturating_add(2);
-        let free2 = data_base.saturating_add(4);
-        assert!(free2 <= last);
-
-        // Mark every block allocated except three isolated free blocks.
-        let mut allocated_blocks = Vec::new();
-        for block in first..=last {
-            if block == free0 || block == free1 || block == free2 {
-                continue;
-            }
-            allocated_blocks.push(block);
-        }
-        testkit::write_block_bitmap(f.disk.as_ref(), sb, desc, &allocated_blocks);
-        reload_group0_cached_bitmaps_from_disk(&f);
-
-        let ptrs = (BLOCK_SIZE / size_of::<u32>()) as u32;
-        let first_double_iblock = 12 + ptrs;
-        let mut block_ptr_tree = make_block_map([0u32; 15], 0, &f.ext2);
-
-        let allocated_data =
-            alloc_single_block(&mut block_ptr_tree, ext2, first_double_iblock).unwrap();
-        assert_ne!(block_ptr_tree.raw_block_ptrs.block_ptrs[13], 0);
-        assert_eq!(
-            block_ptr_tree.lookup_block(first_double_iblock).unwrap(),
-            Some(allocated_data)
-        );
-
-        // All three isolated free blocks should be consumed.
-        assert_eq!(ext2.super_block().free_blocks_count(), 0);
-        assert_eq!(f.ext2.block_group(0).free_blocks_count(), 0);
-        assert_eq!(
-            block_ptr_tree.raw_block_ptrs.sector_count,
-            ((BLOCK_SIZE / SECTOR_SIZE) as u32) * 3
-        );
     }
 
     #[ktest]

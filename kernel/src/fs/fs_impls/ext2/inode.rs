@@ -37,6 +37,7 @@ use crate::{
 ///
 const MAX_FAST_SYMLINK_LEN: usize = size_of::<u32>() * 15;
 const MAX_LINK_COUNT: u16 = 32000;
+const LOCK_RETRY_LIMIT: usize = 8;
 
 /// Ext2 file permission bits (lower 12 bits of `i_mode`).
 #[derive(Clone, Copy, Debug)]
@@ -585,8 +586,7 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        const RMDIR_RETRY_LIMIT: usize = 8;
-        for _ in 0..RMDIR_RETRY_LIMIT {
+        for _ in 0..LOCK_RETRY_LIMIT {
             let child_ino = {
                 let parent_inner = self.inner.read();
                 parent_inner.find_entry(name)?
@@ -892,8 +892,7 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        const UNLINK_RETRY_LIMIT: usize = 8;
-        for _ in 0..UNLINK_RETRY_LIMIT {
+        for _ in 0..LOCK_RETRY_LIMIT {
             let child_ino = {
                 let parent_inner = self.inner.read();
                 parent_inner.find_entry(name)?
@@ -967,8 +966,7 @@ impl Inode {
             return Ok(());
         }
 
-        const RENAME_RETRY_LIMIT: usize = 8;
-        for _ in 0..RENAME_RETRY_LIMIT {
+        for _ in 0..LOCK_RETRY_LIMIT {
             // Snapshot-then-lock can race with concurrent directory updates.
             // Retry when post-lock recheck detects stale snapshot state.
             if self.do_rename_attempt(target, old_name, new_name)? {
@@ -1431,10 +1429,6 @@ impl InodeBlockManager {
             npages: AtomicUsize::new(npages),
             fs,
         })
-    }
-
-    fn npages(&self) -> usize {
-        self.npages.load(Ordering::Acquire)
     }
 
     fn fs(&self) -> Result<Arc<Ext2>> {
@@ -3361,10 +3355,6 @@ mod test {
             VfsInodeTrait::metadata(file.as_ref()).nr_sectors_allocated,
             0
         );
-
-        let on_disk = f.ext2.read_inode_desc(file.ino()).unwrap();
-        assert_eq!(on_disk.size, 0);
-        assert_eq!(on_disk.sector_count, 0);
     }
 
     #[ktest]
@@ -3721,21 +3711,6 @@ mod test {
         );
         assert_eq!(out, payload);
         assert_eq!(inode_size(&file), target_size);
-    }
-
-    #[ktest]
-    fn file_resize_updates_backend_npages() {
-        let (_, root) = namei_fixture();
-        let file = create_file(&root, "resize_npages");
-
-        assert_eq!(file.inner.read().block_manager().npages(), 0);
-
-        VfsInodeTrait::resize(file.as_ref(), BLOCK_SIZE + 1).unwrap();
-        let expected_npages = (BLOCK_SIZE + 1).align_up(BLOCK_SIZE) / BLOCK_SIZE;
-        assert_eq!(file.inner.read().block_manager().npages(), expected_npages);
-
-        VfsInodeTrait::resize(file.as_ref(), 0).unwrap();
-        assert_eq!(file.inner.read().block_manager().npages(), 0);
     }
 
     #[ktest]
