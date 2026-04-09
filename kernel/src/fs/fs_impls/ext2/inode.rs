@@ -37,7 +37,6 @@ use crate::{
 ///
 const MAX_FAST_SYMLINK_LEN: usize = size_of::<u32>() * 15;
 const MAX_LINK_COUNT: u16 = 32000;
-const LOCK_RETRY_LIMIT: usize = 8;
 
 /// Ext2 file permission bits (lower 12 bits of `i_mode`).
 #[derive(Clone, Copy, Debug)]
@@ -586,52 +585,39 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        for _ in 0..LOCK_RETRY_LIMIT {
-            let child_ino = {
-                let parent_inner = self.inner.read();
-                parent_inner.find_entry(name)?
-            };
-            let fs = self.fs()?;
-            let child = fs.read_inode(child_ino)?;
-            let lock_targets = [self, child.as_ref()];
-            let mut guards = MultiInodeInnerGuards::lock(&lock_targets);
+        let child_ino = {
+            let parent_inner = self.inner.read();
+            parent_inner.find_entry(name)?
+        };
+        let fs = self.fs()?;
+        let child = fs.read_inode(child_ino)?;
+        let lock_targets = [self, child.as_ref()];
+        let mut guards = MultiInodeInnerGuards::lock(&lock_targets);
 
-            let parent_inner = guards.inner(self.ino())?;
-            let rechecked_child_ino = parent_inner.find_entry(name)?;
-            if rechecked_child_ino != child_ino {
-                continue;
-            }
-
-            let child_inner = guards.inner_mut(child.ino())?;
-            if child_inner.inode_type() != InodeType::Dir {
-                return_errno!(Errno::ENOTDIR);
-            }
-            if !child_inner.empty_dir(child.ino())? {
-                return_errno!(Errno::ENOTEMPTY);
-            }
-
-            child_inner.set_ctime(now());
-            child_inner.dec_link_count(2);
-
-            if child_inner.link_count() == 0 {
-                child_inner.persist(child_ino)?;
-                let _ = fs.remove_inode_cache(child_ino);
-            }
-
-            let parent_inner = guards.inner_mut(self.ino())?;
-
-            let target_entry = parent_inner.find_entry_target(name)?;
-            parent_inner.delete_entry(&target_entry)?;
-            parent_inner.dec_link_count(1);
-            parent_inner.touch_mtime_ctime(now());
-
-            return Ok(());
+        let child_inner = guards.inner_mut(child.ino())?;
+        if child_inner.inode_type() != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+        if !child_inner.empty_dir(child.ino())? {
+            return_errno!(Errno::ENOTEMPTY);
         }
 
-        return_errno_with_message!(
-            Errno::EAGAIN,
-            "rmdir retried due concurrent directory updates"
-        )
+        child_inner.set_ctime(now());
+        child_inner.dec_link_count(2);
+
+        if child_inner.link_count() == 0 {
+            child_inner.persist(child_ino)?;
+            let _ = fs.remove_inode_cache(child_ino);
+        }
+
+        let parent_inner = guards.inner_mut(self.ino())?;
+
+        let target_entry = parent_inner.find_entry_target(name)?;
+        parent_inner.delete_entry(&target_entry)?;
+        parent_inner.dec_link_count(1);
+        parent_inner.touch_mtime_ctime(now());
+
+        Ok(())
     }
 
     /// Implements fallocate operations for ext2.
@@ -893,48 +879,35 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        for _ in 0..LOCK_RETRY_LIMIT {
-            let child_ino = {
-                let parent_inner = self.inner.read();
-                parent_inner.find_entry(name)?
-            };
-            let fs = self.fs()?;
-            let child = fs.read_inode(child_ino)?;
-            let lock_targets = [self, child.as_ref()];
-            let mut guards = MultiInodeInnerGuards::lock(&lock_targets);
+        let child_ino = {
+            let parent_inner = self.inner.read();
+            parent_inner.find_entry(name)?
+        };
+        let fs = self.fs()?;
+        let child = fs.read_inode(child_ino)?;
+        let lock_targets = [self, child.as_ref()];
+        let mut guards = MultiInodeInnerGuards::lock(&lock_targets);
 
-            let parent_inner = guards.inner(self.ino())?;
-            let rechecked_child_ino = parent_inner.find_entry(name)?;
-            if rechecked_child_ino != child_ino {
-                continue;
-            }
-
-            let child_inner = guards.inner_mut(child.ino())?;
-            if child_inner.inode_type() == InodeType::Dir {
-                return_errno!(Errno::EISDIR);
-            }
-
-            let parent_inner = guards.inner_mut(self.ino())?;
-
-            let target_entry = parent_inner.find_entry_target(name)?;
-            parent_inner.delete_entry(&target_entry)?;
-
-            // Update timestamps before dropping the target link count.
-            let child_inner = guards.inner_mut(child.ino())?;
-            child_inner.set_ctime(now());
-            child_inner.dec_link_count(1);
-
-            if child_inner.link_count() == 0 {
-                child_inner.persist(child_ino)?;
-                let _ = fs.remove_inode_cache(child_ino);
-            }
-            return Ok(());
+        let child_inner = guards.inner_mut(child.ino())?;
+        if child_inner.inode_type() == InodeType::Dir {
+            return_errno!(Errno::EISDIR);
         }
 
-        return_errno_with_message!(
-            Errno::EAGAIN,
-            "unlink retried due concurrent directory updates"
-        )
+        let parent_inner = guards.inner_mut(self.ino())?;
+
+        let target_entry = parent_inner.find_entry_target(name)?;
+        parent_inner.delete_entry(&target_entry)?;
+
+        // Update timestamps before dropping the target link count.
+        let child_inner = guards.inner_mut(child.ino())?;
+        child_inner.set_ctime(now());
+        child_inner.dec_link_count(1);
+
+        if child_inner.link_count() == 0 {
+            child_inner.persist(child_ino)?;
+            let _ = fs.remove_inode_cache(child_ino);
+        }
+        Ok(())
     }
 
     /// Renames or moves an entry from this directory to `target` directory.
@@ -967,21 +940,6 @@ impl Inode {
             return Ok(());
         }
 
-        for _ in 0..LOCK_RETRY_LIMIT {
-            // Snapshot-then-lock can race with concurrent directory updates.
-            // Retry when post-lock recheck detects stale snapshot state.
-            if self.do_rename_attempt(target, old_name, new_name)? {
-                return Ok(());
-            }
-        }
-
-        return_errno_with_message!(
-            Errno::EAGAIN,
-            "rename retried due concurrent directory updates"
-        );
-    }
-
-    fn do_rename_attempt(&self, target: &Inode, old_name: &str, new_name: &str) -> Result<bool> {
         // Step 1: read the current source/target snapshot without write locks.
         let ctx = self.prepare_rename_context(target, old_name, new_name)?;
 
@@ -989,23 +947,27 @@ impl Inode {
         let lock_targets = self.rename_lock_targets(&ctx);
         let mut guards = MultiInodeInnerGuards::lock(&lock_targets);
 
-        // Step 3: verify that the snapshot is still valid under the locks.
-        if !self.recheck_rename_state(&ctx, &guards)? {
-            return Ok(false);
+        // Step 3: validate dotdot consistency for directory moves.
+        if ctx.old_is_dir {
+            let old_inner = guards.inner(ctx.old_inode.ino())?;
+            let dotdot_ino = old_inner.find_entry("..")?;
+            if dotdot_ino != ctx.source_dir.ino {
+                return_errno_with_message!(Errno::EIO, "failed to update dotdot entry");
+            }
         }
+
         // Step 4: apply the rename mutations and persist the metadata.
         self.validate_rename_overwrite(&ctx, &guards)?;
         self.apply_rename_with_locks(&ctx, &mut guards)?;
 
-        if let Some(existing) = ctx.existing_inode.as_ref() {
-            let inner = guards.inner_mut(existing.ino)?;
+        if let Some(replaced) = ctx.replaced_inode.as_ref() {
+            let inner = guards.inner_mut(replaced.ino)?;
             if inner.link_count() == 0 {
-                inner.persist(existing.ino())?;
-                let fs = self.fs()?;
-                let _ = fs.remove_inode_cache(existing.ino());
+                inner.persist(replaced.ino())?;
+                let _ = fs.remove_inode_cache(replaced.ino());
             }
         }
-        Ok(true)
+        Ok(())
     }
 
     fn prepare_rename_context<'a>(
@@ -1020,11 +982,11 @@ impl Inode {
         };
         let fs = self.fs()?;
         let old_inode = fs.read_inode(old_ino)?;
-        let existing_ino = {
+        let replaced_ino = {
             let target_inner = target.inner.read();
             target_inner.find_entry(new_name).ok()
         };
-        let existing_inode = if let Some(ino) = existing_ino {
+        let replaced_inode = if let Some(ino) = replaced_ino {
             Some(fs.read_inode(ino)?)
         } else {
             None
@@ -1039,8 +1001,7 @@ impl Inode {
             new_name,
             old_ino,
             old_inode,
-            existing_ino,
-            existing_inode,
+            replaced_inode,
             old_is_dir,
             moved_ft,
         })
@@ -1051,8 +1012,8 @@ impl Inode {
         Self::add_unique_inode_lock_target(&mut targets, ctx.source_dir);
         Self::add_unique_inode_lock_target(&mut targets, ctx.target_dir);
         Self::add_unique_inode_lock_target(&mut targets, ctx.old_inode.as_ref());
-        if let Some(existing) = ctx.existing_inode.as_ref() {
-            Self::add_unique_inode_lock_target(&mut targets, existing.as_ref());
+        if let Some(replaced) = ctx.replaced_inode.as_ref() {
+            Self::add_unique_inode_lock_target(&mut targets, replaced.as_ref());
         }
         targets
     }
@@ -1064,55 +1025,25 @@ impl Inode {
         targets.push(inode);
     }
 
-    fn recheck_rename_state(
-        &self,
-        ctx: &RenameContext<'_>,
-        guards: &MultiInodeInnerGuards<'_>,
-    ) -> Result<bool> {
-        let source_inner = guards.inner(ctx.source_dir.ino)?;
-        let rechecked_old_ino = source_inner.find_entry(ctx.old_name)?;
-        if rechecked_old_ino != ctx.old_ino {
-            // Source entry changed after snapshot; caller should retry.
-            return Ok(false);
-        }
-
-        let target_inner = guards.inner(ctx.target_dir.ino)?;
-        let rechecked_existing_ino = target_inner.find_entry(ctx.new_name).ok();
-        if rechecked_existing_ino != ctx.existing_ino {
-            // Destination state changed after snapshot; caller should retry.
-            return Ok(false);
-        }
-
-        if ctx.old_is_dir {
-            let old_inner = guards.inner(ctx.old_inode.ino())?;
-            let dotdot_ino = old_inner.find_entry("..")?;
-            if dotdot_ino != ctx.source_dir.ino {
-                return_errno_with_message!(Errno::EIO, "failed to update dotdot entry");
-            }
-        }
-
-        Ok(true)
-    }
-
     fn validate_rename_overwrite(
         &self,
         ctx: &RenameContext<'_>,
         guards: &MultiInodeInnerGuards<'_>,
     ) -> Result<()> {
-        let Some(existing) = ctx.existing_inode.as_ref() else {
+        let Some(replaced) = ctx.replaced_inode.as_ref() else {
             return Ok(());
         };
 
-        let existing_is_dir = existing.type_ == InodeType::Dir;
-        if ctx.old_is_dir && !existing_is_dir {
+        let replaced_is_dir = replaced.type_ == InodeType::Dir;
+        if ctx.old_is_dir && !replaced_is_dir {
             return_errno!(Errno::ENOTDIR);
         }
-        if !ctx.old_is_dir && existing_is_dir {
+        if !ctx.old_is_dir && replaced_is_dir {
             return_errno!(Errno::EISDIR);
         }
-        if existing_is_dir {
-            let existing_inner = guards.inner(existing.ino())?;
-            if !existing_inner.empty_dir(existing.ino())? {
+        if replaced_is_dir {
+            let replaced_inner = guards.inner(replaced.ino())?;
+            if !replaced_inner.empty_dir(replaced.ino())? {
                 return_errno!(Errno::ENOTEMPTY);
             }
         }
@@ -1132,12 +1063,12 @@ impl Inode {
                 ctx.new_name,
                 ctx.old_ino,
                 ctx.moved_ft,
-                ctx.existing_inode.is_some(),
+                ctx.replaced_inode.is_some(),
             )?;
             let old_target = dir_inner.find_entry_target(ctx.old_name)?;
             dir_inner.delete_entry(&old_target)?;
             if ctx.old_is_dir {
-                if ctx.existing_inode.is_none() {
+                if ctx.replaced_inode.is_none() {
                     dir_inner.inc_link_count(1);
                 }
                 dir_inner.dec_link_count(1);
@@ -1152,9 +1083,9 @@ impl Inode {
                     ctx.new_name,
                     ctx.old_ino,
                     ctx.moved_ft,
-                    ctx.existing_inode.is_some(),
+                    ctx.replaced_inode.is_some(),
                 )?;
-                if ctx.old_is_dir && ctx.existing_inode.is_none() {
+                if ctx.old_is_dir && ctx.replaced_inode.is_none() {
                     target_inner.inc_link_count(1);
                 }
                 target_inner.touch_mtime_ctime(now());
@@ -1170,14 +1101,13 @@ impl Inode {
             }
         }
 
-        if let Some(existing) = ctx.existing_inode.as_ref() {
-            // Replaced inode can be distinct from moved inode, or the same inode in corner cases.
-            let existing_inner = guards.inner_mut(existing.ino())?;
-            existing_inner.set_ctime(now());
+        if let Some(replaced) = ctx.replaced_inode.as_ref() {
+            let replaced_inner = guards.inner_mut(replaced.ino())?;
+            replaced_inner.set_ctime(now());
             if ctx.old_is_dir {
-                existing_inner.dec_link_count(1);
+                replaced_inner.dec_link_count(1);
             }
-            existing_inner.dec_link_count(1);
+            replaced_inner.dec_link_count(1);
         }
 
         let old_inner = guards.inner_mut(ctx.old_inode.ino())?;
@@ -1195,10 +1125,10 @@ impl Inode {
         new_name: &str,
         old_ino: u32,
         moved_ft: DirEntryFileType,
-        has_existing: bool,
+        has_replaced: bool,
     ) -> Result<()> {
-        if has_existing {
-            // Existing destination entry: ext2_set_link semantics.
+        if has_replaced {
+            // Replaced destination entry: ext2_set_link semantics.
             let target_de = target_inner.find_entry_target(new_name)?;
             target_inner.set_link(&target_de, old_ino, moved_ft)?;
             return Ok(());
@@ -1403,8 +1333,7 @@ struct RenameContext<'a> {
     new_name: &'a str,
     old_ino: u32,
     old_inode: Arc<Inode>,
-    existing_ino: Option<u32>,
-    existing_inode: Option<Arc<Inode>>,
+    replaced_inode: Option<Arc<Inode>>,
     old_is_dir: bool,
     moved_ft: DirEntryFileType,
 }
