@@ -472,10 +472,9 @@ pub(super) fn write_raw_inode_to_disk(
     let index_in_group = (ino - 1) % inodes_per_group;
 
     let inode_size = sb.inode_size();
-    let block_size = sb.block_size();
     let offset_bytes = (index_in_group as usize).saturating_mul(inode_size);
-    let block_index = offset_bytes / block_size;
-    let offset_in_block = offset_bytes % block_size;
+    let block_index = offset_bytes / BLOCK_SIZE;
+    let offset_in_block = offset_bytes % BLOCK_SIZE;
 
     let table_block = descs[group_idx].inode_table + block_index as u32;
     let table_bid = Bid::new(table_block as u64);
@@ -661,11 +660,11 @@ pub(super) fn validate_group0_layout(sb: &SuperBlock, layout: &Group0Layout) -> 
 // Root directory helpers
 // ---------------------------------------------------------------------------
 
-fn make_root_raw_inode(root_bid: u32, block_size: usize) -> RawInode {
+fn make_root_raw_inode(root_bid: u32) -> RawInode {
     RawInodeBuilder::new(InodeType::Dir as u16 | 0o755)
         .link_count(2)
-        .size_lo(block_size as u32)
-        .sector_count((block_size / SECTOR_SIZE) as u32)
+        .size_lo(BLOCK_SIZE as u32)
+        .sector_count((BLOCK_SIZE / SECTOR_SIZE) as u32)
         .block_ptrs({
             let mut ptrs = [0u32; 15];
             ptrs[0] = root_bid;
@@ -674,8 +673,8 @@ fn make_root_raw_inode(root_bid: u32, block_size: usize) -> RawInode {
         .build()
 }
 
-pub(super) fn write_simple_root_dir_block(disk: &Ext2MemoryDisk, root_bid: u32, block_size: usize) {
-    let mut block = vec![0u8; block_size];
+pub(super) fn write_simple_root_dir_block(disk: &Ext2MemoryDisk, root_bid: u32) {
+    let mut block = vec![0u8; BLOCK_SIZE];
 
     // '.'
     block[0..4].copy_from_slice(&ROOT_INO.to_le_bytes());
@@ -686,7 +685,7 @@ pub(super) fn write_simple_root_dir_block(disk: &Ext2MemoryDisk, root_bid: u32, 
 
     // '..'
     block[12..16].copy_from_slice(&ROOT_INO.to_le_bytes());
-    block[16..18].copy_from_slice(&((block_size - 12) as u16).to_le_bytes());
+    block[16..18].copy_from_slice(&((BLOCK_SIZE - 12) as u16).to_le_bytes());
     block[18] = 2;
     block[19] = 2;
     block[20] = b'.';
@@ -904,7 +903,7 @@ impl Ext2FixtureBuilder {
         if self.init_root {
             write_block_bitmap(disk, sb, &descs[0], &[root_bid]);
             write_inode_bitmap(disk, sb, &descs[0], &[ROOT_INO]);
-            write_simple_root_dir_block(disk, root_bid, sb.block_size());
+            write_simple_root_dir_block(disk, root_bid);
         }
 
         if self.init_metadata_block_bitmap {
@@ -975,7 +974,7 @@ impl Ext2FixtureBuilder {
         // disk so later root lookups succeed.
         let root_bid = layout.first_data.saturating_add(1);
         if self.init_root {
-            let root_raw = make_root_raw_inode(root_bid, sb.block_size());
+            let root_raw = make_root_raw_inode(root_bid);
             write_raw_inode_to_disk(&sb, &descs, ROOT_INO, &root_raw, &disk);
         }
 

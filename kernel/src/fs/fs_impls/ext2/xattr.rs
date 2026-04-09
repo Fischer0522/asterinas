@@ -155,9 +155,8 @@ impl Xattr {
         flags: XattrSetFlags,
     ) -> Result<()> {
         let (target_index, target_name) = Self::parse_target_name(name)?;
-        let block_size = self.fs()?.block_size();
         let value_len = value_reader.remain();
-        if value_len > block_size {
+        if value_len > BLOCK_SIZE {
             return_errno_with_message!(Errno::ERANGE, "xattr value is too large");
         }
 
@@ -165,7 +164,7 @@ impl Xattr {
         let mut entries = if self.bid == 0 {
             Vec::new()
         } else {
-            self.read_loaded_entries(block_size)?
+            self.read_loaded_entries()?
         };
 
         let (found, insert_at) = Self::find_entry_position(&entries, target_index, &target_name);
@@ -195,10 +194,10 @@ impl Xattr {
             );
         }
 
-        let working_block = Self::build_block(&entries, block_size)?;
+        let working_block = Self::build_block(&entries)?;
         // TODO: Add rollback if block allocation succeeds but the writeback fails.
         self.alloc_bid_if_need()?;
-        self.write_working_block(&working_block, block_size)?;
+        self.write_working_block(&working_block)?;
         self.dirty = true;
         Ok(())
     }
@@ -215,8 +214,7 @@ impl Xattr {
             return_errno_with_message!(Errno::ENODATA, "the target xattr does not exist");
         }
 
-        let block_size = self.fs()?.block_size();
-        let entries = self.read_loaded_entries(block_size)?;
+        let entries = self.read_loaded_entries()?;
         let value = entries
             .iter()
             .find(|entry| {
@@ -251,8 +249,7 @@ impl Xattr {
             return Ok(0);
         }
 
-        let block_size = self.fs()?.block_size();
-        let entries = self.read_loaded_entries(block_size)?;
+        let entries = self.read_loaded_entries()?;
 
         let mut listed_names = Vec::new();
         let mut total_size = 0usize;
@@ -301,8 +298,7 @@ impl Xattr {
             return_errno_with_message!(Errno::ENODATA, "the target xattr does not exist");
         }
 
-        let block_size = self.fs()?.block_size();
-        let mut entries = self.read_loaded_entries(block_size)?;
+        let mut entries = self.read_loaded_entries()?;
         let (found, _) = Self::find_entry_position(&entries, target_index, &target_name);
         let Some(found_idx) = found else {
             return_errno_with_message!(Errno::ENODATA, "the target xattr does not exist");
@@ -318,8 +314,8 @@ impl Xattr {
             return Ok(());
         }
 
-        let working_block = Self::build_block(&entries, block_size)?;
-        self.write_working_block(&working_block, block_size)?;
+        let working_block = Self::build_block(&entries)?;
+        self.write_working_block(&working_block)?;
         self.dirty = true;
         Ok(())
     }
@@ -436,11 +432,8 @@ impl Xattr {
         (found, insert_at)
     }
 
-    fn alloc_block_buffer(block_size: usize) -> Result<USegment> {
-        let npages = block_size.div_ceil(BLOCK_SIZE);
-        let segment = FrameAllocOptions::new()
-            .zeroed(true)
-            .alloc_segment(npages)?;
+    fn alloc_block_buffer() -> Result<USegment> {
+        let segment = FrameAllocOptions::new().zeroed(true).alloc_segment(1)?;
         Ok(segment.into())
     }
 
@@ -452,12 +445,12 @@ impl Xattr {
         Ok(())
     }
 
-    fn validate_entry(entry: &XattrEntryRaw, offset: usize, block_size: usize) -> Result<()> {
+    fn validate_entry(entry: &XattrEntryRaw, offset: usize) -> Result<()> {
         let entry_len = xattr_entry_len(entry.e_name_len as usize);
         let next = offset
             .checked_add(entry_len)
             .ok_or_else(|| Error::with_message(Errno::EIO, "xattr entry overflow"))?;
-        if next >= block_size {
+        if next >= BLOCK_SIZE {
             return_errno_with_message!(Errno::EIO, "xattr entry overflows block");
         }
         if entry.e_value_block != 0 {
@@ -469,21 +462,21 @@ impl Xattr {
         let value_end = value_off
             .checked_add(value_size)
             .ok_or_else(|| Error::with_message(Errno::EIO, "xattr value range overflow"))?;
-        if value_size > block_size || value_end > block_size {
+        if value_size > BLOCK_SIZE || value_end > BLOCK_SIZE {
             return_errno_with_message!(Errno::EIO, "xattr value range is out of block bounds");
         }
         Ok(())
     }
 
-    fn validate_block(block_buf: &USegment, block_size: usize) -> Result<()> {
-        if block_size < XATTR_HEADER_SIZE + XATTR_TERMINATOR_SIZE {
+    fn validate_block(block_buf: &USegment) -> Result<()> {
+        if BLOCK_SIZE < XATTR_HEADER_SIZE + XATTR_TERMINATOR_SIZE {
             return_errno_with_message!(Errno::EIO, "xattr block is too small");
         }
         Self::validate_header(block_buf)?;
 
         let mut offset = XATTR_HEADER_SIZE;
         loop {
-            if offset + XATTR_TERMINATOR_SIZE > block_size {
+            if offset + XATTR_TERMINATOR_SIZE > BLOCK_SIZE {
                 return_errno_with_message!(Errno::EIO, "xattr entry terminator is missing");
             }
 
@@ -495,12 +488,12 @@ impl Xattr {
             let entry = block_buf.read_val::<XattrEntryRaw>(offset)?;
             let _ = XattrNameIndex::try_from(entry.e_name_index)
                 .map_err(|_| Error::with_message(Errno::EIO, "invalid xattr name index on disk"))?;
-            Self::validate_entry(&entry, offset, block_size)?;
+            Self::validate_entry(&entry, offset)?;
             offset += xattr_entry_len(entry.e_name_len as usize);
         }
     }
 
-    fn read_loaded_entries(&self, block_size: usize) -> Result<Vec<XattrEntryData>> {
+    fn read_loaded_entries(&self) -> Result<Vec<XattrEntryData>> {
         let block_buf = self
             .block_buf
             .as_ref()
@@ -510,7 +503,7 @@ impl Xattr {
         let mut entries: Vec<XattrEntryData> = Vec::new();
         let mut offset = XATTR_HEADER_SIZE;
         loop {
-            if offset + XATTR_TERMINATOR_SIZE > block_size {
+            if offset + XATTR_TERMINATOR_SIZE > BLOCK_SIZE {
                 return_errno_with_message!(Errno::EIO, "xattr entry terminator is missing");
             }
 
@@ -522,7 +515,7 @@ impl Xattr {
             let entry = block_buf.read_val::<XattrEntryRaw>(offset)?;
             let name_index = XattrNameIndex::try_from(entry.e_name_index)
                 .map_err(|_| Error::with_message(Errno::EIO, "invalid xattr name index on disk"))?;
-            Self::validate_entry(&entry, offset, block_size)?;
+            Self::validate_entry(&entry, offset)?;
 
             let name_len = entry.e_name_len as usize;
             let mut name = vec![0u8; name_len];
@@ -659,7 +652,7 @@ impl Xattr {
         Ok(())
     }
 
-    fn build_block(entries: &[XattrEntryData], block_size: usize) -> Result<Vec<u8>> {
+    fn build_block(entries: &[XattrEntryData]) -> Result<Vec<u8>> {
         let mut entries_bytes = 0usize;
         let mut values_bytes = 0usize;
         for entry in entries {
@@ -679,17 +672,17 @@ impl Xattr {
             .and_then(|v| v.checked_add(XATTR_TERMINATOR_SIZE))
             .and_then(|v| v.checked_add(values_bytes))
             .ok_or_else(|| Error::with_message(Errno::ENOSPC, "xattr block size overflow"))?;
-        if required > block_size {
+        if required > BLOCK_SIZE {
             return_errno_with_message!(Errno::ENOSPC, "insufficient xattr block space");
         }
 
-        let mut block = vec![0u8; block_size];
+        let mut block = vec![0u8; BLOCK_SIZE];
         block[0..4].copy_from_slice(&XATTR_MAGIC.to_le_bytes());
         block[4..8].copy_from_slice(&(1u32).to_le_bytes());
         block[8..12].copy_from_slice(&(XATTR_NBLOCKS as u32).to_le_bytes());
 
         let mut entry_cursor = XATTR_HEADER_SIZE;
-        let mut value_cursor = block_size;
+        let mut value_cursor = BLOCK_SIZE;
 
         for entry in entries {
             let padded_value_len = xattr_value_size(entry.value.len());
@@ -736,13 +729,13 @@ impl Xattr {
         Ok(block)
     }
 
-    fn write_working_block(&mut self, working_block: &[u8], block_size: usize) -> Result<()> {
-        if working_block.len() != block_size {
+    fn write_working_block(&mut self, working_block: &[u8]) -> Result<()> {
+        if working_block.len() != BLOCK_SIZE {
             return_errno_with_message!(Errno::EIO, "xattr working block size mismatch");
         }
 
         if self.block_buf.is_none() {
-            self.block_buf = Some(Self::alloc_block_buffer(block_size)?);
+            self.block_buf = Some(Self::alloc_block_buffer()?);
         }
 
         let block_buf = self
@@ -779,13 +772,12 @@ impl Xattr {
         }
 
         let fs = self.fs()?;
-        let block_size = fs.block_size();
-        let block_buf = Self::alloc_block_buffer(block_size)?;
+        let block_buf = Self::alloc_block_buffer()?;
 
         let bio_segment = BioSegment::new_from_segment(block_buf.clone(), BioDirection::FromDevice);
         fs.read_blocks(self.bid, bio_segment)?;
 
-        Self::validate_block(&block_buf, block_size)?;
+        Self::validate_block(&block_buf)?;
         self.block_buf = Some(block_buf);
         Ok(())
     }

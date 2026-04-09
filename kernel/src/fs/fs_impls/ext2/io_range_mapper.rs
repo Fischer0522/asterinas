@@ -26,7 +26,6 @@ pub(super) struct MappedRange {
 pub(super) struct IoRangeMapper<'a> {
     range: Range<u32>,
     block_ptr_tree: RwMutexReadGuard<'a, BlockPtrTree>,
-    fs: &'a Ext2,
 }
 
 /// Direct-I/O block-range classification for the current logical interval.
@@ -42,12 +41,10 @@ impl<'a> IoRangeMapper<'a> {
     pub(super) fn new(
         range: Range<Ext2Bid>,
         block_ptr_tree: RwMutexReadGuard<'a, BlockPtrTree>,
-        fs: &'a Ext2,
     ) -> Self {
         Self {
             range: range.start..range.end,
             block_ptr_tree,
-            fs,
         }
     }
 
@@ -63,9 +60,9 @@ impl<'a> IoRangeMapper<'a> {
 
         let start_iblock = self.range.start;
         let max_blocks = self.range.end - self.range.start;
-        let device_block_range =
-            self.block_ptr_tree
-                .lookup_block_range(self.fs, start_iblock, max_blocks)?;
+        let device_block_range = self
+            .block_ptr_tree
+            .lookup_block_range(start_iblock, max_blocks)?;
         if !device_block_range.is_empty() {
             debug_assert!(device_block_range.end >= device_block_range.start);
             let logical_end = start_iblock + device_block_range.end - device_block_range.start;
@@ -83,7 +80,7 @@ impl<'a> IoRangeMapper<'a> {
             let remaining = self.range.end - iblock;
             if !self
                 .block_ptr_tree
-                .lookup_block_range(self.fs, iblock, remaining)?
+                .lookup_block_range(iblock, remaining)?
                 .is_empty()
             {
                 break;
@@ -123,7 +120,7 @@ mod test {
         let block_ptr_tree = make_block_map(block_ptrs, &f.ext2);
 
         let binding = RwMutex::new(block_ptr_tree);
-        let mut mapper = IoRangeMapper::new(0..5, binding.read(), &f.ext2);
+        let mut mapper = IoRangeMapper::new(0..5, binding.read());
 
         assert_eq!(
             mapper.next().unwrap(),

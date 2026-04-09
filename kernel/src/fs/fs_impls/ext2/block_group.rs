@@ -718,11 +718,13 @@ impl BlockGroup {
 
         // Persistent in-memory bitmap cache; writeback is deferred to sync_metadata.
 
-        debug_assert!(metadata
-            .desc
-            .free_blocks_count
-            .checked_add(actually_freed as u16)
-            .is_some());
+        debug_assert!(
+            metadata
+                .desc
+                .free_blocks_count
+                .checked_add(actually_freed as u16)
+                .is_some()
+        );
         metadata.desc.free_blocks_count += actually_freed as u16;
 
         Ok(actually_freed)

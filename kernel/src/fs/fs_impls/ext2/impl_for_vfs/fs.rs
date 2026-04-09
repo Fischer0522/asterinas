@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use aster_block::bio::BioStatus;
+use aster_block::{BLOCK_SIZE, bio::BioStatus};
 
 use crate::{
     fs::{
@@ -42,7 +42,7 @@ impl FileSystem for Ext2 {
         };
         SuperBlock {
             magic: MAGIC_NUM as u64,
-            bsize: ext2_sb.block_size(),
+            bsize: BLOCK_SIZE,
             blocks: blocks as usize,
             bfree: ext2_sb.free_blocks_count() as usize,
             bavail: ext2_sb

@@ -20,7 +20,7 @@ stdenvNoCC.mkDerivation {
     ln -sf /proc/self/fd/0 /dev/stdin 2>/dev/null || true
     ln -sf /proc/self/fd/1 /dev/stdout 2>/dev/null || true
     ln -sf /proc/self/fd/2 /dev/stderr 2>/dev/null || true
-    
+
     export PATH=\
     ${pkgs.perl}/bin:\
     ${pkgs.bash}/bin:\

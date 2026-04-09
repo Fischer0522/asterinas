@@ -178,11 +178,10 @@ impl<'a> DirBlock<'a> {
     pub(super) fn from_index(
         page_cache: &'a PageCache,
         block_idx: usize,
-        block_size: usize,
         file_size: usize,
     ) -> Self {
-        let offset = block_idx * block_size;
-        let limit = file_size.saturating_sub(offset).min(block_size);
+        let offset = block_idx * BLOCK_SIZE;
+        let limit = file_size.saturating_sub(offset).min(BLOCK_SIZE);
         Self::new(page_cache, offset, limit)
     }
 

@@ -63,7 +63,6 @@ impl FilePerm {
 pub struct Inode {
     ino: u32,
     type_: InodeType,
-    block_size: usize,
     inner: RwMutex<InodeInner>,
     block_group_idx: usize,
     fs: Weak<Ext2>,
@@ -79,18 +78,12 @@ impl Inode {
         block_group_idx: usize,
         fs: Weak<Ext2>,
     ) -> Arc<Self> {
-        let block_size = fs
-            .upgrade()
-            .expect("filesystem must be alive during inode creation")
-            .block_size();
-
         // Use `new_cyclic` so `InodeInner` can keep a weak self pointer for
         // inode-internal workflows that need to upgrade to `Arc<Inode>`.
 
         Arc::new_cyclic(|weak_self: &Weak<Self>| Self {
             ino,
             type_,
-            block_size,
             block_group_idx,
 
             xattr: match type_ {
@@ -171,7 +164,6 @@ impl Inode {
     }
 
     pub(super) fn resize(&self, new_size: usize) -> Result<()> {
-        let block_size = self.block_size;
         if self.type_ != InodeType::File
             && self.type_ != InodeType::Dir
             && self.type_ != InodeType::SymLink
@@ -180,7 +172,7 @@ impl Inode {
         }
 
         let mut inner = self.inner.write();
-        if inner.desc.is_fast_symlink(block_size) && inner.file_size() != 0 {
+        if inner.desc.is_fast_symlink() && inner.file_size() != 0 {
             return_errno!(Errno::EINVAL);
         }
         if inner
@@ -223,7 +215,7 @@ impl Inode {
         Metadata {
             ino: self.ino as u64,
             size: inner.file_size(),
-            optimal_block_size: self.block_size,
+            optimal_block_size: BLOCK_SIZE,
             nr_sectors_allocated: block_meta.sector_count as usize,
             last_access_at: inner.atime(),
             last_modify_at: inner.mtime(),
@@ -401,7 +393,7 @@ impl Inode {
             Error::with_message(Errno::ENAMETOOLONG, "symlink target length overflow")
         })?;
 
-        if with_nul > self.block_size {
+        if with_nul > BLOCK_SIZE {
             return_errno!(Errno::ENAMETOOLONG);
         }
         let mut inner = self.inner.write();
@@ -477,8 +469,8 @@ impl Inode {
             return_errno!(Errno::EISDIR);
         }
 
-        let block_size = self.block_size;
-        if !offset.is_multiple_of(block_size) || !writer.avail().is_multiple_of(block_size) {
+        let read_len = writer.avail();
+        if !is_block_aligned(offset) || !is_block_aligned(read_len) {
             return_errno_with_message!(Errno::EINVAL, "not block-aligned");
         }
 
@@ -512,15 +504,16 @@ impl Inode {
             return_errno!(Errno::EISDIR);
         }
 
-        let block_size = self.block_size;
-        if !offset.is_multiple_of(block_size) || !reader.remain().is_multiple_of(block_size) {
-            return_errno_with_message!(Errno::EINVAL, "not block-aligned");
-        }
-
         let write_len = reader.remain();
         if write_len == 0 {
             return Ok(0);
         }
+
+        if !is_block_aligned(offset) || !is_block_aligned(write_len) {
+            // TODO: fallback to buffer_io like Linux.
+            return_errno_with_message!(Errno::EINVAL, "not block-aligned");
+        }
+
         let end = offset
             .checked_add(write_len)
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
@@ -535,11 +528,15 @@ impl Inode {
         }
 
         // Discard overlapping cached pages before direct write.
-        let discard_start = offset.min(old_size);
-        let discard_end = end.min(old_size);
-        if discard_start < discard_end {
-            inner.page_cache().flush_range(discard_start..discard_end)?;
-            inner.page_cache().evict_range(discard_start..discard_end)?;
+        let discard_start_bytes = offset.min(old_size);
+        let discard_end_bytes = end.min(old_size);
+        if discard_start_bytes < discard_end_bytes {
+            inner
+                .page_cache()
+                .flush_range(discard_start_bytes..discard_end_bytes)?;
+            inner
+                .page_cache()
+                .evict_range(discard_start_bytes..discard_end_bytes)?;
         }
 
         if let Err(err) = inner.write_direct_at(offset, reader) {
@@ -654,8 +651,7 @@ impl Inode {
                     inner.ensure_size_within_limit(end)?;
                 }
 
-                let block_size = self.block_size;
-                let new_blocks = match inner.allocate_range_blocks(offset, end, block_size) {
+                let new_blocks = match inner.allocate_range_blocks(offset, end) {
                     Ok(new_blocks) => new_blocks,
                     Err(err) => {
                         inner.rollback_write(old_size, end);
@@ -1268,9 +1264,9 @@ impl InodeDesc {
 
     /// Determines whether the symlink payload is stored inline in `i_block[15]`.
     ///
-    fn is_fast_symlink(&self, block_size: usize) -> bool {
+    fn is_fast_symlink(&self) -> bool {
         let ea_blocks = if self.file_acl != 0 {
-            (block_size / SECTOR_SIZE) as u32
+            (BLOCK_SIZE / SECTOR_SIZE) as u32
         } else {
             0
         };
@@ -1450,8 +1446,7 @@ impl InodeBlockManager {
     /// Looks up a single logical block → physical block (read lock).
     fn lookup_block(&self, iblock: u32) -> Result<Option<Ext2Bid>> {
         let tree = self.block_ptr_tree.read();
-        let fs = self.fs()?;
-        tree.lookup_block(&fs, iblock)
+        tree.lookup_block(iblock)
     }
 
     /// Decodes the device ID from the block pointer payload (read lock).
@@ -1474,13 +1469,12 @@ impl InodeBlockManager {
     fn for_each_io_range(
         &self,
         block_range: Range<Ext2Bid>,
-        mut f: impl FnMut(IoRange) -> Result<()>,
+        mut io_fn: impl FnMut(IoRange) -> Result<()>,
     ) -> Result<()> {
         let tree = self.block_ptr_tree.read();
-        let fs = self.fs()?;
-        let mut mapper = IoRangeMapper::new(block_range, tree, &fs);
+        let mut mapper = IoRangeMapper::new(block_range, tree);
         while let Some(range) = mapper.next()? {
-            f(range)?;
+            io_fn(range)?;
         }
         Ok(())
     }
@@ -1529,7 +1523,7 @@ impl InodeBlockManager {
             let iblock = current_block as u32;
             let remaining = (end_block - current_block) as u32;
 
-            let mapped_range = tree.lookup_block_range(&fs, iblock, remaining)?;
+            let mapped_range = tree.lookup_block_range(iblock, remaining)?;
             if !mapped_range.is_empty() {
                 debug_assert!(mapped_range.end >= mapped_range.start);
                 current_block += (mapped_range.end - mapped_range.start) as usize;
@@ -1616,7 +1610,7 @@ struct InodeInner {
 /// Information about a candidate directory entry slot.
 #[derive(Clone, Copy, Debug)]
 struct DirSlotInfo {
-    /// Byte offset within the directory (block_idx * block_size + offset_in_block).
+    /// Byte offset within the directory (block_idx * BLOCK_SIZE + offset_in_block).
     dir_offset: usize,
     /// Current rec_len of the candidate slot.
     slot_rec_len: usize,
@@ -1836,20 +1830,17 @@ impl InodeInner {
     /// Initializes an empty directory with `.` and `..` entries.
     ///
     fn make_empty(&mut self, ino: u32, parent_ino: u32) -> Result<()> {
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
-
         if !self.block_manager().is_first_block_ptr_zero() {
             return_errno_with_message!(Errno::EIO, "dir block pointer already occupied");
         }
 
         // Allocate one block for the directory.
-        self.prepare_write(0, block_size)?;
+        self.prepare_write(0, BLOCK_SIZE)?;
 
-        let block = DirBlock::new(self.page_cache(), 0, block_size);
+        let block = DirBlock::new(self.page_cache(), 0, BLOCK_SIZE);
         let dot_len = DirEntryHeader::dir_rec_len(1) as usize;
         let write_result = (|| -> Result<()> {
-            self.page_cache().fill_zeros(0..block_size)?;
+            self.page_cache().fill_zeros(0..BLOCK_SIZE)?;
             block.write_entry(
                 0,
                 ino,
@@ -1860,7 +1851,7 @@ impl InodeInner {
             block.write_entry(
                 dot_len,
                 parent_ino,
-                (block_size - dot_len) as u16,
+                (BLOCK_SIZE - dot_len) as u16,
                 b"..",
                 DirEntryFileType::Dir,
             )?;
@@ -1868,11 +1859,11 @@ impl InodeInner {
         })();
 
         if let Err(err) = write_result {
-            self.rollback_write(0, block_size);
+            self.rollback_write(0, BLOCK_SIZE);
             return Err(err);
         }
 
-        self.set_file_size(block_size);
+        self.set_file_size(BLOCK_SIZE);
 
         Ok(())
     }
@@ -1881,9 +1872,8 @@ impl InodeInner {
     ///
     fn read_direct_at(&self, offset: usize, end: usize, writer: &mut VmWriter) -> Result<()> {
         let fs = self.fs()?;
-        let block_size = fs.block_size();
         self.block_manager.for_each_io_range(
-            (offset / block_size) as u32..(end.div_ceil(block_size)) as u32,
+            (offset / BLOCK_SIZE) as u32..(end.div_ceil(BLOCK_SIZE)) as u32,
             |range| {
                 match range {
                     IoRange::Mapped(mapped_range) => {
@@ -1895,7 +1885,7 @@ impl InodeInner {
                         segment_reader.read_fallible(writer)?;
                     }
                     IoRange::Hole(range) => {
-                        let n_bytes = (range.end as usize - range.start as usize) * block_size;
+                        let n_bytes = (range.end as usize - range.start as usize) * BLOCK_SIZE;
                         writer.fill_zeros(n_bytes)?;
                     }
                 }
@@ -1908,13 +1898,12 @@ impl InodeInner {
     ///
     fn write_direct_at(&self, offset: usize, reader: &mut VmReader) -> Result<()> {
         let fs = self.fs()?;
-        let block_size = fs.block_size();
         let write_len = reader.remain();
-        debug_assert_eq!(write_len % block_size, 0);
+        debug_assert_eq!(write_len % BLOCK_SIZE, 0);
         // end is already checked in `Inode::write_direct_at`.
         let end = offset + write_len;
         self.block_manager.for_each_io_range(
-            (offset / block_size) as u32..(end.div_ceil(block_size)) as u32,
+            (offset / BLOCK_SIZE) as u32..(end.div_ceil(BLOCK_SIZE)) as u32,
             |range| {
                 match range {
                     IoRange::Mapped(m) => {
@@ -1950,14 +1939,12 @@ impl InodeInner {
             return Ok(false);
         }
 
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
         let file_size = self.file_size();
-        let data_blocks = file_size.div_ceil(block_size);
+        let data_blocks = file_size.div_ceil(BLOCK_SIZE);
 
         for block_idx in 0..data_blocks {
-            let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, file_size);
-            let block_offset = block_idx * block_size;
+            let block = DirBlock::from_index(self.page_cache(), block_idx, file_size);
+            let block_offset = block_idx * BLOCK_SIZE;
             let mut iter = block.iter_entries();
 
             loop {
@@ -1995,14 +1982,12 @@ impl InodeInner {
             return_errno!(Errno::ENOTDIR);
         }
 
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
         let file_size = self.file_size();
         let name_bytes = name.as_bytes();
 
-        for block_idx in 0..file_size.div_ceil(block_size) {
-            let block_offset = block_idx * block_size;
-            let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, file_size);
+        for block_idx in 0..file_size.div_ceil(BLOCK_SIZE) {
+            let block_offset = block_idx * BLOCK_SIZE;
+            let block = DirBlock::from_index(self.page_cache(), block_idx, file_size);
             let mut iter = block.iter_entries();
             while let Some((_entry_offset, entry)) = iter.next_entry(block_offset)? {
                 let ino = u32::from_le(entry.header.inode);
@@ -2019,8 +2004,6 @@ impl InodeInner {
     }
 
     fn shrink(&mut self, new_size: usize) -> Result<()> {
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
         let old_size = self.desc.size as usize;
 
         self.resize_page_cache_and_update_npages(new_size, old_size)?;
@@ -2035,14 +2018,12 @@ impl InodeInner {
         }
 
         // Fill the partial tail of the new EOF block.
-        self.zero_eof_tail(new_size, block_size)?;
+        self.zero_eof_tail(new_size)?;
         self.set_file_size(new_size);
         Ok(())
     }
 
     fn expand(&mut self, new_size: usize) -> Result<()> {
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
         let old_size = self.file_size();
 
         if new_size <= old_size {
@@ -2052,8 +2033,8 @@ impl InodeInner {
         self.resize_page_cache_and_update_npages(new_size, old_size)?;
 
         // Zero the partial tail of the old EOF block and the new EOF block.
-        self.zero_eof_tail(old_size, block_size)?;
-        self.zero_eof_tail(new_size, block_size)?;
+        self.zero_eof_tail(old_size)?;
+        self.zero_eof_tail(new_size)?;
         self.set_file_size(new_size);
         Ok(())
     }
@@ -2071,21 +2052,18 @@ impl InodeInner {
             return Ok(0);
         }
 
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
-
-        let start_block = offset / block_size;
+        let start_block = offset / BLOCK_SIZE;
         let mut current_offset = offset;
         let mut advanced = 0usize;
 
-        let total_blocks = (size + block_size - 1) / block_size;
+        let total_blocks = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
         for block_idx in start_block..total_blocks {
-            let block_offset = block_idx * block_size;
+            let block_offset = block_idx * BLOCK_SIZE;
             if block_offset >= size {
                 break;
             }
 
-            let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, size);
+            let block = DirBlock::from_index(self.page_cache(), block_idx, size);
             let mut iter = block.iter_entries();
             while let Some((entry_off, entry)) = iter.next_entry(block_offset)? {
                 let entry_offset = block_offset + entry_off;
@@ -2144,10 +2122,8 @@ impl InodeInner {
 
     fn read_link(&self) -> Result<String> {
         let link_size = self.file_size();
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
 
-        if self.is_fast_symlink(block_size) {
+        if self.is_fast_symlink() {
             // Linux stores symlink targets as C-style strings with a trailing NUL,
             // so reserve one byte for the trailing NUL.
             let read_len = link_size.min(MAX_FAST_SYMLINK_LEN - 1);
@@ -2165,9 +2141,9 @@ impl InodeInner {
             .map_err(|_| Error::with_message(Errno::EIO, "symlink target is not valid UTF-8"))
     }
 
-    fn is_fast_symlink(&self, block_size: usize) -> bool {
+    fn is_fast_symlink(&self) -> bool {
         let ea_blocks = if self.desc.file_acl != 0 {
-            (block_size / SECTOR_SIZE) as u32
+            (BLOCK_SIZE / SECTOR_SIZE) as u32
         } else {
             0
         };
@@ -2180,11 +2156,6 @@ impl InodeInner {
     // 3. Allocate new blocks for the write range.
     // 4. Fill zeros for newly exposed partial ranges.
     fn prepare_write(&mut self, offset: usize, end: usize) -> Result<()> {
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
-        if block_size == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid filesystem block size");
-        }
         let old_size = self.file_size();
         if end > old_size {
             self.ensure_size_within_limit(end)?;
@@ -2200,21 +2171,21 @@ impl InodeInner {
 
         // If the write extends EOF, zero the partial tail of the old EOF block.
         if offset > old_size {
-            self.zero_eof_tail(old_size, block_size)?;
+            self.zero_eof_tail(old_size)?;
         }
 
         // Treat the write end as the new partial EOF boundary.
-        self.zero_partial_writes(offset, end, block_size)?;
-        self.allocate_range_blocks(offset, end, block_size)?;
+        self.zero_partial_writes(offset, end)?;
+        self.allocate_range_blocks(offset, end)?;
         Ok(())
     }
     // NOTE: Make sure the page cache is already resized before calling this function.
     // When the file expands, zero the partial tail of the old EOF block. EOF
     // cleanup belongs to the operation that changes the file size, such as
     // write, shrink, expand, or fallocate.
-    fn zero_eof_tail(&self, eof: usize, block_size: usize) -> Result<()> {
-        if !eof.is_multiple_of(block_size) {
-            let block_end = eof.align_up(block_size);
+    fn zero_eof_tail(&self, eof: usize) -> Result<()> {
+        if !eof.is_multiple_of(BLOCK_SIZE) {
+            let block_end = eof.align_up(BLOCK_SIZE);
             self.page_cache().fill_zeros(eof..block_end)?;
         }
         Ok(())
@@ -2225,14 +2196,14 @@ impl InodeInner {
     // Conditionally fill zeros for:
     // 1. The partial start block when it is a hole.
     // 2. The partial end block when it is a hole.
-    fn zero_partial_writes(&mut self, start: usize, end: usize, block_size: usize) -> Result<()> {
-        let start_iblock = (start / block_size) as u32;
-        let end_iblock = (end / block_size) as u32;
+    fn zero_partial_writes(&mut self, start: usize, end: usize) -> Result<()> {
+        let start_iblock = (start / BLOCK_SIZE) as u32;
+        let end_iblock = (end / BLOCK_SIZE) as u32;
         let block_manager = self.block_manager();
 
-        if !start.is_multiple_of(block_size) && block_manager.lookup_block(start_iblock)?.is_none()
+        if !start.is_multiple_of(BLOCK_SIZE) && block_manager.lookup_block(start_iblock)?.is_none()
         {
-            let new_start_block = start.align_down(block_size);
+            let new_start_block = start.align_down(BLOCK_SIZE);
             let page_idx = new_start_block / PAGE_SIZE;
             let page = self.page_cache.commit_on(page_idx)?;
             if !page.is_dirty() {
@@ -2240,8 +2211,8 @@ impl InodeInner {
             }
         }
 
-        if !end.is_multiple_of(block_size) && block_manager.lookup_block(end_iblock)?.is_none() {
-            let new_end_block = end.align_up(block_size);
+        if !end.is_multiple_of(BLOCK_SIZE) && block_manager.lookup_block(end_iblock)?.is_none() {
+            let new_end_block = end.align_up(BLOCK_SIZE);
             let end_page_idx = end / PAGE_SIZE;
             let page = self.page_cache.commit_on(end_page_idx)?;
             if !page.is_dirty() {
@@ -2252,14 +2223,9 @@ impl InodeInner {
     }
 
     /// Allocates missing data blocks that cover the requested file byte range.
-    fn allocate_range_blocks(
-        &mut self,
-        offset: usize,
-        end: usize,
-        block_size: usize,
-    ) -> Result<Vec<Ext2Bid>> {
-        let start_block = offset / block_size;
-        let end_block = end.div_ceil(block_size);
+    fn allocate_range_blocks(&mut self, offset: usize, end: usize) -> Result<Vec<Ext2Bid>> {
+        let start_block = offset / BLOCK_SIZE;
+        let end_block = end.div_ceil(BLOCK_SIZE);
         let block_manager = self.block_manager().clone();
         let new_blocks = block_manager.allocate_range_blocks(start_block, end_block)?;
         Ok(new_blocks)
@@ -2274,8 +2240,7 @@ impl InodeInner {
         }
 
         let fs = self.fs()?;
-        let block_size = fs.block_size();
-        let zero_block = vec![0u8; block_size];
+        let zero_block = vec![0u8; BLOCK_SIZE];
         for &bid in blocks {
             let bio_segment = BioSegment::alloc(1, BioDirection::ToDevice);
             {
@@ -2325,19 +2290,17 @@ impl InodeInner {
             return_errno!(Errno::EINVAL);
         }
 
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
         let reclen = DirEntryHeader::dir_rec_len(name_bytes.len()) as usize;
-        if reclen > block_size {
+        if reclen > BLOCK_SIZE {
             return_errno_with_message!(Errno::ENOSPC, "dir entry too large for block");
         }
 
         let file_size = self.file_size();
-        let data_blocks = file_size.div_ceil(block_size);
+        let data_blocks = file_size.div_ceil(BLOCK_SIZE);
 
         for block_idx in 0..data_blocks {
-            let block_offset = block_idx * block_size;
-            let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, file_size);
+            let block_offset = block_idx * BLOCK_SIZE;
+            let block = DirBlock::from_index(self.page_cache(), block_idx, file_size);
             let mut iter = block.iter_entries();
 
             while let Some((entry_offset, entry)) = iter.next_entry(block_offset)? {
@@ -2374,17 +2337,15 @@ impl InodeInner {
     /// Grows the directory by one data block.
     ///
     fn grow_dir_block(&mut self) -> Result<DirSlotInfo> {
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
         let old_size = self.file_size();
 
-        self.prepare_write(old_size, old_size + block_size)?;
-        let new_size = old_size.saturating_add(block_size);
+        self.prepare_write(old_size, old_size + BLOCK_SIZE)?;
+        let new_size = old_size.saturating_add(BLOCK_SIZE);
         self.set_file_size(new_size);
 
         Ok(DirSlotInfo {
             dir_offset: old_size,
-            slot_rec_len: block_size,
+            slot_rec_len: BLOCK_SIZE,
             used_rec_len: 0,
         })
     }
@@ -2437,14 +2398,12 @@ impl InodeInner {
     /// Locate a target entry by name for delete/set_link operations.
     ///
     fn find_entry_target(&self, name: &str) -> Result<DirEntryTarget> {
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
         let file_size = self.file_size();
         let name_bytes = name.as_bytes();
 
-        for block_idx in 0..file_size.div_ceil(block_size) {
-            let block_offset = block_idx * block_size;
-            let block = DirBlock::from_index(self.page_cache(), block_idx, block_size, file_size);
+        for block_idx in 0..file_size.div_ceil(BLOCK_SIZE) {
+            let block_offset = block_idx * BLOCK_SIZE;
+            let block = DirBlock::from_index(self.page_cache(), block_idx, file_size);
             let mut iter = block.iter_entries();
             while let Some((entry_offset, entry)) = iter.next_entry(block_offset)? {
                 let ino = u32::from_le(entry.header.inode);
@@ -2466,29 +2425,23 @@ impl InodeInner {
     /// Deletes a located entry by zeroing inode and merging rec_len.
     ///
     fn delete_entry(&self, target: &DirEntryTarget) -> Result<()> {
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
-        let block_base = (target.dir_offset / block_size) * block_size;
-        let block_idx = block_base / block_size;
+        let block_base = (target.dir_offset / BLOCK_SIZE) * BLOCK_SIZE;
+        let block_idx = block_base / BLOCK_SIZE;
         let entry_offset = target.dir_offset - block_base;
 
-        let block =
-            DirBlock::from_index(self.page_cache(), block_idx, block_size, self.file_size());
-        block.delete_entry(block_size, entry_offset, target.entry_rec_len)?;
+        let block = DirBlock::from_index(self.page_cache(), block_idx, self.file_size());
+        block.delete_entry(BLOCK_SIZE, entry_offset, target.entry_rec_len)?;
         Ok(())
     }
 
     /// Rewrites a located entry's inode/type.
     ///
     fn set_link(&self, target: &DirEntryTarget, new_ino: u32, ft: DirEntryFileType) -> Result<()> {
-        let fs = self.fs()?;
-        let block_size = fs.block_size();
-        let block_base = (target.dir_offset / block_size) * block_size;
-        let block_idx = block_base / block_size;
+        let block_base = (target.dir_offset / BLOCK_SIZE) * BLOCK_SIZE;
+        let block_idx = block_base / BLOCK_SIZE;
         let entry_offset = target.dir_offset - block_base;
 
-        let block =
-            DirBlock::from_index(self.page_cache(), block_idx, block_size, self.file_size());
+        let block = DirBlock::from_index(self.page_cache(), block_idx, self.file_size());
         block.set_inode(entry_offset, new_ino)?;
         block.set_file_type(entry_offset, ft)?;
         Ok(())
@@ -2612,6 +2565,10 @@ fn write_lock_two_inodes<'a>(
     }
 }
 
+fn is_block_aligned(offset: usize) -> bool {
+    return offset.is_multiple_of(BLOCK_SIZE);
+}
+
 #[cfg(ktest)]
 mod test {
     use core::time::Duration;
@@ -2650,10 +2607,9 @@ mod test {
         let group_idx = ((ino - 1) / inodes_per_group) as usize;
         let index_in_group = (ino - 1) % inodes_per_group;
         let inode_size = f.sb.inode_size();
-        let block_size = f.sb.block_size();
         let offset_bytes = (index_in_group as usize) * inode_size;
-        let block_index = offset_bytes / block_size;
-        let offset_in_block = offset_bytes % block_size;
+        let block_index = offset_bytes / BLOCK_SIZE;
+        let offset_in_block = offset_bytes % BLOCK_SIZE;
         let table_block = f.descs[group_idx].inode_table + block_index as u32;
         f.disk
             .segment()
@@ -2768,20 +2724,6 @@ mod test {
         assert_eq!(f.ext2.super_block().free_inodes_count(), free_inodes_before);
     }
 
-    #[ktest]
-    fn create_socket_returns_einval() {
-        let (_f, root) = namei_fixture();
-
-        assert_errno!(
-            root.create(
-                "sock",
-                InodeType::Socket,
-                FilePerm::from_bits_truncate(0o644)
-            ),
-            Errno::EINVAL
-        );
-    }
-
     // -----------------------------------------------------------------------
     // link / unlink
     // -----------------------------------------------------------------------
@@ -2841,8 +2783,7 @@ mod test {
 
         let old = create_file(&root, "old");
         let old_ino = old.ino();
-        let block_size = f.ext2.block_size();
-        let payload = vec![0x6au8; block_size];
+        let payload = vec![0x6au8; BLOCK_SIZE];
         let mut payload_reader = VmReader::from(payload.as_slice()).to_fallible();
         old.write_direct_at(0, &mut payload_reader).unwrap();
 
@@ -3155,11 +3096,10 @@ mod test {
     fn lookup_missing_returns_enoent() {
         let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let (disk, ext2) = (&f.disk, &f.ext2);
-        let block_size = ext2.block_size();
 
-        let mut one_block = vec![0u8; block_size];
+        let mut one_block = vec![0u8; BLOCK_SIZE];
         encode_dir_entry(&mut one_block, 0, 2, 12, b".", 2);
-        encode_dir_entry(&mut one_block, 12, 0, (block_size - 12) as u16, b"", 0);
+        encode_dir_entry(&mut one_block, 12, 0, (BLOCK_SIZE - 12) as u16, b"", 0);
         let data_bid = 81u32;
         disk.segment()
             .write_bytes(Bid::new(data_bid as u64).to_offset(), &one_block)
@@ -3167,7 +3107,7 @@ mod test {
 
         let mut ptrs = [0u32; 15];
         ptrs[0] = data_bid;
-        let dir_inode = make_live_dir_inode(ext2, 4, block_size, 0, FileFlags::empty(), ptrs);
+        let dir_inode = make_live_dir_inode(ext2, 4, BLOCK_SIZE, 0, FileFlags::empty(), ptrs);
         assert_errno!(lookup_ino(&dir_inode, "missing"), Errno::ENOENT);
 
         // Directory smaller than one entry header yields zero-advance readdir.
@@ -3179,7 +3119,7 @@ mod test {
         let mut vec_visitor = Vec::<String>::new();
         assert_eq!(
             dir_inode
-                .readdir_at(block_size - 11, &mut vec_visitor)
+                .readdir_at(BLOCK_SIZE - 11, &mut vec_visitor)
                 .unwrap(),
             0
         );
@@ -3189,9 +3129,8 @@ mod test {
     fn readdir_bad_entry_returns_eio() {
         let f = Ext2FixtureBuilder::new(2, 256).build().unwrap();
         let (disk, ext2) = (&f.disk, &f.ext2);
-        let block_size = ext2.block_size();
 
-        let mut bad_block = vec![0u8; block_size];
+        let mut bad_block = vec![0u8; BLOCK_SIZE];
         bad_block[0..4].copy_from_slice(&2u32.to_le_bytes());
         bad_block[4..6].copy_from_slice(&8u16.to_le_bytes());
         bad_block[6] = 1;
@@ -3235,8 +3174,7 @@ mod test {
 
     #[ktest]
     fn dir_grow_lookup_ok() {
-        let (f, root) = namei_fixture();
-        let block_size = f.ext2.block_size();
+        let (_, root) = namei_fixture();
 
         let size_before = inode_size(&root);
         let name_pad = "x".repeat(240);
@@ -3254,7 +3192,7 @@ mod test {
 
         let size_after = inode_size(&root);
         assert!(size_after > size_before);
-        assert!(size_after >= size_before.saturating_add(block_size));
+        assert!(size_after >= size_before.saturating_add(BLOCK_SIZE));
 
         assert!(root.lookup(&first_name.unwrap()).is_ok());
         assert!(root.lookup(&last_name.unwrap()).is_ok());
@@ -3288,11 +3226,10 @@ mod test {
 
     #[ktest]
     fn dir_make_empty_ok() {
-        let (f, root) = namei_fixture();
-        let block_size = f.ext2.block_size();
+        let (_, root) = namei_fixture();
 
         let dir = create_dir(&root, "empty");
-        assert_eq!(inode_size(&dir), block_size);
+        assert_eq!(inode_size(&dir), BLOCK_SIZE);
 
         let mut visitor = CollectDirentVisitor::default();
         dir.readdir_at(0, &mut visitor).unwrap();
@@ -3309,14 +3246,13 @@ mod test {
     #[ktest]
     fn dir_make_empty_clears_stale_bytes() {
         let (f, root) = namei_fixture();
-        let block_size = f.ext2.block_size();
         let layout = group0_layout(&f.sb);
         let root_bid = layout.first_data.saturating_add(1);
         let group_last = f.sb.group_last_block_no(0);
 
         // Regression test for xfstests generic/002: creating a fresh directory
         // must not expose stale bytes from a reused data block.
-        let stale_block = vec![0xAB; block_size];
+        let stale_block = vec![0xAB; BLOCK_SIZE];
         for bid in layout.first_data..=group_last {
             if bid == root_bid {
                 continue;
@@ -3337,7 +3273,7 @@ mod test {
             .lookup_block(0)
             .unwrap()
             .unwrap();
-        let mut raw_block = vec![0u8; block_size];
+        let mut raw_block = vec![0u8; BLOCK_SIZE];
         f.disk
             .segment()
             .read_bytes(Bid::new(dir_bid as u64).to_offset(), &mut raw_block)
@@ -3373,7 +3309,7 @@ mod test {
         parent.rmdir("sub").unwrap();
         assert_eq!(inode_nlinks(&parent), 2);
         assert_errno!(lookup_ino(&parent, "sub"), Errno::ENOENT);
-        assert_eq!(inode_size(&child), f.ext2.block_size());
+        assert_eq!(inode_size(&child), BLOCK_SIZE);
         assert_eq!(inode_nlinks(&child), 0);
         assert_errno!(f.ext2.read_inode(child_ino), Errno::ESTALE);
 
@@ -3401,8 +3337,7 @@ mod test {
     fn file_direct_write_truncate_ok() {
         let (f, root) = namei_fixture();
         let file = create_file(&root, "io_file");
-        let block_size = f.ext2.block_size();
-        let payload = vec![0x5au8; block_size];
+        let payload = vec![0x5au8; BLOCK_SIZE];
 
         let free_before_write = f.ext2.super_block().free_blocks_count();
         assert_eq!(
@@ -3413,7 +3348,7 @@ mod test {
         assert_eq!(free_before_write.saturating_sub(free_after_write), 1);
 
         assert_eq!(inode_size(&file), payload.len());
-        let readback = read_file_at(&file, 0, block_size, StatusFlags::O_DIRECT).unwrap();
+        let readback = read_file_at(&file, 0, BLOCK_SIZE, StatusFlags::O_DIRECT).unwrap();
         assert_eq!(&readback[..payload.len()], payload.as_slice());
 
         let free_before_truncate = f.ext2.super_block().free_blocks_count();
@@ -3440,20 +3375,19 @@ mod test {
             .with_free_blocks(64, 64)
             .build()
             .unwrap();
-        let block_size = f.ext2.block_size();
         let file =
-            make_live_file_inode(&f.ext2, 72, block_size * 3, 0, FileFlags::empty(), [0; 15]);
-        let payload = vec![0x6bu8; block_size];
+            make_live_file_inode(&f.ext2, 72, BLOCK_SIZE * 3, 0, FileFlags::empty(), [0; 15]);
+        let payload = vec![0x6bu8; BLOCK_SIZE];
 
         assert_eq!(
-            write_file_at(&file, block_size, &payload, StatusFlags::O_DIRECT).unwrap(),
-            block_size
+            write_file_at(&file, BLOCK_SIZE, &payload, StatusFlags::O_DIRECT).unwrap(),
+            BLOCK_SIZE
         );
 
-        let out = read_file_at(&file, block_size, block_size, StatusFlags::O_DIRECT).unwrap();
+        let out = read_file_at(&file, BLOCK_SIZE, BLOCK_SIZE, StatusFlags::O_DIRECT).unwrap();
         assert_eq!(out, payload);
 
-        let hole = read_file_at(&file, 0, block_size, StatusFlags::O_DIRECT).unwrap();
+        let hole = read_file_at(&file, 0, BLOCK_SIZE, StatusFlags::O_DIRECT).unwrap();
         assert!(hole.iter().all(|byte| *byte == 0));
     }
 
@@ -3465,12 +3399,11 @@ mod test {
             .with_free_blocks(64, 64)
             .build()
             .unwrap();
-        let block_size = f.ext2.block_size();
-        let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
+        let sectors_per_block = (BLOCK_SIZE / SECTOR_SIZE) as u32;
         let old_size = 100usize;
         let data_bid = 80u32;
 
-        let mut on_disk_block = vec![0xaau8; block_size];
+        let mut on_disk_block = vec![0xaau8; BLOCK_SIZE];
         on_disk_block[..old_size].fill(0x11);
         f.disk
             .segment()
@@ -3487,19 +3420,19 @@ mod test {
             FileFlags::empty(),
             ptrs,
         );
-        let payload = vec![0x5cu8; block_size];
+        let payload = vec![0x5cu8; BLOCK_SIZE];
 
         assert_eq!(
-            write_file_at(&file, block_size, &payload, StatusFlags::O_DIRECT).unwrap(),
-            block_size
+            write_file_at(&file, BLOCK_SIZE, &payload, StatusFlags::O_DIRECT).unwrap(),
+            BLOCK_SIZE
         );
 
-        let first_block = read_file_at(&file, 0, block_size, StatusFlags::empty()).unwrap();
+        let first_block = read_file_at(&file, 0, BLOCK_SIZE, StatusFlags::empty()).unwrap();
         assert!(first_block[..old_size].iter().all(|byte| *byte == 0x11));
         assert!(first_block[old_size..].iter().all(|byte| *byte == 0));
 
         let second_block =
-            read_file_at(&file, block_size, block_size, StatusFlags::O_DIRECT).unwrap();
+            read_file_at(&file, BLOCK_SIZE, BLOCK_SIZE, StatusFlags::O_DIRECT).unwrap();
         assert_eq!(second_block, payload);
     }
 
@@ -3538,10 +3471,10 @@ mod test {
 
     #[ktest]
     fn symlink_too_long_err() {
-        let (f, root) = namei_fixture();
+        let (_f, root) = namei_fixture();
         let link = create_symlink(&root, "long_link");
 
-        let too_long = "y".repeat(f.ext2.block_size());
+        let too_long = "y".repeat(BLOCK_SIZE);
         assert_errno!(link.write_link(&too_long), Errno::ENAMETOOLONG);
     }
 
@@ -3556,17 +3489,16 @@ mod test {
 
     #[ktest]
     fn file_write_partial_ok() {
-        let (f, root) = namei_fixture();
+        let (_, root) = namei_fixture();
         let file = create_file(&root, "partial");
-        let block_size = f.ext2.block_size();
-        let original = vec![0x11u8; block_size];
+        let original = vec![0x11u8; BLOCK_SIZE];
         let patch = vec![0x7cu8; 257];
         let patch_off = 123usize;
 
         write_file_at(&file, 0, &original, StatusFlags::empty()).unwrap();
         write_file_at(&file, patch_off, &patch, StatusFlags::empty()).unwrap();
 
-        let out = read_file_at(&file, 0, block_size, StatusFlags::empty()).unwrap();
+        let out = read_file_at(&file, 0, BLOCK_SIZE, StatusFlags::empty()).unwrap();
         assert_eq!(&out[..patch_off], &original[..patch_off]);
         assert_eq!(&out[patch_off..patch_off + patch.len()], patch.as_slice());
         assert_eq!(
@@ -3577,32 +3509,30 @@ mod test {
 
     #[ktest]
     fn file_write_cross_block_ok() {
-        let (f, root) = namei_fixture();
+        let (_, root) = namei_fixture();
         let file = create_file(&root, "cross");
-        let block_size = f.ext2.block_size();
-        let crossing_off = block_size - 64;
+        let crossing_off = BLOCK_SIZE - 64;
         let crossing_data = (0..128)
             .map(|i| (i as u8).wrapping_add(1))
             .collect::<Vec<_>>();
 
-        let zeros = vec![0u8; block_size * 2];
+        let zeros = vec![0u8; BLOCK_SIZE * 2];
         write_file_at(&file, 0, &zeros, StatusFlags::empty()).unwrap();
         write_file_at(&file, crossing_off, &crossing_data, StatusFlags::empty()).unwrap();
 
-        let out = read_file_at(&file, 0, block_size * 2, StatusFlags::empty()).unwrap();
+        let out = read_file_at(&file, 0, BLOCK_SIZE * 2, StatusFlags::empty()).unwrap();
         assert_eq!(
             &out[crossing_off..crossing_off + 128],
             crossing_data.as_slice()
         );
-        assert_eq!(inode_size(&file), block_size * 2);
+        assert_eq!(inode_size(&file), BLOCK_SIZE * 2);
     }
 
     #[ktest]
     fn file_write_sparse_ok() {
         let (f, root) = namei_fixture();
         let file = create_file(&root, "sparse");
-        let block_size = f.ext2.block_size();
-        let write_off = block_size * 2 + 128;
+        let write_off = BLOCK_SIZE * 2 + 128;
         let payload = vec![0x3au8; 256];
 
         let free_before = f.ext2.super_block().free_blocks_count();
@@ -3615,7 +3545,7 @@ mod test {
         let out = read_file_at(&file, write_off, payload.len(), StatusFlags::empty()).unwrap();
         assert_eq!(out, payload);
 
-        let hole = read_file_at(&file, 0, block_size, StatusFlags::empty()).unwrap();
+        let hole = read_file_at(&file, 0, BLOCK_SIZE, StatusFlags::empty()).unwrap();
         assert!(hole.iter().all(|b| *b == 0));
     }
 
@@ -3631,23 +3561,22 @@ mod test {
             .unwrap();
         let root = f.root();
         let file = create_file(&root, "enospc");
-        let block_size = f.ext2.block_size();
-        let base_data = vec![0x44u8; block_size];
+        let base_data = vec![0x44u8; BLOCK_SIZE];
 
         write_file_at(&file, 0, &base_data, StatusFlags::O_DIRECT).unwrap();
         let free_before_fail = f.ext2.super_block().free_blocks_count();
         assert_eq!(free_before_fail, 1);
 
-        let fail_payload = vec![0x66u8; block_size * 2];
+        let fail_payload = vec![0x66u8; BLOCK_SIZE * 2];
         assert_errno!(
-            write_file_at(&file, block_size, &fail_payload, StatusFlags::O_DIRECT),
+            write_file_at(&file, BLOCK_SIZE, &fail_payload, StatusFlags::O_DIRECT),
             Errno::ENOSPC
         );
 
-        assert_eq!(inode_size(&file), block_size);
+        assert_eq!(inode_size(&file), BLOCK_SIZE);
         assert_eq!(f.ext2.super_block().free_blocks_count(), free_before_fail);
 
-        let readback = read_file_at(&file, 0, block_size, StatusFlags::O_DIRECT).unwrap();
+        let readback = read_file_at(&file, 0, BLOCK_SIZE, StatusFlags::O_DIRECT).unwrap();
         assert_eq!(readback, base_data);
     }
 
@@ -3668,18 +3597,17 @@ mod test {
             .build()
             .unwrap();
         let file = make_live_file_inode(&f.ext2, 29, 0, 0, FileFlags::empty(), [0; 15]);
-        let block_size = f.ext2.block_size();
-        let write_off = block_size * 2 + 128;
+        let write_off = BLOCK_SIZE * 2 + 128;
         let payload = (0..256u16).map(|v| v as u8).collect::<Vec<_>>();
 
         let mut payload_reader = VmReader::from(payload.as_slice()).to_fallible();
         file.write_at(write_off, &mut payload_reader).unwrap();
 
-        let buf = read_file_at(&file, block_size, block_size + 256, StatusFlags::empty()).unwrap();
-        assert_eq!(buf.len(), block_size + 256);
-        assert!(buf[..block_size].iter().all(|b| *b == 0));
-        assert!(buf[block_size..block_size + 128].iter().all(|b| *b == 0));
-        assert_eq!(&buf[block_size + 128..], &payload[..128]);
+        let buf = read_file_at(&file, BLOCK_SIZE, BLOCK_SIZE + 256, StatusFlags::empty()).unwrap();
+        assert_eq!(buf.len(), BLOCK_SIZE + 256);
+        assert!(buf[..BLOCK_SIZE].iter().all(|b| *b == 0));
+        assert!(buf[BLOCK_SIZE..BLOCK_SIZE + 128].iter().all(|b| *b == 0));
+        assert_eq!(&buf[BLOCK_SIZE + 128..], &payload[..128]);
 
         // Read past EOF returns 0 bytes.
         let eof_buf =
@@ -3699,11 +3627,10 @@ mod test {
             .with_free_blocks(64, 64)
             .build()
             .unwrap();
-        let block_size = f.ext2.block_size();
         let file =
-            make_live_file_inode(&f.ext2, 74, block_size * 2, 0, FileFlags::empty(), [0; 15]);
+            make_live_file_inode(&f.ext2, 74, BLOCK_SIZE * 2, 0, FileFlags::empty(), [0; 15]);
 
-        let buf = read_file_at(&file, 0, block_size, StatusFlags::O_DIRECT).unwrap();
+        let buf = read_file_at(&file, 0, BLOCK_SIZE, StatusFlags::O_DIRECT).unwrap();
         assert!(buf.iter().all(|byte| *byte == 0));
     }
 
@@ -3733,8 +3660,7 @@ mod test {
             .build()
             .unwrap();
 
-        let block_size = io_f.ext2.block_size();
-        let sectors_per_block = (block_size / SECTOR_SIZE) as u32;
+        let sectors_per_block = (BLOCK_SIZE / SECTOR_SIZE) as u32;
         let mut ptrs = [0u32; 15];
         ptrs[0] = fail_bid;
         let file = make_live_file_inode(
@@ -3759,8 +3685,7 @@ mod test {
     fn file_resize_extend_sparse_ok() {
         let (f, root) = namei_fixture();
         let file = create_file(&root, "resize_sparse");
-        let block_size = f.ext2.block_size();
-        let target = block_size * 3 + 123;
+        let target = BLOCK_SIZE * 3 + 123;
 
         let free_before = f.ext2.super_block().free_blocks_count();
         VfsInodeTrait::resize(file.as_ref(), target).unwrap();
@@ -3769,19 +3694,18 @@ mod test {
         assert_eq!(inode_size(&file), target);
         assert_eq!(free_before, free_after);
 
-        let buf = read_file_at(&file, 0, block_size, StatusFlags::empty()).unwrap();
+        let buf = read_file_at(&file, 0, BLOCK_SIZE, StatusFlags::empty()).unwrap();
         assert!(buf.iter().all(|b| *b == 0));
     }
 
     #[ktest]
     fn file_resize_then_write_read_ok() {
-        let (f, root) = namei_fixture();
+        let (_, root) = namei_fixture();
         let file = create_file(&root, "resize_then_write");
-        let block_size = f.ext2.block_size();
-        let target_size = block_size * 2 + 64;
+        let target_size = BLOCK_SIZE * 2 + 64;
         VfsInodeTrait::resize(file.as_ref(), target_size).unwrap();
 
-        let write_off = block_size + 16;
+        let write_off = BLOCK_SIZE + 16;
         let payload = (0..128u16).map(|v| (v as u8) ^ 0x5a).collect::<Vec<_>>();
         let mut payload_reader = VmReader::from(payload.as_slice()).to_fallible();
         assert_eq!(
@@ -3801,14 +3725,13 @@ mod test {
 
     #[ktest]
     fn file_resize_updates_backend_npages() {
-        let (f, root) = namei_fixture();
+        let (_, root) = namei_fixture();
         let file = create_file(&root, "resize_npages");
-        let block_size = f.ext2.block_size();
 
         assert_eq!(file.inner.read().block_manager().npages(), 0);
 
-        VfsInodeTrait::resize(file.as_ref(), block_size + 1).unwrap();
-        let expected_npages = (block_size + 1).align_up(BLOCK_SIZE) / BLOCK_SIZE;
+        VfsInodeTrait::resize(file.as_ref(), BLOCK_SIZE + 1).unwrap();
+        let expected_npages = (BLOCK_SIZE + 1).align_up(BLOCK_SIZE) / BLOCK_SIZE;
         assert_eq!(file.inner.read().block_manager().npages(), expected_npages);
 
         VfsInodeTrait::resize(file.as_ref(), 0).unwrap();
@@ -3817,19 +3740,18 @@ mod test {
 
     #[ktest]
     fn file_sparse_shrink_discards_dirty_truncated_pages() {
-        let (f, root) = namei_fixture();
+        let (_, root) = namei_fixture();
         let file = create_file(&root, "sparse_shrink");
-        let block_size = f.ext2.block_size();
-        let sparse_size = block_size * 3;
+        let sparse_size = BLOCK_SIZE * 3;
 
         VfsInodeTrait::resize(file.as_ref(), sparse_size).unwrap();
         let vmo = VfsInodeTrait::page_cache(file.as_ref()).unwrap();
         let dirty = [0x5au8; 32];
-        vmo.write_bytes(block_size * 2, &dirty).unwrap();
+        vmo.write_bytes(BLOCK_SIZE * 2, &dirty).unwrap();
 
-        VfsInodeTrait::resize(file.as_ref(), block_size).unwrap();
-        assert_eq!(inode_size(&file), block_size);
-        assert_eq!(vmo.size(), block_size.align_up(BLOCK_SIZE));
+        VfsInodeTrait::resize(file.as_ref(), BLOCK_SIZE).unwrap();
+        assert_eq!(inode_size(&file), BLOCK_SIZE);
+        assert_eq!(vmo.size(), BLOCK_SIZE.align_up(BLOCK_SIZE));
     }
 
     #[ktest]
@@ -3841,11 +3763,10 @@ mod test {
             .build()
             .unwrap();
         let file = make_live_file_inode(&f.ext2, 67, 0, 0, FileFlags::empty(), [0; 15]);
-        let block_size = f.ext2.block_size();
-        let new_size = block_size + 210;
+        let new_size = BLOCK_SIZE + 210;
         let free_before = f.ext2.super_block().free_blocks_count();
 
-        file.fallocate(FallocMode::Allocate, block_size + 10, 200)
+        file.fallocate(FallocMode::Allocate, BLOCK_SIZE + 10, 200)
             .unwrap();
         assert_eq!(file.file_size(), new_size);
 
@@ -3854,7 +3775,7 @@ mod test {
 
         let mut out = vec![0x5au8; 210];
         let mut out_writer = VmWriter::from(out.as_mut_slice()).to_fallible();
-        assert_eq!(file.read_at(block_size, &mut out_writer).unwrap(), 210);
+        assert_eq!(file.read_at(BLOCK_SIZE, &mut out_writer).unwrap(), 210);
         assert!(out.iter().all(|byte| *byte == 0));
     }
 
@@ -3867,21 +3788,20 @@ mod test {
     //         .build()
     //         .unwrap();
     //     let file = make_live_file_inode(&f.ext2, 68, 123, 0, FileFlags::empty(), [0; 15]);
-    //     let block_size = f.ext2.block_size();
     //     let free_before = f.ext2.super_block().free_blocks_count();
 
-    //     file.fallocate(FallocMode::AllocateKeepSize, block_size, 512)
+    //     file.fallocate(FallocMode::AllocateKeepSize, BLOCK_SIZE, 512)
     //         .unwrap();
     //     assert_eq!(file.file_size(), 123);
 
     //     let free_after = f.ext2.super_block().free_blocks_count();
     //     assert_eq!(free_before.saturating_sub(free_after), 1);
 
-    //     file.resize(block_size + 512).unwrap();
+    //     file.resize(BLOCK_SIZE + 512).unwrap();
 
     //     let mut out = vec![0x5au8; 512];
     //     let mut out_writer = VmWriter::from(out.as_mut_slice()).to_fallible();
-    //     assert_eq!(file.read_at(block_size, &mut out_writer).unwrap(), 512);
+    //     assert_eq!(file.read_at(BLOCK_SIZE, &mut out_writer).unwrap(), 512);
     //     assert!(out.iter().all(|byte| *byte == 0));
     // }
 
@@ -3894,19 +3814,18 @@ mod test {
             .build()
             .unwrap();
         let file = make_live_file_inode(&f.ext2, 69, 0, 0, FileFlags::empty(), [0; 15]);
-        let block_size = f.ext2.block_size();
 
-        file.fallocate(FallocMode::Allocate, 0, block_size * 2)
+        file.fallocate(FallocMode::Allocate, 0, BLOCK_SIZE * 2)
             .unwrap();
         assert_eq!(f.ext2.super_block().free_blocks_count(), 0);
-        assert_eq!(file.file_size(), block_size * 2);
+        assert_eq!(file.file_size(), BLOCK_SIZE * 2);
 
         assert_errno!(
-            file.fallocate(FallocMode::Allocate, block_size * 2, block_size),
+            file.fallocate(FallocMode::Allocate, BLOCK_SIZE * 2, BLOCK_SIZE),
             Errno::ENOSPC
         );
         assert_eq!(f.ext2.super_block().free_blocks_count(), 0);
-        assert_eq!(file.file_size(), block_size * 2);
+        assert_eq!(file.file_size(), BLOCK_SIZE * 2);
     }
 
     // #[ktest]
@@ -3918,9 +3837,8 @@ mod test {
     //         .build()
     //         .unwrap();
     //     let file = make_live_file_inode(&f.ext2, 70, 0, 0, FileFlags::empty(), [0; 15]);
-    //     let block_size = f.ext2.block_size();
 
-    //     let payload = vec![0xabu8; block_size];
+    //     let payload = vec![0xabu8; BLOCK_SIZE];
     //     let mut payload_reader = VmReader::from(payload.as_slice()).to_fallible();
     //     file.write_at(0, &mut payload_reader).unwrap();
 
@@ -3929,9 +3847,9 @@ mod test {
     //     file.fallocate(FallocMode::PunchHoleKeepSize, punch_off, punch_len)
     //         .unwrap();
 
-    //     let mut out = vec![0u8; block_size];
+    //     let mut out = vec![0u8; BLOCK_SIZE];
     //     let mut out_writer = VmWriter::from(out.as_mut_slice()).to_fallible();
-    //     assert_eq!(file.read_at(0, &mut out_writer).unwrap(), block_size);
+    //     assert_eq!(file.read_at(0, &mut out_writer).unwrap(), BLOCK_SIZE);
 
     //     assert_eq!(&out[..punch_off], &payload[..punch_off]);
     //     assert!(
@@ -3943,7 +3861,7 @@ mod test {
     //         &out[punch_off + punch_len..],
     //         &payload[punch_off + punch_len..]
     //     );
-    //     assert_eq!(file.file_size(), block_size);
+    //     assert_eq!(file.file_size(), BLOCK_SIZE);
     // }
 
     #[ktest]
@@ -3973,23 +3891,22 @@ mod test {
     fn file_resize_shrink_zero_tail_ok() {
         let (f, root) = namei_fixture();
         let file = create_file(&root, "shrink_tail");
-        let block_size = f.ext2.block_size();
         let keep_in_tail = 200usize;
 
-        let payload = vec![0xabu8; block_size * 2];
+        let payload = vec![0xabu8; BLOCK_SIZE * 2];
         write_file_at(&file, 0, &payload, StatusFlags::O_DIRECT).unwrap();
 
         let free_before_resize = f.ext2.super_block().free_blocks_count();
-        VfsInodeTrait::resize(file.as_ref(), block_size + keep_in_tail).unwrap();
+        VfsInodeTrait::resize(file.as_ref(), BLOCK_SIZE + keep_in_tail).unwrap();
         let free_after_resize = f.ext2.super_block().free_blocks_count();
 
-        let kept = read_file_at(&file, block_size, keep_in_tail, StatusFlags::empty()).unwrap();
+        let kept = read_file_at(&file, BLOCK_SIZE, keep_in_tail, StatusFlags::empty()).unwrap();
         assert!(kept.iter().all(|b| *b == 0xab));
 
-        let eof = read_file_at(&file, block_size + keep_in_tail, 32, StatusFlags::empty()).unwrap();
+        let eof = read_file_at(&file, BLOCK_SIZE + keep_in_tail, 32, StatusFlags::empty()).unwrap();
         assert_eq!(eof.len(), 0);
 
-        assert_eq!(inode_size(&file), block_size + keep_in_tail);
+        assert_eq!(inode_size(&file), BLOCK_SIZE + keep_in_tail);
         assert_eq!(free_before_resize, free_after_resize);
     }
 
@@ -3999,16 +3916,15 @@ mod test {
 
     #[ktest]
     fn page_cache_vmo_size_ok() {
-        let (f, root) = namei_fixture();
+        let (_, root) = namei_fixture();
         let file = create_file(&root, "pcache");
-        let block_size = f.ext2.block_size();
 
         let vmo = VfsInodeTrait::page_cache(file.as_ref()).unwrap();
         assert_eq!(vmo.size(), 0);
 
-        VfsInodeTrait::resize(file.as_ref(), block_size + 1).unwrap();
-        assert_eq!(inode_size(&file), block_size + 1);
-        assert_eq!(vmo.size(), (block_size + 1).align_up(BLOCK_SIZE));
+        VfsInodeTrait::resize(file.as_ref(), BLOCK_SIZE + 1).unwrap();
+        assert_eq!(inode_size(&file), BLOCK_SIZE + 1);
+        assert_eq!(vmo.size(), (BLOCK_SIZE + 1).align_up(BLOCK_SIZE));
 
         VfsInodeTrait::resize(file.as_ref(), 0).unwrap();
         assert_eq!(inode_size(&file), 0);

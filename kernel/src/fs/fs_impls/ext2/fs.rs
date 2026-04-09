@@ -76,8 +76,6 @@ pub struct Ext2 {
     block_groups: Vec<BlockGroup>,
     /// Inodes per group.
     inodes_per_group: u32,
-    /// Block size in bytes.
-    block_size: usize,
     /// Group descriptor table segment.
     group_descriptors_segment: USegment,
     /// Runtime mount options that affect statfs projection.
@@ -116,7 +114,6 @@ impl Ext2 {
             block_device: device,
             super_block: RwMutex::new(Dirty::new(super_block)),
             inodes_per_group,
-            block_size,
             group_descriptors_segment,
             mount_options,
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
@@ -130,11 +127,6 @@ impl Ext2 {
     /// Returns the block device.
     pub(super) fn block_device(&self) -> &dyn BlockDevice {
         self.block_device.as_ref()
-    }
-
-    /// Returns the block size in bytes.
-    pub(super) fn block_size(&self) -> usize {
-        self.block_size
     }
 
     /// Returns the maximum regular file size supported by this ext2 instance.
@@ -891,8 +883,7 @@ mod test {
 
     fn expected_statfs_overhead_blocks(sb: &SuperBlock) -> u32 {
         let groups_count = sb.block_groups_count() as usize;
-        let gdb_count =
-            ((groups_count * size_of::<RawGroupDesc>()).div_ceil(sb.block_size())) as u32;
+        let gdb_count = ((groups_count * size_of::<RawGroupDesc>()).div_ceil(BLOCK_SIZE)) as u32;
         let mut overhead = sb.first_data_block();
 
         for group_idx in 0..groups_count {
