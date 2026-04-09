@@ -179,13 +179,10 @@ impl Inode {
             return_errno!(Errno::EINVAL);
         }
 
-        let inner = self.inner.upread();
-        // Keep resize invalid for existing fast symlinks (inline payload), but
-        // allow empty newly-created symlink inodes to grow into slow symlinks.
+        let mut inner = self.inner.write();
         if inner.desc.is_fast_symlink(block_size) && inner.file_size() != 0 {
             return_errno!(Errno::EINVAL);
         }
-
         if inner
             .desc
             .flags
@@ -195,12 +192,10 @@ impl Inode {
         }
 
         let old_size = inner.file_size();
-
         if new_size == old_size {
             return Ok(());
         }
 
-        let mut inner = inner.upgrade();
         if new_size < old_size {
             inner.shrink(new_size)?;
         } else {
@@ -424,15 +419,18 @@ impl Inode {
             return Ok(0);
         }
 
-        let inner = self.inner.upread();
-        let file_size = inner.file_size();
-        if offset >= file_size {
-            return Ok(0);
-        }
-        let read_len = writer.avail().min(file_size - offset);
-        writer.limit(read_len);
-        inner.page_cache().read(offset, writer)?;
-        inner.upgrade().set_atime(now());
+        let read_len = {
+            let inner = self.inner.read();
+            let file_size = inner.file_size();
+            if offset >= file_size {
+                return Ok(0);
+            }
+            let read_len = writer.avail().min(file_size - offset);
+            writer.limit(read_len);
+            inner.page_cache().read(offset, writer)?;
+            read_len
+        };
+        self.inner.write().set_atime(now());
         Ok(read_len)
     }
 
@@ -484,23 +482,26 @@ impl Inode {
             return_errno_with_message!(Errno::EINVAL, "not block-aligned");
         }
 
-        let inner = self.inner.upread();
+        let read_len = {
+            let inner = self.inner.read();
 
-        let file_size = inner.file_size();
-        if offset >= file_size || writer.avail() == 0 {
-            return Ok(0);
-        }
+            let file_size = inner.file_size();
+            if offset >= file_size || writer.avail() == 0 {
+                return Ok(0);
+            }
 
-        let read_len = writer.avail().min(file_size - offset);
-        writer.limit(read_len);
-        let end = offset
-            .checked_add(read_len)
-            .ok_or_else(|| Error::with_message(Errno::EINVAL, "read range overflow"))?;
+            let read_len = writer.avail().min(file_size - offset);
+            writer.limit(read_len);
+            let end = offset
+                .checked_add(read_len)
+                .ok_or_else(|| Error::with_message(Errno::EINVAL, "read range overflow"))?;
 
-        // Flush the dirty pages in the read range to make sure the read data is up to date.
-        inner.page_cache().flush_range(offset..end)?;
-        inner.read_direct_at(offset, end, writer)?;
-        inner.upgrade().set_atime(now());
+            // Flush the dirty pages in the read range to make sure the read data is up to date.
+            inner.page_cache().flush_range(offset..end)?;
+            inner.read_direct_at(offset, end, writer)?;
+            read_len
+        };
+        self.inner.write().set_atime(now());
         Ok(read_len)
     }
 
@@ -692,17 +693,19 @@ impl Inode {
             xattr.write().flush()?;
         }
         // Fsync step 2: flush dirty data pages before metadata writeback.
-        let inner = self.inner.upread();
-        let block_manager = inner.block_manager();
-        inner.sync_data_pages()?;
+        {
+            let inner = self.inner.read();
+            let block_manager = inner.block_manager();
+            inner.sync_data_pages()?;
 
-        // Fsync step 3: flush inode-local indirect metadata before
-        // persisting inode-table state.
-        block_manager.sync_indirect_blocks()?;
+            // Fsync step 3: flush inode-local indirect metadata before
+            // persisting inode-table state.
+            block_manager.sync_indirect_blocks()?;
+        }
 
         // Fsync step 4: persist inode metadata. The caller is
         // responsible for the final device-cache flush.
-        let mut inner = inner.upgrade();
+        let mut inner = self.inner.write();
         inner.sync_metadata(self.ino, self.block_group_idx, sync_inode_table)?;
 
         Ok(())
@@ -755,20 +758,22 @@ impl Inode {
     }
 
     pub(super) fn sync_data(&self) -> Result<()> {
-        let inner = self.inner.upread();
-        let block_manager = inner.block_manager();
+        {
+            let inner = self.inner.read();
+            let block_manager = inner.block_manager();
 
-        // Fdatasync writes back dirty data pages first. The caller is
-        // responsible for the final device-cache flush.
-        inner.sync_data_pages()?;
+            // Fdatasync writes back dirty data pages first. The caller is
+            // responsible for the final device-cache flush.
+            inner.sync_data_pages()?;
 
-        // fdatasync must also persist dirty indirect metadata needed to reach
-        // newly written data blocks before the final device flush.
-        block_manager.sync_indirect_blocks()?;
+            // fdatasync must also persist dirty indirect metadata needed to reach
+            // newly written data blocks before the final device flush.
+            block_manager.sync_indirect_blocks()?;
+        }
 
         // Persist metadata conservatively whenever the descriptor is dirty so
         // `fdatasync` does not miss file-size or block-mapping updates.
-        let mut inner = inner.upgrade();
+        let mut inner = self.inner.write();
         if inner.is_dirty() {
             inner.persist(self.ino)?;
         }
