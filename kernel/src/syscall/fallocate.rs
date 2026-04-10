@@ -8,7 +8,10 @@ use crate::{
         vfs::inode::FallocMode,
     },
     prelude::*,
-    process::ResourceType,
+    process::{
+        ResourceType,
+        signal::{constants::SIGXFSZ, signals::kernel::KernelSignal},
+    },
 };
 
 pub fn sys_fallocate(
@@ -56,6 +59,8 @@ fn check_offset_and_len(offset: i64, len: i64, ctx: &Context) -> Result<()> {
             .get_cur() as usize
     };
     if (offset + len) as usize > max_file_size {
+        ctx.posix_thread
+            .enqueue_signal(Box::new(KernelSignal::new(SIGXFSZ)));
         return_errno_with_message!(Errno::EFBIG, "offset+len exceeds the maximum file size");
     }
     Ok(())

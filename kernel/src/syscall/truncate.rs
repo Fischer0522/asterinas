@@ -9,7 +9,10 @@ use crate::{
         vfs::path::{AT_FDCWD, FsPath},
     },
     prelude::*,
-    process::ResourceType,
+    process::{
+        ResourceType,
+        signal::{constants::SIGXFSZ, signals::kernel::KernelSignal},
+    },
 };
 
 pub fn sys_ftruncate(fd: FileDesc, len: isize, ctx: &Context) -> Result<SyscallReturn> {
@@ -57,6 +60,8 @@ fn check_length(len: isize, ctx: &Context) -> Result<()> {
             .get_cur() as usize
     };
     if len as usize > max_file_size {
+        ctx.posix_thread
+            .enqueue_signal(Box::new(KernelSignal::new(SIGXFSZ)));
         return_errno_with_message!(Errno::EFBIG, "length is larger than the maximum file size");
     }
     Ok(())
