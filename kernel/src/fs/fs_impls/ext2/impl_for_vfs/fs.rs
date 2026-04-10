@@ -8,7 +8,7 @@ use crate::{
         utils::NAME_MAX,
         vfs::{
             file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
-            inode::Inode as VfsInode,
+            inode::Inode,
         },
     },
     prelude::*,
@@ -27,7 +27,7 @@ impl FileSystem for Ext2 {
         Ok(())
     }
 
-    fn root_inode(&self) -> Arc<dyn VfsInode> {
+    fn root_inode(&self) -> Arc<dyn Inode> {
         self.root_inode().unwrap()
     }
 

@@ -9,12 +9,12 @@ use crate::{
     device,
     fs::{
         file::{AccessMode, FileIo, InodeMode, InodeType, Permission, StatusFlags},
-        fs_impls::ext2::{FilePerm, Inode},
+        fs_impls::ext2::{FilePerm, Inode as Ext2Inode},
         utils::DirentVisitor,
         vfs::{
             file_system::FileSystem,
             inode::{
-                Extension, FallocMode, Inode as VfsInode, InodeIo, Metadata, MknodType,
+                Extension, FallocMode, Inode, InodeIo, Metadata, MknodType,
                 SymbolicLink,
             },
             xattr::{XattrName, XattrNamespace, XattrSetFlags},
@@ -25,7 +25,7 @@ use crate::{
     vm::vmo::Vmo,
 };
 
-impl InodeIo for Inode {
+impl InodeIo for Ext2Inode {
     fn read_at(
         &self,
         offset: usize,
@@ -33,9 +33,9 @@ impl InodeIo for Inode {
         status_flags: StatusFlags,
     ) -> Result<usize> {
         if status_flags.contains(StatusFlags::O_DIRECT) {
-            Inode::read_direct_at(self, offset, writer)
+            self.read_direct_at(offset, writer)
         } else {
-            Inode::read_at(self, offset, writer)
+            self.read_at(offset, writer)
         }
     }
 
@@ -46,84 +46,84 @@ impl InodeIo for Inode {
         status_flags: StatusFlags,
     ) -> Result<usize> {
         if status_flags.contains(StatusFlags::O_DIRECT) {
-            Inode::write_direct_at(self, offset, reader)
+            self.write_direct_at(offset, reader)
         } else {
-            Inode::write_at(self, offset, reader)
+            self.write_at(offset, reader)
         }
     }
 }
 
-impl VfsInode for Inode {
+impl Inode for Ext2Inode {
     fn size(&self) -> usize {
-        Inode::file_size(self)
+        self.file_size()
     }
 
     fn resize(&self, new_size: usize) -> Result<()> {
-        Inode::resize(self, new_size)
+        self.resize(new_size)
     }
 
     fn metadata(&self) -> Metadata {
-        Inode::metadata(self)
+        self.metadata()
     }
 
     fn ino(&self) -> u64 {
-        Inode::ino(self) as u64
+        self.ino() as u64
     }
 
     fn type_(&self) -> InodeType {
-        Inode::inode_type(self)
+        self.inode_type()
     }
 
     fn mode(&self) -> Result<InodeMode> {
-        Ok(Inode::mode(self))
+        Ok(self.mode())
     }
 
     fn set_mode(&self, mode: InodeMode) -> Result<()> {
-        Inode::set_mode(self, mode)
+        self.set_mode(mode)
     }
 
     fn owner(&self) -> Result<Uid> {
-        Ok(Uid::new(Inode::uid(self)))
+        Ok(Uid::new(self.uid()))
     }
 
     fn set_owner(&self, uid: Uid) -> Result<()> {
-        Inode::set_uid(self, uid.into())
+        self.set_uid(uid.into())
     }
 
     fn group(&self) -> Result<Gid> {
-        Ok(Gid::new(Inode::gid(self)))
+        Ok(Gid::new(self.gid()))
     }
 
     fn set_group(&self, gid: Gid) -> Result<()> {
-        Inode::set_gid(self, gid.into())
+        self.set_gid(gid.into())
     }
 
     fn atime(&self) -> Duration {
-        Inode::atime(self)
+        self.atime()
     }
 
     fn set_atime(&self, time: Duration) {
-        Inode::set_atime(self, time)
+        self.set_atime(time)
     }
 
     fn mtime(&self) -> Duration {
-        Inode::mtime(self)
+        self.mtime()
     }
 
     fn set_mtime(&self, time: Duration) {
-        Inode::set_mtime(self, time)
+        self.set_mtime(time)
     }
 
     fn ctime(&self) -> Duration {
-        Inode::ctime(self)
+        self.ctime()
     }
 
     fn set_ctime(&self, time: Duration) {
-        Inode::set_ctime(self, time)
+        self.set_ctime(time)
     }
 
     fn page_cache(&self) -> Option<Arc<Vmo>> {
-        Some(Inode::page_cache_vmo(self))
+        Some(self.page_cache_vmo())
     }
 
     fn open(
@@ -154,11 +154,11 @@ impl VfsInode for Inode {
         }
     }
 
-    fn create(&self, name: &str, type_: InodeType, mode: InodeMode) -> Result<Arc<dyn VfsInode>> {
-        Ok(Inode::create(self, name, type_, mode.into())?)
+    fn create(&self, name: &str, type_: InodeType, mode: InodeMode) -> Result<Arc<dyn Inode>> {
+        Ok(self.create(name, type_, mode.into())?)
     }
 
-    fn mknod(&self, name: &str, mode: InodeMode, type_: MknodType) -> Result<Arc<dyn VfsInode>> {
+    fn mknod(&self, name: &str, mode: InodeMode, type_: MknodType) -> Result<Arc<dyn Inode>> {
         // Map mknod request to ext2 inode type plus optional encoded device id.
         let (inode_type, device_id) = match type_ {
             MknodType::CharDevice(dev_id) => (InodeType::CharDevice, Some(dev_id)),
@@ -166,7 +166,7 @@ impl VfsInode for Inode {
             MknodType::NamedPipe => (InodeType::NamedPipe, None),
         };
 
-        let new_inode = Inode::create(self, name, inode_type, mode.into())?;
+        let new_inode = self.create(name, inode_type, mode.into())?;
         if let Some(device_id) = device_id {
             // Persist the ext2 special-file device encoding in `i_block`.
             new_inode.set_device_id(device_id)?;
@@ -175,60 +175,60 @@ impl VfsInode for Inode {
         Ok(new_inode)
     }
 
-    fn lookup(&self, name: &str) -> Result<Arc<dyn VfsInode>> {
-        Ok(Inode::lookup(self, name)?)
+    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>> {
+        Ok(self.lookup(name)?)
     }
 
     fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize> {
-        Inode::readdir_at(self, offset, visitor)
+        self.readdir_at(offset, visitor)
     }
 
-    fn link(&self, old: &Arc<dyn VfsInode>, name: &str) -> Result<()> {
+    fn link(&self, old: &Arc<dyn Inode>, name: &str) -> Result<()> {
         let old = old
-            .downcast_ref::<Inode>()
+            .downcast_ref::<Ext2Inode>()
             .ok_or_else(|| Error::with_message(Errno::EXDEV, "not same fs"))?;
-        Inode::link(self, old, name)
+        self.link(old, name)
     }
 
     fn unlink(&self, name: &str) -> Result<()> {
-        Inode::unlink(self, name)
+        self.unlink(name)
     }
 
     fn rmdir(&self, name: &str) -> Result<()> {
-        Inode::rmdir(self, name)
+        self.rmdir(name)
     }
 
-    fn rename(&self, old_name: &str, target: &Arc<dyn VfsInode>, new_name: &str) -> Result<()> {
+    fn rename(&self, old_name: &str, target: &Arc<dyn Inode>, new_name: &str) -> Result<()> {
         let target = target
-            .downcast_ref::<Inode>()
+            .downcast_ref::<Ext2Inode>()
             .ok_or_else(|| Error::with_message(Errno::EXDEV, "not same fs"))?;
-        Inode::rename(self, old_name, target, new_name)
+        self.rename(old_name, target, new_name)
     }
 
     fn read_link(&self) -> Result<SymbolicLink> {
-        Inode::read_link(self).map(SymbolicLink::Plain)
+        self.read_link().map(SymbolicLink::Plain)
     }
 
     fn write_link(&self, target: &str) -> Result<()> {
-        Inode::write_link(self, target)
+        self.write_link(target)
     }
 
     fn sync_all(&self) -> Result<()> {
-        Inode::sync_all(self, true)?;
-        if Inode::fs(self)?.block_device().sync()? != BioStatus::Complete {
+        self.sync_all(true)?;
+        if self.fs()?.block_device().sync()? != BioStatus::Complete {
             return_errno_with_message!(Errno::EIO, "failed to flush block device");
         }
         Ok(())
     }
 
     fn sync_data(&self) -> Result<()> {
-        Inode::sync_data(self)?;
+        self.sync_data()?;
 
         if self.is_dirty() {
-            Inode::sync_metadata(self, true)?;
+            self.sync_metadata(true)?;
         }
 
-        if Inode::fs(self)?.block_device().sync()? != BioStatus::Complete {
+        if self.fs()?.block_device().sync()? != BioStatus::Complete {
             return_errno_with_message!(Errno::EIO, "failed to flush block device");
         }
         Ok(())
@@ -236,16 +236,16 @@ impl VfsInode for Inode {
 
     fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {
         // Route VFS fallocate requests through the ext2 compatibility path.
-        Inode::fallocate(self, mode, offset, len)
+        self.fallocate(mode, offset, len)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
         // The inode must belong to a live filesystem instance.
-        Inode::fs(self).unwrap()
+        self.fs().unwrap()
     }
 
     fn extension(&self) -> &Extension {
-        Inode::extension(self)
+        self.extension()
     }
 
     fn set_xattr(
@@ -255,22 +255,22 @@ impl VfsInode for Inode {
         flags: XattrSetFlags,
     ) -> Result<()> {
         self.check_permission(Permission::MAY_WRITE)?;
-        Inode::set_xattr(self, name, value_reader, flags)
+        self.set_xattr(name, value_reader, flags)
     }
 
     fn get_xattr(&self, name: XattrName, value_writer: &mut VmWriter) -> Result<usize> {
         self.check_permission(Permission::MAY_READ)?;
-        Inode::get_xattr(self, name, value_writer)
+        self.get_xattr(name, value_writer)
     }
 
     fn list_xattr(&self, namespace: XattrNamespace, list_writer: &mut VmWriter) -> Result<usize> {
         self.check_permission(Permission::MAY_ACCESS)?;
-        Inode::list_xattr(self, namespace, list_writer)
+        self.list_xattr(namespace, list_writer)
     }
 
     fn remove_xattr(&self, name: XattrName) -> Result<()> {
         self.check_permission(Permission::MAY_WRITE)?;
-        Inode::remove_xattr(self, name)
+        self.remove_xattr(name)
     }
 }
 
