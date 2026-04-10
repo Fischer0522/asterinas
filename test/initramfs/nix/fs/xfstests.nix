@@ -1,5 +1,9 @@
 { lib, stdenvNoCC, pkgs }:
-
+let
+  standaloneLs = pkgs.writeShellScriptBin "ls" ''
+    exec ${pkgs.coreutils}/bin/ls "$@"
+  '';
+in
 stdenvNoCC.mkDerivation {
   name = "xfstests-package";
 
@@ -22,6 +26,7 @@ stdenvNoCC.mkDerivation {
     ln -sf /proc/self/fd/2 /dev/stderr 2>/dev/null || true
 
     export PATH=\
+    ${standaloneLs}/bin:\
     ${pkgs.perl}/bin:\
     ${pkgs.bash}/bin:\
     ${pkgs.gnugrep}/bin:\
