@@ -407,6 +407,7 @@ impl VmMapping {
 
             let (va, item) = cursor.query().unwrap();
             let is_write = required_perms.contains(VmPerms::WRITE);
+            let page_offset = page_aligned_addr - self.map_to_addr;
             match item {
                 Some(VmQueriedItem::MappedRam { frame, mut prop }) => {
                     if VmPerms::from(prop.flags).contains(required_perms) {
@@ -429,6 +430,14 @@ impl VmMapping {
                     let only_reference = frame.reference_count() == 1;
 
                     let new_flags = PageFlags::W | PageFlags::ACCESSED | PageFlags::DIRTY;
+
+                    if self.is_shared {
+                        // Keep the page-cache dirty state in sync with shared
+                        // file-backed writable faults. Otherwise later
+                        // page-cache users may still treat the page as a clean
+                        // hole and overwrite mmap-written bytes.
+                        self.vmo().unwrap().mark_page_dirty(page_offset)?;
+                    }
 
                     if self.is_shared || only_reference {
                         cursor.protect_next(PAGE_SIZE, |flags, _cache| {
@@ -486,6 +495,9 @@ impl VmMapping {
                     page_flags |= PageFlags::ACCESSED;
                     if is_write {
                         page_flags |= PageFlags::DIRTY;
+                        if self.is_shared {
+                            self.vmo().unwrap().mark_page_dirty(page_offset)?;
+                        }
                     }
                     let map_prop = PageProperty::new_user(page_flags, CachePolicy::Writeback);
 
@@ -875,6 +887,12 @@ impl MappedVmo {
     /// a page from the underlying page cache.
     pub fn commit_on(&self, page_idx: usize) -> Result<UFrame> {
         self.vmo.commit_on(page_idx).map(|frame| frame.into())
+    }
+
+    /// Marks the page at the mapping-relative page-aligned offset dirty in the
+    /// underlying page cache.
+    fn mark_page_dirty(&self, page_offset: usize) -> Result<()> {
+        self.vmo.mark_page_dirty(self.offset + page_offset)
     }
 
     /// Traverses the indices within a specified range of a VMO sequentially.

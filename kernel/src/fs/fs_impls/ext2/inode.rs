@@ -13,7 +13,7 @@ use ostd::{const_assert, mm::io::util::HasVmReaderWriter};
 
 use super::{
     block_ptr_tree::{BlockPtrTree, Ext2Bid, RawBlockPtrs},
-    dir::{DirBlock, DirEntryHeader, DOT_BYTE, DOT_DOT_BYTE},
+    dir::{DOT_BYTE, DOT_DOT_BYTE, DirBlock, DirEntryHeader},
     fs::Ext2,
     io_range_mapper::{IoRange, IoRangeMapper},
     prelude::*,
@@ -998,9 +998,7 @@ impl Inode {
         let has_replaced = replaced_inode.is_some();
         if is_same_dir {
             let dir_inner = guards.inner_mut(self.ino)?;
-            Self::apply_rename_target_locked(
-                dir_inner, new_name, old_ino, moved_ft, has_replaced,
-            )?;
+            Self::apply_rename_target_locked(dir_inner, new_name, old_ino, moved_ft, has_replaced)?;
             let old_target = dir_inner.find_entry_target(old_name)?;
             dir_inner.delete_entry(&old_target)?;
             if old_is_dir && has_replaced {
@@ -1011,7 +1009,11 @@ impl Inode {
             {
                 let target_inner = guards.inner_mut(target.ino)?;
                 Self::apply_rename_target_locked(
-                    target_inner, new_name, old_ino, moved_ft, has_replaced,
+                    target_inner,
+                    new_name,
+                    old_ino,
+                    moved_ft,
+                    has_replaced,
                 )?;
                 if old_is_dir && !has_replaced {
                     target_inner.inc_link_count(1);
@@ -2424,10 +2426,10 @@ mod test {
             fs_impls::ext2::{
                 fs::ROOT_INO,
                 testkit::{
-                    self, assert_errno, create_dir, create_file, create_symlink, encode_dir_entry,
-                    group0_layout, inode_nlinks, inode_size, lookup_ino, namei_fixture,
-                    read_file_at, write_file_at, CollectDirentVisitor, ErrorBioDisk,
-                    Ext2FixtureBuilder, RawInodeBuilder, StopAfterVisitor,
+                    self, CollectDirentVisitor, ErrorBioDisk, Ext2FixtureBuilder, RawInodeBuilder,
+                    StopAfterVisitor, assert_errno, create_dir, create_file, create_symlink,
+                    encode_dir_entry, group0_layout, inode_nlinks, inode_size, lookup_ino,
+                    namei_fixture, read_file_at, write_file_at,
                 },
             },
             vfs::{
@@ -2631,12 +2633,13 @@ mod test {
         let free_blocks_before = f.ext2.super_block().free_blocks_count();
         root.unlink("old").unwrap();
         assert_errno!(f.ext2.read_inode(old_ino), Errno::ESTALE);
-        assert!(f
-            .ext2
-            .block_group(0)
-            .metadata()
-            .inode_bitmap
-            .is_allocated((old_ino - 1) as u16));
+        assert!(
+            f.ext2
+                .block_group(0)
+                .metadata()
+                .inode_bitmap
+                .is_allocated((old_ino - 1) as u16)
+        );
 
         f.ext2.sync_all().unwrap();
         let raw_before_drop = read_raw_inode_from_disk(&f, old_ino);
@@ -2647,12 +2650,13 @@ mod test {
         drop(old);
         f.ext2.sync_all().unwrap();
         assert_errno!(f.ext2.read_inode(old_ino), Errno::ENOENT);
-        assert!(!f
-            .ext2
-            .block_group(0)
-            .metadata()
-            .inode_bitmap
-            .is_allocated((old_ino - 1) as u16));
+        assert!(
+            !f.ext2
+                .block_group(0)
+                .metadata()
+                .inode_bitmap
+                .is_allocated((old_ino - 1) as u16)
+        );
         let raw_after_drop = read_raw_inode_from_disk(&f, old_ino);
         assert_eq!(raw_after_drop.link_count, 0);
         assert_eq!(raw_after_drop.sector_count, 0);
@@ -3572,6 +3576,46 @@ mod test {
         VfsInodeTrait::resize(file.as_ref(), BLOCK_SIZE).unwrap();
         assert_eq!(inode_size(&file), BLOCK_SIZE);
         assert_eq!(vmo.size(), BLOCK_SIZE.align_up(BLOCK_SIZE));
+    }
+
+    #[ktest]
+    fn file_sparse_buffered_write_preserves_mmap_dirty_tail() {
+        let (_f, root) = namei_fixture();
+        let file = create_file(&root, "mmap_dirty_tail");
+        let vmo = VfsInodeTrait::page_cache(file.as_ref()).unwrap();
+
+        VfsInodeTrait::resize(file.as_ref(), BLOCK_SIZE * 3).unwrap();
+
+        let block_start = BLOCK_SIZE;
+        let mmap_offset = block_start + 200;
+        let mmap_payload = [0x5au8; 32];
+
+        let page = vmo.commit_on(block_start / PAGE_SIZE).unwrap();
+        page.write_bytes(mmap_offset % PAGE_SIZE, &mmap_payload)
+            .unwrap();
+        vmo.mark_page_dirty(block_start).unwrap();
+
+        let buffered_offset = block_start + 100;
+        let buffered_payload = [0xa5u8; 100];
+        assert_eq!(
+            write_file_at(
+                &file,
+                buffered_offset,
+                &buffered_payload,
+                StatusFlags::empty()
+            )
+            .unwrap(),
+            buffered_payload.len()
+        );
+
+        let read_back = read_file_at(
+            &file,
+            mmap_offset,
+            mmap_payload.len(),
+            StatusFlags::empty(),
+        )
+        .unwrap();
+        assert_eq!(read_back, mmap_payload);
     }
 
     #[ktest]

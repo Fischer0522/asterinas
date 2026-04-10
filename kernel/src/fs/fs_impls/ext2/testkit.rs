@@ -8,13 +8,13 @@ use core::{
 };
 
 use aster_block::{
+    BLOCK_SIZE, BlockDevice, BlockDeviceMeta, SECTOR_SIZE,
     bio::{BioEnqueueError, BioStatus, BioType, SubmittedBio},
     id::Bid,
-    BlockDevice, BlockDeviceMeta, BLOCK_SIZE, SECTOR_SIZE,
 };
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::{
-    mm::{io::util::HasVmReaderWriter, FrameAllocOptions, Segment, USegment, VmIo, PAGE_SIZE},
+    mm::{FrameAllocOptions, PAGE_SIZE, Segment, USegment, VmIo, io::util::HasVmReaderWriter},
     prelude::*,
 };
 
@@ -24,7 +24,7 @@ use super::{
     fs::{Ext2, ROOT_INO},
     inode::{FilePerm, Inode, RawInode},
     super_block::{
-        ErrorsBehavior, FsState, OsId, RawSuperBlock, RevLevel, MAGIC_NUM, SUPER_BLOCK_OFFSET,
+        ErrorsBehavior, FsState, MAGIC_NUM, OsId, RawSuperBlock, RevLevel, SUPER_BLOCK_OFFSET,
     },
 };
 use crate::{
@@ -35,7 +35,7 @@ use crate::{
         utils::DirentVisitor,
         vfs::inode::InodeIo,
     },
-    prelude::{return_errno_with_message, Errno, Result, *},
+    prelude::{Errno, Result, return_errno_with_message, *},
     time::clocks,
 };
 

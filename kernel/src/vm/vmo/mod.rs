@@ -307,6 +307,26 @@ impl Vmo {
         &self.writable_mapping_status
     }
 
+    /// Marks the disk-backed page at the given page-aligned VMO offset dirty.
+    ///
+    /// Shared file mappings use this helper on the first writable fault so
+    /// mmap-written bytes participate in the same page-cache dirty tracking as
+    /// buffered writes and writeback.
+    pub(crate) fn mark_page_dirty(&self, page_offset: usize) -> Result<()> {
+        if !page_offset.is_multiple_of(PAGE_SIZE) {
+            return_errno_with_message!(Errno::EINVAL, "page offset is not aligned");
+        }
+
+        if !self.is_disk_backed() {
+            return Ok(());
+        }
+
+        let page = self.commit_on(page_offset / PAGE_SIZE)?;
+        let locked_page = page.lock();
+        locked_page.set_dirty();
+        Ok(())
+    }
+
     fn decommit_pages(
         &self,
         mut locked_pages: LockedXArray<CachePage>,
