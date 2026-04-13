@@ -3,8 +3,7 @@ let
   standaloneLs = pkgs.writeShellScriptBin "ls" ''
     exec ${pkgs.coreutils}/bin/ls "$@"
   '';
-in
-stdenvNoCC.mkDerivation {
+in stdenvNoCC.mkDerivation {
   name = "xfstests-package";
 
   buildCommand = ''

@@ -16,24 +16,140 @@ use super::{
 
 pub(super) type Ext2Bid = u32;
 
-// TODO: Refactor this into a more idiomatic Rust representation, such as an `enum`.
-/// Block path offsets for direct/indirect traversal.
+/// Offsets within indirect blocks, from outermost to innermost.
+#[derive(Clone, Copy, Debug)]
+enum IndirectOffsets {
+    /// Direct block — no indirect layers.
+    None,
+    /// Single indirect: one offset into the indirect block.
+    Single(u32),
+    /// Double indirect: offsets into L1 and L2 indirect blocks.
+    Double(u32, u32),
+    /// Triple indirect: offsets into L1, L2, and L3 indirect blocks.
+    Triple(u32, u32, u32),
+}
+
+impl IndirectOffsets {
+    /// Returns the number of indirect levels (0 for direct).
+    pub fn depth(&self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Single(_) => 1,
+            Self::Double(..) => 2,
+            Self::Triple(..) => 3,
+        }
+    }
+
+    /// Returns whether this is a direct block path (no indirect levels).
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    /// Returns the offset at the given indirect level (0-indexed from outermost).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx` is out of range for this variant.
+    pub fn offset_at(&self, idx: usize) -> u32 {
+        match (self, idx) {
+            (Self::Single(a), 0) => *a,
+            (Self::Double(a, _), 0) => *a,
+            (Self::Double(_, b), 1) => *b,
+            (Self::Triple(a, _, _), 0) => *a,
+            (Self::Triple(_, b, _), 1) => *b,
+            (Self::Triple(_, _, c), 2) => *c,
+            _ => panic!(
+                "indirect offset index {idx} out of range for depth {}",
+                self.depth()
+            ),
+        }
+    }
+
+    /// Returns the innermost (leaf) indirect offset, or `None` for direct blocks.
+    pub fn leaf_offset(&self) -> Option<u32> {
+        match self {
+            Self::None => Option::None,
+            Self::Single(a) => Some(*a),
+            Self::Double(_, b) => Some(*b),
+            Self::Triple(_, _, c) => Some(*c),
+        }
+    }
+
+    /// Trims trailing zero offsets from the innermost levels.
+    ///
+    /// Used by `truncate_blocks` to raise the shared-branch level when the
+    /// truncation point sits at the start of an indirect block.
+    pub fn trim_trailing_zeros(&self) -> Self {
+        match *self {
+            Self::None => Self::None,
+            Self::Single(a) => {
+                if a == 0 {
+                    Self::None
+                } else {
+                    Self::Single(a)
+                }
+            }
+            Self::Double(a, b) => {
+                if b == 0 {
+                    if a == 0 { Self::None } else { Self::Single(a) }
+                } else {
+                    Self::Double(a, b)
+                }
+            }
+            Self::Triple(a, b, c) => {
+                if c == 0 {
+                    if b == 0 {
+                        if a == 0 { Self::None } else { Self::Single(a) }
+                    } else {
+                        Self::Double(a, b)
+                    }
+                } else {
+                    Self::Triple(a, b, c)
+                }
+            }
+        }
+    }
+}
+
+/// Block path for direct/indirect traversal.
 ///
 /// Produced by `logical_block_to_path` from a logical block number.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct BlockPointerPath {
-    /// Number of levels in the pointer chain (1 = direct, 2 = single indirect,
-    /// 3 = double indirect, 4 = triple indirect). A depth of 0 is invalid.
-    pub depth: usize,
-    /// Index at each level of the block pointer tree. Only `offsets[0..depth]`
-    /// are meaningful. `offsets[0]` indexes into `inode.i_block[]` (0..11 for
-    /// direct, 12/13/14 for indirect entries); subsequent elements index into
-    /// the corresponding indirect block.
-    pub offsets: [u32; 4],
+struct BlockPointerPath {
+    /// Index into `inode.i_block[0..15]`. For direct blocks this is 0..12;
+    /// for single/double/triple indirect it is 12/13/14.
+    iblock_index: u32,
+    /// Offsets within indirect blocks. `None` for direct blocks.
+    indirect: IndirectOffsets,
     /// Number of consecutive block slots remaining after the current offset
-    /// within the lowest-level indirect block (or the direct region for depth 1).
-    /// Used for multi-block contiguous allocation optimization.
-    pub boundary: u32,
+    /// within the lowest-level block (direct region or indirect block).
+    boundary: u32,
+}
+
+impl BlockPointerPath {
+    /// Total depth of the pointer chain (1 = direct, 2..4 = indirect).
+    pub fn depth(&self) -> usize {
+        1 + self.indirect.depth()
+    }
+
+    /// Returns the offset at the given level of the block pointer tree.
+    ///
+    /// Level 0 returns `iblock_index`; levels 1.. index into `indirect`.
+    pub fn offset_at(&self, level: usize) -> u32 {
+        if level == 0 {
+            self.iblock_index
+        } else {
+            self.indirect.offset_at(level - 1)
+        }
+    }
+
+    /// Returns the offset at the deepest (leaf) level.
+    ///
+    /// For direct blocks this is `iblock_index`; for indirect blocks
+    /// it is the innermost indirect offset.
+    pub fn leaf_offset(&self) -> u32 {
+        self.indirect.leaf_offset().unwrap_or(self.iblock_index)
+    }
 }
 
 /// A single level in the block-pointer chain.
@@ -42,15 +158,15 @@ pub(super) struct BlockPointerPath {
 struct IndirectBlockEntry {
     /// Physical block number read from this level's slot; 0 means hole.
     key: Ext2Bid,
-    /// Indirect metadata block that contains this level's slot.
+    /// Block number of the parent indirect block that contains this level's slot.
     /// `None` for level 0, where the slot lives in inode `i_block[]`.
-    bh: Option<Ext2Bid>,
+    parent_bid: Option<Ext2Bid>,
 }
 
 /// Result of traversing a block-pointer chain.
 #[derive(Debug)]
 struct BranchChainWalkResult {
-    /// Level where traversal stopped on a zero pointer, or `path.depth` if complete.
+    /// Level where traversal stopped on a zero pointer, or `path.depth()` if complete.
     partial_level: usize,
     /// Entries traversed so far.
     chain: Vec<IndirectBlockEntry>,
@@ -202,70 +318,6 @@ impl BlockPtrTree {
         self.indirect_blocks_manager.lock().sync()
     }
 
-    /// Translates a logical block number into a path of block pointer offsets.
-    ///
-    pub(super) fn logical_block_to_path(&self, iblock: u32) -> Result<BlockPointerPath> {
-        let ptrs = (BLOCK_SIZE / size_of::<u32>()) as u32;
-        if ptrs == 0 {
-            return_errno_with_message!(Errno::EINVAL, "block number out of range");
-        }
-
-        let ptrs_bits = ptrs.trailing_zeros();
-        let direct_blocks = 12u32;
-        let indirect_blocks = ptrs;
-        let double_blocks = 1u32
-            .checked_shl(ptrs_bits * 2)
-            .ok_or_else(|| Error::with_message(Errno::EINVAL, "block path shift overflow"))?;
-
-        let mut offsets = [0u32; 4];
-        let depth;
-        let boundary;
-        let mut block = iblock;
-
-        // NOTE: Each branch subtracts the preceding region's size from `block`,
-        // so the branches MUST stay in this exact order.
-        if block < direct_blocks {
-            offsets[0] = block;
-            depth = 1usize;
-            boundary = direct_blocks - 1 - block;
-        } else {
-            block -= direct_blocks;
-            if block < indirect_blocks {
-                offsets[0] = 12;
-                offsets[1] = block;
-                depth = 2usize;
-                boundary = ptrs - 1 - (block & (ptrs - 1));
-            } else {
-                block -= indirect_blocks;
-                if block < double_blocks {
-                    offsets[0] = 13;
-                    offsets[1] = block >> ptrs_bits;
-                    offsets[2] = block & (ptrs - 1);
-                    depth = 3usize;
-                    boundary = ptrs - 1 - (block & (ptrs - 1));
-                } else {
-                    block -= double_blocks;
-                    if (block >> (ptrs_bits * 2)) < ptrs {
-                        offsets[0] = 14;
-                        offsets[1] = block >> (ptrs_bits * 2);
-                        offsets[2] = (block >> ptrs_bits) & (ptrs - 1);
-                        offsets[3] = block & (ptrs - 1);
-                        depth = 4usize;
-                        boundary = ptrs - 1 - (block & (ptrs - 1));
-                    } else {
-                        return_errno_with_message!(Errno::EINVAL, "block number exceeds maximum");
-                    }
-                }
-            }
-        }
-
-        Ok(BlockPointerPath {
-            depth,
-            offsets,
-            boundary,
-        })
-    }
-
     /// Resolves a logical block to a contiguous physical block range.
     ///
     pub(super) fn lookup_block_range(
@@ -278,10 +330,6 @@ impl BlockPtrTree {
         }
 
         let path = self.logical_block_to_path(iblock)?;
-        if path.depth == 0 {
-            return Ok(0..0);
-        }
-
         let branch = self.walk_block_chain(&path)?;
         self.mapped_range_from_branch(&path, &branch, max_blocks)
     }
@@ -312,14 +360,11 @@ impl BlockPtrTree {
 
         // Convert the logical block into a direct/indirect traversal path.
         let path = self.logical_block_to_path(iblock)?;
-        if path.depth == 0 {
-            return_errno_with_message!(Errno::EIO, "invalid block path depth");
-        }
 
         // Walk the existing branch until we either reach the target data slot or
         // stop at the first hole in the pointer chain.
         let branch = self.walk_block_chain(&path)?;
-        if branch.partial_level == path.depth {
+        if branch.partial_level == path.depth() {
             // The full mapping already exists, so only report the contiguous run.
             return self.mapped_range_from_branch(&path, &branch, max_blocks);
         }
@@ -346,11 +391,8 @@ impl BlockPtrTree {
         let iblock = u32::try_from(new_size.div_ceil(BLOCK_SIZE))
             .map_err(|_| Error::with_message(Errno::EINVAL, "truncate size exceeds ext2 limits"))?;
 
-        // Convert logical block number to access path (depth + offsets).
+        // Convert logical block number to access path.
         let path = self.logical_block_to_path(iblock)?;
-        if path.depth == 0 {
-            return Ok(());
-        }
 
         let ptrs_per_block = BLOCK_SIZE / size_of::<u32>();
         if ptrs_per_block == 0 {
@@ -358,9 +400,9 @@ impl BlockPtrTree {
         }
 
         // === Case 1: Direct blocks only ===
-        if path.depth == 1 {
-            // Free direct blocks from `offsets[0]` through `block_ptrs[11]`.
-            let start = (path.offsets[0] as usize).min(12);
+        if path.indirect.is_none() {
+            // Free direct blocks from `iblock_index` through `block_ptrs[11]`.
+            let start = (path.iblock_index as usize).min(12);
             for idx in start..12 {
                 let ptr = self.raw_block_ptrs.block_ptrs[idx];
                 if ptr == 0 {
@@ -378,15 +420,12 @@ impl BlockPtrTree {
             // Ext2_find_shared-style partial branch handling.
             // If truncation point is at the start of an indirect block (offset = 0),
             // we can handle it at a higher level without reading that indirect block.
-            let mut k = path.depth;
-            while k > 1 && path.offsets[k - 1] == 0 {
-                k -= 1;
-            }
             let shared_path = BlockPointerPath {
-                depth: k,
-                offsets: path.offsets,
+                iblock_index: path.iblock_index,
+                indirect: path.indirect.trim_trailing_zeros(),
                 boundary: path.boundary,
             };
+            let k = shared_path.depth();
 
             // --- Step 2: Read indirect block chain ---
             // branch.chain[i] contains the i-th level indirect block.
@@ -413,7 +452,7 @@ impl BlockPtrTree {
                 let current_bid = branch
                     .chain
                     .get(partial)
-                    .and_then(|entry| entry.bh)
+                    .and_then(|entry| entry.parent_bid)
                     .ok_or_else(|| {
                         Error::with_message(
                             Errno::EIO,
@@ -424,7 +463,7 @@ impl BlockPtrTree {
                 let all_zero = {
                     let mut indirect_blocks = self.indirect_blocks_manager.lock();
                     let block = indirect_blocks.find(current_bid)?;
-                    let keep_entries = path.offsets[partial] as usize;
+                    let keep_entries = path.offset_at(partial) as usize;
                     let mut all_zero = true;
                     for idx in 0..keep_entries {
                         if block.read_bid(idx)? != 0 {
@@ -443,11 +482,11 @@ impl BlockPtrTree {
             }
 
             // --- Step 4: Detach subtree root ---
-            // Disconnect the pointer at offsets[partial] and get the subtree root block number.
+            // Disconnect the pointer at the partial level and get the subtree root block number.
             let detached_nr;
             if partial == 0 {
                 // Detach from inode.block_ptrs directly.
-                let slot = path.offsets[0] as usize;
+                let slot = path.iblock_index as usize;
                 if slot >= self.raw_block_ptrs.block_ptrs.len() {
                     return_errno_with_message!(Errno::EIO, "inode block pointer slot out of range");
                 }
@@ -457,11 +496,11 @@ impl BlockPtrTree {
                 let parent_bid = branch
                     .chain
                     .get(partial)
-                    .and_then(|entry| entry.bh)
+                    .and_then(|entry| entry.parent_bid)
                     .ok_or_else(|| {
                         Error::with_message(Errno::EIO, "missing parent indirect block")
                     })?;
-                let slot = path.offsets[partial] as usize;
+                let slot = path.offset_at(partial) as usize;
                 let mut indirect_blocks = self.indirect_blocks_manager.lock();
                 let parent_block = indirect_blocks.find_mut(parent_bid)?;
                 detached_nr = parent_block.read_bid(slot)?;
@@ -471,25 +510,25 @@ impl BlockPtrTree {
             // Recursively free the detached subtree.
             if detached_nr != 0 {
                 // Free detached subtree root.
-                let subtree_depth = (path.depth - 1 - partial) as u32;
+                let subtree_depth = (path.depth() - 1 - partial) as u32;
                 self.free_branches(fs, detached_nr, subtree_depth);
             }
 
             // --- Step 5: Clear right side of partially shared indirect blocks ---
             // Clear right side of each partially shared indirect block.
             // For each level from partial down to 1, free all pointers to the right
-            // of offsets[level].
+            // of the offset at that level.
             for level in (1..=partial).rev() {
                 let current_bid = branch
                     .chain
                     .get(level)
-                    .and_then(|entry| entry.bh)
+                    .and_then(|entry| entry.parent_bid)
                     .ok_or_else(|| {
                         Error::with_message(Errno::EIO, "invalid indirect block number on tail")
                     })?;
 
-                let start_idx = (path.offsets[level] as usize) + 1;
-                let child_depth = (path.depth - 1 - level) as u32;
+                let start_idx = (path.offset_at(level) as usize) + 1;
+                let child_depth = (path.depth() - 1 - level) as u32;
                 let child_blocks = {
                     let mut indirect_blocks = self.indirect_blocks_manager.lock();
                     let block = indirect_blocks.find_mut(current_bid)?;
@@ -513,7 +552,7 @@ impl BlockPtrTree {
         // === Step 6: Free complete indirect block trees ===
         // If truncation point is in direct blocks, free all indirect trees.
         // If in single indirect, free double and triple indirect trees, etc.
-        if path.offsets[0] < 12 {
+        if path.iblock_index < 12 {
             // Truncation in direct blocks: free single, double, triple indirect.
             let nr = self.raw_block_ptrs.block_ptrs[12];
             if nr != 0 {
@@ -521,7 +560,7 @@ impl BlockPtrTree {
                 self.free_branches(fs, nr, 1);
             }
         }
-        if path.offsets[0] <= 12 {
+        if path.iblock_index <= 12 {
             // Truncation in direct or single indirect: free double, triple indirect.
             let nr = self.raw_block_ptrs.block_ptrs[13];
             if nr != 0 {
@@ -529,7 +568,7 @@ impl BlockPtrTree {
                 self.free_branches(fs, nr, 2);
             }
         }
-        if path.offsets[0] <= 13 {
+        if path.iblock_index <= 13 {
             // Truncation in direct, single, or double indirect: free triple indirect.
             let nr = self.raw_block_ptrs.block_ptrs[14];
             if nr != 0 {
@@ -541,24 +580,78 @@ impl BlockPtrTree {
         Ok(())
     }
 
+    /// Translates a logical block number into a path of block pointer offsets.
+    ///
+    fn logical_block_to_path(&self, iblock: u32) -> Result<BlockPointerPath> {
+        let ptrs = (BLOCK_SIZE / size_of::<u32>()) as u32;
+        let ptrs_bits = ptrs.trailing_zeros();
+        let direct_blocks = 12u32;
+        let indirect_blocks = ptrs;
+        let double_blocks = 1u32
+            .checked_shl(ptrs_bits * 2)
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "block path shift overflow"))?;
+
+        let mut block = iblock;
+
+        // NOTE: Each branch subtracts the preceding region's size from `block`,
+        // so the branches MUST stay in this exact order.
+        if block < direct_blocks {
+            Ok(BlockPointerPath {
+                iblock_index: block,
+                indirect: IndirectOffsets::None,
+                boundary: direct_blocks - 1 - block,
+            })
+        } else {
+            block -= direct_blocks;
+            if block < indirect_blocks {
+                Ok(BlockPointerPath {
+                    iblock_index: 12,
+                    indirect: IndirectOffsets::Single(block),
+                    boundary: ptrs - 1 - (block & (ptrs - 1)),
+                })
+            } else {
+                block -= indirect_blocks;
+                if block < double_blocks {
+                    Ok(BlockPointerPath {
+                        iblock_index: 13,
+                        indirect: IndirectOffsets::Double(block >> ptrs_bits, block & (ptrs - 1)),
+                        boundary: ptrs - 1 - (block & (ptrs - 1)),
+                    })
+                } else {
+                    block -= double_blocks;
+                    if (block >> (ptrs_bits * 2)) < ptrs {
+                        Ok(BlockPointerPath {
+                            iblock_index: 14,
+                            indirect: IndirectOffsets::Triple(
+                                block >> (ptrs_bits * 2),
+                                (block >> ptrs_bits) & (ptrs - 1),
+                                block & (ptrs - 1),
+                            ),
+                            boundary: ptrs - 1 - (block & (ptrs - 1)),
+                        })
+                    } else {
+                        return_errno_with_message!(Errno::EINVAL, "block number exceeds maximum");
+                    }
+                }
+            }
+        }
+    }
+
     /// Traverses the existing block pointer chain for a block path.
     ///
     fn walk_block_chain(&self, path: &BlockPointerPath) -> Result<BranchChainWalkResult> {
-        if path.depth == 0 || path.depth > path.offsets.len() {
-            return_errno_with_message!(Errno::EIO, "invalid block path depth");
-        }
-
-        let top_offset = path.offsets[0] as usize;
+        let top_offset = path.iblock_index as usize;
         let top_key = *self
             .raw_block_ptrs
             .block_ptrs
             .get(top_offset)
             .ok_or_else(|| Error::with_message(Errno::EIO, "invalid top-level block pointer"))?;
 
-        let mut chain = Vec::with_capacity(path.depth);
+        let depth = path.depth();
+        let mut chain = Vec::with_capacity(depth);
         chain.push(IndirectBlockEntry {
             key: top_key,
-            bh: None,
+            parent_bid: None,
         });
         if top_key == 0 {
             // Zero pointer means the chain is broken at level 0.
@@ -570,16 +663,16 @@ impl BlockPtrTree {
 
         // Callers hold `InodeInner` locks, so chain pointers are stable and no
         // retry loop is needed while walking the existing branch.
-        for level in 1..path.depth {
+        for level in 1..depth {
             let parent_key = chain[level - 1].key;
             let next_key = self
                 .indirect_blocks_manager
                 .lock()
                 .find(parent_key)?
-                .read_bid(path.offsets[level] as usize)?;
+                .read_bid(path.offset_at(level) as usize)?;
             chain.push(IndirectBlockEntry {
                 key: next_key,
-                bh: Some(parent_key),
+                parent_bid: Some(parent_key),
             });
             if next_key == 0 {
                 // Include the zero-key entry and report break level.
@@ -591,7 +684,7 @@ impl BlockPtrTree {
         }
 
         Ok(BranchChainWalkResult {
-            partial_level: path.depth,
+            partial_level: depth,
             chain,
         })
     }
@@ -611,14 +704,14 @@ impl BlockPtrTree {
         }
         // A partial walk means the logical block lands in a hole, so there is
         // no mapped physical range to report.
-        if branch.partial_level < path.depth {
+        let depth = path.depth();
+        if branch.partial_level < depth {
             return Ok(0..0);
         }
-
         // The last chain entry is the first mapped data block for `iblock`.
         let first_bid = branch
             .chain
-            .get(path.depth - 1)
+            .get(depth - 1)
             .ok_or_else(|| Error::with_message(Errno::EIO, "incomplete branch result"))?
             .key;
         if first_bid == 0 {
@@ -627,9 +720,9 @@ impl BlockPtrTree {
 
         let max_count = Self::max_blocks_in_run(path, max_blocks);
         let mut count = 1u32;
-        let start_slot = path.offsets[path.depth - 1] as usize;
+        let start_slot = path.leaf_offset() as usize;
 
-        if path.depth == 1 {
+        if path.indirect.is_none() {
             // Direct blocks are stored inline in the inode, so scan forward in
             // `i_block[]` while the next physical block stays contiguous.
             while count < max_count {
@@ -649,8 +742,8 @@ impl BlockPtrTree {
             // live in the final indirect block reached by the walk.
             let leaf_bid = branch
                 .chain
-                .get(path.depth - 1)
-                .and_then(|entry| entry.bh)
+                .get(depth - 1)
+                .and_then(|entry| entry.parent_bid)
                 .ok_or_else(|| Error::with_message(Errno::EIO, "missing indirect leaf block"))?;
             let mut indirect_blocks = self.indirect_blocks_manager.lock();
             let leaf_block = indirect_blocks.find(leaf_bid)?;
@@ -681,7 +774,7 @@ impl BlockPtrTree {
 
         // Missing branch levels correspond to indirect metadata blocks that
         // must be allocated before any data block can be linked into the tree.
-        let indirect_blks = (path.depth - 1 - branch.partial_level) as u32;
+        let indirect_blks = (path.depth() - 1 - branch.partial_level) as u32;
         // Never allocate past the current leaf boundary even if the caller asks
         // for a larger contiguous run.
         let max_data_blks = Self::max_blocks_in_run(path, max_blocks);
@@ -693,9 +786,9 @@ impl BlockPtrTree {
 
         // The metadata path already exists, so only count how many consecutive
         // empty slots remain in the current leaf.
-        let start_slot = path.offsets[path.depth - 1] as usize;
+        let start_slot = path.leaf_offset() as usize;
         let mut count = 1u32;
-        if path.depth == 1 {
+        if path.indirect.is_none() {
             // Direct blocks live inline in the inode's `i_block[]`.
             while count < max_data_blks {
                 let slot = start_slot
@@ -713,8 +806,8 @@ impl BlockPtrTree {
             // Indirect cases use the final indirect block as the allocation leaf.
             let leaf_bid = branch
                 .chain
-                .get(path.depth - 1)
-                .and_then(|entry| entry.bh)
+                .get(path.depth() - 1)
+                .and_then(|entry| entry.parent_bid)
                 .ok_or_else(|| Error::with_message(Errno::EIO, "missing indirect leaf block"))?;
             let mut indirect_blocks = self.indirect_blocks_manager.lock();
             let leaf_block = indirect_blocks.find(leaf_bid)?;
@@ -868,7 +961,7 @@ impl BlockPtrTree {
         if data_blks == 0 {
             return_errno_with_message!(Errno::EIO, "invalid zero data allocation");
         }
-        if branch.partial_level >= path.depth {
+        if branch.partial_level >= path.depth() {
             return_errno_with_message!(Errno::EIO, "branch is already complete");
         }
 
@@ -944,20 +1037,20 @@ impl BlockPtrTree {
         if indirect_blocks.is_empty() {
             // The branch already exists; only fill data pointers into existing slots.
             if branch.partial_level == 0 {
-                let slot = path.offsets[0] as usize;
+                let slot = path.iblock_index as usize;
                 self.write_data_range_to_direct_slots(slot, data_blocks)?;
             } else {
                 let parent_bid = branch
                     .chain
                     .get(branch.partial_level)
-                    .and_then(|entry| entry.bh)
+                    .and_then(|entry| entry.parent_bid)
                     .ok_or_else(|| {
                         Error::with_message(
                             Errno::EIO,
                             "missing parent indirect block for data splice",
                         )
                     })?;
-                let slot = path.offsets[branch.partial_level] as usize;
+                let slot = path.offset_at(branch.partial_level) as usize;
                 let mut mgr = self.indirect_blocks_manager.lock();
                 let parent_block = mgr.find_mut(parent_bid)?;
                 Self::write_data_range_to_indirect_block(parent_block, slot, data_blocks)?;
@@ -969,9 +1062,10 @@ impl BlockPtrTree {
             let result = (|| -> Result<()> {
                 // Build the indirect blocks chain: each block points to the next;
                 // the leaf block points to the allocated data range.
+                let depth = path.depth();
                 for (i, new_bid) in indirect_blocks.iter().copied().enumerate() {
                     let level = branch.partial_level + 1 + i;
-                    if level >= path.depth {
+                    if level >= depth {
                         return_errno_with_message!(
                             Errno::EIO,
                             "invalid branch depth during allocation"
@@ -980,7 +1074,7 @@ impl BlockPtrTree {
 
                     let mut block = IndirectBlock::alloc_new(new_bid)?;
                     block.clear();
-                    let start_slot = path.offsets[level] as usize;
+                    let start_slot = path.offset_at(level) as usize;
                     if i + 1 == indirect_blocks.len() {
                         Self::write_data_range_to_indirect_block(
                             &mut block,
@@ -995,7 +1089,7 @@ impl BlockPtrTree {
 
                 // Splice the chain root into the parent pointer.
                 if branch.partial_level == 0 {
-                    let slot = path.offsets[0] as usize;
+                    let slot = path.iblock_index as usize;
                     if slot >= self.raw_block_ptrs.block_ptrs.len() {
                         return_errno_with_message!(Errno::EIO, "invalid inode block pointer slot");
                     }
@@ -1010,7 +1104,7 @@ impl BlockPtrTree {
                     let parent_bid = branch
                         .chain
                         .get(branch.partial_level)
-                        .and_then(|entry| entry.bh)
+                        .and_then(|entry| entry.parent_bid)
                         .ok_or_else(|| {
                             Error::with_message(
                                 Errno::EIO,
@@ -1018,7 +1112,7 @@ impl BlockPtrTree {
                             )
                         })?;
                     let parent_block = mgr.find_mut(parent_bid)?;
-                    let slot = path.offsets[branch.partial_level] as usize;
+                    let slot = path.offset_at(branch.partial_level) as usize;
                     if parent_block.read_bid(slot)? != 0 {
                         return_errno_with_message!(
                             Errno::EIO,
@@ -1109,70 +1203,70 @@ mod test {
 
         // Cover exact transition boundaries across all block-map levels.
         let direct_path = block_ptr_tree.logical_block_to_path(0).unwrap();
-        assert_eq!(direct_path.depth, 1);
-        assert_eq!(direct_path.offsets[0], 0);
+        assert_eq!(direct_path.depth(), 1);
+        assert_eq!(direct_path.iblock_index, 0);
         assert_eq!(direct_path.boundary, 11);
 
         let direct_last_path = block_ptr_tree.logical_block_to_path(11).unwrap();
-        assert_eq!(direct_last_path.depth, 1);
-        assert_eq!(direct_last_path.offsets[0], 11);
+        assert_eq!(direct_last_path.depth(), 1);
+        assert_eq!(direct_last_path.iblock_index, 11);
         assert_eq!(direct_last_path.boundary, 0);
 
         let indirect_first_path = block_ptr_tree.logical_block_to_path(12).unwrap();
-        assert_eq!(indirect_first_path.depth, 2);
-        assert_eq!(indirect_first_path.offsets[0], 12);
-        assert_eq!(indirect_first_path.offsets[1], 0);
+        assert_eq!(indirect_first_path.depth(), 2);
+        assert_eq!(indirect_first_path.iblock_index, 12);
+        assert_eq!(indirect_first_path.indirect.offset_at(0), 0);
 
         let indirect_path = block_ptr_tree
             .logical_block_to_path(12 + indirect_index)
             .unwrap();
-        assert_eq!(indirect_path.depth, 2);
-        assert_eq!(indirect_path.offsets[0], 12);
-        assert_eq!(indirect_path.offsets[1], indirect_index);
+        assert_eq!(indirect_path.depth(), 2);
+        assert_eq!(indirect_path.iblock_index, 12);
+        assert_eq!(indirect_path.indirect.offset_at(0), indirect_index);
 
         let indirect_last_iblock = 12 + ptrs - 1;
         let indirect_last_path = block_ptr_tree
             .logical_block_to_path(indirect_last_iblock)
             .unwrap();
-        assert_eq!(indirect_last_path.depth, 2);
-        assert_eq!(indirect_last_path.offsets[0], 12);
-        assert_eq!(indirect_last_path.offsets[1], ptrs - 1);
+        assert_eq!(indirect_last_path.depth(), 2);
+        assert_eq!(indirect_last_path.iblock_index, 12);
+        assert_eq!(indirect_last_path.indirect.offset_at(0), ptrs - 1);
         assert_eq!(indirect_last_path.boundary, 0);
 
         let first_double_iblock = 12 + ptrs;
         let first_double_path = block_ptr_tree
             .logical_block_to_path(first_double_iblock)
             .unwrap();
-        assert_eq!(first_double_path.depth, 3);
-        assert_eq!(first_double_path.offsets[0], 13);
-        assert_eq!(first_double_path.offsets[1], 0);
-        assert_eq!(first_double_path.offsets[2], 0);
+        assert_eq!(first_double_path.depth(), 3);
+        assert_eq!(first_double_path.iblock_index, 13);
+        assert_eq!(first_double_path.indirect.offset_at(0), 0);
+        assert_eq!(first_double_path.indirect.offset_at(1), 0);
 
         let double_iblock = 12 + ptrs + (3 << ptrs_bits) + 4;
         let double_path = block_ptr_tree.logical_block_to_path(double_iblock).unwrap();
-        assert_eq!(double_path.depth, 3);
-        assert_eq!(double_path.offsets[0], 13);
-        assert_eq!(double_path.offsets[1], 3);
-        assert_eq!(double_path.offsets[2], 4);
+        assert_eq!(double_path.depth(), 3);
+        assert_eq!(double_path.iblock_index, 13);
+        assert_eq!(double_path.indirect.offset_at(0), 3);
+        assert_eq!(double_path.indirect.offset_at(1), 4);
 
         let first_triple_iblock = 12 + ptrs + double_blocks;
         let first_triple_path = block_ptr_tree
             .logical_block_to_path(first_triple_iblock)
             .unwrap();
-        assert_eq!(first_triple_path.depth, 4);
-        assert_eq!(first_triple_path.offsets[0], 14);
-        assert_eq!(first_triple_path.offsets[1], 0);
-        assert_eq!(first_triple_path.offsets[2], 0);
-        assert_eq!(first_triple_path.offsets[3], 0);
+        assert_eq!(first_triple_path.depth(), 4);
+        assert_eq!(first_triple_path.iblock_index, 14);
+        assert_eq!(first_triple_path.indirect.offset_at(0), 0);
+        assert_eq!(first_triple_path.indirect.offset_at(1), 0);
+        assert_eq!(first_triple_path.indirect.offset_at(2), 0);
 
         let triple_iblock =
             12 + ptrs + double_blocks + (2 << (ptrs_bits * 2)) + (3 << ptrs_bits) + 4;
         let triple_path = block_ptr_tree.logical_block_to_path(triple_iblock).unwrap();
-        assert_eq!(triple_path.depth, 4);
-        assert_eq!(triple_path.offsets[0], 14);
-        assert_eq!(triple_path.offsets[1], 2);
-        assert_eq!(triple_path.offsets[2], 3);
-        assert_eq!(triple_path.offsets[3], 4);
+        assert_eq!(triple_path.depth(), 4);
+        assert_eq!(triple_path.iblock_index, 14);
+        assert_eq!(triple_path.indirect.offset_at(0), 2);
+        assert_eq!(triple_path.indirect.offset_at(1), 3);
+        assert_eq!(triple_path.indirect.offset_at(2), 4);
 
         // Verify block lookup resolves direct/indirect/double/triple chains.
         assert_eq!(block_ptr_tree.lookup_block(0).unwrap(), Some(11));

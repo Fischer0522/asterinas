@@ -3608,13 +3608,8 @@ mod test {
             buffered_payload.len()
         );
 
-        let read_back = read_file_at(
-            &file,
-            mmap_offset,
-            mmap_payload.len(),
-            StatusFlags::empty(),
-        )
-        .unwrap();
+        let read_back =
+            read_file_at(&file, mmap_offset, mmap_payload.len(), StatusFlags::empty()).unwrap();
         assert_eq!(read_back, mmap_payload);
     }
 

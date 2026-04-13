@@ -13,10 +13,7 @@ use crate::{
         utils::DirentVisitor,
         vfs::{
             file_system::FileSystem,
-            inode::{
-                Extension, FallocMode, Inode, InodeIo, Metadata, MknodType,
-                SymbolicLink,
-            },
+            inode::{Extension, FallocMode, Inode, InodeIo, Metadata, MknodType, SymbolicLink},
             xattr::{XattrName, XattrNamespace, XattrSetFlags},
         },
     },
