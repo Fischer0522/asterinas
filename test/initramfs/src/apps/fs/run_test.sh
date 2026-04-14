@@ -91,6 +91,14 @@ test_ext2 "/ext2" "test_file.txt"
 ./ext2/rename
 ./ext2/rmdir
 ./ext2/unix_socket
+./ext2/file_io
+./ext2/namei
+./ext2/symlink_test
+./ext2/readdir_test
+./ext2/xattr
+./ext2/fallocate_test
+./ext2/permissions
+./ext2/open_unlink
 echo "All ext2 fs test passed."
 
 echo "Start fdatasync test......"
