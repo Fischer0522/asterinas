@@ -86,22 +86,35 @@ fn listxattr(
         return_errno_with_message!(Errno::E2BIG, "xattr list too long");
     }
 
-    let namespace = get_current_xattr_namespace(ctx);
+    let namespaces = get_visible_xattr_namespaces(ctx);
     let mut list_writer = user_space.writer(list_ptr, list_len)?;
 
     let path = lookup_path_for_xattr(&file_ctx, ctx)?;
-    path.list_xattr(namespace, &mut list_writer)
+    let mut total = 0;
+    for &ns in namespaces {
+        total += path.list_xattr(ns, &mut list_writer)?;
+    }
+    Ok(total)
 }
 
-fn get_current_xattr_namespace(ctx: &Context) -> XattrNamespace {
+/// Returns the set of xattr namespaces visible to the current process.
+///
+/// In Linux, `listxattr` enumerates entries from all namespaces the caller
+/// is permitted to see. User and Security namespaces are always visible;
+/// Trusted is visible only to processes with `CAP_SYS_ADMIN`.
+fn get_visible_xattr_namespaces(ctx: &Context) -> &'static [XattrNamespace] {
     let credentials = ctx.posix_thread.credentials();
     let permitted_capset = credentials.permitted_capset();
     let effective_capset = credentials.effective_capset();
 
     if permitted_capset.contains(CapSet::SYS_ADMIN) && effective_capset.contains(CapSet::SYS_ADMIN)
     {
-        XattrNamespace::Trusted
+        &[
+            XattrNamespace::User,
+            XattrNamespace::Trusted,
+            XattrNamespace::Security,
+        ]
     } else {
-        XattrNamespace::User
+        &[XattrNamespace::User, XattrNamespace::Security]
     }
 }
