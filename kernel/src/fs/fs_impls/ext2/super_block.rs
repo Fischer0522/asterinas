@@ -857,4 +857,69 @@ mod test {
         let err = SuperBlock::try_from(raw).unwrap_err();
         assert_eq!(err.error(), Errno::EINVAL);
     }
+
+    #[ktest]
+    fn try_from_unsupported_incompat_feature_returns_einval() {
+        let mut raw = make_valid_raw_super_block(1);
+        // Set COMPRESSION (bit 0), which is not in the allowed set.
+        raw.feature_incompat = FeatureInCompatSet::COMPRESSION.bits();
+
+        let err = SuperBlock::try_from(raw).unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
+    }
+
+    #[ktest]
+    fn try_from_rev0_uses_fixed_inode_layout() {
+        let raw = make_valid_raw_super_block(1);
+        assert_eq!(raw.rev_level, RevLevel::GoodOld as u32);
+
+        let sb = SuperBlock::try_from(raw).unwrap();
+        assert_eq!(sb.inode_size(), 128);
+        assert_eq!(sb.first_ino(), 11);
+    }
+
+    #[ktest]
+    fn try_from_dynamic_rev_uses_raw_inode_size() {
+        let mut raw = make_valid_raw_super_block(1);
+        raw.rev_level = RevLevel::Dynamic as u32;
+        raw.inode_size = 256;
+        raw.first_ino = 12;
+
+        let sb = SuperBlock::try_from(raw).unwrap();
+        assert_eq!(sb.inode_size(), 256);
+        assert_eq!(sb.first_ino(), 12);
+    }
+
+    #[ktest]
+    fn try_from_dynamic_rev_bad_inode_size_returns_einval() {
+        let mut raw = make_valid_raw_super_block(1);
+        raw.rev_level = RevLevel::Dynamic as u32;
+        // inode_size not power of two
+        raw.inode_size = 100;
+
+        let err = SuperBlock::try_from(raw).unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
+    }
+
+    #[ktest]
+    fn sparse_super_backup_groups() {
+        let mut raw = make_valid_raw_super_block(30);
+        raw.feature_ro_compat = FeatureRoCompatSet::SPARSE_SUPER.bits();
+
+        let sb = SuperBlock::try_from(raw).unwrap();
+        // Group 0 is primary, not "backup".
+        assert!(!sb.is_backup_group(0));
+        // Group 1 is always a backup.
+        assert!(sb.is_backup_group(1));
+        // Powers of 3, 5, 7 are backups.
+        assert!(sb.is_backup_group(3));
+        assert!(sb.is_backup_group(5));
+        assert!(sb.is_backup_group(7));
+        assert!(sb.is_backup_group(9)); // 3^2
+        assert!(sb.is_backup_group(25)); // 5^2
+        // 2, 4, 6 are not backups with sparse_super.
+        assert!(!sb.is_backup_group(2));
+        assert!(!sb.is_backup_group(4));
+        assert!(!sb.is_backup_group(6));
+    }
 }

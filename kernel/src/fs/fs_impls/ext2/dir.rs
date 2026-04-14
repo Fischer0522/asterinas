@@ -305,4 +305,21 @@ mod test {
         assert_eq!(DirEntryHeader::dir_rec_len(1), 12);
         assert_eq!(DirEntryHeader::dir_rec_len(NAME_MAX), 264);
     }
+
+    #[ktest]
+    fn dir_rec_len_boundary_values() {
+        // 4-byte alignment: name_len 1..4 all round to 12.
+        assert_eq!(DirEntryHeader::dir_rec_len(1), 12);
+        assert_eq!(DirEntryHeader::dir_rec_len(2), 12);
+        assert_eq!(DirEntryHeader::dir_rec_len(3), 12);
+        assert_eq!(DirEntryHeader::dir_rec_len(4), 12);
+        // name_len=5 crosses to next alignment bucket.
+        assert_eq!(DirEntryHeader::dir_rec_len(5), 16);
+        // Maximum name length (255).
+        assert_eq!(DirEntryHeader::dir_rec_len(255), 264);
+        // Verify alignment: result is always 4-byte aligned.
+        for name_len in 0..=NAME_MAX {
+            assert_eq!(DirEntryHeader::dir_rec_len(name_len) % 4, 0);
+        }
+    }
 }

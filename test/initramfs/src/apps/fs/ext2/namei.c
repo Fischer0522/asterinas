@@ -223,7 +223,8 @@ FN_TEST(rename_cross_dir_replace)
 
 	const char src_data[] = "source_data";
 	int fd = TEST_SUCC(open(src, O_CREAT | O_WRONLY, 0644));
-	TEST_RES(write(fd, src_data, sizeof(src_data)), _ret == (ssize_t)sizeof(src_data));
+	TEST_RES(write(fd, src_data, sizeof(src_data)),
+		 _ret == (ssize_t)sizeof(src_data));
 	TEST_SUCC(close(fd));
 
 	fd = TEST_SUCC(creat(dst, 0644));

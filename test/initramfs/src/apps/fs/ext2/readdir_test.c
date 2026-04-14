@@ -71,8 +71,7 @@ FN_TEST(readdir_returns_all_entries)
 
 	if (count != 7) {
 		__tests_failed++;
-		fprintf(stderr,
-			"%s: readdir count: expected 7, got %d\n",
+		fprintf(stderr, "%s: readdir count: expected 7, got %d\n",
 			__func__, count);
 	} else {
 		__tests_passed++;
@@ -80,9 +79,8 @@ FN_TEST(readdir_returns_all_entries)
 	for (int i = 0; i < 7; i++) {
 		if (!found[i]) {
 			__tests_failed++;
-			fprintf(stderr,
-				"%s: entry %d not found\n",
-				__func__, i);
+			fprintf(stderr, "%s: entry %d not found\n", __func__,
+				i);
 		} else {
 			__tests_passed++;
 		}
@@ -125,7 +123,8 @@ FN_TEST(readdir_seekdir_resume)
 	char first_remaining[256] = { 0 };
 	ent = readdir(dp);
 	if (ent)
-		snprintf(first_remaining, sizeof(first_remaining), "%s", ent->d_name);
+		snprintf(first_remaining, sizeof(first_remaining), "%s",
+			 ent->d_name);
 	closedir(dp);
 
 	// Second pass: reopen, seekdir, verify same entry appears
@@ -135,8 +134,7 @@ FN_TEST(readdir_seekdir_resume)
 	seekdir(dp, saved_pos);
 	ent = readdir(dp);
 	if (ent)
-		TEST_RES(strcmp(ent->d_name, first_remaining),
-			 _ret == 0);
+		TEST_RES(strcmp(ent->d_name, first_remaining), _ret == 0);
 	closedir(dp);
 
 	// Cleanup
@@ -171,9 +169,8 @@ FN_TEST(mkdir_contains_dot_dotdot)
 
 	if (count != 2) {
 		__tests_failed++;
-		fprintf(stderr,
-			"%s: expected 2 entries, got %d\n",
-			__func__, count);
+		fprintf(stderr, "%s: expected 2 entries, got %d\n", __func__,
+			count);
 	} else {
 		__tests_passed++;
 	}
@@ -230,9 +227,8 @@ FN_TEST(dir_growth_many_files)
 
 	if (count != num_files + 2) {
 		__tests_failed++;
-		fprintf(stderr,
-			"%s: expected %d entries, got %d\n",
-			__func__, num_files + 2, count);
+		fprintf(stderr, "%s: expected %d entries, got %d\n", __func__,
+			num_files + 2, count);
 	} else {
 		__tests_passed++;
 	}
@@ -267,15 +263,13 @@ FN_TEST(dot_dotdot_semantics)
 
 	if ((ino_t)st_dot.st_ino != (ino_t)st_child.st_ino) {
 		__tests_failed++;
-		fprintf(stderr,
-			"%s: child/. ino mismatch\n", __func__);
+		fprintf(stderr, "%s: child/. ino mismatch\n", __func__);
 	} else {
 		__tests_passed++;
 	}
 	if ((ino_t)st_dotdot.st_ino != (ino_t)st_parent.st_ino) {
 		__tests_failed++;
-		fprintf(stderr,
-			"%s: child/.. ino mismatch\n", __func__);
+		fprintf(stderr, "%s: child/.. ino mismatch\n", __func__);
 	} else {
 		__tests_passed++;
 	}

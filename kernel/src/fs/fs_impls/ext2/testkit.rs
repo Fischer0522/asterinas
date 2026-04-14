@@ -429,30 +429,6 @@ impl DirentVisitor for CollectDirentVisitor {
     }
 }
 
-pub(super) struct StopAfterVisitor {
-    allow_count: usize,
-    seen: usize,
-}
-
-impl StopAfterVisitor {
-    pub(super) fn new(allow_count: usize) -> Self {
-        Self {
-            allow_count,
-            seen: 0,
-        }
-    }
-}
-
-impl DirentVisitor for StopAfterVisitor {
-    fn visit(&mut self, _name: &str, _ino: u64, _type_: InodeType, _offset: usize) -> Result<()> {
-        if self.seen >= self.allow_count {
-            return_errno_with_message!(Errno::EINTR, "operation interrupted");
-        }
-        self.seen += 1;
-        Ok(())
-    }
-}
-
 /// Writes one u32 pointer into an indirect block slot.
 pub(super) fn write_indirect_ptr(disk: &Ext2MemoryDisk, bid: u32, index: u32, next: u32) {
     let offset = Bid::new(bid as u64).to_offset() + (index as usize) * size_of::<u32>();
@@ -1019,16 +995,6 @@ pub(super) fn create_file(dir: &Arc<Inode>, name: &str) -> Arc<Inode> {
 pub(super) fn create_dir(dir: &Arc<Inode>, name: &str) -> Arc<Inode> {
     dir.create(name, InodeType::Dir, FilePerm::from_bits_truncate(0o755))
         .unwrap()
-}
-
-/// Creates a symlink (mode 0o777) inside `dir`.
-pub(super) fn create_symlink(dir: &Arc<Inode>, name: &str) -> Arc<Inode> {
-    dir.create(
-        name,
-        InodeType::SymLink,
-        FilePerm::from_bits_truncate(0o777),
-    )
-    .unwrap()
 }
 
 /// Builds a `namei_env` fixture and returns `(fixture, root_inode)` with clocks initialized.

@@ -49,13 +49,11 @@ FN_TEST(xattr_list)
 	TEST_SUCC(setxattr(path, "user.beta", "b", 1, 0));
 
 	char buf[256] = { 0 };
-	ssize_t len =
-		TEST_RES(listxattr(path, buf, sizeof(buf)), _ret > 0);
+	ssize_t len = TEST_RES(listxattr(path, buf, sizeof(buf)), _ret > 0);
 
 	if (len > 0) {
 		int found_alpha = 0, found_beta = 0;
-		for (const char *p = buf; p < buf + len;
-		     p += strlen(p) + 1) {
+		for (const char *p = buf; p < buf + len; p += strlen(p) + 1) {
 			if (strcmp(p, "user.alpha") == 0)
 				found_alpha = 1;
 			if (strcmp(p, "user.beta") == 0)

@@ -140,8 +140,7 @@ FN_TEST(write_append)
 	TEST_SUCC(close(fd));
 
 	fd = TEST_SUCC(open(path, O_RDONLY));
-	TEST_RES(read(fd, buf, sizeof(buf)),
-		 _ret == (ssize_t)strlen(expected));
+	TEST_RES(read(fd, buf, sizeof(buf)), _ret == (ssize_t)strlen(expected));
 	TEST_RES(memcmp(buf, expected, strlen(expected)), _ret == 0);
 	TEST_SUCC(close(fd));
 

@@ -46,7 +46,8 @@ FN_TEST(symlink_short_roundtrip)
 	TEST_SUCC(symlink(file, link));
 
 	char buf[PATH_MAX];
-	TEST_RES(readlink(link, buf, sizeof(buf)), _ret == (ssize_t)strlen(file));
+	TEST_RES(readlink(link, buf, sizeof(buf)),
+		 _ret == (ssize_t)strlen(file));
 	buf[strlen(file)] = '\0';
 	TEST_RES(strcmp(buf, file), _ret == 0);
 

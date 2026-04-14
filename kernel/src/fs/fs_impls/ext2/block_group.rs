@@ -817,4 +817,31 @@ mod test {
         assert_eq!(group.free_blocks_count(), descs[1].free_blocks_count);
         assert_eq!(group.free_inodes_count(), descs[1].free_inodes_count);
     }
+
+    #[ktest]
+    fn multi_group_first_last_block_boundaries() {
+        let sb = make_valid_super_block(3);
+        let first_data = sb.first_data_block();
+        let bpg = sb.blocks_per_group();
+
+        // Group 0 starts at first_data_block.
+        assert_eq!(sb.group_first_block_no(0), first_data);
+        assert_eq!(sb.group_last_block_no(0), first_data + bpg - 1);
+
+        // Group 1 starts right after group 0.
+        assert_eq!(sb.group_first_block_no(1), first_data + bpg);
+        assert_eq!(sb.group_last_block_no(1), first_data + 2 * bpg - 1);
+
+        // Last group may be shorter than blocks_per_group.
+        let last_group = sb.block_groups_count() as usize - 1;
+        assert_eq!(
+            sb.group_first_block_no(last_group),
+            first_data + (last_group as u32) * bpg,
+        );
+        assert_eq!(sb.group_last_block_no(last_group), sb.total_blocks() - 1);
+        // Verify last group is indeed shorter.
+        let last_group_blocks =
+            sb.group_last_block_no(last_group) - sb.group_first_block_no(last_group) + 1;
+        assert!(last_group_blocks <= bpg);
+    }
 }
