@@ -14,9 +14,10 @@ use super::{
     prelude::*,
 };
 
-pub(super) type Ext2Bid = u32;
 /// Logical block index within a file (0-based).
 pub(super) type Iblock = u32;
+/// Physical block index on the device
+pub(super) type Ext2Bid = u32;
 
 /// Offsets within indirect blocks, from outermost to innermost.
 #[derive(Clone, Copy, Debug)]

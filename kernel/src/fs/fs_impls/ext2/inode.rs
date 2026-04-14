@@ -2080,7 +2080,6 @@ impl InodeInner {
         Ok(new_blocks)
     }
 
-    // TODO: Maybe zeroing only the page cache is sufficient here.
     /// Zeroes newly allocated data blocks before exposing them via mapped reads.
     ///
     fn zero_new_blocks(&self, blocks: &[Ext2Bid]) -> Result<()> {

@@ -49,7 +49,7 @@ impl From<XattrNamespace> for XattrNameIndex {
             XattrNamespace::Trusted => Self::Trusted,
             XattrNamespace::Security => Self::Security,
             XattrNamespace::System => {
-                // POSIX ACL xattrs are not implemented yet.
+                // TODO: POSIX ACL xattrs are not implemented yet.
                 Self::PosixAclAccess
             }
         }
