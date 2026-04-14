@@ -17,15 +17,13 @@
 //!
 //! ```no_run
 //! // Opens an `Ext2` filesystem from the block device.
-//! let ext2 = Ext2::open(block_device)?;
+//! let ext2 = Ext2::open(block_device, None)?;
 //! // Looks up the root inode.
-//! let root = ext2.root_inode();
+//! let root = ext2.root_inode()?;
 //! // Creates a file inside the root directory.
 //! let file = root.create("file", InodeType::File, FilePerm::from_bits_truncate(0o666))?;
-//! // Writes data into the file.
-//! const WRITE_DATA: &[u8] = b"Hello, World";
-//! let len = file.write_at(0, WRITE_DATA)?;
-//! assert!(len == WRITE_DATA.len());
+//! // Newly created regular files start empty.
+//! assert_eq!(file.file_size(), 0);
 //! ```
 //!
 //! # Limitations

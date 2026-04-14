@@ -663,7 +663,6 @@ impl Ext2 {
         for group in &self.block_groups {
             group.sync_all(&self.group_descriptors_segment)?;
         }
-
         self.sync_metadata()
     }
 

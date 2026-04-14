@@ -22,7 +22,7 @@ use super::{
 };
 use crate::{
     fs::{
-        ext2::dir::DirEntryFileType,
+        ext2::{block_ptr_tree::BlockRangeStep, dir::DirEntryFileType},
         file::InodeMode,
         utils::CachePageExt,
         vfs::{
@@ -637,15 +637,15 @@ impl Inode {
                     inner.ensure_size_within_limit(end)?;
                 }
 
-                let new_blocks = match inner.allocate_range_blocks(offset, end) {
-                    Ok(new_blocks) => new_blocks,
+                let new_block_ranges = match inner.allocate_range_blocks(offset, end) {
+                    Ok(new_block_ranges) => new_block_ranges,
                     Err(err) => {
                         inner.rollback_write(old_size, end);
                         return Err(err);
                     }
                 };
 
-                if let Err(err) = inner.zero_new_blocks(&new_blocks) {
+                if let Err(err) = inner.zero_new_blocks(&new_block_ranges) {
                     inner.rollback_write(old_size, end);
                     return Err(err);
                 }
@@ -1328,7 +1328,7 @@ impl InodeBlockManager {
         Ok(())
     }
 
-    /// Truncates blocks and returns a snapshot of the resulting state (write lock).
+    /// Truncates blocks under the block-pointer-tree write lock.
     fn truncate_blocks(&self, new_size: usize) -> Result<()> {
         let fs = self.fs()?;
         let mut tree = self.block_ptr_tree.write();
@@ -1336,7 +1336,7 @@ impl InodeBlockManager {
         Ok(())
     }
 
-    /// Encodes a device ID and returns a snapshot (write lock).
+    /// Encodes a device ID under the block-pointer-tree write lock.
     fn encode_device_id(&self, device_id: u64) {
         let mut tree = self.block_ptr_tree.write();
         tree.raw_block_ptrs.encode_device_id(device_id);
@@ -1359,11 +1359,14 @@ impl InodeBlockManager {
         self.block_ptr_tree.write().sync_indirect_blocks()
     }
 
-    /// Allocates missing data blocks that cover the requested file byte range.
+    /// Allocates missing data blocks that cover the requested logical block range.
     ///
-    /// Returns `(snapshot, new_block_ids)` on success. On failure,
-    /// `RawBlockPtrs` is unchanged so no descriptor sync is needed.
-    fn allocate_range_blocks(&self, start_block: usize, end_block: usize) -> Result<Vec<Ext2Bid>> {
+    /// Returns newly created block ranges on success.
+    fn allocate_range_blocks(
+        &self,
+        start_block: usize,
+        end_block: usize,
+    ) -> Result<Vec<Range<Ext2Bid>>> {
         let fs = self.fs()?;
         let mut tree = self.block_ptr_tree.write();
         let mut new_blocks = Vec::new();
@@ -1372,19 +1375,18 @@ impl InodeBlockManager {
             let iblock = current_block as Iblock;
             let remaining = (end_block - current_block) as u32;
 
-            let mapped_range = tree.lookup_block_range(iblock, remaining)?;
-            if !mapped_range.is_empty() {
-                debug_assert!(mapped_range.end >= mapped_range.start);
-                current_block += (mapped_range.end - mapped_range.start) as usize;
-                continue;
+            let block_range = tree.lookup_or_alloc_block_range(&fs, iblock, remaining)?;
+            match block_range {
+                BlockRangeStep::Mapped(range) => {
+                    debug_assert!(!range.is_empty());
+                    current_block += range.len() as usize;
+                }
+                BlockRangeStep::Allocated(range) => {
+                    debug_assert!(!range.is_empty());
+                    current_block += range.len() as usize;
+                    new_blocks.push(range);
+                }
             }
-            let allocated_range = tree.lookup_or_alloc_block_range(&fs, iblock, remaining, true)?;
-            if allocated_range.is_empty() {
-                return_errno_with_message!(Errno::EIO, "missing block mapping after allocation");
-            }
-            debug_assert!(allocated_range.end >= allocated_range.start);
-            current_block += (allocated_range.end - allocated_range.start) as usize;
-            new_blocks.extend(allocated_range);
         }
         Ok(new_blocks)
     }
@@ -1427,15 +1429,20 @@ impl PageCacheBackend for InodeBlockManager {
         let iblock = Iblock::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
         let fs = self.fs()?;
+
         // The block is already allocated, write it directly.
         if let Some(bid) = self.lookup_block(iblock)? {
             return fs.write_blocks_async(bid, bio_segment, complete_fn);
         }
-        // Encounter a hole, allocate block here.
 
-        let bids = self.allocate_range_blocks(idx, idx + 1)?;
-        assert_eq!(bids.len(), 1);
-        let bid = bids[0];
+        // Encounter a hole, allocate block here.
+        let mut tree = self.block_ptr_tree.write();
+        let step = tree.lookup_or_alloc_block_range(&fs, iblock, 1)?;
+        let bid = match step {
+            BlockRangeStep::Allocated(r) => r.start,
+            // lookup_block already returned None, so this shouldn't happen.
+            BlockRangeStep::Mapped(_) => unreachable!("block was not mapped before allocation"),
+        };
 
         fs.write_blocks_async(bid, bio_segment, complete_fn)
     }
@@ -2072,7 +2079,7 @@ impl InodeInner {
     }
 
     /// Allocates missing data blocks that cover the requested file byte range.
-    fn allocate_range_blocks(&mut self, offset: usize, end: usize) -> Result<Vec<Ext2Bid>> {
+    fn allocate_range_blocks(&mut self, offset: usize, end: usize) -> Result<Vec<Range<Ext2Bid>>> {
         let start_block = offset / BLOCK_SIZE;
         let end_block = end.div_ceil(BLOCK_SIZE);
         let block_manager = self.block_manager().clone();
@@ -2082,23 +2089,24 @@ impl InodeInner {
 
     /// Zeroes newly allocated data blocks before exposing them via mapped reads.
     ///
-    fn zero_new_blocks(&self, blocks: &[Ext2Bid]) -> Result<()> {
-        if blocks.is_empty() {
+    fn zero_new_blocks(&self, ranges: &[Range<Ext2Bid>]) -> Result<()> {
+        if ranges.is_empty() {
             return Ok(());
         }
 
         let fs = self.fs()?;
-        let zero_block = vec![0u8; BLOCK_SIZE];
-        for &bid in blocks {
-            let bio_segment = BioSegment::alloc(1, BioDirection::ToDevice);
+        for range in ranges {
+            if range.is_empty() {
+                continue;
+            }
+            let bio_segment = BioSegment::alloc(range.len(), BioDirection::ToDevice);
             {
                 let mut segment_writer = bio_segment.writer().map_err(|_| {
                     Error::with_message(Errno::EIO, "failed to access zero-write bio segment")
                 })?;
-                let mut zero_reader = VmReader::from(zero_block.as_slice()).to_fallible();
-                segment_writer.write_fallible(&mut zero_reader)?;
+                segment_writer.fill_zeros(range.len() * BLOCK_SIZE);
             }
-            fs.write_blocks(bid, bio_segment).map_err(|_| {
+            fs.write_blocks(range.start, bio_segment).map_err(|_| {
                 Error::with_message(Errno::EIO, "failed to zero newly allocated data block")
             })?;
         }
