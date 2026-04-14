@@ -559,7 +559,7 @@ impl BlockGroup {
         &self,
         count: u32,
         sb_free_blocks: u32,
-    ) -> Result<(Option<Range<u32>>, bool)> {
+    ) -> Result<(Option<Range<Ext2Bid>>, bool)> {
         let group_size = self.last_block - self.first_block + 1;
         if group_size as usize > BLOCK_SIZE * 8 {
             return_errno_with_message!(Errno::EIO, "block group size exceeds bitmap capacity");

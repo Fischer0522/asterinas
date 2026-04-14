@@ -15,6 +15,8 @@ use super::{
 };
 
 pub(super) type Ext2Bid = u32;
+/// Logical block index within a file (0-based).
+pub(super) type Iblock = u32;
 
 /// Offsets within indirect blocks, from outermost to innermost.
 #[derive(Clone, Copy, Debug)]
@@ -322,7 +324,7 @@ impl BlockPtrTree {
     ///
     pub(super) fn lookup_block_range(
         &self,
-        iblock: u32,
+        iblock: Iblock,
         max_blocks: u32,
     ) -> Result<Range<Ext2Bid>> {
         if max_blocks == 0 {
@@ -336,7 +338,7 @@ impl BlockPtrTree {
 
     /// Resolves a logical block to physical block (read-only).
     ///
-    pub(super) fn lookup_block(&self, iblock: u32) -> Result<Option<Ext2Bid>> {
+    pub(super) fn lookup_block(&self, iblock: Iblock) -> Result<Option<Ext2Bid>> {
         let range = self.lookup_block_range(iblock, 1)?;
         Ok(if range.is_empty() {
             None
@@ -350,7 +352,7 @@ impl BlockPtrTree {
     pub(super) fn lookup_or_alloc_block_range(
         &mut self,
         fs: &Arc<Ext2>,
-        iblock: u32,
+        iblock: Iblock,
         max_blocks: u32,
         create: bool,
     ) -> Result<Range<Ext2Bid>> {
@@ -388,7 +390,7 @@ impl BlockPtrTree {
         let sectors_per_block = (BLOCK_SIZE / SECTOR_SIZE) as u32;
 
         // First logical block to free = ceil(new_size / block_size).
-        let iblock = u32::try_from(new_size.div_ceil(BLOCK_SIZE))
+        let iblock = Iblock::try_from(new_size.div_ceil(BLOCK_SIZE))
             .map_err(|_| Error::with_message(Errno::EINVAL, "truncate size exceeds ext2 limits"))?;
 
         // Convert logical block number to access path.
@@ -582,7 +584,7 @@ impl BlockPtrTree {
 
     /// Translates a logical block number into a path of block pointer offsets.
     ///
-    fn logical_block_to_path(&self, iblock: u32) -> Result<BlockPointerPath> {
+    fn logical_block_to_path(&self, iblock: Iblock) -> Result<BlockPointerPath> {
         let ptrs = (BLOCK_SIZE / size_of::<u32>()) as u32;
         let ptrs_bits = ptrs.trailing_zeros();
         let direct_blocks = 12u32;
@@ -1153,7 +1155,7 @@ mod test {
         prelude::*,
     };
 
-    fn alloc_single_block(tree: &mut BlockPtrTree, fs: &Arc<Ext2>, iblock: u32) -> Result<Ext2Bid> {
+    fn alloc_single_block(tree: &mut BlockPtrTree, fs: &Arc<Ext2>, iblock: Iblock) -> Result<Ext2Bid> {
         let range = tree.lookup_or_alloc_block_range(fs, iblock, 1, true)?;
         assert!(!range.is_empty());
         Ok(range.start)

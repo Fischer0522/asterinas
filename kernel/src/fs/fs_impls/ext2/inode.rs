@@ -12,7 +12,7 @@ use device_id::DeviceId;
 use ostd::{const_assert, mm::io::util::HasVmReaderWriter};
 
 use super::{
-    block_ptr_tree::{BlockPtrTree, Ext2Bid, RawBlockPtrs},
+    block_ptr_tree::{BlockPtrTree, Ext2Bid, Iblock, RawBlockPtrs},
     dir::{DOT_BYTE, DOT_DOT_BYTE, DirBlock, DirEntryHeader},
     fs::Ext2,
     io_range_mapper::{IoRange, IoRangeMapper},
@@ -1293,7 +1293,7 @@ impl InodeBlockManager {
     }
 
     /// Looks up a single logical block → physical block (read lock).
-    fn lookup_block(&self, iblock: u32) -> Result<Option<Ext2Bid>> {
+    fn lookup_block(&self, iblock: Iblock) -> Result<Option<Ext2Bid>> {
         let tree = self.block_ptr_tree.read();
         tree.lookup_block(iblock)
     }
@@ -1317,7 +1317,7 @@ impl InodeBlockManager {
     /// the provided closure for each `IoRange`.
     fn for_each_io_range(
         &self,
-        block_range: Range<Ext2Bid>,
+        block_range: Range<Iblock>,
         mut io_fn: impl FnMut(IoRange) -> Result<()>,
     ) -> Result<()> {
         let tree = self.block_ptr_tree.read();
@@ -1369,7 +1369,7 @@ impl InodeBlockManager {
         let mut new_blocks = Vec::new();
         let mut current_block = start_block;
         while current_block < end_block {
-            let iblock = current_block as u32;
+            let iblock = current_block as Iblock;
             let remaining = (end_block - current_block) as u32;
 
             let mapped_range = tree.lookup_block_range(iblock, remaining)?;
@@ -1397,7 +1397,7 @@ impl PageCacheBackend for InodeBlockManager {
         bio_segment: BioSegment,
         complete_fn: Option<BioCompleteFn>,
     ) -> Result<BioWaiter> {
-        let iblock = u32::try_from(idx)
+        let iblock = Iblock::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
         match self.lookup_block(iblock)? {
             Some(bid) => {
@@ -1424,7 +1424,7 @@ impl PageCacheBackend for InodeBlockManager {
         bio_segment: BioSegment,
         complete_fn: Option<BioCompleteFn>,
     ) -> Result<BioWaiter> {
-        let iblock = u32::try_from(idx)
+        let iblock = Iblock::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
         let fs = self.fs()?;
         // The block is already allocated, write it directly.

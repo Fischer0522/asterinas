@@ -311,7 +311,7 @@ impl Ext2 {
     }
 
     /// Allocates up to `count` contiguous blocks.
-    pub(super) fn alloc_blocks(&self, count: u32, goal: Ext2Bid) -> Result<Range<u32>> {
+    pub(super) fn alloc_blocks(&self, count: u32, goal: Ext2Bid) -> Result<Range<Ext2Bid>> {
         if count == 0 {
             return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
         }
@@ -389,7 +389,7 @@ impl Ext2 {
     }
 
     /// Frees a range of blocks starting at `start`.
-    pub(super) fn free_blocks(&self, start: u32, count: u32) -> Result<()> {
+    pub(super) fn free_blocks(&self, start: Ext2Bid, count: u32) -> Result<()> {
         if count == 0 {
             return Ok(());
         }

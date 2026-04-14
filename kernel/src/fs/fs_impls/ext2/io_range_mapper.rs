@@ -5,7 +5,7 @@
 use core::ops::Range;
 
 use super::{
-    block_ptr_tree::{BlockPtrTree, Ext2Bid},
+    block_ptr_tree::{BlockPtrTree, Ext2Bid, Iblock},
     prelude::*,
 };
 
@@ -13,7 +13,7 @@ use super::{
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct MappedRange {
     /// Logical block interval in the file that produced this mapped run.
-    pub(super) logical_block_range: Range<u32>,
+    pub(super) logical_block_range: Range<Iblock>,
     /// Physical device block interval backing the logical block interval.
     pub(super) device_block_range: Range<Ext2Bid>,
 }
@@ -23,7 +23,7 @@ pub(super) struct MappedRange {
 /// Used by the direct-I/O path to batch contiguous device-block runs
 /// into single BIO requests.
 pub(super) struct IoRangeMapper<'a> {
-    range: Range<u32>,
+    range: Range<Iblock>,
     block_ptr_tree: RwMutexReadGuard<'a, BlockPtrTree>,
 }
 
@@ -33,12 +33,12 @@ pub(super) enum IoRange {
     /// A contiguous mapped device-block range.
     Mapped(MappedRange),
     /// A hole in the file expressed as a logical-block interval.
-    Hole(Range<u32>),
+    Hole(Range<Iblock>),
 }
 
 impl<'a> IoRangeMapper<'a> {
     pub(super) fn new(
-        range: Range<Ext2Bid>,
+        range: Range<Iblock>,
         block_ptr_tree: RwMutexReadGuard<'a, BlockPtrTree>,
     ) -> Self {
         Self {
