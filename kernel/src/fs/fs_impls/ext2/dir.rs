@@ -232,7 +232,7 @@ impl<'a> DirBlock<'a> {
         }
 
         if let Some(prev) = prev_offset {
-            let merged_len = to.saturating_sub(prev) as u16;
+            let merged_len = (to - prev) as u16;
             self.set_rec_len(prev, merged_len)?;
         }
 

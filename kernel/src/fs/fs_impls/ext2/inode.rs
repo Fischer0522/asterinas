@@ -2168,9 +2168,7 @@ impl InodeInner {
                 };
 
                 // Free entry can be reused, occupied entry can be split.
-                if (ino == 0 && rec_len >= reclen)
-                    || (ino != 0 && rec_len >= used_len.saturating_add(reclen))
-                {
+                if (ino == 0 && rec_len >= reclen) || (ino != 0 && rec_len >= used_len + reclen) {
                     return Ok(Some(DirSlotInfo {
                         dir_offset: block_offset + entry_offset,
                         slot_rec_len: rec_len,
@@ -2187,9 +2185,8 @@ impl InodeInner {
     ///
     fn grow_dir_block(&mut self) -> Result<DirSlotInfo> {
         let old_size = self.file_size();
-
-        self.prepare_write(old_size, old_size + BLOCK_SIZE)?;
-        let new_size = old_size.saturating_add(BLOCK_SIZE);
+        let new_size = old_size + BLOCK_SIZE;
+        self.prepare_write(old_size, new_size)?;
         self.set_file_size(new_size);
 
         Ok(DirSlotInfo {
@@ -2232,11 +2229,11 @@ impl InodeInner {
             }
             // When splitting, update the predecessor's rec_len first.
             self.page_cache.write_bytes(
-                slot.dir_offset.saturating_add(4),
+                slot.dir_offset + 4,
                 &(slot.used_rec_len as u16).to_le_bytes(),
             )?;
-            offset = slot.dir_offset.saturating_add(slot.used_rec_len);
-            rec_len = slot.slot_rec_len.saturating_sub(slot.used_rec_len);
+            offset = slot.dir_offset + slot.used_rec_len;
+            rec_len = slot.slot_rec_len - slot.used_rec_len;
         }
 
         let block = DirBlock::new(self.page_cache(), offset, rec_len);

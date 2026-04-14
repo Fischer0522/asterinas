@@ -213,7 +213,10 @@ impl IndirectBlock {
         let offset = idx
             .checked_mul(size_of::<Ext2Bid>())
             .ok_or_else(|| Error::with_message(Errno::EIO, "indirect pointer index overflow"))?;
-        if offset + size_of::<Ext2Bid>() > BLOCK_SIZE {
+        let end = offset
+            .checked_add(size_of::<Ext2Bid>())
+            .ok_or_else(|| Error::with_message(Errno::EIO, "indirect pointer end overflow"))?;
+        if end > BLOCK_SIZE {
             return_errno_with_message!(Errno::EIO, "indirect pointer index out of bounds");
         }
         Ok(offset)

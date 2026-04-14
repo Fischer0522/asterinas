@@ -692,7 +692,7 @@ impl BlockPtrTree {
     }
 
     fn max_blocks_in_run(path: &BlockPointerPath, max_blocks: u32) -> u32 {
-        max_blocks.min(path.boundary.saturating_add(1))
+        max_blocks.min(path.boundary + 1)
     }
 
     fn mapped_range_from_branch(
@@ -1155,7 +1155,11 @@ mod test {
         prelude::*,
     };
 
-    fn alloc_single_block(tree: &mut BlockPtrTree, fs: &Arc<Ext2>, iblock: Iblock) -> Result<Ext2Bid> {
+    fn alloc_single_block(
+        tree: &mut BlockPtrTree,
+        fs: &Arc<Ext2>,
+        iblock: Iblock,
+    ) -> Result<Ext2Bid> {
         let range = tree.lookup_or_alloc_block_range(fs, iblock, 1, true)?;
         assert!(!range.is_empty());
         Ok(range.start)
